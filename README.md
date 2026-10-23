@@ -22,10 +22,17 @@ bash scripts/install.sh
 ~/.local/bin/cctx ping
 ```
 
-**2. Install the extension.** Download
-**[code-context-native.vsix](https://github.com/dotnetpower/code-context/releases/latest/download/code-context-native.vsix)**,
-then choose **Extensions → … → Install from VSIX…** in VS Code.
-The backend is installed separately; a VSIX alone is not enough.
+**2. Install [Code Context by dotnetpower from Marketplace](https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native)**,
+or run:
+
+```sh
+code --install-extension dotnetpower.code-context-native
+```
+
+For offline/manual installation, download the
+[VSIX](https://github.com/dotnetpower/code-context/releases/latest/download/code-context-native.vsix)
+and choose **Extensions → … → Install from VSIX…**.
+The backend is installed separately; installing the extension alone is not enough.
 Existing VSIX users should follow the [publisher migration guide](vscode-extension/docs/SETUP.md#extension-details-resources-and-vsix-updates).
 
 **3. Open a trusted project** and run **Code Context: Getting Started**.
@@ -35,8 +42,8 @@ Enable Code Context tools in the agent's tool picker, then try:
 
 No proposed API flags are needed. For Windows Agents, SSH, manual registration,
 or MCP-only clients, see the [setup guide](vscode-extension/docs/SETUP.md) and
-[backend reference](docs/REFERENCE.md). Marketplace publication is separate
-from the downloadable VSIX.
+[backend reference](docs/REFERENCE.md). Marketplace and GitHub VSIX distribution
+use the same extension identity.
 
 ## Measured performance
 
