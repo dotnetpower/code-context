@@ -1,6 +1,16 @@
-use code_context::shared_mcp::{dispatch, serve};
+use code_context::shared_mcp::dispatch;
 use serde_json::json;
-use std::io::Cursor;
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+struct PrivateDaemon(Child);
+impl Drop for PrivateDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 fn shared_mcp_routes_host_dispatch_delays_without_relaxing_policy_or_repeating_work() {
@@ -49,11 +59,38 @@ fn shared_mcp_rejects_invalid_request_shapes_and_identifiers() {
 
 #[test]
 fn shared_stdio_enforces_frame_budget_and_json_only_output() {
-    assert!(serve(Cursor::new(vec![b'a'; 1024 * 1024 + 2]), Vec::new()).is_err());
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("state");
+    let log = directory.path().join("daemon.log");
+    let binary = env!("CARGO_BIN_EXE_cctx");
+    let mut daemon = PrivateDaemon(Command::new(binary).env("CCTX_HOME", &home)
+        .env_remove("CCTX_IO_GUARD").env_remove("CCTX_MEMORY_GUARD")
+        .arg("daemon").stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap());
+    let started = Instant::now();
+    loop {
+        let ping = Command::new(binary).env("CCTX_HOME", &home).arg("ping").output().unwrap();
+        if ping.status.success() { break; }
+        assert!(daemon.0.try_wait().unwrap().is_none(), "{}", std::fs::read_to_string(&log).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(5), "private daemon did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let run = |input: &[u8]| {
+        let mut child = Command::new(binary).env("CCTX_HOME", &home)
+            .arg("shared-mcp").stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        if let Err(error) = child.stdin.take().unwrap().write_all(input) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        child.wait_with_output().unwrap()
+    };
+    let oversized = run(&vec![b'a'; 1024 * 1024 + 2]);
+    assert!(!oversized.status.success());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("MCP input exceeds 1 MiB"));
     let input = b"invalid\n{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"ping\"}\n";
-    let mut output = Vec::new();
-    serve(Cursor::new(input), &mut output).unwrap();
-    let values: Vec<serde_json::Value> = String::from_utf8(output)
+    let output = run(input);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let values: Vec<serde_json::Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
