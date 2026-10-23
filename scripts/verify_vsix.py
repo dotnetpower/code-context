@@ -43,6 +43,8 @@ def verify(path: Path) -> dict:
             raise ValueError("Native tool references changed")
         if manifest["publisher"] != "dotnetpower" or manifest["name"] != "code-context-native":
             raise ValueError("Extension identity changed")
+        if manifest["displayName"] != "Code Context by dotnetpower":
+            raise ValueError("Use the publisher-qualified Marketplace display name")
         if manifest["repository"]["url"] != "https://github.com/dotnetpower/code-context.git":
             raise ValueError("Unexpected source repository")
         vsix = ET.fromstring(archive.read("extension.vsixmanifest"))
@@ -50,6 +52,9 @@ def verify(path: Path) -> dict:
         if any(identity.attrib[key] != manifest[field] for key, field in
                (("Publisher", "publisher"), ("Id", "name"), ("Version", "version"))):
             raise ValueError("VSIX identity differs from the new publisher manifest")
+        display_name = next(element.text for element in vsix.iter() if element.tag.endswith("}DisplayName"))
+        if display_name != manifest["displayName"]:
+            raise ValueError("VSIX display name differs from package metadata")
         properties = {element.attrib["Id"]: element.attrib["Value"]
                       for element in vsix.iter() if element.tag.endswith("}Property")}
         for key, value in {

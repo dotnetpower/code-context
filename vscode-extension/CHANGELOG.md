@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.1
+
+- Qualify the Marketplace display name as **Code Context by dotnetpower** after
+  the unqualified display name was rejected as already taken.
+- Preserve the publisher, extension ID, settings, and seven native references.
+- Verify that both the packaged manifest and VSIX metadata use the corrected
+  display name.
+
 ## 0.13.0
 
 - Adopt `dotnetpower.code-context-native` for the first Marketplace publication.

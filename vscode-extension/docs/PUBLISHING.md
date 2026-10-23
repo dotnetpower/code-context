@@ -45,6 +45,12 @@ need the Linux/WSL backend described in the setup guide.
 ## Marketplace checklist
 
 The first Marketplace identity is `dotnetpower.code-context-native`.
+Its display name is **Code Context by dotnetpower**: the unqualified name
+was rejected by Marketplace as already taken. Changing a display name does
+not change the publisher/name identity or require reinstalling a new ID.
+Local packaging cannot reserve or guarantee Marketplace name availability;
+only the server's accepted publication verifies it.
+
 Log in to a Microsoft account with publishing access to the **dotnetpower**
 publisher; a GitHub username alone does not grant that access.
 

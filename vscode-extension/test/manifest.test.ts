@@ -20,7 +20,7 @@ void test('release branding uses verified PNGs and complete Marketplace metadata
   };
   assert.equal(manifest.publisher, 'dotnetpower');
   assert.equal(manifest.name, 'code-context-native');
-  assert.equal(manifest.displayName, 'Code Context');
+  assert.equal(manifest.displayName, 'Code Context by dotnetpower');
   assert.ok(manifest.description.length <= 140);
   assert.equal(manifest.repository.url, 'https://github.com/dotnetpower/code-context.git');
   assert.equal(manifest.repository.directory, 'vscode-extension');

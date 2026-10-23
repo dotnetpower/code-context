@@ -2,7 +2,7 @@
   <img src="resources/banner.png" alt="Code Context — local context, less friction" width="100%">
 </p>
 
-# Code Context
+# Code Context by dotnetpower
 
 **Local source context for your coding agent.** Find files, search source, and
 read nearby code with seven native tools backed by one shared Rust cache.
