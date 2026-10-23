@@ -99,6 +99,22 @@ export function activate(context: vscode.ExtensionContext): void {
     status,
     bridge,
     client,
+    vscode.commands.registerCommand('codeContextNative.gettingStarted', async () => {
+      await vscode.commands.executeCommand(
+        'workbench.action.openWalkthrough', 'moonchoi.code-context-native#getting-started', false,
+      );
+    }),
+    vscode.commands.registerCommand('codeContextNative.configureConnection', async () => {
+      await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:moonchoi.code-context-native');
+    }),
+    vscode.commands.registerCommand('codeContextNative.openSetupGuide', async () => {
+      const opened = await vscode.env.openExternal(vscode.Uri.parse(
+        'https://github.com/dotnetpower/code-context/blob/main/vscode-extension/docs/SETUP.md',
+      ));
+      if (!opened) {
+        await vscode.window.showErrorMessage('Could not open the Code Context setup guide.');
+      }
+    }),
     vscode.commands.registerCommand('codeContextNative.showStatus', async () => {
       await showStatus(bridge, status, output, usage.lastRoot);
     }),
@@ -200,11 +216,23 @@ async function runSelfTest(
   explicitRoot?: string,
 ): Promise<void> {
   try {
+    await vscode.commands.executeCommand('setContext', 'codeContextNative.selfTestPassed', false);
     const started = performance.now();
     const source = new vscode.CancellationTokenSource();
     try {
       const workspaces = await bridge.listWorkspaces(source.token);
-      const root = await bridge.resolveRoot(explicitRoot, source.token, false);
+      let requestedRoot = explicitRoot;
+      if (!requestedRoot && client?.usesWslBridge && workspaces.length > 1) {
+        requestedRoot = await vscode.window.showQuickPick(
+          workspaces.map((workspace) => workspace.root),
+          { title: 'Code Context: Select a registered Linux root', placeHolder: 'The self-test observes status; it does not load source.' },
+        );
+        if (!requestedRoot) {
+          output.appendLine('SELF_TEST_CANCELLED no registered root selected');
+          return;
+        }
+      }
+      const root = await bridge.resolveRoot(requestedRoot, source.token, false);
       const registered = registeredNativeTools();
       if (registered.length !== NATIVE_TOOL_NAMES.length) {
         throw new Error(
@@ -222,6 +250,7 @@ async function runSelfTest(
       const statusText = toolResultText(toolResult);
       const daemonStatus = JSON.parse(statusText) as JsonValue;
       validateDaemonStatus(daemonStatus);
+      await vscode.commands.executeCommand('setContext', 'codeContextNative.selfTestPassed', true);
       const metadata: unknown = vscode.extensions.getExtension('moonchoi.code-context-native')?.packageJSON;
       const version = typeof metadata === 'object' && metadata !== null && 'version' in metadata
         && typeof metadata.version === 'string' ? metadata.version : 'unknown';
@@ -229,7 +258,7 @@ async function runSelfTest(
         extensionCallable: true,
         extensionVersion: version,
         chatPickerEnablement: 'unverified',
-        nextStep: 'Enable Code Context Native in the Agent tools picker and test #cctxNativeFiles in this chat.',
+        nextStep: 'Enable Code Context tools in the agent tool settings and test #cctxNativeFiles in this chat.',
         nativeTools: registered,
         registeredWorkspaces: workspaces.length,
         resolvedRoot: root,
@@ -279,7 +308,7 @@ async function runStartupProbe(
     statusBar.text = '$(database) CCTX Available';
     statusBar.tooltip = `${registered.length} native tools registered and callable for ${root}; Chat picker enablement is user-controlled`;
     output.appendLine(
-      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length} root=${root} probe=codeWorkspaces index_initialization=on-demand source_scan=none elapsed_ms=${(performance.now() - started).toFixed(3)} agent_picker=unverified; enable Code Context Native in the Agent tools picker`,
+      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length} root=${root} probe=codeWorkspaces index_initialization=on-demand source_scan=none elapsed_ms=${(performance.now() - started).toFixed(3)} agent_picker=unverified; enable Code Context tools in the agent tool settings`,
     );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);

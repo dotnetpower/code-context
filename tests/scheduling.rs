@@ -323,10 +323,9 @@ fn cold_misses_return_without_waiting_and_coalesce_only_the_requested_root() {
             .count(),
         1
     );
-    assert_eq!(
-        status["data"]["daemon_admission"]["target_bytes"],
-        3usize * 1024 * 1024 * 1024
-    );
+    let target = status["data"]["daemon_admission"]["target_bytes"].as_u64().unwrap();
+    assert!(target > 0 && target <= 3_u64 * 1024 * 1024 * 1024);
+    assert_eq!(status["data"]["process_memory"]["adaptive"]["mode"], "capped_auto");
 }
 
 #[test]

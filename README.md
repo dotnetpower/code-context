@@ -138,12 +138,12 @@ The `Native` suffix intentionally avoids collisions with MCP-generated
 references such as `#cctxContext`. MCP remains available under its existing
 tool names.
 
-The seven native tools are grouped into the `code-context-native` Language Model
-Tool Set. VS Code Agent Host forwards extension tools through enabled tool sets;
-ensure **Code Context Native** is enabled in the Agent tools picker.
-The manifest uses the real trust context key `isWorkspaceTrusted`; an earlier
-`workspaceTrust` condition silently filtered every tool from Agent Host while
-leaving them visible in `vscode.lm.tools`.
+The seven native tools use stable Language Model Tool contributions. VS Code
+provides their automatic extension grouping for Agent Host delivery; no proposed
+tool-set API or runtime-argument edit is required. Enable Code Context tools in
+the agent's tool settings. The extension rejects untrusted workspace activation
+and rechecks the authoritative trust API on invocation rather than relying on
+a UI trust context key that can differ in Agents windows.
 
 The extension runs in the workspace host, so WSL paths and the private Unix
 socket stay on Linux. It resolves the active editor/workspace against registered
@@ -194,7 +194,7 @@ the live registration still equals that fingerprint. A CLI or Customize change
 releases the root from automatic management rather than being overwritten.
 
 Extension client tools are available to direct VS Code chats only when the
-**Code Context Native** tool set is enabled. Delegated/headless sessions and
+Code Context tools are enabled. Delegated/headless sessions and
 Copilot CLI can omit client tools by design; the MCP surface remains the
 cross-session fallback and uses the same daemon/index.
 

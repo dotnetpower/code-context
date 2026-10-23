@@ -1,10 +1,26 @@
 {
   "name": "code-context-native",
-  "displayName": "Code Context Native Tools",
-  "description": "Native VS Code language model tools backed by the shared Rust code-context daemon.",
-  "version": "0.11.1",
+  "displayName": "Code Context",
+  "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
+  "version": "0.12.0",
   "publisher": "moonchoi",
   "license": "MIT",
+  "icon": "resources/icon.png",
+  "preview": true,
+  "galleryBanner": {
+    "color": "#0B1220",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotnetpower/code-context.git",
+    "directory": "vscode-extension"
+  },
+  "homepage": "https://github.com/dotnetpower/code-context/tree/main/vscode-extension#readme",
+  "bugs": {
+    "url": "https://github.com/dotnetpower/code-context/issues"
+  },
+  "qna": "https://github.com/dotnetpower/code-context/issues",
   "engines": {
     "vscode": "^1.140.0"
   },
@@ -20,9 +36,6 @@
       "supported": false
     }
   },
-  "enabledApiProposals": [
-    "contribLanguageModelToolSets"
-  ],
   "categories": [
     "AI",
     "Other"
@@ -41,6 +54,9 @@
   "files": [
     "out/src",
     "prompts",
+    "resources/*.png",
+    "docs",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE",
     "package.json"
@@ -52,6 +68,23 @@
       }
     ],
     "commands": [
+      {
+        "command": "codeContextNative.gettingStarted",
+        "title": "Code Context: Getting Started",
+        "category": "Code Context",
+        "icon": "$(book)"
+      },
+      {
+        "command": "codeContextNative.configureConnection",
+        "title": "Code Context: Configure Connection",
+        "category": "Code Context",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "codeContextNative.openSetupGuide",
+        "title": "Code Context: Open Setup Guide",
+        "category": "Code Context"
+      },
       {
         "command": "codeContextNative.showStatus",
         "title": "Code Context: Show Native Tool Status",
@@ -422,19 +455,45 @@
         }
       }
     ],
-    "languageModelToolSets": [
+    "walkthroughs": [
       {
-        "name": "code-context-native",
-        "description": "Use first for fast saved-source search, context, and reads through the native Rust RAM index; includes sync, status, and workspace tools.",
-        "icon": "$(database)",
-        "tools": [
-          "cctxNativeFiles",
-          "cctxNativeGrep",
-          "cctxNativeContext",
-          "cctxNativeRead",
-          "cctxNativeStatus",
-          "cctxNativeSync",
-          "cctxNativeWorkspaces"
+        "id": "getting-started",
+        "title": "Get started with Code Context",
+        "description": "A local context engine for your AI agent. Connect once, then search, read, and gather source context.",
+        "icon": "resources/icon.png",
+        "steps": [
+          {
+            "id": "backend",
+            "title": "1. Install the local engine",
+            "description": "The extension connects to cctx, a shared Rust engine running on Linux or WSL. It never silently downloads or installs an executable.\n[Open setup guide](command:codeContextNative.openSetupGuide)",
+            "completionEvents": [
+              "onCommand:codeContextNative.openSetupGuide"
+            ]
+          },
+          {
+            "id": "connection",
+            "title": "2. Choose your connection",
+            "description": "Linux, WSL, and SSH workspace hosts use a Unix socket. Windows Agent Sessions use your chosen WSL distribution and the Linux cctx executable.\n[Configure connection](command:codeContextNative.configureConnection)",
+            "completionEvents": [
+              "onCommand:codeContextNative.configureConnection"
+            ]
+          },
+          {
+            "id": "check",
+            "title": "3. Check readiness",
+            "description": "Trust your workspace, register it with the backend, and verify the native tools. On Windows Agent Sessions, use an explicit Linux root with source tools; the self-test needs an unambiguous root.\n[Run native self-test](command:codeContextNative.selfTest)",
+            "completionEvents": [
+              "onContext:codeContextNative.selfTestPassed"
+            ]
+          },
+          {
+            "id": "search",
+            "title": "4. Put context to work",
+            "description": "Enable the Code Context tools in your agent's tool settings. Try #cctxNativeFiles or #cctxNativeContext. A cold cache returns CACHE_MISS immediately: continue with normal tools while it loads only the requested root.\n[View status](command:codeContextNative.showStatus)",
+            "completionEvents": [
+              "onCommand:codeContextNative.showStatus"
+            ]
+          }
         ]
       }
     ]
@@ -446,7 +505,7 @@
     "lint": "eslint .",
     "test": "npm run compile && node --test out/test/**/*.test.js",
     "bench": "npm run compile && node scripts/bench-native.mjs",
-    "package": "npm run clean && npm run lint && npm test && vsce package --allow-missing-repository --out dist/code-context-native.vsix",
+    "package": "npm run clean && npm run lint && npm test && vsce package --baseContentUrl https://github.com/dotnetpower/code-context/blob/main/vscode-extension --baseImagesUrl https://raw.githubusercontent.com/dotnetpower/code-context/main/vscode-extension --out dist/code-context-native.vsix",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

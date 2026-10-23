@@ -12,6 +12,48 @@ interface ToolContribution {
   when?: string;
 }
 
+void test('release branding uses verified PNGs and complete Marketplace metadata', async () => {
+  const manifest = JSON.parse(await readFile(resolve(__dirname, '../../package.json'), 'utf8')) as {
+    publisher: string; name: string; displayName: string; description: string; icon: string;
+    repository: { url: string; directory: string };
+    galleryBanner: { color: string; theme: string };
+  };
+  assert.equal(manifest.publisher, 'moonchoi');
+  assert.equal(manifest.name, 'code-context-native');
+  assert.equal(manifest.displayName, 'Code Context');
+  assert.ok(manifest.description.length <= 140);
+  assert.equal(manifest.repository.url, 'https://github.com/dotnetpower/code-context.git');
+  assert.equal(manifest.repository.directory, 'vscode-extension');
+  assert.equal(manifest.galleryBanner.theme, 'dark');
+  assert.equal(manifest.icon, 'resources/icon.png');
+  for (const [name, width, height] of [['icon', 256, 256], ['banner', 1440, 480]] as const) {
+    const image = await readFile(resolve(__dirname, `../../resources/${name}.png`));
+    assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.equal(image.readUInt32BE(16), width);
+    assert.equal(image.readUInt32BE(20), height);
+  }
+});
+
+void test('onboarding reports backend requirement and does not mark an unpassed self-test complete', async () => {
+  const manifest = JSON.parse(await readFile(resolve(__dirname, '../../package.json'), 'utf8')) as {
+    version: string;
+    contributes: { walkthroughs: Array<{
+      id: string; steps: Array<{ id: string; completionEvents: string[]; description: string }>;
+    }> };
+  };
+  const walkthrough = manifest.contributes.walkthroughs[0];
+  assert.equal(walkthrough?.id, 'getting-started');
+  assert.equal(walkthrough.steps.length, 4);
+  const check = walkthrough.steps.find((step) => step.id === 'check');
+  assert.deepEqual(check?.completionEvents, ['onContext:codeContextNative.selfTestPassed']);
+  const readme = await readFile(resolve(__dirname, '../../README.md'), 'utf8');
+  assert.match(readme, /Local backend required/);
+  assert.match(readme, /Marketplace publication is separate/);
+  assert.match(readme, /No proposed API flags/);
+  const changelog = await readFile(resolve(__dirname, '../../CHANGELOG.md'), 'utf8');
+  assert.ok(changelog.includes(`## ${manifest.version}`));
+});
+
 void test('manifest contributes exactly the seven registered native tools', async () => {
   const packagePath = resolve(__dirname, '../../package.json');
   const manifest = JSON.parse(await readFile(packagePath, 'utf8')) as {
@@ -92,12 +134,8 @@ void test('manifest contributes exactly the seven registered native tools', asyn
   assert.equal(manifest.capabilities?.agentsWindow?.supported, true);
   assert.equal(manifest.capabilities?.untrustedWorkspaces?.supported, false);
   assert.deepEqual(manifest.activationEvents, ['onStartupFinished']);
-  assert.deepEqual(manifest.enabledApiProposals, [
-    'contribLanguageModelToolSets',
-  ]);
-  const toolSet = manifest.contributes?.languageModelToolSets?.[0];
-  assert.equal(toolSet?.name, 'code-context-native');
-  assert.deepEqual([...(toolSet?.tools ?? [])].sort(), expectedReferences);
+  assert.equal(manifest.enabledApiProposals, undefined);
+  assert.equal(manifest.contributes?.languageModelToolSets, undefined);
   assert.deepEqual(
     tools.map((tool) => tool.toolReferenceName).sort(),
     expectedReferences,
@@ -107,6 +145,9 @@ void test('manifest contributes exactly the seven registered native tools', asyn
       .map((command) => command.command)
       .sort(),
     [
+      'codeContextNative.configureConnection',
+      'codeContextNative.gettingStarted',
+      'codeContextNative.openSetupGuide',
       'codeContextNative.registerWorkspace',
       'codeContextNative.selfTest',
       'codeContextNative.showStatus',
