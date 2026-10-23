@@ -1,0 +1,462 @@
+{
+  "name": "code-context-native",
+  "displayName": "Code Context Native Tools",
+  "description": "Native VS Code language model tools backed by the shared Rust code-context daemon.",
+  "version": "0.11.0",
+  "publisher": "moonchoi",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "capabilities": {
+    "agentsWindow": {
+      "supported": true
+    },
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "enabledApiProposals": [
+    "contribLanguageModelToolSets"
+  ],
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "language model tool",
+    "search",
+    "rust",
+    "code context"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "files": [
+    "out/src",
+    "prompts",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "contributes": {
+    "chatInstructions": [
+      {
+        "path": "./prompts/code-context.instructions.md"
+      }
+    ],
+    "commands": [
+      {
+        "command": "codeContextNative.showStatus",
+        "title": "Code Context: Show Native Tool Status",
+        "category": "Code Context"
+      },
+      {
+        "command": "codeContextNative.selfTest",
+        "title": "Code Context: Run Native Tool Self-Test",
+        "category": "Code Context"
+      },
+      {
+        "command": "codeContextNative.registerWorkspace",
+        "title": "Code Context: Register Current Workspace",
+        "category": "Code Context"
+      }
+    ],
+    "configuration": {
+      "title": "Code Context Native",
+      "properties": {
+        "codeContextNative.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute code-context daemon socket path. Empty uses CCTX_HOME or ~/.local/state/code-context/daemon.sock."
+        },
+        "codeContextNative.autoStartService": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start code-context.service through systemctl --user when the daemon socket is unavailable."
+        },
+        "codeContextNative.wslDistribution": {
+          "type": "string",
+          "default": "",
+          "description": "Windows extension hosts: WSL distribution running the shared daemon. Native IPC uses wsl.exe, not MCP or TCP."
+        },
+        "codeContextNative.wslExecutablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Windows extension hosts: absolute Linux cctx executable supporting native-bridge. Supply an explicit Linux root in Agent Sessions."
+        },
+        "codeContextNative.autoRegisterWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Initialize trusted unregistered workspace folders on the first source lookup, never during window reload. Disable to require manual registration."
+        },
+        "codeContextNative.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute cctx executable path used for interactive workspace registration. Empty uses ~/.local/bin/cctx."
+        },
+        "codeContextNative.requestTimeoutMs": {
+          "type": "number",
+          "default": 40000,
+          "minimum": 1000,
+          "maximum": 120000,
+          "description": "Native tool request timeout in milliseconds."
+        }
+      }
+    },
+    "languageModelTools": [
+      {
+        "name": "code-context-native_codeFiles",
+        "toolReferenceName": "cctxNativeFiles",
+        "displayName": "Code Context: Find Files",
+        "modelDescription": "Use this FIRST for filename/path glob discovery, NOT content. This native tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_files; do not repeat pending calls. Respects registration and exclusions.",
+        "userDescription": "Find indexed filenames and paths without searching file contents.",
+        "tags": [
+          "files",
+          "search",
+          "paths",
+          "native",
+          "code-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(files)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            },
+            "glob": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "description": "Filename or relative-path glob, e.g. *Tools.ts, *.json or src/**/*.rs."
+            },
+            "paths": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string"
+              }
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 200
+            }
+          },
+          "required": [
+            "glob"
+          ]
+        }
+      },
+      {
+        "name": "code-context-native_codeGrep",
+        "tags": [
+          "files",
+          "search",
+          "saved-source",
+          "ram-index",
+          "fast",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeGrep",
+        "displayName": "Code Context: Search",
+        "modelDescription": "Use this FIRST for saved-source exact/regex search with path/glob filters. This native tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_grep; do not repeat pending calls.",
+        "userDescription": "Search indexed workspace source with the native Rust code-context tool.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(search)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            },
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation such as a|b or other regex syntax."
+            },
+            "regex": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable regular expressions explicitly; otherwise |, parentheses and other operators are literal characters."
+            },
+            "ignore_case": {
+              "type": "boolean",
+              "default": false
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 200
+            },
+            "paths": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional relative file or directory prefixes."
+            },
+            "glob": {
+              "type": "string",
+              "description": "Optional filename or relative-path glob."
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "code-context-native_codeContext",
+        "tags": [
+          "files",
+          "search",
+          "read",
+          "saved-source",
+          "ram-index",
+          "fast",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeContext",
+        "displayName": "Code Context: Search with Context",
+        "modelDescription": "Use this FIRST for symbol/literal/regex lookup with nearby saved source in one native call. This tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_context; do not repeat pending calls.",
+        "userDescription": "Search indexed source and return versioned surrounding context.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(book)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            },
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation such as a|b or other regex syntax."
+            },
+            "regex": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable regular expressions explicitly; otherwise |, parentheses and other operators are literal characters."
+            },
+            "ignore_case": {
+              "type": "boolean",
+              "default": false
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 20
+            },
+            "radius": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 3
+            },
+            "paths": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string"
+              }
+            },
+            "glob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "code-context-native_codeRead",
+        "tags": [
+          "files",
+          "read",
+          "saved-source",
+          "ram-index",
+          "fast",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeRead",
+        "displayName": "Code Context: Read Ranges",
+        "modelDescription": "Use this for known saved-source ranges and live-verified hashes in a native batch read. This tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not a missing disk file. If foreground host dispatch is unavailable, prefer backend MCP code_read; do not repeat pending calls.",
+        "userDescription": "Read multiple indexed source ranges with live hash verification.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(file-code)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            },
+            "page": {
+              "type": "boolean",
+              "default": false,
+              "description": "Use for large reads. Returns explicit snippets,complete,next_ranges under256KiB. Continue page=true with next_ranges;compare file hashes across pages. false keeps atomic snippet-array output."
+            },
+            "split_ranges": {
+              "type": "boolean",
+              "default": true,
+              "description": "Split broad reads into explicitly returned snippets of at most500lines; max64segments and256KiBtotal. false keeps strict500line input ranges."
+            },
+            "ranges": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "start": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "end": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "path",
+                  "start",
+                  "end"
+                ]
+              }
+            }
+          },
+          "required": [
+            "ranges"
+          ]
+        }
+      },
+      {
+        "name": "code-context-native_codeStatus",
+        "tags": [
+          "status",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeStatus",
+        "displayName": "Code Context: Status",
+        "modelDescription": "Show native code-context index state, coverage, memory and protocol counters without loading, refreshing or hashing source. An unloaded index is normal until the first source lookup.",
+        "userDescription": "Show native index and daemon status.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(pulse)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            }
+          }
+        }
+      },
+      {
+        "name": "code-context-native_codeSync",
+        "tags": [
+          "files",
+          "sync",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeSync",
+        "displayName": "Code Context: Sync",
+        "modelDescription": "Run the preferred native explicit full-source synchronization barrier before exhaustive absence claims or after edits. Rechecks ignore/profile policy and updates only changed postings.",
+        "userDescription": "Synchronize the native source index with saved files.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(sync)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+            }
+          }
+        }
+      },
+      {
+        "name": "code-context-native_codeWorkspaces",
+        "tags": [
+          "workspace",
+          "code-context"
+        ],
+        "toolReferenceName": "cctxNativeWorkspaces",
+        "displayName": "Code Context: Registered Workspaces",
+        "modelDescription": "List explicitly registered native code-context roots, scopes, globs, exclusion settings, and memory policies. Use only when automatic current-workspace root resolution is ambiguous.",
+        "userDescription": "List registered native code-context workspaces.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(root-folder)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    ],
+    "languageModelToolSets": [
+      {
+        "name": "code-context-native",
+        "description": "Use first for fast saved-source search, context, and reads through the native Rust RAM index; includes sync, status, and workspace tools.",
+        "icon": "$(database)",
+        "tools": [
+          "cctxNativeFiles",
+          "cctxNativeGrep",
+          "cctxNativeContext",
+          "cctxNativeRead",
+          "cctxNativeStatus",
+          "cctxNativeSync",
+          "cctxNativeWorkspaces"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "lint": "eslint .",
+    "test": "npm run compile && node --test out/test/**/*.test.js",
+    "bench": "npm run compile && node scripts/bench-native.mjs",
+    "package": "npm run clean && npm run lint && npm test && vsce package --allow-missing-repository --out dist/code-context-native.vsix",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.19.0",
+    "@types/vscode": "^1.140.0",
+    "@vscode/vsce": "^4.0.0",
+    "eslint": "^10.13.0",
+    "jsonc-parser": "^3.3.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.2"
+  }
+}

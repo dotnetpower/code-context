@@ -1,0 +1,29 @@
+[Unit]
+Description=Shared local Rust code search index
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cctx daemon
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=CCTX_IO_GUARD=1
+Environment=CCTX_MEMORY_GUARD=1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=mixed
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+TasksMax=96
+LimitNOFILE=16384
+MemoryAccounting=yes
+CPUWeight=20
+IOAccounting=yes
+IOWeight=10
+IOReadBandwidthMax=%h 32M
+IOWriteBandwidthMax=%h 1M
+
+[Install]
+WantedBy=default.target

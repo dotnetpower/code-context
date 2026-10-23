@@ -1,0 +1,166 @@
+use code_context::catalog::Spec;
+use code_context::engine::{Backend, Engine};
+use code_context::files::FileQuery;
+use code_context::watched::Watched;
+use code_context::workspace::Workspace;
+use serde_json::json;
+
+fn fixture() -> (tempfile::TempDir, Workspace) {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["src", "docs", ".github", "node_modules"] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    for (path, text) in [
+        ("src/nativeTools.ts", "const registered = true;\n"),
+        ("src/other.ts", "nativeTools.ts appears only here\n"),
+        ("README.md", "documentation marker\n"),
+        ("docs/guide.md", "documentation marker\n"),
+        ("package.json", "{\"name\":\"fixture\"}\n"),
+        ("config.yaml", "enabled: true\n"),
+        ("Cargo.toml", "[package]\n"),
+        ("secrets.json", "{\"token\":\"must remain excluded\"}\n"),
+        ("credentials.yaml", "token: excluded\n"),
+        (".github/private.md", "hidden\n"),
+        ("node_modules/vendor.ts", "generated\n"),
+        ("ignored.md", "ignored\n"),
+        (".gitignore", "ignored.md\n"),
+    ] {
+        std::fs::write(dir.path().join(path), text).unwrap();
+    }
+    let workspace = Workspace::new(
+        dir.path(),
+        vec![".".into()],
+        ["*.ts", "*.md", "*.json", "*.yaml", "*.toml"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    )
+    .unwrap();
+    (dir, workspace)
+}
+
+fn query(glob: &str, paths: &[&str], limit: usize) -> FileQuery {
+    FileQuery {
+        glob: glob.into(),
+        paths: paths.iter().map(|p| (*p).into()).collect(),
+        limit,
+    }
+}
+
+#[test]
+fn filename_discovery_is_not_content_search_and_matches_all_backends() {
+    let (_dir, workspace) = fixture();
+    for backend in [Backend::Live, Backend::Ram, Backend::Index] {
+        let engine = Engine::new(workspace.clone(), backend).unwrap();
+        let result = engine.files(&query("nativeTools.ts", &[], 200)).unwrap();
+        assert_eq!(result.paths, ["src/nativeTools.ts"]);
+        assert_eq!(result.total_matches, 1);
+        assert!(!result.truncated);
+        let docs = engine.files(&query("*.md", &[], 1)).unwrap();
+        assert_eq!(docs.paths, ["README.md"]);
+        assert_eq!(docs.total_matches, 2);
+        assert!(docs.truncated);
+        assert_eq!(
+            engine.files(&query("*.md", &["docs"], 20)).unwrap().paths,
+            ["docs/guide.md"]
+        );
+        assert!(
+            engine
+                .files(&query("*.md", &["doc"], 20))
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn watched_files_read_and_context_include_docs_configs_but_keep_exclusions() {
+    let (dir, workspace) = fixture();
+    let mut watched = Watched::new(Spec {
+        root: workspace.root,
+        scopes: workspace.scopes,
+        globs: workspace.globs,
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let all = watched.call("code_files", json!({"glob":"*"})).unwrap();
+    assert_eq!(
+        all["paths"],
+        json!([
+            "Cargo.toml",
+            "README.md",
+            "config.yaml",
+            "docs/guide.md",
+            "package.json",
+            "src/nativeTools.ts",
+            "src/other.ts",
+        ])
+    );
+    let read = watched
+        .call(
+            "code_read",
+            json!({"ranges":[
+                {"path":"README.md","start":1,"end":1},
+                {"path":"package.json","start":1,"end":1},
+            ]}),
+        )
+        .unwrap();
+    assert_eq!(read[0]["lines"], json!(["documentation marker"]));
+    let context = watched
+        .call(
+            "code_context",
+            json!({"pattern":"documentation marker","radius":40}),
+        )
+        .unwrap();
+    assert_eq!(context["search"]["total_matches"], 2);
+    assert!(
+        watched
+            .call("code_context", json!({"pattern":"marker","radius":101}))
+            .is_err()
+    );
+    std::fs::write(dir.path().join("docs/new.md"), "new\n").unwrap();
+    watched.call("code_sync", json!({})).unwrap();
+    assert_eq!(
+        watched
+            .call("code_files", json!({"glob":"new.md"}))
+            .unwrap()["paths"],
+        json!(["docs/new.md"])
+    );
+    std::fs::remove_file(dir.path().join("docs/new.md")).unwrap();
+    watched.call("code_sync", json!({})).unwrap();
+    assert_eq!(
+        watched
+            .call("code_files", json!({"glob":"new.md"}))
+            .unwrap()["total_matches"],
+        0
+    );
+}
+
+#[test]
+fn file_discovery_rejects_invalid_filters_and_has_explicit_empty_results() {
+    let (_dir, workspace) = fixture();
+    let engine = Engine::new(workspace, Backend::Index).unwrap();
+    for request in [
+        query("", &[], 1),
+        query("[", &[], 1),
+        query("*", &[], 0),
+        query("*", &[], 1001),
+        query("*", &["../escape"], 1),
+        query("*", &[".github"], 1),
+    ] {
+        assert!(engine.files(&request).is_err(), "{request:?}");
+    }
+    assert_eq!(
+        engine
+            .files(&query("missing.*", &[], 1))
+            .unwrap()
+            .total_matches,
+        0
+    );
+}
