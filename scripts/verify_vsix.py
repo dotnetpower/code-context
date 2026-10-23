@@ -41,11 +41,15 @@ def verify(path: Path) -> dict:
         tools = manifest["contributes"]["languageModelTools"]
         if len(tools) != 7 or {tool["toolReferenceName"] for tool in tools} != expected:
             raise ValueError("Native tool references changed")
-        if manifest["publisher"] != "moonchoi" or manifest["name"] != "code-context-native":
+        if manifest["publisher"] != "dotnetpower" or manifest["name"] != "code-context-native":
             raise ValueError("Extension identity changed")
         if manifest["repository"]["url"] != "https://github.com/dotnetpower/code-context.git":
             raise ValueError("Unexpected source repository")
         vsix = ET.fromstring(archive.read("extension.vsixmanifest"))
+        identity = next(element for element in vsix.iter() if element.tag.endswith("}Identity"))
+        if any(identity.attrib[key] != manifest[field] for key, field in
+               (("Publisher", "publisher"), ("Id", "name"), ("Version", "version"))):
+            raise ValueError("VSIX identity differs from the new publisher manifest")
         properties = {element.attrib["Id"]: element.attrib["Value"]
                       for element in vsix.iter() if element.tag.endswith("}Property")}
         for key, value in {
@@ -67,7 +71,7 @@ def verify(path: Path) -> dict:
         for name in names:
             if name.lower().endswith(".md"):
                 text = archive.read(name).decode("utf-8")
-                if manifest["publisher"] in text or re.search(r"(?:/home/|/Users/|[A-Z]:\\Users\\)[^<\s/\\]+", text):
+                if re.search(r"(?:/home/|/Users/|[A-Z]:\\Users\\)[^<\s/\\]+", text):
                     raise ValueError(f"Machine-specific documentation in package: {name}")
         for walkthrough in manifest["contributes"]["walkthroughs"]:
             for step in walkthrough["steps"]:

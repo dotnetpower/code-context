@@ -122,6 +122,18 @@ a new executable or VSIX does not replace code cached in a running host.
 
 ## Extension details, Resources, and VSIX updates
 
+Version 0.13 uses the publisher **dotnetpower** and the extension ID
+`dotnetpower.code-context-native`. This is a new identity, not an automatic
+upgrade of a package from the previous publisher.
+
+Uninstall the previous Code Context extension in each relevant profile/host
+before installing the new one. Keep the existing `codeContextNative.*` settings
+and backend registration; the service and all seven tool references are
+unchanged. If `remote.extensionKind` contains a publisher-specific override,
+replace its key with the new extension ID. If the previous host is still
+active, reload only that window at a safe boundary. The new adapter refuses
+to register duplicate tools while the old extension is still present.
+
 The installed extension's README is versioned with the VSIX. Editing GitHub's
 README does not update an already installed package, and VSIX-only distribution
 does not automatically poll GitHub Releases for new versions.

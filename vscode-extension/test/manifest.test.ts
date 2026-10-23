@@ -18,7 +18,7 @@ void test('release branding uses verified PNGs and complete Marketplace metadata
     repository: { url: string; directory: string };
     galleryBanner: { color: string; theme: string };
   };
-  assert.equal(manifest.publisher, 'moonchoi');
+  assert.equal(manifest.publisher, 'dotnetpower');
   assert.equal(manifest.name, 'code-context-native');
   assert.equal(manifest.displayName, 'Code Context');
   assert.ok(manifest.description.length <= 140);

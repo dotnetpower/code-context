@@ -19,15 +19,19 @@ const toolNames = [
 ];
 
 async function activateFixture(trusted: boolean, registered: boolean,
-  registration?: (path:string)=>Promise<void>): Promise<{
+  registration?: (path:string)=>Promise<void>, legacy = false): Promise<{
   calls: string[];
   messages: string[];
   events: Array<() => void>;
   prepareMissing(path:string):Promise<void>;
+  invokeCommand(name: string): Promise<void>;
+  executed: Array<{ name: string; args: unknown[] }>;
 }> {
   const calls: string[] = [];
   const messages: string[] = [];
   const events: Array<() => void> = [];
+  const commands = new Map<string, () => unknown>();
+  const executed: Array<{ name: string; args: unknown[] }> = [];
   let prepare:((path:string)=>Promise<void>)|undefined;
   const disposable = { dispose(): void {} };
   const event = (listener: () => void): typeof disposable => {
@@ -66,9 +70,24 @@ async function activateFixture(trusted: boolean, registered: boolean,
     window: {
       createOutputChannel: (): object => ({ ...disposable, appendLine: (line: string): void => { messages.push(line); } }),
       createStatusBarItem: (): object => ({ ...disposable, show(): void {} }),
+      showWarningMessage: (message: string): Promise<void> => {
+        messages.push(message);
+        return Promise.resolve();
+      },
     },
+    extensions: { getExtension: (id: string): { id: string } | undefined =>
+      legacy && id === 'moonchoi.code-context-native' ? { id } : undefined },
     StatusBarAlignment: { Left: 1 },
-    commands: { registerCommand: (): object => disposable },
+    commands: {
+      registerCommand: (name: string, callback: () => unknown): object => {
+        commands.set(name, callback);
+        return disposable;
+      },
+      executeCommand: (name: string, ...args: unknown[]): Promise<void> => {
+        executed.push({ name, args });
+        return Promise.resolve();
+      },
+    },
     CancellationTokenSource: class {
       public token = {};
       public dispose(): void {}
@@ -123,13 +142,39 @@ async function activateFixture(trusted: boolean, registered: boolean,
     },
   }, { filename: 'extension-startup-under-test.js' });
   assert.ok(exports.activate);
-  exports.activate({ subscriptions: [], globalState: {} });
-  return { calls, messages, events, prepareMissing:(path:string):Promise<void>=>{
+  exports.activate({
+    subscriptions: [], globalState: {},
+    extension: { id: 'dotnetpower.code-context-native', packageJSON: { version: '0.13.0' } },
+  });
+  return { calls, messages, events, executed,
+    invokeCommand: async (name: string): Promise<void> => {
+      const callback = commands.get(name);
+      assert.ok(callback, name);
+      await callback();
+    },
+    prepareMissing:(path:string):Promise<void>=>{
     assert.ok(prepare);
     const invoke=prepare;
     return Promise.resolve().then(()=>invoke(path));
   } };
 }
+
+void test('publisher migration blocks duplicate native registration until the old extension is removed', async () => {
+  const fixture = await activateFixture(true, true, undefined, true);
+  assert.deepEqual(fixture.calls, []);
+  assert.ok(fixture.messages.some((message) => message.startsWith('MIGRATION_REQUIRED:')));
+  assert.ok(fixture.messages.some((message) => message.includes('safe boundary')));
+});
+
+void test('publisher-specific UI commands use the running extension identity', async () => {
+  const fixture = await activateFixture(false, false);
+  await fixture.invokeCommand('codeContextNative.gettingStarted');
+  await fixture.invokeCommand('codeContextNative.configureConnection');
+  assert.deepEqual(fixture.executed, [
+    { name: 'workbench.action.openWalkthrough', args: ['dotnetpower.code-context-native#getting-started', false] },
+    { name: 'workbench.action.openSettings', args: ['@ext:dotnetpower.code-context-native'] },
+  ]);
+});
 
 void test('reloads never scan source or build indexes even with twenty workspace folders', async () => {
   for (const registered of [true, false]) {

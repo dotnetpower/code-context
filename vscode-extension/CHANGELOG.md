@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.0
+
+- Adopt `dotnetpower.code-context-native` for the first Marketplace publication.
+- Resolve walkthroughs, settings, and self-test metadata from the running
+  extension identity instead of a previous publisher.
+- Keep all seven native tool references, settings, and the shared backend stable.
+- Refuse duplicate registration while the previous publisher's extension is
+  present; document profile/host migration and safe-boundary reloads.
+- Validate both VSIX and package identities and allow the public publisher brand
+  in docs while continuing to reject machine-specific paths.
+
 ## 0.12.3
 
 - Put Resources links and the complete benchmark table before installation in

@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import unittest
 
@@ -52,8 +54,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertGreater(record["disabled_ms"], 0)
             self.assertGreater(record["enabled_ms"], 0)
 
-    def test_public_documentation_contains_no_local_account_or_machine_paths(self):
-        publisher = json.loads((ROOT / "vscode-extension/package.json").read_text())["publisher"]
+    def test_public_documentation_contains_no_local_machine_paths(self):
         documents = [ROOT / name for name in ("README.md", "DESIGN.md", "REPORT.md")]
         documents += list((ROOT / "docs").rglob("*.md"))
         documents += [ROOT / "vscode-extension/README.md"]
@@ -61,7 +62,6 @@ class BenchmarkTests(unittest.TestCase):
         documents += list((ROOT / "vscode-extension/docs").rglob("*.md"))
         for path in documents:
             text = path.read_text()
-            self.assertNotIn(publisher, text, str(path.relative_to(ROOT)))
             self.assertNotRegex(text, r"(?:/home/|/Users/|[A-Z]:\\Users\\)[^<\s/\\]+")
             self.assertNotIn(str(Path.home()), text)
 
@@ -88,6 +88,29 @@ class BenchmarkTests(unittest.TestCase):
                     continue
                 target = target.split("#")[0]
                 self.assertTrue((path.parent / target).exists(), f"{path.relative_to(ROOT)} -> {target}")
+
+    def test_installer_blocks_legacy_publisher_before_dependency_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_path = Path(directory)
+            code = bin_path / "code"
+            node = bin_path / "node"
+            npm = bin_path / "npm"
+            node.write_text("#!/bin/sh\nexit 98\n")
+            node.chmod(0o700)
+            npm.write_text("#!/bin/sh\nexit 99\n")
+            npm.chmod(0o700)
+            env = {**os.environ, "PATH": str(bin_path) + os.pathsep + os.environ["PATH"]}
+            for publisher, expected in (("moonchoi", 1), ("dotnetpower", 99)):
+                with self.subTest(publisher=publisher):
+                    code.write_text(f"#!/bin/sh\nprintf '%s\\n' '{publisher}.code-context-native'\n")
+                    code.chmod(0o700)
+                    result = subprocess.run(
+                        ["bash", str(ROOT / "scripts/install-vscode-extension.sh")],
+                        env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected == 1:
+                        self.assertIn("Remove the previous publisher extension", result.stderr)
 
 
 if __name__ == "__main__":

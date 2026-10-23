@@ -44,6 +44,10 @@ need the Linux/WSL backend described in the setup guide.
 
 ## Marketplace checklist
 
+The first Marketplace identity is `dotnetpower.code-context-native`.
+Log in to a Microsoft account with publishing access to the **dotnetpower**
+publisher; a GitHub username alone does not grant that access.
+
 Packaging readiness is not proof that the extension is listed on Marketplace.
 Before publishing:
 
@@ -58,10 +62,18 @@ Before publishing:
 5. Authenticate using the official publisher flow. Keep tokens out of source,
    issues, logs, and chat messages.
 
+Prefer an existing authorized Microsoft Entra identity without saving a PAT:
+
 ```sh
-npx vsce login "$(node -p "require('./package.json').publisher")"
-npx vsce publish --packagePath dist/code-context-native.vsix
+npx vsce verify-pat --azure-credential "$(node -p "require('./package.json').publisher")"
+npx vsce publish --azure-credential --packagePath dist/code-context-native.vsix
 ```
+
+If access is denied, use the management portal to create/select the publisher
+and configure its members, or upload the verified VSIX there after signing in.
+Do not bypass the denial or use another publisher identity without approval.
+Do not use `vsce login` when its credential-store warning says that credentials
+would fall back to plaintext storage.
 
 The actual listing, publisher permissions, and Marketplace review are external
 steps. No Marketplace token is embedded in the extension or GitHub workflow.

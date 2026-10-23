@@ -28,7 +28,8 @@ if (errors.length > 0 || typeof document !== 'object' || document === null) {
 const current = Array.isArray(document['enable-proposed-api'])
   ? document['enable-proposed-api'].filter((value) => typeof value === 'string')
   : [];
-const extensionId = 'moonchoi.code-context-native';
+const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+const extensionId = `${manifest.publisher}.${manifest.name}`;
 if (!current.includes(extensionId)) {
   current.push(extensionId);
 }

@@ -26,6 +26,7 @@ bash scripts/install.sh
 **[code-context-native.vsix](https://github.com/dotnetpower/code-context/releases/latest/download/code-context-native.vsix)**,
 then choose **Extensions → … → Install from VSIX…** in VS Code.
 The backend is installed separately; a VSIX alone is not enough.
+Existing VSIX users should follow the [publisher migration guide](vscode-extension/docs/SETUP.md#extension-details-resources-and-vsix-updates).
 
 **3. Open a trusted project** and run **Code Context: Getting Started**.
 Enable Code Context tools in the agent's tool picker, then try:

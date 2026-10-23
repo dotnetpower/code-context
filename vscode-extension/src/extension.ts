@@ -17,6 +17,14 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Code Context Native', {
     log: true,
   });
+  const legacy = vscode.extensions.getExtension('moonchoi.code-context-native');
+  if (legacy) {
+    const message = `Remove ${legacy.id} before enabling ${context.extension.id}, then reload the affected window at a safe boundary to avoid duplicate native tools.`;
+    output.appendLine(`MIGRATION_REQUIRED: ${message}`);
+    context.subscriptions.push(output);
+    void vscode.window.showWarningMessage(message);
+    return;
+  }
   client = new DaemonClient(readSettings);
   const pending = new Map<string, Promise<void>>();
   const usage = new UsageSummary();
@@ -101,11 +109,11 @@ export function activate(context: vscode.ExtensionContext): void {
     client,
     vscode.commands.registerCommand('codeContextNative.gettingStarted', async () => {
       await vscode.commands.executeCommand(
-        'workbench.action.openWalkthrough', 'moonchoi.code-context-native#getting-started', false,
+        'workbench.action.openWalkthrough', `${context.extension.id}#getting-started`, false,
       );
     }),
     vscode.commands.registerCommand('codeContextNative.configureConnection', async () => {
-      await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:moonchoi.code-context-native');
+      await vscode.commands.executeCommand('workbench.action.openSettings', `@ext:${context.extension.id}`);
     }),
     vscode.commands.registerCommand('codeContextNative.openSetupGuide', async () => {
       const opened = await vscode.env.openExternal(vscode.Uri.parse(
@@ -119,7 +127,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await showStatus(bridge, status, output, usage.lastRoot);
     }),
     vscode.commands.registerCommand('codeContextNative.selfTest', async (root?: string) => {
-      await runSelfTest(bridge, output, root);
+      await runSelfTest(bridge, output, context.extension, root);
     }),
     vscode.commands.registerCommand(
       'codeContextNative.registerWorkspace',
@@ -213,6 +221,7 @@ async function showStatus(
 async function runSelfTest(
   bridge: NativeToolBridge,
   output: vscode.OutputChannel,
+  extension: vscode.Extension<unknown>,
   explicitRoot?: string,
 ): Promise<void> {
   try {
@@ -251,7 +260,7 @@ async function runSelfTest(
       const daemonStatus = JSON.parse(statusText) as JsonValue;
       validateDaemonStatus(daemonStatus);
       await vscode.commands.executeCommand('setContext', 'codeContextNative.selfTestPassed', true);
-      const metadata: unknown = vscode.extensions.getExtension('moonchoi.code-context-native')?.packageJSON;
+      const metadata: unknown = extension.packageJSON;
       const version = typeof metadata === 'object' && metadata !== null && 'version' in metadata
         && typeof metadata.version === 'string' ? metadata.version : 'unknown';
       const report: JsonValue = {

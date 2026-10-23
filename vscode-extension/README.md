@@ -6,6 +6,7 @@
 
 **Local source context for your coding agent.** Find files, search source, and
 read nearby code with seven native tools backed by one shared Rust cache.
+Publisher: **dotnetpower**. Previous VSIX users: [migration steps](docs/SETUP.md#extension-details-resources-and-vsix-updates).
 
 ## Resources
 
