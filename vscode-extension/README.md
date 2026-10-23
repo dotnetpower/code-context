@@ -270,6 +270,9 @@ Native status is updated by call-completion events, with no source polling:
 those last two categories and shows the last operation/time/root. Counts include
 metadata calls and are not a whole-session or daemon-wide success rate. Click
 for daemon status and aggregate native/MCP outcome counts.
+Outcome and Windows host-memory trace fields are sent only when the connected
+daemon explicitly advertises those capabilities. Older daemons keep their
+original trace schema; reconnecting renegotiates support.
 
 Direct VS Code chats can use the Native tools when the tool set is enabled.
 Delegated/headless sessions and Copilot CLI may not receive client extension

@@ -69,6 +69,8 @@ export class DaemonClient {
   private queue: Promise<void> = Promise.resolve();
   private disposed = false;
   private tracingAvailable: boolean | undefined;
+  private traceOutcomesAvailable = false;
+  private hostMemoryReportingAvailable = false;
 
   public constructor(
     private readonly settings: () => ClientSettings,
@@ -104,11 +106,6 @@ export class DaemonClient {
       total_ms: 0, success: false, available: false, daemon: null,
       started_unix_ms: Date.now(), completed_unix_ms: 0,
     };
-    if (process.platform === 'win32') {
-      trace.host_memory = {
-        platform: 'win32', total_bytes: totalmem(), available_bytes: freemem(),
-      };
-    }
     try {
       const value = await this.enqueue<T>(request, cancellation, trace);
       trace.total_ms = performance.now() - started + prepareMs;
@@ -176,14 +173,30 @@ export class DaemonClient {
           this.tracingAvailable = isRecord(ping) && isRecord(ping.capabilities)
             && ping.capabilities.request_tracing === true
             && ping.capabilities.trace_clock === 'unix_ms';
+          this.traceOutcomesAvailable = isRecord(ping) && isRecord(ping.capabilities)
+            && ping.capabilities.client_trace_outcomes === true;
+          this.hostMemoryReportingAvailable = isRecord(ping) && isRecord(ping.capabilities)
+            && ping.capabilities.host_memory_reporting === true;
         }
         if (trace) {
           trace.prepare_ms += performance.now() - preparing;
           trace.available = this.tracingAvailable === true;
+          if (process.platform === 'win32' && this.hostMemoryReportingAvailable) {
+            trace.host_memory = {
+              platform: 'win32', total_bytes: totalmem(), available_bytes: freemem(),
+            };
+          } else {
+            delete trace.host_memory;
+          }
+        }
+        const argumentsForDaemon = { ...request.arguments };
+        if (request.name === 'code_trace') {
+          if (!this.traceOutcomesAvailable) { delete argumentsForDaemon.outcome; }
+          if (!this.hostMemoryReportingAvailable) { delete argumentsForDaemon.host_memory; }
         }
         const outgoing = trace && this.tracingAvailable
-          ? { ...request, arguments: { ...request.arguments, _cctx_trace: trace.trace_id } }
-          : request;
+          ? { ...request, arguments: { ...argumentsForDaemon, _cctx_trace: trace.trace_id } }
+          : { ...request, arguments: argumentsForDaemon };
         const ipcStarted = performance.now();
         let value: JsonValue;
         try {
@@ -374,6 +387,8 @@ export class DaemonClient {
     this.socket = undefined;
     this.socketPath = undefined;
     this.tracingAvailable = undefined;
+    this.traceOutcomesAvailable = false;
+    this.hostMemoryReportingAvailable = false;
     this.receiveBuffer = Buffer.alloc(0);
     const pending = this.takePending();
     pending?.reject(error);

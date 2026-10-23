@@ -233,6 +233,42 @@ void test('actual native tool returns before its queued telemetry reply and expo
   }
 });
 
+void test('new trace metadata is sent only after explicit daemon capability negotiation', async () => {
+  for (const extended of [false, true]) {
+    let reports = 0;
+    const server = await fixture((value, socket) => {
+      const input = value as DaemonRequest;
+      if (input.name === 'ping') {
+        writeResponse(socket, { result: { capabilities: {
+          request_tracing: true, trace_clock: 'unix_ms',
+          ...(extended ? { client_trace_outcomes: true, host_memory_reporting: true } : {}),
+        } } });
+      } else if (input.name === 'code_trace') {
+        reports += 1;
+        assert.equal('outcome' in input.arguments, extended);
+        assert.equal('host_memory' in input.arguments, extended);
+        writeResponse(socket, { result: { recorded: true } });
+      } else {
+        writeResponse(socket, { result: {
+          value: { ready: true },
+          _cctx_trace: { trace_id: input.arguments._cctx_trace, daemon_request_id: 1, queue_ms: 0, execute_ms: 0 },
+        } });
+      }
+    });
+    const client = new DaemonClient(() => settings(server.path));
+    try {
+      const result = await client.requestTraced(request('code_status'), uncancelled(), 'negotiation-check');
+      result.trace.outcome = 'success';
+      result.trace.host_memory = { platform: 'win32', total_bytes: 1024, available_bytes: 512 };
+      await client.request({ ...request('code_trace'), arguments: result.trace }, uncancelled());
+      assert.equal(reports, 1);
+    } finally {
+      client.dispose();
+      await server.cleanup();
+    }
+  }
+});
+
 void test('old daemons receive unchanged arguments and explicitly unavailable tracing', async () => {
   const seen: DaemonRequest[] = [];
   const testServer = await fixture((value, socket) => {

@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context Native Tools",
   "description": "Native VS Code language model tools backed by the shared Rust code-context daemon.",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "publisher": "moonchoi",
   "license": "MIT",
   "engines": {

@@ -34,7 +34,9 @@ pub fn capabilities() -> Result<Value> {
         "registration_migration":true,"read_pages":true,"background_workers":1,"request_tracing":true,
         "cache_peak_admission":"minimum_lru","prewarm_priority":"disabled","trace_clock":"unix_ms",
         "source_cache":"nonblocking_root_cache","cache_pending_roots":8,"cache_miss":"CACHE_MISS",
-        "read_policy_cache":true,"idle_maintenance_interval_ms":1000,
+        "read_policy_cache":true,"adaptive_memory":true,
+        "client_trace_outcomes":true,"host_memory_reporting":true,
+        "idle_maintenance_interval_ms":1000,
         "active_poll_interval_ms":25,"runtime_identity_guard":true,
         "max_registered_roots":crate::catalog::MAX_REGISTERED_ROOTS,
         "idle_source_lease_seconds":crate::watched::IDLE_ROOT_TIMEOUT.as_secs()}))
