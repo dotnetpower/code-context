@@ -38,7 +38,10 @@ void test('onboarding reports backend requirement and does not mark an unpassed 
   const manifest = JSON.parse(await readFile(resolve(__dirname, '../../package.json'), 'utf8')) as {
     version: string;
     contributes: { walkthroughs: Array<{
-      id: string; steps: Array<{ id: string; completionEvents: string[]; description: string }>;
+      id: string; steps: Array<{
+        id: string; completionEvents: string[]; description: string;
+        media: { markdown: string };
+      }>;
     }> };
   };
   const walkthrough = manifest.contributes.walkthroughs[0];
@@ -46,6 +49,11 @@ void test('onboarding reports backend requirement and does not mark an unpassed 
   assert.equal(walkthrough.steps.length, 4);
   const check = walkthrough.steps.find((step) => step.id === 'check');
   assert.deepEqual(check?.completionEvents, ['onContext:codeContextNative.selfTestPassed']);
+  for (const step of walkthrough.steps) {
+    assert.ok(step.media.markdown.startsWith('docs/walkthrough/'), step.id);
+    const media = await readFile(resolve(__dirname, '../../', step.media.markdown), 'utf8');
+    assert.ok(media.length > 200, step.id);
+  }
   const readme = await readFile(resolve(__dirname, '../../README.md'), 'utf8');
   assert.match(readme, /Local backend required/);
   assert.match(readme, /Marketplace publication is separate/);

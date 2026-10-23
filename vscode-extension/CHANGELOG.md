@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+- Supply required, packaged walkthrough media for all four setup steps.
+- Verify those media entries against the built VSIX as well as the manifest.
+- Keep the first installable GitHub distribution on this corrected patch version.
+
 ## 0.12.0
 
 ### Added

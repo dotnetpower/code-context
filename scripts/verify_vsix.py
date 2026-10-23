@@ -42,6 +42,11 @@ def verify(path: Path) -> dict:
             raise ValueError("Extension identity changed")
         if manifest["repository"]["url"] != "https://github.com/dotnetpower/code-context.git":
             raise ValueError("Unexpected source repository")
+        for walkthrough in manifest["contributes"]["walkthroughs"]:
+            for step in walkthrough["steps"]:
+                media = step.get("media", {}).get("markdown")
+                if not media or not media.startswith("docs/walkthrough/") or f"extension/{media}" not in names:
+                    raise ValueError(f"Missing packaged walkthrough media: {step['id']}")
         for name, expected_size in [("icon", (256, 256)), ("banner", (1440, 480))]:
             image = archive.read(f"extension/resources/{name}.png")
             if image[:8] != b"\x89PNG\r\n\x1a\n" or struct.unpack(">II", image[16:24]) != expected_size:

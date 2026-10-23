@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "publisher": "moonchoi",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -468,7 +468,10 @@
             "description": "The extension connects to cctx, a shared Rust engine running on Linux or WSL. It never silently downloads or installs an executable.\n[Open setup guide](command:codeContextNative.openSetupGuide)",
             "completionEvents": [
               "onCommand:codeContextNative.openSetupGuide"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/backend.md"
+            }
           },
           {
             "id": "connection",
@@ -476,7 +479,10 @@
             "description": "Linux, WSL, and SSH workspace hosts use a Unix socket. Windows Agent Sessions use your chosen WSL distribution and the Linux cctx executable.\n[Configure connection](command:codeContextNative.configureConnection)",
             "completionEvents": [
               "onCommand:codeContextNative.configureConnection"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/connection.md"
+            }
           },
           {
             "id": "check",
@@ -484,7 +490,10 @@
             "description": "Trust your workspace, register it with the backend, and verify the native tools. On Windows Agent Sessions, use an explicit Linux root with source tools; the self-test needs an unambiguous root.\n[Run native self-test](command:codeContextNative.selfTest)",
             "completionEvents": [
               "onContext:codeContextNative.selfTestPassed"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/verify.md"
+            }
           },
           {
             "id": "search",
@@ -492,7 +501,10 @@
             "description": "Enable the Code Context tools in your agent's tool settings. Try #cctxNativeFiles or #cctxNativeContext. A cold cache returns CACHE_MISS immediately: continue with normal tools while it loads only the requested root.\n[View status](command:codeContextNative.showStatus)",
             "completionEvents": [
               "onCommand:codeContextNative.showStatus"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/search.md"
+            }
           }
         ]
       }
