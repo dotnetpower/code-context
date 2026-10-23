@@ -66,6 +66,23 @@ void test('onboarding reports backend requirement and does not mark an unpassed 
   assert.ok(changelog.includes(`## ${manifest.version}`));
 });
 
+void test('extension details expose resources and numeric benchmarks before installation', async () => {
+  const readme = await readFile(resolve(__dirname, '../../README.md'), 'utf8');
+  const resources = readme.indexOf('## Resources');
+  const performance = readme.indexOf('## Performance');
+  const install = readme.indexOf('## Install');
+  assert.ok(resources >= 0 && resources < performance && performance < install);
+  for (const link of ['Repository', 'Setup', 'Benchmark report', 'Issues', 'License']) {
+    assert.ok(readme.includes(`[${link}](`));
+  }
+  assert.match(readme, /native right-hand Resources panel uses Marketplace metadata/);
+  for (const text of ['4.257 ms', '0.566 ms', '4.965 ms', '0.428 ms', '5.122 ms',
+    '0.499 ms', '0.070 ms', '0.799 ms', '3.809', '0.557', '6.83', 'slower']) {
+    assert.ok(readme.includes(text), text);
+  }
+  assert.match(readme, /!\[.*\]\(resources\/benchmark\.png\)/);
+});
+
 void test('manifest contributes exactly the seven registered native tools', async () => {
   const packagePath = resolve(__dirname, '../../package.json');
   const manifest = JSON.parse(await readFile(packagePath, 'utf8')) as {

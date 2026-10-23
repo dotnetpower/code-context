@@ -7,6 +7,41 @@
 **Local source context for your coding agent.** Find files, search source, and
 read nearby code with seven native tools backed by one shared Rust cache.
 
+## Resources
+
+[Repository](https://github.com/dotnetpower/code-context) ·
+[Setup](docs/SETUP.md) ·
+[Tool reference](https://github.com/dotnetpower/code-context/blob/main/docs/REFERENCE.md#native-tools) ·
+[Benchmark report](https://github.com/dotnetpower/code-context/blob/main/docs/BENCHMARKS.md) ·
+[Issues](https://github.com/dotnetpower/code-context/issues) · [License](LICENSE)
+
+VS Code's native right-hand Resources panel uses Marketplace metadata.
+For VSIX-only installations, use the links above instead.
+
+## Performance
+
+On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
+retrieval mix averaged **6.83× faster** with a warm CCTX cache
+(95% CI **6.65–7.06×**): **3.809 → 0.557 ms per operation**.
+
+| Task | CCTX off | CCTX on, warm | Off / on |
+|---|---:|---:|---:|
+| Filename discovery | 4.257 ms | 0.566 ms | 7.52× |
+| Literal search | 4.965 ms | 0.428 ms | 11.60× |
+| Search + context | 5.122 ms | 0.499 ms | 10.26× |
+| Known read + hash | **0.070 ms** | 0.799 ms | **0.09× — slower** |
+| Fixed mixed suite | 3.809 ms | 0.557 ms | 6.83× |
+
+![Warm retrieval latency and speedup, including slower known reads](resources/benchmark.png)
+
+Eight daemon sessions and 8,960 correctness-checked pairs; OS cache warm in both
+arms. Off bypasses CCTX with ripgrep/direct reads; on uses daemon RPC.
+**Known small reads were slower through CCTX.** Cold misses fall back instead
+of waiting. This is not a measurement of VS Code dispatch, LLM latency, or
+whole-agent speed.
+
+[Full method, cold-start chart, raw data, and reproduction](https://github.com/dotnetpower/code-context/blob/main/docs/BENCHMARKS.md)
+
 ## Install
 
 > **Preview · Local backend required.** Linux, WSL, or Linux SSH with stable
@@ -32,29 +67,6 @@ Enable the tools in your agent's tool picker and try:
 **No proposed API flags are needed.** Marketplace publication is separate
 from the downloadable VSIX. Windows Agents connection settings, manual
 registration, and troubleshooting are in the **[setup guide](docs/SETUP.md)**.
-
-## Performance
-
-On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), a fixed
-28-task retrieval mix averaged **6.83× faster** with a warm CCTX cache
-(95% CI 6.65–7.06×): **3.809 → 0.557 ms per operation**.
-
-![Warm retrieval latency and speedup, including slower known reads](resources/benchmark.png)
-
-Eight daemon sessions and 8,960 paired operations; OS cache warm in both arms.
-Off uses ripgrep/direct reads; on uses daemon RPC. **Known small reads were
-slower through CCTX** (0.070 → 0.799 ms). Cold misses fall back instead of waiting.
-This is not a measurement of VS Code dispatch, LLM latency, or whole-agent speed.
-
-[Full method, cold-start chart, raw data, and reproduction](https://github.com/dotnetpower/code-context/blob/main/docs/BENCHMARKS.md)
-
-## Details
-
-- [Setup and troubleshooting](docs/SETUP.md)
-- [Seven tool references](https://github.com/dotnetpower/code-context/blob/main/docs/REFERENCE.md#native-tools)
-- [Backend reference: CLI, MCP, memory, and privacy](https://github.com/dotnetpower/code-context/blob/main/docs/REFERENCE.md)
-- [Source and architecture](https://github.com/dotnetpower/code-context)
-- [Report an issue](https://github.com/dotnetpower/code-context/issues)
 
 The cache is optional: `CACHE_MISS` is not an empty search. Continue with permitted
 host tools. Source remains local to the backend until selected results are

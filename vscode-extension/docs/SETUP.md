@@ -119,3 +119,29 @@ stopping other sessions.
 
 After an update, reload only the affected window at a safe boundary. Installing
 a new executable or VSIX does not replace code cached in a running host.
+
+## Extension details, Resources, and VSIX updates
+
+The installed extension's README is versioned with the VSIX. Editing GitHub's
+README does not update an already installed package, and VSIX-only distribution
+does not automatically poll GitHub Releases for new versions.
+
+1. Check the installed version in the extension's details view.
+2. Download the latest VSIX from
+   [Releases](https://github.com/dotnetpower/code-context/releases/latest).
+3. Install it in the actual host: the Linux/WSL workspace host, and also the
+   Windows/local host when using Windows Agents. Check other profiles separately.
+4. Close and reopen the extension's details tab to discard its cached README.
+   Only a running tool host needs a safe-boundary window reload for code changes.
+
+In the supported editor version, the native right-hand **Resources** panel
+reads repository/support/license links from Marketplace gallery metadata, not
+directly from an installed VSIX's manifest. Correct `repository`, `bugs`,
+`homepage`, and license assets prepare a package for publication but cannot
+force that sidebar to appear before Marketplace publication. Do not patch VS
+Code or forge gallery installation metadata to simulate a published listing.
+
+The README therefore provides **Resources** links followed by the complete
+benchmark table and chart before the installation section. The numeric results
+remain readable even if remote images are blocked. The chart itself is also
+included in the VSIX.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.3
+
+- Put Resources links and the complete benchmark table before installation in
+  extension details, retaining results even when images cannot load.
+- Explain the Marketplace-only native Resources sidebar and manual VSIX updates.
+- Validate the packaged README, image, and gallery-ready resource properties.
+
 ## 0.12.2
 
 - Simplify installation READMEs and move detailed operation notes to dedicated guides.

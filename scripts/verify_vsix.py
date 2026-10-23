@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 
 
@@ -44,6 +45,25 @@ def verify(path: Path) -> dict:
             raise ValueError("Extension identity changed")
         if manifest["repository"]["url"] != "https://github.com/dotnetpower/code-context.git":
             raise ValueError("Unexpected source repository")
+        vsix = ET.fromstring(archive.read("extension.vsixmanifest"))
+        properties = {element.attrib["Id"]: element.attrib["Value"]
+                      for element in vsix.iter() if element.tag.endswith("}Property")}
+        for key, value in {
+            "Source": manifest["repository"]["url"],
+            "Support": manifest["bugs"]["url"],
+            "Learn": manifest["homepage"],
+        }.items():
+            if properties.get("Microsoft.VisualStudio.Services.Links." + key) != value:
+                raise ValueError(f"Missing gallery-ready resource property: {key}")
+        readme = archive.read("extension/readme.md").decode("utf-8")
+        resources, performance, install = (readme.find("## " + title)
+                                            for title in ("Resources", "Performance", "Install"))
+        if not 0 <= resources < performance < install:
+            raise ValueError("Resources and benchmarks must precede installation")
+        if "| Fixed mixed suite |" not in readme or "6.83" not in readme or "slower" not in readme:
+            raise ValueError("Missing readable benchmark table")
+        if "https://raw.githubusercontent.com/dotnetpower/code-context/main/vscode-extension/resources/benchmark.png" not in readme:
+            raise ValueError("Missing resolvable packaged benchmark image")
         for name in names:
             if name.lower().endswith(".md"):
                 text = archive.read(name).decode("utf-8")
