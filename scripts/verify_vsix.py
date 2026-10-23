@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import struct
 import sys
 import zipfile
@@ -23,6 +24,7 @@ def verify(path: Path) -> dict:
             "extension/changelog.md", "extension/docs/SETUP.md",
             "extension/docs/PUBLISHING.md", "extension/resources/icon.png",
             "extension/resources/banner.png", "extension/out/src/extension.js",
+            "extension/resources/benchmark.png",
             "extension/prompts/code-context.instructions.md",
         }
         missing = required - names
@@ -42,6 +44,11 @@ def verify(path: Path) -> dict:
             raise ValueError("Extension identity changed")
         if manifest["repository"]["url"] != "https://github.com/dotnetpower/code-context.git":
             raise ValueError("Unexpected source repository")
+        for name in names:
+            if name.lower().endswith(".md"):
+                text = archive.read(name).decode("utf-8")
+                if manifest["publisher"] in text or re.search(r"(?:/home/|/Users/|[A-Z]:\\Users\\)[^<\s/\\]+", text):
+                    raise ValueError(f"Machine-specific documentation in package: {name}")
         for walkthrough in manifest["contributes"]["walkthroughs"]:
             for step in walkthrough["steps"]:
                 media = step.get("media", {}).get("markdown")
@@ -51,6 +58,9 @@ def verify(path: Path) -> dict:
             image = archive.read(f"extension/resources/{name}.png")
             if image[:8] != b"\x89PNG\r\n\x1a\n" or struct.unpack(">II", image[16:24]) != expected_size:
                 raise ValueError(f"Invalid {name} dimensions")
+        chart = archive.read("extension/resources/benchmark.png")
+        if chart[:8] != b"\x89PNG\r\n\x1a\n" or min(struct.unpack(">II", chart[16:24])) < 600:
+            raise ValueError("Invalid or undersized benchmark figure")
         return {
             "artifact": path.name, "version": manifest["version"], "entries": len(names),
             "native_tools": len(tools), "stable_api_only": True,

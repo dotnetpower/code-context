@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "publisher": "moonchoi",
   "license": "MIT",
   "icon": "resources/icon.png",

@@ -40,15 +40,18 @@ source scan merely because a window reloads. Set
 
 A WSL-only extension installation cannot register client tools in a separate
 Windows Agents window. Install the VSIX in the Windows/local extension host
-too. Use these settings only in the Agents workspace:
+too. Use these settings only in the Agents workspace. Replace every angle-bracket
+placeholder: use **Copy Extension ID** from the extension's gear menu, discover
+the distribution with `wsl --list --quiet`, and get the executable inside that
+distribution with `command -v cctx` (or `realpath ~/.local/bin/cctx`):
 
 ```json
 {
   "remote.extensionKind": {
-    "moonchoi.code-context-native": ["ui"]
+    "<extension-id>": ["ui"]
   },
-  "codeContextNative.wslDistribution": "Ubuntu-22.04",
-  "codeContextNative.wslExecutablePath": "/home/you/.local/bin/cctx"
+  "codeContextNative.wslDistribution": "<distribution-name>",
+  "codeContextNative.wslExecutablePath": "<absolute-linux-path-to-cctx>"
 }
 ```
 
@@ -60,6 +63,9 @@ Authorized Git worktrees can be prepared lazily by the daemon. Register manual
 roots inside WSL; the Windows registration command will not reinterpret a
 Windows path as Linux source. A programmatic native self-test may pass an
 explicit Linux root to `codeContextNative.selfTest`.
+
+For all seven native references and CLI/MCP alternatives, see the
+[tool reference](../../docs/REFERENCE.md#native-tools).
 
 ## Commands
 
@@ -92,7 +98,7 @@ Adaptive memory is a backend feature. It preserves system reserve, considers
 parent cgroup headroom, and can use fresh Windows physical-memory reports from
 native clients. On WSL without a fresh host report, it conservatively starts
 with a 4GiB ceiling. Manual limits are documented in the
-[backend guide](../../README.md#use).
+[backend reference](../../docs/REFERENCE.md#memory-and-io).
 
 ## When something looks wrong
 

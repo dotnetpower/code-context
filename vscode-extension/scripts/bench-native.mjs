@@ -4,20 +4,13 @@ import { performance } from 'node:perf_hooks';
 
 import { DaemonClient } from '../out/src/daemonClient.js';
 
-const queries = [
-  'get_azure_bearer_token_provider',
-  'class AutonomousDialogueEngine',
-  'def strip_particles(',
-  'AZURE_OPENAI_DEPLOYMENT_NAME',
-  '__absent_e49a__',
-  'def generate_bori_reply(',
-];
+const queries = ['class ', 'def ', 'function ', 'async ', 'TODO', '__cctx_absent_71d83__'];
 
 const output = process.argv[2];
-if (!output) {
-  throw new Error('usage: node scripts/bench-native.mjs OUTPUT [ROOT]');
+if (!output || !process.argv[3]) {
+  throw new Error('usage: node scripts/bench-native.mjs OUTPUT ROOT');
 }
-const root = resolve(process.argv[3] ?? '/home/moonchoi/dev/agent-san');
+const root = resolve(process.argv[3]);
 const cancellation = {
   isCancellationRequested: false,
   onCancellationRequested: () => ({ dispose: () => undefined }),

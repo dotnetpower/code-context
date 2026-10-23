@@ -32,6 +32,10 @@ void test('release branding uses verified PNGs and complete Marketplace metadata
     assert.equal(image.readUInt32BE(16), width);
     assert.equal(image.readUInt32BE(20), height);
   }
+  const chart = await readFile(resolve(__dirname, '../../resources/benchmark.png'));
+  assert.equal(chart.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.ok(chart.readUInt32BE(16) >= 2000);
+  assert.ok(chart.readUInt32BE(20) >= 600);
 });
 
 void test('onboarding reports backend requirement and does not mark an unpassed self-test complete', async () => {

@@ -47,9 +47,9 @@ need the Linux/WSL backend described in the setup guide.
 Packaging readiness is not proof that the extension is listed on Marketplace.
 Before publishing:
 
-1. Confirm ownership and publishing access for publisher **`moonchoi`** at
+1. Read the publisher from `package.json` and confirm its publishing access at
    <https://marketplace.visualstudio.com/manage>.
-2. Keep the existing ID `moonchoi.code-context-native` for in-place upgrades.
+2. Keep the existing publisher/name pair in `package.json` for in-place upgrades.
    Changing the publisher is a new extension identity, not a harmless rename.
 3. Verify the version, README links, icon, changelog, package contents, and the
    seven stable tool references.
@@ -59,7 +59,7 @@ Before publishing:
    issues, logs, and chat messages.
 
 ```sh
-npx vsce login moonchoi
+npx vsce login "$(node -p "require('./package.json').publisher")"
 npx vsce publish --packagePath dist/code-context-native.vsix
 ```
 

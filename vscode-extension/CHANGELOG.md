@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.2
+
+- Simplify installation READMEs and move detailed operation notes to dedicated guides.
+- Replace local machine/project examples with portable placeholders.
+- Publish a correctness-checked AKS Store Demo on/off retrieval benchmark, with
+  session-bootstrap confidence intervals, cold behavior, and slower known reads.
+- Include the benchmark figure in the VSIX; preserve the existing extension identity.
+
 ## 0.12.1
 
 - Supply required, packaged walkthrough media for all four setup steps.

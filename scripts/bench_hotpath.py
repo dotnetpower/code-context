@@ -8,14 +8,7 @@ import subprocess
 import time
 
 
-QUERIES = [
-    "get_azure_bearer_token_provider",
-    "class AutonomousDialogueEngine",
-    "def strip_particles(",
-    "AZURE_OPENAI_DEPLOYMENT_NAME",
-    "__absent_e49a__",
-    "def generate_bori_reply(",
-]
+QUERIES = ["class ", "def ", "function ", "async ", "TODO", "__cctx_absent_71d83__"]
 
 
 def percentile(values, percentage):
@@ -38,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--blocks", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--tool", choices=["code_grep", "code_context"], default="code_grep")
@@ -46,7 +40,7 @@ def main():
         parser.error("output exists")
     process = subprocess.Popen(
         [str(Path.home() / ".local/bin/cctx"), "shared-mcp"],
-        cwd="/home/moonchoi/dev/agent-san",
+        cwd=args.root.resolve(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
