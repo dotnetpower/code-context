@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.2
+
+- Render native Output traces, status, self-test, and registration as readable
+  text; use real log levels and preserve machine-facing JSON contracts.
+- Emit one call summary with timings and correlation; record root-resolution
+  failures and escape control characters in error text.
+- Treat Windows Agents' explicit-root requirement as callable readiness instead
+  of an unregistered error, and skip unrelated session-folder readiness probes.
+- Avoid registry enumeration for explicit WSL roots while retaining backend
+  authorization; let Windows status choose a registered Linux root.
+
 ## 0.13.1
 
 - Qualify the Marketplace display name as **Code Context by dotnetpower** after

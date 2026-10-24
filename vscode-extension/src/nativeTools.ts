@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 
 import { TracedRequestError, type ClientTrace, type DaemonClient } from './daemonClient.js';
 import { formatToolResult } from './resultFormatter.js';
+import { formatTrace, outcomeLevel, singleLine } from './logFormatter.js';
 import { resolveRegisteredRootAfterRefresh, resolveWslRoot } from './rootResolver.js';
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
@@ -101,7 +102,7 @@ export class NativeToolBridge implements vscode.Disposable {
 
   public constructor(
     private readonly client: DaemonClient,
-    private readonly output: vscode.OutputChannel,
+    private readonly output: vscode.LogOutputChannel,
     private readonly registerMissingRoot?: (path: string) => Promise<void>,
     private readonly onUsage?: (event: UsageEvent) => void,
   ) {
@@ -132,7 +133,9 @@ export class NativeToolBridge implements vscode.Disposable {
     input: T,
     token: vscode.CancellationToken,
   ): Promise<JsonValue> {
-    return (await this.invokeTraced(definition, input, token)).value;
+    const result = await this.invokeTraced(definition, input, token);
+    this.recordTrace(result.trace, token);
+    return result.value;
   }
 
   public async invokeTraced<T>(
@@ -160,9 +163,6 @@ export class NativeToolBridge implements vscode.Disposable {
       result.trace.completed_unix_ms = Date.now();
       result.trace.outcome = 'success';
       this.onUsage?.({ operation: definition.operation, root });
-      this.output.appendLine(
-        `${definition.operation} root=${root ?? '-'} ${result.trace.total_ms.toFixed(3)}ms trace=${traceId}`,
-      );
       if (definition.operation === 'code_sync') {
         this.registry.invalidate();
       }
@@ -170,25 +170,31 @@ export class NativeToolBridge implements vscode.Disposable {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.onUsage?.({ operation: definition.operation, root, error: message });
-      if (error instanceof TracedRequestError) {
-        error.trace.outcome = classifyOutcome(message);
-        error.trace.started_unix_ms = startedUnixMs;
-        error.trace.completed_unix_ms = Date.now();
-        this.recordTrace(error.trace, token);
-      }
-      this.output.appendLine(`${definition.operation} failed trace=${traceId}: ${message}`);
+      const elapsed = performance.now() - started;
+      const trace: ClientTrace = error instanceof TracedRequestError ? error.trace : {
+        trace_id: traceId, origin: 'native', operation: definition.operation,
+        root: root ?? (definition.needsRoot ? (input as RootInput).root ?? null : null),
+        queue_ms: 0, prepare_ms: elapsed, ipc_ms: 0, serialize_ms: 0, write_ms: 0,
+        total_ms: elapsed, success: false, available: false, daemon: null,
+        started_unix_ms: startedUnixMs, completed_unix_ms: Date.now(),
+      };
+      trace.outcome = classifyOutcome(message);
+      trace.started_unix_ms = startedUnixMs;
+      trace.completed_unix_ms = Date.now();
+      this.recordTrace(trace, token, message);
       throw new Error(message.includes(`[cctx_trace=${traceId}]`)
         ? message : `${message} [cctx_trace=${traceId}]`, { cause: error });
     }
   }
 
-  public recordTrace(trace: ClientTrace, token: vscode.CancellationToken): void {
-    this.output.appendLine(`CCTX_CLIENT_TRACE ${JSON.stringify(trace)}`);
+  public recordTrace(trace: ClientTrace, token: vscode.CancellationToken, reason?: string): void {
+    const outcome = trace.success ? 'success' : classifyOutcome(reason ?? 'Unknown native request failure');
+    this.output[outcomeLevel(outcome)](formatTrace(trace, reason));
     if (trace.available !== true) {
       return;
     }
     void this.client.request(request(null, 'code_trace', trace), token).catch((error: unknown) => {
-      this.output.appendLine(`CCTX_TRACE_REPORT_FAILED trace=${trace.trace_id}: ${String(error)}`);
+      this.output.warn(`CCTX_TRACE_REPORT_FAILED trace=${trace.trace_id}: ${singleLine(String(error))}`);
     });
   }
 
@@ -203,6 +209,10 @@ export class NativeToolBridge implements vscode.Disposable {
     allowPreparation = true,
   ): Promise<string> {
     ensureTrustedWorkspace();
+    if (this.client.usesWslBridge && explicit !== undefined) {
+      // The daemon remains authoritative for registration and access policy.
+      return resolveWslRoot([], explicit);
+    }
     const candidates = workspaceCandidates();
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
@@ -216,6 +226,8 @@ export class NativeToolBridge implements vscode.Disposable {
       allowPreparation ? this.registerMissingRoot : undefined,
     );
   }
+
+  public get usesWslBridge(): boolean { return this.client.usesWslBridge; }
 
   public dispose(): void {
     for (const disposable of this.disposables) {

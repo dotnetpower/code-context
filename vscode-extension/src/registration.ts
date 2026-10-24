@@ -24,6 +24,7 @@ import {
 } from './registrationPlan.js';
 import { parseGitIdentity, resolveRegisteredRoot, RootResolutionError } from './rootResolver.js';
 import type { JsonValue } from './types.js';
+import { singleLine } from './logFormatter.js';
 
 const execFileAsync = promisify(execFile);
 const SEARCH_EXCLUDE =
@@ -33,7 +34,7 @@ let registrationQueue: Promise<string[]> = Promise.resolve([]);
 
 export async function registerCurrentWorkspace(
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
 ): Promise<boolean> {
   if (!vscode.workspace.isTrusted) {
     throw new Error('Trust this workspace before registering Code Context.');
@@ -77,7 +78,7 @@ export async function registerCurrentWorkspace(
     async () => runCctxRegister(executable, plan),
   );
   bridge.invalidateRegistry();
-  output.appendLine(`REGISTERED ${JSON.stringify(registered)}`);
+  output.info(`REGISTERED root=${singleLine(registered.root)} ${compactPlanSummary(registered)}`);
   await vscode.window.showInformationMessage(
     `Code Context registered: ${folder.uri.fsPath}`,
   );
@@ -86,7 +87,7 @@ export async function registerCurrentWorkspace(
 
 export async function autoRegisterWorkspaceFolders(
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
   state: vscode.Memento,
   folders: readonly vscode.WorkspaceFolder[] = vscode.workspace.workspaceFolders ?? [],
 ): Promise<string[]> {
@@ -98,7 +99,7 @@ export async function autoRegisterWorkspaceFolders(
 
 async function performAutomaticRegistration(
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
   state: vscode.Memento,
   folders: readonly vscode.WorkspaceFolder[],
 ): Promise<string[]> {
@@ -121,7 +122,7 @@ async function performAutomaticRegistration(
         folderRoot = await realpath(folder.uri.fsPath);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
-        output.appendLine(`AUTO_REGISTER_SKIPPED root=${folder.uri.fsPath} ${message}`);
+        output.warn(`AUTO_REGISTER_SKIPPED root=${singleLine(folder.uri.fsPath)} ${singleLine(message)}`);
         continue;
       }
       let registeredRoot: string | undefined;
@@ -146,7 +147,7 @@ async function performAutomaticRegistration(
               const executable = executablePath();
               const checked = await runCctxPlan(executable, inferred, true);
               await runCctxRegister(executable, inferred, true);
-              output.appendLine(
+              output.info(
                 `AUTO_UPDATED root=${inferred.root} scopes=${inferred.scopes.join(',')} globs=${inferred.globs.join(',')} ${compactPlanSummary(checked)}`,
               );
               bridge.invalidateRegistry();
@@ -156,8 +157,8 @@ async function performAutomaticRegistration(
             await state.update(AUTO_PLAN_STATE_KEY, automaticPlans);
           } catch (error: unknown) {
             const message = error instanceof Error ? error.message : String(error);
-            output.appendLine(
-              `AUTO_UPDATE_SKIPPED root=${folder.uri.fsPath} ${message}`,
+            output.warn(
+              `AUTO_UPDATE_SKIPPED root=${singleLine(folder.uri.fsPath)} ${singleLine(message)}`,
             );
           }
         } else if (remembered !== undefined) {
@@ -184,7 +185,7 @@ async function performAutomaticRegistration(
         workspaces = await bridge.listWorkspaces(source.token);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
-        output.appendLine(`AUTO_REGISTER_SKIPPED root=${folder.uri.fsPath} ${message}`);
+        output.warn(`AUTO_REGISTER_SKIPPED root=${singleLine(folder.uri.fsPath)} ${singleLine(message)}`);
       }
     }
   } finally {
@@ -196,7 +197,7 @@ async function performAutomaticRegistration(
 export async function prepareMissingWorkspace(
   target: string,
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
   state: vscode.Memento,
 ): Promise<void> {
   if (!vscode.workspace.isTrusted || !vscode.workspace.getConfiguration('codeContextNative')
@@ -218,7 +219,7 @@ export async function prepareMissingWorkspace(
 async function registerTrustedWorktree(
   target: string,
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
 ): Promise<void> {
   if (!vscode.workspace.isTrusted || !vscode.workspace.getConfiguration('codeContextNative')
     .get<boolean>('autoRegisterWorkspace', true)) {
@@ -256,7 +257,7 @@ async function registerTrustedWorktree(
     return;
   }
   const message = `No open trusted repository authorizes worktree ${target}. ${failures.join('; ')}`;
-  output.appendLine(`WORKTREE_REGISTRATION_REJECTED ${message}`);
+  output.warn(`WORKTREE_REGISTRATION_REJECTED ${singleLine(message)}`);
   throw new RootResolutionError(message);
 }
 

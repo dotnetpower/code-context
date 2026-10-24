@@ -10,6 +10,8 @@ void test('usage distinguishes unavailable caches from refusals and actual failu
   assert.equal(classifyOutcome('READ_POLICY_DENIED reason=unsupported_glob'), 'policy_denied');
   assert.equal(classifyOutcome('READ_RANGE_OUT_OF_BOUNDS'), 'invalid_request');
   assert.equal(classifyOutcome('CACHE_LOAD_FAILED: admission'), 'system_error');
+  assert.equal(classifyOutcome('Windows Agent Sessions require an explicit absolute Linux root'), 'invalid_request');
+  assert.equal(classifyOutcome('WSL Code Context root must be an absolute Linux path.'), 'invalid_request');
 });
 
 void test('status is event driven, bounded and identifies native-host rather than global usage', () => {

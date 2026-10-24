@@ -117,6 +117,36 @@ Open **Output → Code Context Native** for bounded native trace details.
 `cctx --root /project doctor` compares installed/client/daemon builds without
 stopping other sessions.
 
+### Reading the log
+
+The Output channel uses ordinary timestamped text with real info/warning/error
+levels, not JSON records. Each call has one summary with its outcome, latency
+phases, root, and correlation ID:
+
+```text
+[info] code_context success total=4.200ms prepare=0.300ms queue=0.100ms ipc=3.500ms format=0.300ms daemon=2.000ms request=42 root=/project trace=example
+[info] code_read cache_not_ready ... reason=CACHE_MISS ...
+[warning] code_read policy_denied ... reason=READ_POLICY_DENIED ...
+[error] code_context system_error ... reason=...
+```
+
+Status and self-test commands print labeled fields rather than raw JSON.
+Long diagnostic trees explicitly report when the log view is truncated.
+Control characters in request errors are escaped so they cannot forge log lines.
+Machine-facing IPC, CLI JSON, tool trace footers, and asynchronous daemon trace
+reports remain structured and compatible; only the human Output view changes.
+
+Windows Agents with several registered roots are **callable**, not unregistered.
+Pass an explicit absolute Linux root to source tools. The status command lets
+you choose an existing root without loading source. Changes to unrelated
+Windows session folders do not repeat the Linux readiness probe. Explicit Linux
+roots go directly to the backend, which still enforces registration/access.
+
+A cold miss is expected, not a system error. A policy warning does not authorize
+widening scopes or bypassing exclusions. Large `prepare` time can reflect
+reconnecting the WSL bridge after idle expiry; it is not index-search time.
+There is no keepalive polling or automatic warmup to hide that cost.
+
 After an update, reload only the affected window at a safe boundary. Installing
 a new executable or VSIX does not replace code cached in a running host.
 

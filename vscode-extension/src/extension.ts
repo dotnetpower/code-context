@@ -10,6 +10,7 @@ import { RootResolutionError } from './rootResolver.js';
 import { validateDaemonStatus } from './resultFormatter.js';
 import type { ClientSettings, JsonValue } from './types.js';
 import { UsageSummary } from './usage.js';
+import { formatLogDetails, singleLine } from './logFormatter.js';
 
 let client: DaemonClient | undefined;
 
@@ -20,7 +21,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const legacy = vscode.extensions.getExtension('moonchoi.code-context-native');
   if (legacy) {
     const message = `Remove ${legacy.id} before enabling ${context.extension.id}, then reload the affected window at a safe boundary to avoid duplicate native tools.`;
-    output.appendLine(`MIGRATION_REQUIRED: ${message}`);
+    output.warn(`MIGRATION_REQUIRED: ${message}`);
     context.subscriptions.push(output);
     void vscode.window.showWarningMessage(message);
     return;
@@ -65,7 +66,7 @@ export function activate(context: vscode.ExtensionContext): void {
             if (oldest!==undefined) { preparationFailures.delete(oldest); }
           }
           preparationFailures.set(path,{at:performance.now(),message:String(error)});
-          output.appendLine(`CACHE_REGISTRATION_FAILED root=${path}: ${String(error)}`);
+          output.error(`CACHE_REGISTRATION_FAILED root=${singleLine(path)}: ${singleLine(String(error))}`);
         })
         .finally(() => { pending.delete(path); });
       pending.set(path, operation);
@@ -134,7 +135,7 @@ export function activate(context: vscode.ExtensionContext): void {
       async () => {
         if (client?.usesWslBridge) {
           const message = 'Register manual workspaces with cctx register inside WSL. Authorized worktrees are prepared lazily by the daemon.';
-          output.appendLine(`REGISTRATION_REQUIRED: ${message}`);
+          output.warn(`REGISTRATION_REQUIRED: ${message}`);
           await vscode.window.showErrorMessage(message);
           return;
         }
@@ -148,7 +149,7 @@ export function activate(context: vscode.ExtensionContext): void {
         client?.reset();
         bridge.invalidateRegistry();
         output.appendLine('Code Context native settings changed; applying on next request.');
-        if (event.affectsConfiguration('codeContextNative.autoRegisterWorkspace')) {
+        if (!bridge.usesWslBridge && event.affectsConfiguration('codeContextNative.autoRegisterWorkspace')) {
           void probe();
         }
       }
@@ -158,7 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       bridge.invalidateRegistry();
-      if (vscode.workspace.isTrusted) {
+      if (vscode.workspace.isTrusted && !bridge.usesWslBridge) {
         void probe();
       }
     }),
@@ -184,13 +185,24 @@ export function deactivate(): void {
 async function showStatus(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
   explicitRoot?: string,
 ): Promise<void> {
   try {
     const source = new vscode.CancellationTokenSource();
     try {
-      const root = await bridge.resolveRoot(explicitRoot, source.token, false);
+      let requestedRoot = explicitRoot;
+      if (!requestedRoot && bridge.usesWslBridge) {
+        const workspaces = await bridge.listWorkspaces(source.token);
+        requestedRoot = workspaces.length === 1 ? workspaces[0]?.root :
+          await vscode.window.showQuickPick(workspaces.map((workspace) => workspace.root),
+            { title: 'Code Context: Select a registered Linux root', placeHolder: 'Status does not load source.' });
+        if (!requestedRoot) {
+          output.info('STATUS_CANCELLED no registered root selected; register a Linux root if the list is empty.');
+          return;
+        }
+      }
+      const root = await bridge.resolveRoot(requestedRoot, source.token, false);
       const value = await bridge.invoke(
         {
           name: 'command_status',
@@ -202,7 +214,7 @@ async function showStatus(
         { root },
         source.token,
       );
-      output.appendLine(JSON.stringify(value, null, 2));
+      output.info(formatLogDetails('Code Context status', value));
       output.show(true);
     } finally {
       source.dispose();
@@ -220,7 +232,7 @@ async function showStatus(
 
 async function runSelfTest(
   bridge: NativeToolBridge,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
   extension: vscode.Extension<unknown>,
   explicitRoot?: string,
 ): Promise<void> {
@@ -274,7 +286,7 @@ async function runSelfTest(
         elapsedMs: Number((performance.now() - started).toFixed(3)),
         invocationResult: daemonStatus,
       };
-      output.appendLine(JSON.stringify(report, null, 2));
+      output.info(formatLogDetails('Code Context native self-test', report));
       output.show(true);
       await vscode.window.showInformationMessage(
         `Code Context extension self-test passed: ${root}. Chat picker enablement is not verified.`,
@@ -290,7 +302,7 @@ async function runSelfTest(
 async function runStartupProbe(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
 ): Promise<void> {
   const started = performance.now();
   const source = new vscode.CancellationTokenSource();
@@ -313,11 +325,13 @@ async function runStartupProbe(
     if (!Array.isArray(workspaces)) {
       throw new Error('Native workspace probe returned a non-array result.');
     }
-    const root = await bridge.resolveRoot(undefined, source.token, false);
+    const root = bridge.usesWslBridge && workspaces.length !== 1
+      ? 'explicit Linux root required'
+      : await bridge.resolveRoot(undefined, source.token, false);
     statusBar.text = '$(database) CCTX Available';
     statusBar.tooltip = `${registered.length} native tools registered and callable for ${root}; Chat picker enablement is user-controlled`;
     output.appendLine(
-      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length} root=${root} probe=codeWorkspaces index_initialization=on-demand source_scan=none elapsed_ms=${(performance.now() - started).toFixed(3)} agent_picker=unverified; enable Code Context tools in the agent tool settings`,
+      `EXTENSION_CALLABLE tools=${registered.length} workspaces=${workspaces.length} root=${root} probe=codeWorkspaces index_initialization=on-demand source_scan=none elapsed_ms=${(performance.now() - started).toFixed(3)} agent_picker=unverified; enable Code Context tools in the agent tool settings`,
     );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -328,7 +342,7 @@ async function runStartupProbe(
     } else {
       statusBar.text = '$(warning) CCTX Native';
       statusBar.tooltip = message;
-      output.appendLine(`NATIVE_NOT_READY ${message}`);
+      output.error(`NATIVE_NOT_READY ${singleLine(message)}`);
     }
   } finally {
     source.dispose();
@@ -367,10 +381,10 @@ function readSettings(): ClientSettings {
 
 async function showFailure(
   error: unknown,
-  output: vscode.OutputChannel,
+  output: vscode.LogOutputChannel,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
-  output.appendLine(`ERROR: ${message}`);
+  output.error(singleLine(message));
   output.show(true);
   await vscode.window.showErrorMessage(`Code Context native tools: ${message}`);
 }

@@ -7,6 +7,8 @@ import { runInNewContext } from 'node:vm';
 import { RootResolutionError } from '../src/rootResolver.js';
 import { CacheMissError } from '../src/daemonClient.js';
 import { UsageSummary } from '../src/usage.js';
+import { formatLogDetails, singleLine } from '../src/logFormatter.js';
+import { validateDaemonStatus } from '../src/resultFormatter.js';
 
 const toolNames = [
   'code-context-native_codeContext',
@@ -19,7 +21,7 @@ const toolNames = [
 ];
 
 async function activateFixture(trusted: boolean, registered: boolean,
-  registration?: (path:string)=>Promise<void>, legacy = false): Promise<{
+  registration?: (path:string)=>Promise<void>, legacy = false, wsl = false): Promise<{
   calls: string[];
   messages: string[];
   events: Array<() => void>;
@@ -41,12 +43,27 @@ async function activateFixture(trusted: boolean, registered: boolean,
   class TextPart {
     public constructor(public readonly value: string) {}
   }
+  const daemonStatus = {
+    index_state: 'unloaded', stats: null,
+    capabilities: { schema: 3, code_files: true, context_radius_max: 100,
+      authorized_worktrees: true, read_pages: true, request_tracing: true,
+      trace_clock: 'unix_ms', source_cache: 'nonblocking_root_cache' },
+  };
   class Bridge {
+    public readonly usesWslBridge = wsl;
     public constructor(_client:unknown,_output:unknown,callback?:(path:string)=>Promise<void>) {
       prepare=callback;
     }
     public register(): void { calls.push('register-tools'); }
     public invalidateRegistry(): void {}
+    public listWorkspaces(): Promise<Array<{ root: string }>> {
+      calls.push('list-registered-roots');
+      return Promise.resolve(wsl ? [{ root: '/first' }, { root: '/second' }] : [{ root: '/large-workspace' }]);
+    }
+    public invoke(): Promise<typeof daemonStatus> {
+      calls.push('command-status');
+      return Promise.resolve(daemonStatus);
+    }
     public resolveRoot(_explicit: unknown, _token: unknown, allowPreparation: boolean): Promise<string> {
       assert.equal(allowPreparation, false, 'startup must never prepare or scan source');
       calls.push('resolve-existing-root');
@@ -68,11 +85,28 @@ async function activateFixture(trusted: boolean, registered: boolean,
       onDidChangeWorkspaceFolders: event,
     },
     window: {
-      createOutputChannel: (): object => ({ ...disposable, appendLine: (line: string): void => { messages.push(line); } }),
+      createOutputChannel: (): object => ({
+        ...disposable,
+        appendLine: (line: string): void => { messages.push(line); },
+        info: (line: string): void => { messages.push(line); },
+        warn: (line: string): void => { messages.push(line); },
+        error: (line: string): void => { messages.push(line); },
+        show(): void {},
+      }),
       createStatusBarItem: (): object => ({ ...disposable, show(): void {} }),
       showWarningMessage: (message: string): Promise<void> => {
         messages.push(message);
         return Promise.resolve();
+      },
+      showInformationMessage: (message: string): Promise<void> => {
+        messages.push(message); return Promise.resolve();
+      },
+      showErrorMessage: (message: string): Promise<void> => {
+        messages.push(message); return Promise.resolve();
+      },
+      showQuickPick: (items: string[]): Promise<string | undefined> => {
+        calls.push('pick-registered-root');
+        return Promise.resolve(items[0]);
       },
     },
     extensions: { getExtension: (id: string): { id: string } | undefined =>
@@ -97,10 +131,12 @@ async function activateFixture(trusted: boolean, registered: boolean,
       tools: toolNames.map((name) => ({ name })),
       invokeTool: async (name: string): Promise<object> => {
         calls.push(name);
-        assert.equal(name, 'code-context-native_codeWorkspaces', 'startup cannot request source or index status');
+        assert.ok(['code-context-native_codeWorkspaces', 'code-context-native_codeStatus'].includes(name));
         await new Promise<void>((done) => setImmediate(done));
         return { content: [
-          new TextPart(JSON.stringify(registered ? [{ root: '/large-workspace' }] : [])),
+          new TextPart(JSON.stringify(name === 'code-context-native_codeStatus' ? daemonStatus :
+            wsl ? [{ root: '/first' }, { root: '/second' }] :
+              registered ? [{ root: '/large-workspace' }] : [])),
           new TextPart('CCTX_TRACE {"trace_id":"startup-probe"}'),
         ] };
       },
@@ -130,8 +166,9 @@ async function activateFixture(trusted: boolean, registered: boolean,
       },
     },
     './rootResolver.js': { RootResolutionError },
-    './resultFormatter.js': {},
+    './resultFormatter.js': { validateDaemonStatus },
     './usage.js': { UsageSummary },
+    './logFormatter.js': { formatLogDetails, singleLine },
   };
   runInNewContext(source, {
     exports,
@@ -201,6 +238,32 @@ void test('trust and workspace event bursts share one in-flight readiness probe'
   await new Promise<void>((done) => setImmediate(done));
   await new Promise<void>((done) => setImmediate(done));
   assert.equal(fixture.calls.filter((name) => name === 'code-context-native_codeWorkspaces').length, 1);
+});
+
+void test('Windows multiple-root startup is callable and session-folder changes do not re-probe', async () => {
+  const fixture = await activateFixture(true, true, undefined, false, true);
+  await new Promise<void>((done) => setImmediate(done));
+  await new Promise<void>((done) => setImmediate(done));
+  assert.ok(fixture.messages.some((message) => message.includes('EXTENSION_CALLABLE')));
+  assert.ok(fixture.messages.some((message) => message.includes('explicit Linux root required')));
+  assert.ok(!fixture.messages.some((message) => message.includes('NATIVE_UNREGISTERED')));
+  assert.ok(!fixture.calls.includes('resolve-existing-root'));
+  for (let index = 0; index < 5; index += 1) {
+    fixture.events[2]?.();
+    await new Promise<void>((done) => setImmediate(done));
+  }
+  assert.equal(fixture.calls.filter((name) => name === 'code-context-native_codeWorkspaces').length, 1);
+});
+
+void test('status and self-test commands print readable diagnostics and Windows status selects a root', async () => {
+  const fixture = await activateFixture(false, true, undefined, false, true);
+  await fixture.invokeCommand('codeContextNative.showStatus');
+  assert.ok(fixture.calls.includes('pick-registered-root'));
+  assert.ok(fixture.messages.some((message) => message.includes('Code Context status\nindex_state: unloaded')));
+  await fixture.invokeCommand('codeContextNative.selfTest');
+  assert.ok(fixture.messages.some((message) => message.includes('Code Context native self-test\nextensionCallable: true')));
+  assert.ok(fixture.messages.some((message) => message.includes('extensionVersion: 0.13.0')));
+  assert.ok(fixture.messages.every((message) => !message.trimStart().startsWith('{')));
 });
 
 void test('untrusted workspace only registers tools and never probes the daemon', async () => {

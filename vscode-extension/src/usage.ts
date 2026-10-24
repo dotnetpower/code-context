@@ -12,7 +12,7 @@ export function classifyOutcome(error?: string): Outcome {
   if (/READ_POLICY_DENIED|reason=(outside_scope|excluded_by_rule|unsupported_glob|ignored_by_discovery|symlink_not_allowed)|only non-hidden/u.test(error)) {
     return 'policy_denied';
   }
-  if (/READ_RANGE_OUT_OF_BOUNDS|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field/u.test(error)) {
+  if (/READ_RANGE_OUT_OF_BOUNDS|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root/u.test(error)) {
     return 'invalid_request';
   }
   return 'system_error';
