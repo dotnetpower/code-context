@@ -42,8 +42,15 @@
   ],
   "keywords": [
     "copilot",
+    "github copilot",
     "language model tool",
-    "search",
+    "mcp",
+    "mcp server",
+    "code search",
+    "trigram index",
+    "token optimization",
+    "context engineering",
+    "coding agent",
     "rust",
     "code context"
   ],

@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "Code Context (cctx): Fast Local Source Search and Smart Context Cache for AI Coding Agents"
+message: "If you use Code Context or its retrieval and token-efficiency benchmarks, please cite this software."
+type: software
+authors:
+  - alias: dotnetpower
+    name: "Code Context Contributors"
+repository-code: "https://github.com/dotnetpower/code-context"
+url: "https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native"
+license: MIT
+version: 0.14.0
+date-released: "2026-10-30"
+keywords:
+  - coding-agents
+  - github-copilot
+  - vscode-extension
+  - model-context-protocol
+  - mcp-server
+  - code-search
+  - trigram-index
+  - token-optimization
+  - context-engineering
+  - rust

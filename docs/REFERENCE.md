@@ -6,8 +6,11 @@ For host-specific connection settings, use the
 
 ## Requirements and installation
 
-The supported backend runs on Linux/Unix sockets. The managed installer needs
-stable Rust/Cargo, ripgrep on `PATH`, systemd user services, and cgroup v2.
+The backend runs on Linux/WSL/SSH (Unix domain sockets) and native Windows
+(`cctx.exe`, authenticated loopback RPC with hidden daemon auto-start).
+The managed Linux installer needs stable Rust/Cargo, ripgrep on `PATH`,
+systemd user services, and cgroup v2. On native Windows, `cctx.exe` uses `rg`
+on `PATH` or falls back automatically to the `rg.exe` bundled with VS Code.
 The VSIX contains the adapter, not a backend executable. Node.js 22+ and npm are
 needed only to build the extension from source.
 
@@ -89,9 +92,12 @@ Tool discovery does not prove that a model selects the tools.
 | `#cctxNativeSync` | Explicit full-source freshness barrier |
 | `#cctxNativeWorkspaces` | Registered roots and coverage |
 
-The extension uses stable APIs. Ordinary Linux/WSL/SSH workspace windows use the
-workspace host. A Windows Agents host can use framed native IPC through WSL;
-it is not MCP, TCP, or a second index. See the
+The extension uses stable APIs and contributes automatic agent usage
+instructions (`applyTo: "**"`). Ordinary Linux/WSL/SSH workspace windows use
+the workspace host; local Windows workspace windows (`C:\...`) use native
+`cctx.exe native-bridge` and automatically start `cctx.exe daemon` in the
+background. A Windows Agents host with `wslDistribution` configured uses framed
+native IPC through WSL; it is not MCP, TCP, or a second index. See the
 [connection guide](../vscode-extension/docs/SETUP.md#windows-agent-sessions).
 The extension rejects untrusted activation and rechecks trust on every call.
 

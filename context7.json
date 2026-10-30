@@ -1,0 +1,30 @@
+{
+  "projectTitle": "Code Context (cctx)",
+  "description": "Fast local file discovery, trigram-indexed source search, and smart block-clamped context cache for AI coding agents (VS Code Native Language Model Tools & MCP server in Rust).",
+  "folders": [
+    "docs",
+    "vscode-extension/docs",
+    "vscode-extension/prompts"
+  ],
+  "excludeFolders": [
+    "logs",
+    "target",
+    "fixtures",
+    "benchmarks/results",
+    "vscode-extension/node_modules",
+    "vscode-extension/out",
+    "vscode-extension/dist",
+    "vscode-extension/test"
+  ],
+  "excludeFiles": [
+    "REPORT.md",
+    "vscode-extension/CHANGELOG.md"
+  ],
+  "rules": [
+    "Use #cctxNativeContext (or MCP code_context) first to search and fetch surrounding source in one call instead of separate grep and file-read calls.",
+    "Use #cctxNativeFiles (or MCP code_files) for filename/path glob discovery, never content patterns.",
+    "Content search in code_grep and code_context is literal by default; set regex=true for alternation (a|b) or regular expressions.",
+    "Treat CACHE_MISS as an immediate nonblocking cache miss that queues background loading for that root; fall back to permitted host search/read for that lookup without polling or calling code_sync to wait.",
+    "Use max_matches_per_file in code_grep or code_context to cap noisy files and prioritize symbol definitions (fn, struct, class, def, interface)."
+  ]
+}
