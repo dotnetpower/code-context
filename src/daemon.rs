@@ -9,11 +9,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::{
     fs::PermissionsExt,
     net::{UnixListener, UnixStream},
 };
+#[cfg(windows)]
+type RpcStream = std::net::TcpStream;
+#[cfg(unix)]
+type RpcStream = UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -32,6 +38,7 @@ const SERVICE_WRITE_BPS: u64 = 1_000_000;
 type WireResult = std::result::Result<Value, String>;
 pub(crate) const TRACE_ARGUMENT: &str = "_cctx_trace";
 
+#[cfg(unix)]
 fn current_cgroup_dir()->Result<PathBuf> {
     let cgroup=std::fs::read_to_string("/proc/self/cgroup")?;
     let relative=cgroup.lines().find_map(|line|line.strip_prefix("0::"))
@@ -43,6 +50,12 @@ fn current_cgroup_dir()->Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(windows)]
+fn current_cgroup_dir() -> Result<PathBuf> {
+    catalog::state_dir()
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn service_io_guard_rule(device:&str,current:&str)->Result<String> {
     let existing=current.lines().find(|line|line.split_whitespace().next()==Some(device));
     let limit=|key:&str,ceiling:u64|->Result<u64>{
@@ -57,6 +70,7 @@ fn service_io_guard_rule(device:&str,current:&str)->Result<String> {
         limit("wbps=",SERVICE_WRITE_BPS)?))
 }
 
+#[cfg(unix)]
 fn apply_service_io_guard()->Result<()> {
     match std::env::var_os("CCTX_IO_GUARD") {
         None=>return Ok(()),
@@ -85,12 +99,19 @@ fn apply_service_io_guard()->Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn apply_service_io_guard() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 struct RuntimeIdentity {
     paths: [PathBuf;3],
     identities: [(u64,u64);3],
     last_check: Instant,
 }
 
+#[cfg(unix)]
 impl RuntimeIdentity {
     fn capture(directory:&std::path::Path,socket:&std::path::Path,lock:&std::fs::File)->Result<Self> {
         let paths=[directory.to_path_buf(),socket.to_path_buf(),directory.join("daemon.lock")];
@@ -125,6 +146,63 @@ impl RuntimeIdentity {
             }
         }
         self.last_check=Instant::now();
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+struct RuntimeIdentity {
+    paths: [PathBuf; 3],
+    socket_contents: String,
+    last_check: Instant,
+}
+
+#[cfg(windows)]
+impl RuntimeIdentity {
+    fn capture(directory: &std::path::Path, socket: &std::path::Path, _lock: &std::fs::File) -> Result<Self> {
+        let paths = [directory.to_path_buf(), socket.to_path_buf(), directory.join("daemon.lock")];
+        let socket_contents = std::fs::read_to_string(&paths[1])?;
+        let mut value = Self {
+            paths,
+            socket_contents,
+            last_check: Instant::now() - IDLE_MAINTENANCE_INTERVAL,
+        };
+        value.check()?;
+        Ok(value)
+    }
+
+    fn check(&mut self) -> Result<()> {
+        if self.last_check.elapsed() < IDLE_MAINTENANCE_INTERVAL {
+            return Ok(());
+        }
+        for (index, path) in self.paths.iter().enumerate() {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                invalid(format!(
+                    "RUNTIME_UNAVAILABLE path={}: {error}; daemon is stopping instead of polling an inaccessible runtime",
+                    path.display()
+                ))
+            })?;
+            let valid_kind = if index == 0 {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            if !valid_kind || metadata.file_type().is_symlink() {
+                return Err(invalid(format!(
+                    "RUNTIME_REPLACED_OR_UNSAFE path={}; daemon is stopping",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        if std::fs::read_to_string(&self.paths[1]).ok().as_ref() != Some(&self.socket_contents) {
+            return Err(invalid(format!(
+                "RUNTIME_REPLACED_OR_UNSAFE path={}; daemon is stopping",
+                self.paths[1].display()
+            ))
+            .into());
+        }
+        self.last_check = Instant::now();
         Ok(())
     }
 }
@@ -333,15 +411,43 @@ impl Drop for ActiveConnection {
     }
 }
 
+#[cfg(unix)]
+fn connect_rpc_stream() -> Result<RpcStream> {
+    Ok(UnixStream::connect(catalog::socket_path()?)?)
+}
+
+#[cfg(windows)]
+fn connect_rpc_stream() -> Result<RpcStream> {
+    let path = catalog::socket_path()?;
+    let contents = std::fs::read_to_string(&path)?;
+    let mut lines = contents.lines();
+    let addr: std::net::SocketAddr = lines
+        .next()
+        .ok_or_else(|| invalid("daemon endpoint file is empty"))?
+        .trim()
+        .parse()
+        .map_err(|e| invalid(format!("invalid daemon endpoint address: {e}")))?;
+    let secret = lines
+        .next()
+        .ok_or_else(|| invalid("daemon endpoint file is missing auth token"))?
+        .trim();
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    stream.set_nodelay(true)?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(secret.as_bytes())?;
+    stream.write_all(b"\n")?;
+    Ok(stream)
+}
+
 pub struct Client {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    stream: RpcStream,
+    reader: BufReader<RpcStream>,
     tracing: bool,
 }
 
 impl Client {
     pub fn connect() -> Result<Self> {
-        let mut stream = UnixStream::connect(catalog::socket_path()?)
+        let mut stream = connect_rpc_stream()
             .map_err(|error| invalid(format!("daemon unavailable: {error}")))?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -402,8 +508,7 @@ impl Client {
 }
 
 pub fn request(request: &Request) -> Result<Value> {
-    let path = catalog::socket_path()?;
-    let mut stream = UnixStream::connect(path).map_err(|e| {
+    let mut stream = connect_rpc_stream().map_err(|e| {
         invalid(format!(
             "daemon unavailable: {e}; start cctx daemon or the user service"
         ))
@@ -437,8 +542,39 @@ fn decode_response(response: &[u8]) -> Result<Value> {
         .ok_or_else(|| invalid("missing daemon response result").into())
 }
 
+#[cfg(windows)]
+fn start_windows_daemon() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+        .spawn()?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        if connect_rpc_stream().is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
 pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> Result<()> {
-    let mut client = Client::connect()?;
+    let mut client = match Client::connect() {
+        Ok(client) => client,
+        #[cfg(windows)]
+        Err(_) if std::env::var_os("CCTX_NO_AUTO_START").is_none() => {
+            let _ = start_windows_daemon();
+            Client::connect()?
+        }
+        Err(error) => return Err(error),
+    };
     output.write_all(b"CCTXN1\n")?;
     output.flush()?;
     let mut magic = [0; 7];
@@ -575,11 +711,12 @@ impl Server {
                 if request.arguments != json!({}) {
                     return Err(invalid("code_status takes empty arguments").into());
                 }
-                let requested = request
-                    .root
-                    .as_ref()
-                    .ok_or_else(|| invalid("root is required; use code_workspaces"))?
-                    .canonicalize()?;
+                let requested = catalog::canonicalize(
+                    request
+                        .root
+                        .as_ref()
+                        .ok_or_else(|| invalid("root is required; use code_workspaces"))?,
+                )?;
                 let spec = self.registry.iter().filter(|spec| requested.starts_with(&spec.root))
                     .max_by_key(|spec| spec.root.components().count())
                     .ok_or_else(|| invalid("status root is not registered; prepare it explicitly or issue a source lookup"))?;
@@ -624,7 +761,7 @@ impl Server {
             request.name.as_str(),
             "code_files" | "code_grep" | "code_context" | "code_read"
         ) {
-            let canonical = requested_root.canonicalize()?;
+            let canonical = catalog::canonicalize(&requested_root)?;
             let expected = self.requested_registration(&canonical)?;
             if expected.as_ref().is_none_or(|spec| {
                 self.roots
@@ -663,7 +800,16 @@ impl Server {
             .get_mut(&root)
             .ok_or_else(|| invalid("missing registered root"))?;
         let previous = entry.restrict_admission(root_budget);
-        let outcome = entry.call(&request.name, request.arguments);
+        let mut outcome = entry.call(&request.name, request.arguments.clone());
+        if let Err(ref error) = outcome
+            && matches!(
+                request.name.as_str(),
+                "code_files" | "code_grep" | "code_context"
+            )
+            && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
+        {
+            outcome = entry.call(&request.name, request.arguments);
+        }
         entry.restore_admission(previous);
         let result = outcome?;
         if let Some(watched) = self.roots.get(&root) {
@@ -813,7 +959,7 @@ impl Server {
     }
 
     fn source_spec(&mut self, requested: &std::path::Path) -> Result<Spec> {
-        let canonical = requested.canonicalize()?;
+        let canonical = catalog::canonicalize(requested)?;
         let registered = self
             .registry
             .iter()
@@ -1037,12 +1183,13 @@ impl Server {
             return Ok(true);
         }
         self.refresh_registry()?;
-        let canonical = envelope
-            .request
-            .root
-            .as_ref()
-            .ok_or_else(|| invalid("root is required"))?
-            .canonicalize()?;
+        let canonical = catalog::canonicalize(
+            envelope
+                .request
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("root is required"))?,
+        )?;
         if envelope.request.name == "code_sync" && envelope.request.arguments != json!({}) {
             return Err(invalid("code_sync takes empty arguments").into());
         }
@@ -1475,7 +1622,13 @@ impl Server {
     fn refresh_registry(&mut self) -> Result<()> {
         let path = catalog::state_dir()?.join("workspaces.json");
         let stamp = match std::fs::metadata(&path) {
-            Ok(metadata) => Some((metadata.ino(), metadata.len(), metadata.modified()?)),
+            Ok(metadata) => {
+                #[cfg(unix)]
+                let ino = metadata.ino();
+                #[cfg(not(unix))]
+                let ino = 0_u64;
+                Some((ino, metadata.len(), metadata.modified()?))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
@@ -1604,6 +1757,12 @@ impl Server {
         }
     }
 
+    #[cfg(windows)]
+    fn process_rss_bytes() -> usize {
+        crate::memory::win_mem::process_memory().0
+    }
+
+    #[cfg(not(windows))]
     fn process_rss_bytes() -> usize {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
             return 0;
@@ -1672,7 +1831,7 @@ fn release_allocator_memory() {
     }
 }
 
-fn receive(reader: &mut BufReader<UnixStream>) -> Result<Option<Request>> {
+fn receive(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> {
     let mut bytes = Vec::new();
     let count = std::io::Read::take(reader, MAX_WIRE as u64 + 1).read_until(b'\n', &mut bytes)?;
     if count == 0 {
@@ -1691,7 +1850,7 @@ fn parse_json_frame(bytes: &[u8]) -> Result<Request> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-fn receive_binary(reader: &mut BufReader<UnixStream>) -> Result<Option<Request>> {
+fn receive_binary(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> {
     let mut length = [0_u8; 4];
     match std::io::Read::read_exact(reader, &mut length) {
         Ok(()) => {}
@@ -1713,7 +1872,7 @@ fn receive_binary(reader: &mut BufReader<UnixStream>) -> Result<Option<Request>>
     }))
 }
 
-fn receive_framed_json(reader: &mut BufReader<UnixStream>) -> Result<Option<Request>> {
+fn receive_framed_json(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> {
     let Some(bytes) = receive_length_prefixed(reader, "framed JSON request")? else {
         return Ok(None);
     };
@@ -1721,7 +1880,7 @@ fn receive_framed_json(reader: &mut BufReader<UnixStream>) -> Result<Option<Requ
 }
 
 fn receive_length_prefixed(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<RpcStream>,
     label: &str,
 ) -> Result<Option<Vec<u8>>> {
     let mut length = [0_u8; 4];
@@ -1739,7 +1898,7 @@ fn receive_length_prefixed(
     Ok(Some(bytes))
 }
 
-fn respond(stream: &mut UnixStream, result: WireResult) -> Result<()> {
+fn respond(stream: &mut RpcStream, result: WireResult) -> Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let response = match result {
         Ok(result) => json!({"result":result}),
@@ -1751,7 +1910,7 @@ fn respond(stream: &mut UnixStream, result: WireResult) -> Result<()> {
 }
 
 fn respond_protocol(
-    stream: &mut UnixStream,
+    stream: &mut RpcStream,
     protocol: Protocol,
     result: &WireResult,
 ) -> Result<(f64, f64)> {
@@ -1788,12 +1947,15 @@ fn respond_protocol(
 }
 
 fn handle_connection(
-    mut stream: UnixStream,
+    mut stream: RpcStream,
     tx: std::sync::mpsc::SyncSender<Envelope>,
     active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     timing_tx: std::sync::mpsc::SyncSender<RequestTiming>,
+    #[cfg(windows)] expected_secret: std::sync::Arc<String>,
 ) {
     let _connection = ActiveConnection(active);
+    #[cfg(windows)]
+    let _ = stream.set_nodelay(true);
     let mut reader = match stream.try_clone() {
         Ok(reader) => BufReader::new(reader),
         Err(error) => {
@@ -1804,6 +1966,18 @@ fn handle_connection(
     if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(2))) {
         let _ = respond(&mut stream, Err(error.to_string()));
         return;
+    }
+    #[cfg(windows)]
+    {
+        let mut auth = Vec::new();
+        if std::io::Read::take(&mut reader, 256)
+            .read_until(b'\n', &mut auth)
+            .is_err()
+            || auth.trim_ascii() != expected_secret.as_bytes()
+        {
+            let _ = respond(&mut stream, Err("unauthorized daemon connection".into()));
+            return;
+        }
     }
     let mut opening = Vec::new();
     let opening_result =
@@ -1957,22 +2131,40 @@ pub fn serve() -> Result<()> {
         .open(dir.join("daemon.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|e| invalid(format!("daemon already active or lock unavailable: {e}")))?;
+    #[cfg(unix)]
     lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let memory = crate::memory::Controller::start(current_cgroup_dir()?, memory_guard)?;
     let socket = catalog::socket_path()?;
-    match std::fs::symlink_metadata(&socket) {
-        Ok(meta) => {
-            use std::os::unix::fs::FileTypeExt;
-            if !meta.file_type().is_socket() {
-                return Err(invalid("refusing to replace non-socket runtime path").into());
+    #[cfg(unix)]
+    let listener = {
+        match std::fs::symlink_metadata(&socket) {
+            Ok(meta) => {
+                use std::os::unix::fs::FileTypeExt;
+                if !meta.file_type().is_socket() {
+                    return Err(invalid("refusing to replace non-socket runtime path").into());
+                }
+                std::fs::remove_file(&socket)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let listener = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        listener
+    };
+    #[cfg(windows)]
+    let (listener, rpc_secret) = {
+        if let Ok(meta) = std::fs::symlink_metadata(&socket) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(invalid("refusing to replace non-file runtime path").into());
             }
             std::fs::remove_file(&socket)?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let secret = std::sync::Arc::new(format!("{}-{}", new_trace_id(), new_trace_id()));
+        std::fs::write(&socket, format!("{}\n{}\n", listener.local_addr()?, secret))?;
+        (listener, secret)
+    };
     eprintln!("code-context daemon ready at {}", socket.display());
     let (tx, rx) = std::sync::mpsc::sync_channel::<Envelope>(32);
     let (timing_tx, timing_rx) = std::sync::mpsc::sync_channel::<RequestTiming>(64);
@@ -2000,10 +2192,21 @@ pub fn serve() -> Result<()> {
                 let worker_active = active.clone();
                 let tx = tx.clone();
                 let timing_tx = timing_tx.clone();
+                #[cfg(windows)]
+                let secret = rpc_secret.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name("cctx-rpc".into())
                     .stack_size(WORKER_STACK_BYTES)
-                    .spawn(move || handle_connection(stream, tx, worker_active, timing_tx))
+                    .spawn(move || {
+                        handle_connection(
+                            stream,
+                            tx,
+                            worker_active,
+                            timing_tx,
+                            #[cfg(windows)]
+                            secret,
+                        )
+                    })
                 {
                     eprintln!("failed to spawn RPC connection worker: {error}");
                     // The closure was dropped without running its RAII decrement.
@@ -2553,7 +2756,16 @@ mod tests {
 
     #[test]
     fn framed_json_errors_remain_length_prefixed() {
+        #[cfg(unix)]
         let (mut server, client) = UnixStream::pair().unwrap();
+        #[cfg(windows)]
+        let (mut server, client) = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = std::net::TcpStream::connect(addr).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            (server, client)
+        };
         let stats =
             respond_protocol(&mut server, Protocol::FramedJson, &Err("queue full".into())).unwrap();
         assert!(stats.0 >= 0.0 && stats.1 >= 0.0);
@@ -2633,7 +2845,7 @@ mod tests {
             managed_parent: None,
         };
         let watched = Watched::new(spec.clone()).unwrap();
-        let canonical = root.path().canonicalize().unwrap();
+        let canonical = catalog::canonicalize(root.path()).unwrap();
         let mut server = Server {
             registry: vec![spec],
             idle_timeout: Duration::ZERO,

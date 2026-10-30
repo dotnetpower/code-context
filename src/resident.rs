@@ -480,6 +480,57 @@ impl Resident {
             .collect()
     }
 
+    pub(crate) fn candidates_byte_classes(&self, positions: &[[u8; 2]]) -> Vec<usize> {
+        let Some(index) = &self.postings else {
+            return (0..self.documents.len()).collect();
+        };
+        if positions.len() < 3 {
+            return (0..self.documents.len()).collect();
+        }
+        let mut window_lists: Vec<Vec<u32>> = Vec::new();
+        let mut seen_windows: Vec<&[[u8; 2]]> = Vec::new();
+        for window in positions.windows(3) {
+            if seen_windows.contains(&window) {
+                continue;
+            }
+            seen_windows.push(window);
+            let mut trigram_keys = Vec::with_capacity(8);
+            for b0 in [window[0][0], window[0][1]] {
+                for b1 in [window[1][0], window[1][1]] {
+                    for b2 in [window[2][0], window[2][1]] {
+                        let key = trigram(&[b0, b1, b2]);
+                        if !trigram_keys.contains(&key) {
+                            trigram_keys.push(key);
+                        }
+                    }
+                }
+            }
+            let mut merged = Vec::new();
+            for key in trigram_keys {
+                if let Some(list) = index.get(&key) {
+                    merged.extend_from_slice(list);
+                }
+            }
+            if merged.is_empty() {
+                return Vec::new();
+            }
+            merged.sort_unstable();
+            merged.dedup();
+            window_lists.push(merged);
+        }
+        window_lists.sort_by_key(|list| list.len());
+        window_lists.truncate(MAX_QUERY_POSTING_INTERSECTIONS);
+        window_lists[0]
+            .iter()
+            .filter(|id| {
+                window_lists[1..]
+                    .iter()
+                    .all(|list| list.binary_search(id).is_ok())
+            })
+            .map(|id| *id as usize)
+            .collect()
+    }
+
     pub(crate) fn candidate_bytes(&self, ids: &[usize]) -> usize {
         ids.iter().map(|id| self.documents[*id].text.len()).sum()
     }

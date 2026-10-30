@@ -5,12 +5,13 @@ export function formatToolResult(operation: string, value: JsonValue): string {
     case 'code_files': {
       const result = recordValue(value, 'file result');
       const paths = arrayValue(result.paths, 'file paths');
+      const total = integerValue(result.total_matches, 'total_matches');
       const lines = [
-        `files=${integerValue(result.total_matches, 'total_matches')} truncated=${booleanValue(result.truncated, 'truncated')}`,
+        `files=${total} truncated=${booleanValue(result.truncated, 'truncated')}`,
         ...paths.map((path) => stringValue(path, 'file path')),
       ];
       if (result.freshness !== undefined) {
-        lines.splice(1, 0, formatFreshness(result.freshness));
+        lines.splice(1, 0, formatFreshness(result.freshness, total === 0));
       }
       return lines.join('\n');
     }
@@ -45,11 +46,12 @@ export function validateDaemonStatus(value: JsonValue): void {
   }
 }
 
-function formatSearch(value: JsonValue): string {
+function formatSearch(value: JsonValue, includeFreshness = true): string {
   const search = recordValue(value, 'search result');
   const matches = arrayValue(search.matches, 'search matches');
+  const total = integerValue(search.total_matches, 'total_matches');
   const lines = [
-    `matches=${integerValue(search.total_matches, 'total_matches')} truncated=${booleanValue(search.truncated, 'truncated')}`,
+    `matches=${total} truncated=${booleanValue(search.truncated, 'truncated')}`,
   ];
   for (const [index, match] of matches.entries()) {
     const item = recordValue(match, `search match ${index}`);
@@ -59,26 +61,32 @@ function formatSearch(value: JsonValue): string {
       item.text === undefined ? '' : ` ${stringValue(item.text, `search match ${index} text`)}`;
     lines.push(`${path}:${line}${text}`);
   }
-  if (search.freshness !== undefined) {
-    lines.splice(1, 0, formatFreshness(search.freshness));
+  if (includeFreshness && search.freshness !== undefined) {
+    lines.splice(1, 0, formatFreshness(search.freshness, total === 0));
   }
   return lines.join('\n');
 }
 
 function formatContext(value: JsonValue): string {
   const context = recordValue(value, 'context result');
-  const search = formatSearch(requiredValue(context, 'search', 'context result'));
+  const searchVal = requiredValue(context, 'search', 'context result');
+  const searchRec = recordValue(searchVal, 'search result');
+  const total = integerValue(searchRec.total_matches, 'total_matches');
+  const search = formatSearch(searchVal, context.freshness === undefined);
   const snippets = formatSnippets(requiredValue(context, 'snippets', 'context result'));
-  const notice = context.freshness === undefined ? '' : `\n${formatFreshness(context.freshness)}`;
+  const notice = context.freshness === undefined ? '' : `\n${formatFreshness(context.freshness, total === 0)}`;
   return `${search}${notice}\n\n${snippets}`;
 }
 
-function formatFreshness(value: JsonValue): string {
+function formatFreshness(value: JsonValue, includeNotice = true): string {
   const freshness = recordValue(value, 'search freshness');
+  const basis = stringValue(freshness.basis, 'freshness basis');
   const check = stringValue(freshness.returned_file_check, 'returned_file_check');
   const verified = booleanValue(freshness.full_disk_verified, 'full_disk_verified');
   const notice = stringValue(freshness.notice, 'freshness notice');
-  return `NOTICE freshness=${stringValue(freshness.basis, 'freshness basis')} returned_file_check=${check} full_disk_verified=${verified}: ${notice}`;
+  return includeNotice
+    ? `NOTICE freshness=${basis} returned_file_check=${check} full_disk_verified=${verified}: ${notice}`
+    : `NOTICE freshness=${basis} returned_file_check=${check} full_disk_verified=${verified}`;
 }
 
 function formatSnippets(value: JsonValue): string {

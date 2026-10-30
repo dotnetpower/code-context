@@ -137,6 +137,7 @@ void test('manifest contributes exactly the seven registered native tools', asyn
     'utf8',
   );
   assert.match(contributedInstructions, /description: "Use when:/);
+  assert.match(contributedInstructions, /applyTo: "\*\*"/);
   assert.match(contributedInstructions, /#cctxNativeContext/);
   assert.match(contributedInstructions, /prefer backend MCP/);
   assert.match(contributedInstructions, /cctx --backend shared --root/);

@@ -3,9 +3,12 @@ import { freemem, totalmem } from 'node:os';
 import type { Duplex } from 'node:stream';
 
 import {
-  connectNativeTransport, nativeEndpoint, RequestCancelledError, startNativeService,
+  connectNativeTransport, nativeEndpoint, RequestCancelledError, startNativeService, usesWslTransport,
 } from './nativeTransport.js';
-export { defaultSocketPath, normalizeSocketPath, RequestCancelledError } from './nativeTransport.js';
+export {
+  defaultExecutablePath, defaultSocketPath, normalizeExecutablePath, normalizeSocketPath,
+  RequestCancelledError, usesWslTransport, windowsLocalLaunch,
+} from './nativeTransport.js';
 
 import type {
   CancellationLike,
@@ -79,7 +82,7 @@ export class DaemonClient {
   ) {}
 
   public get usesWslBridge(): boolean {
-    return process.platform === 'win32';
+    return usesWslTransport(this.settings());
   }
 
   public get endpoint(): string {

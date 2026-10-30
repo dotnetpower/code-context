@@ -139,7 +139,7 @@ impl Workspace {
         excludes: Vec<String>,
         default_excludes: bool,
     ) -> Result<Self> {
-        let root = root.canonicalize()?;
+        let root = crate::catalog::canonicalize(root)?;
         if !root.is_dir() || scopes.is_empty() || globs.is_empty() {
             return Err(
                 invalid("root must be a directory; explicit scopes and globs required").into(),
@@ -179,11 +179,11 @@ impl Workspace {
             safe_relative(Path::new(scope))?;
             let path = root.join(scope);
             reject_symlinks(&root, Path::new(scope))?;
-            if !path.is_dir() || !path.canonicalize()?.starts_with(&root) {
+            if !path.is_dir() || !crate::catalog::canonicalize(&path)?.starts_with(&root) {
                 return Err(invalid("scopes must be directories inside root").into());
             }
-            let canonical = path.canonicalize()?;
-            let relative = canonical.strip_prefix(&root)?;
+            let canonical = crate::catalog::canonicalize(&path)?;
+            let relative = normalize(canonical.strip_prefix(&root)?);
             let name = if relative.as_os_str().is_empty() {
                 ".".into()
             } else {
@@ -227,8 +227,10 @@ impl Workspace {
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new("rg");
+        let mut command = Command::new(rg_executable());
         command.current_dir(&self.root).arg("--no-config");
+        #[cfg(windows)]
+        command.arg("--path-separator=/");
         // Explicit search roots do not reliably inherit cwd ignore rules outside
         // Git repositories. Apply root policy explicitly for every discovery.
         for name in [".gitignore", ".ignore"] {
@@ -454,7 +456,7 @@ impl Workspace {
         safe_relative(path)?;
         reject_symlinks(&self.root, path)?;
         let absolute = self.root.join(path);
-        if !absolute.canonicalize()?.starts_with(&self.root) {
+        if !crate::catalog::canonicalize(&absolute)?.starts_with(&self.root) {
             return Err(invalid("resolved file is outside root").into());
         }
         let mut bytes = Vec::new();
@@ -472,10 +474,89 @@ impl Workspace {
     }
 }
 
+fn rg_executable() -> &'static std::ffi::OsStr {
+    static RG: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    RG.get_or_init(|| {
+        if let Some(configured) = std::env::var_os("CCTX_RG")
+            && !configured.is_empty()
+        {
+            return configured;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            if Command::new("rg")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return "rg".into();
+            }
+            for env_key in ["LOCALAPPDATA", "ProgramFiles"] {
+                if let Some(base) = std::env::var_os(env_key) {
+                    let vscode_dir = PathBuf::from(base).join("Programs").join("Microsoft VS Code");
+                    let alt_dir = PathBuf::from(std::env::var_os(env_key).unwrap_or_default())
+                        .join("Microsoft VS Code");
+                    for root in [vscode_dir, alt_dir] {
+                        if !root.is_dir() {
+                            continue;
+                        }
+                        for rel in [
+                            "resources/app/node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe",
+                            "resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe",
+                            "resources/app/node_modules/@vscode/ripgrep/bin/rg.exe",
+                        ] {
+                            let candidate = root.join(rel);
+                            if candidate.is_file() {
+                                return candidate.into_os_string();
+                            }
+                        }
+                        if let Ok(entries) = std::fs::read_dir(&root) {
+                            for entry in entries.flatten() {
+                                for rel in [
+                                    "resources/app/node_modules.asar.unpacked/@vscode/ripgrep/bin/rg.exe",
+                                    "resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/win32-x64/rg.exe",
+                                    "resources/app/node_modules/@vscode/ripgrep/bin/rg.exe",
+                                ] {
+                                    let candidate = entry.path().join(rel);
+                                    if candidate.is_file() {
+                                        return candidate.into_os_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "rg".into()
+    })
+    .as_os_str()
+}
+
 pub fn normalize(path: &Path) -> PathBuf {
-    path.components()
-        .filter(|part| *part != Component::CurDir)
-        .collect()
+    #[cfg(windows)]
+    {
+        let mut out = std::ffi::OsString::new();
+        for part in path.components().filter(|part| *part != Component::CurDir) {
+            if !out.is_empty() {
+                out.push("/");
+            }
+            out.push(part.as_os_str());
+        }
+        PathBuf::from(out)
+    }
+    #[cfg(not(windows))]
+    {
+        path.components()
+            .filter(|part| *part != Component::CurDir)
+            .collect()
+    }
 }
 
 pub fn safe_relative(path: &Path) -> Result<()> {
@@ -514,7 +595,14 @@ pub fn capture(command: &mut Command) -> Result<Vec<u8>> {
 }
 
 pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

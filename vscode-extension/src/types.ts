@@ -32,6 +32,7 @@ export interface ClientSettings {
   socketPath: string;
   autoStartService: boolean;
   requestTimeoutMs: number;
+  executablePath?: string;
   wslDistribution?: string;
   wslExecutablePath?: string;
 }

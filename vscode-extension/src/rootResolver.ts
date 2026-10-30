@@ -2,6 +2,11 @@ import { isAbsolute, relative, resolve, sep, posix } from 'node:path';
 
 import type { WorkspaceSpec } from './types.js';
 
+export function normalizeLocalPath(path: string): string {
+  const resolved = resolve(path);
+  return resolved.replace(/^[a-z]:(?=[\\/])/u, (drive) => drive.toUpperCase());
+}
+
 export class RootResolutionError extends Error {
   public constructor(message: string) {
     super(message);
@@ -30,12 +35,12 @@ export function resolveRegisteredRoot(
   explicitPath: string | undefined,
   candidates: readonly string[],
 ): string {
-  const roots = workspaces.map((workspace) => resolve(workspace.root));
+  const roots = workspaces.map((workspace) => normalizeLocalPath(workspace.root));
   if (explicitPath !== undefined) {
     if (!isAbsolute(explicitPath)) {
       throw new RootResolutionError('Code Context root must be an absolute path.');
     }
-    const match = bestContainingRoot(roots, resolve(explicitPath));
+    const match = bestContainingRoot(roots, normalizeLocalPath(explicitPath));
     if (!match) {
       throw new RootResolutionError(
         `No registered Code Context workspace contains ${explicitPath}. Run cctx register first.`,
@@ -44,7 +49,7 @@ export function resolveRegisteredRoot(
     return match;
   }
   for (const candidate of candidates) {
-    const match = bestContainingRoot(roots, resolve(candidate));
+    const match = bestContainingRoot(roots, normalizeLocalPath(candidate));
     if (match) {
       return match;
     }
@@ -71,9 +76,9 @@ export async function resolveRegisteredRootAfterRefresh(
 ): Promise<string> {
   const preferred = candidates[0];
   if (explicitPath === undefined && preferred && isAbsolute(preferred) && registerMissingRoot &&
-    !bestContainingRoot(workspaces.map((workspace) => resolve(workspace.root)), preferred)) {
+    !bestContainingRoot(workspaces.map((workspace) => normalizeLocalPath(workspace.root)), normalizeLocalPath(preferred))) {
     const refreshed = await refresh();
-    if (!bestContainingRoot(refreshed.map((workspace) => resolve(workspace.root)), preferred)) {
+    if (!bestContainingRoot(refreshed.map((workspace) => normalizeLocalPath(workspace.root)), normalizeLocalPath(preferred))) {
       await registerMissingRoot(preferred);
       return resolveRegisteredRoot(await refresh(), preferred, []);
     }

@@ -37,6 +37,7 @@ fn query(pattern: &str, regex: bool, ignore_case: bool) -> Query {
         paths: Vec::new(),
         glob: None,
         limit: 1000,
+        max_matches_per_file: None,
     }
 }
 
@@ -117,6 +118,49 @@ fn unicode_case_equivalents_are_not_filtered_out() {
     compare(&workspace, &resident, &input);
     let result = search_profiled(&resident, &input, &mut QueryCache::default()).unwrap();
     assert_eq!(result.result.total_matches, 2);
+    assert!(result.profile.used_index, "{:?}", result.profile);
+    assert!(result.profile.candidate_files < result.profile.eligible_files);
+}
+
+#[test]
+fn max_matches_per_file_caps_noisy_files_and_prioritizes_definitions() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/a_calls.rs"),
+        "target_sym();\ntarget_sym();\ntarget_sym();\npub fn target_sym() {}\ntarget_sym();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("src/b_other.rs"),
+        "pub struct target_sym;\ntarget_sym();\n",
+    )
+    .unwrap();
+    let workspace =
+        Workspace::new(directory.path(), vec!["src".into()], vec!["*.rs".into()]).unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+    let mut input = query("target_sym", false, false);
+    input.limit = 4;
+    input.max_matches_per_file = Some(2);
+    let result = search_fast(&resident, &input, &mut cache).unwrap();
+    assert_eq!(result.total_matches, 7);
+    assert!(result.truncated);
+    assert_eq!(result.matches.len(), 4);
+    assert!(
+        result
+            .matches
+            .iter()
+            .any(|hit| hit.path == "src/a_calls.rs" && hit.line == 4)
+    );
+    assert_eq!(
+        result
+            .matches
+            .iter()
+            .filter(|hit| hit.path == "src/b_other.rs")
+            .count(),
+        2
+    );
 }
 
 #[test]

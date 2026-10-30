@@ -2,6 +2,7 @@ use crate::{Result, catalog, daemon, invalid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -25,7 +26,18 @@ pub fn capabilities() -> Result<Value> {
     static HASH: std::sync::OnceLock<std::result::Result<String, String>> =
         std::sync::OnceLock::new();
     let hash = HASH
-        .get_or_init(|| executable_hash(Path::new("/proc/self/exe")).map_err(|e| e.to_string()))
+        .get_or_init(|| {
+            #[cfg(unix)]
+            {
+                executable_hash(Path::new("/proc/self/exe")).map_err(|e| e.to_string())
+            }
+            #[cfg(not(unix))]
+            {
+                std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|path| executable_hash(&path).map_err(|e| e.to_string()))
+            }
+        })
         .as_ref()
         .map_err(|e| invalid(e.clone()))?;
     Ok(json!({"schema":CAPABILITY_SCHEMA,"executable_sha256":hash,
@@ -60,7 +72,8 @@ pub fn doctor(root: &Path) -> Result<Value> {
         Err(error) => json!({"registered":false,"error":error.to_string()}),
     };
     let mut processes = Vec::new();
-    let mut inspection_errors = Vec::new();
+    let mut inspection_errors: Vec<String> = Vec::new();
+    #[cfg(unix)]
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
@@ -124,6 +137,31 @@ pub fn doctor(root: &Path) -> Result<Value> {
             "current_build":hash==local["executable_sha256"],"executable_sha256":hash,
             "cwd":std::fs::read_link(entry.path().join("cwd")).ok()}),
         );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &mut inspection_errors;
+        if let Some(ref daemon_info) = remote {
+            let daemon_hash = daemon_info
+                .get("capabilities")
+                .and_then(|c| c.get("executable_sha256"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            processes.push(json!({
+                "pid": daemon_info.get("pid").map(|p| p.to_string()).unwrap_or_default(),
+                "role": "daemon",
+                "current_build": daemon_hash == local["executable_sha256"],
+                "executable_sha256": daemon_hash,
+                "cwd": Value::Null,
+            }));
+        }
+        processes.push(json!({
+            "pid": std::process::id().to_string(),
+            "role": "client",
+            "current_build": true,
+            "executable_sha256": local["executable_sha256"],
+            "cwd": std::env::current_dir().ok(),
+        }));
     }
     let stale = processes
         .iter()

@@ -38,6 +38,43 @@ export function normalizeSocketPath(configured: string): string {
   return resolve(value);
 }
 
+export function defaultExecutablePath(platform = process.platform): string {
+  return join(homedir(), '.local/bin', platform === 'win32' ? 'cctx.exe' : 'cctx');
+}
+
+export function normalizeExecutablePath(configured = '', platform = process.platform): string {
+  const value = configured.trim();
+  const target =
+    value.length === 0
+      ? defaultExecutablePath(platform)
+      : value.startsWith('~/') || (platform === 'win32' && value.startsWith('~\\'))
+        ? join(homedir(), value.slice(2))
+        : value;
+  const absolute = platform === 'win32' ? win32.isAbsolute(target) : isAbsolute(target);
+  if (!absolute || /[\0\r\n]/u.test(target)) {
+    throw new Error('codeContextNative.executablePath must be absolute.');
+  }
+  return platform === 'win32' ? win32.resolve(target) : resolve(target);
+}
+
+export function usesWslTransport(settings: ClientSettings, platform = process.platform): boolean {
+  return (
+    platform === 'win32' &&
+    Boolean((settings.wslDistribution ?? '').trim() || (settings.wslExecutablePath ?? '').trim())
+  );
+}
+
+export function windowsLocalLaunch(
+  settings: ClientSettings,
+  operation: 'bridge' | 'service' = 'bridge',
+): { command: string; args: string[] } {
+  const command = normalizeExecutablePath(settings.executablePath, 'win32');
+  return {
+    command,
+    args: [operation === 'bridge' ? 'native-bridge' : 'daemon'],
+  };
+}
+
 export function wslLaunch(
   settings: ClientSettings,
   operation: 'bridge' | 'service' = 'bridge',
@@ -65,7 +102,10 @@ export function wslLaunch(
 
 export function nativeEndpoint(settings: ClientSettings, platform = process.platform): string {
   if (platform === 'win32') {
-    return `wsl:${settings.wslDistribution ?? ''}:${settings.wslExecutablePath ?? ''}:${settings.socketPath}`;
+    if (usesWslTransport(settings, platform)) {
+      return `wsl:${settings.wslDistribution ?? ''}:${settings.wslExecutablePath ?? ''}:${settings.socketPath}`;
+    }
+    return `win32:${normalizeExecutablePath(settings.executablePath, 'win32')}:${settings.socketPath}`;
   }
   return normalizeSocketPath(settings.socketPath);
 }
@@ -83,7 +123,9 @@ export async function connectNativeTransport(
     throw new RequestCancelledError();
   }
   if (platform === 'win32') {
-    const launch = wslLaunch(settings);
+    const launch = usesWslTransport(settings, platform)
+      ? wslLaunch(settings)
+      : windowsLocalLaunch(settings);
     return new Promise<Duplex>((resolveConnect, rejectConnect) => {
       const child = launcher(launch.command, launch.args);
       let transport: Duplex | undefined;
@@ -175,8 +217,17 @@ export async function connectNativeTransport(
 
 export async function startNativeService(settings: ClientSettings): Promise<void> {
   if (process.platform === 'win32') {
-    const launch = wslLaunch(settings, 'service');
-    await execFileAsync(launch.command, launch.args, { timeout: 10_000, windowsHide: true });
+    if (usesWslTransport(settings, 'win32')) {
+      const launch = wslLaunch(settings, 'service');
+      await execFileAsync(launch.command, launch.args, { timeout: 10_000, windowsHide: true });
+    } else {
+      const launch = windowsLocalLaunch(settings, 'service');
+      const child = spawn(launch.command, launch.args, {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+    }
   } else if (process.platform === 'linux') {
     await execFileAsync('systemctl', ['--user', 'start', 'code-context.service'], {
       timeout: 10_000, windowsHide: true,

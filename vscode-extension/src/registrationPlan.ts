@@ -176,6 +176,10 @@ export function canUpdateAutomaticRegistration(
   );
 }
 
+function normalizeRootPath(path: string): string {
+  return resolve(path).replace(/^[a-z]:(?=[\\/])/u, (drive) => drive.toUpperCase());
+}
+
 export function normalizeAutomaticPlanRegistry(value: unknown): AutomaticPlanRegistry {
   if (!isRecord(value)) {
     return {};
@@ -190,7 +194,8 @@ export function normalizeAutomaticPlanRegistry(value: unknown): AutomaticPlanReg
     if (!scopes || !globs) {
       continue;
     }
-    normalized[resolve(root)] = { root: resolve(root), scopes, globs };
+    const key = normalizeRootPath(root);
+    normalized[key] = { root: key, scopes, globs };
   }
   return normalized;
 }
@@ -199,7 +204,7 @@ export function rememberAutomaticPlan(
   registry: AutomaticPlanRegistry,
   plan: RegistrationPlan,
 ): AutomaticPlanRegistry {
-  const root = resolve(plan.root);
+  const root = normalizeRootPath(plan.root);
   const next = { ...registry };
   delete next[root];
   next[root] = { root, scopes: [...plan.scopes], globs: [...plan.globs] };
@@ -227,7 +232,7 @@ export function validatePlanResult(
   if (
     typeof root !== 'string' ||
     !isAbsolute(root) ||
-    resolve(root) !== resolve(expected.root)
+    normalizeRootPath(root) !== normalizeRootPath(expected.root)
   ) {
     throw new Error('Code Context plan returned an invalid root.');
   }

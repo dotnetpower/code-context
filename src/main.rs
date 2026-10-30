@@ -205,7 +205,7 @@ fn run() -> Result<()> {
                 managed_parent: None,
             };
             let spec = if args.preserve_registration_settings {
-                let root = requested_spec.root.canonicalize()?;
+                let root = catalog::canonicalize(&requested_spec.root)?;
                 let existing = catalog::load()?
                     .into_iter()
                     .find(|spec| spec.root == root)
@@ -336,7 +336,7 @@ fn run() -> Result<()> {
             _ => return Err(code_context::invalid("unsupported shared command").into()),
         };
         return print(&daemon::request(&daemon::Request {
-            root: Some(args.root.canonicalize()?),
+            root: Some(catalog::canonicalize(&args.root)?),
             name: name.into(),
             arguments,
             compact: false,

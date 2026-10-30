@@ -16,33 +16,34 @@ pub fn tools() -> Value {
     for tool in items.iter_mut() {
         tool["inputSchema"]["properties"]["root"] = json!({"type":"string","description":"Optional absolute registered project root. Omit for the current workspace; the server resolves only an explicitly registered ancestor."});
         if tool["name"] != "code_read" && tool["name"] != "code_files" {
-            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Optional relative file/directory prefixes within root."});
-            tool["inputSchema"]["properties"]["glob"] = json!({"type":"string","description":"Optional filename/path glob, e.g. *.py or src/**/*.rs."});
+            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Optional relative path prefixes."});
+            tool["inputSchema"]["properties"]["glob"] = json!({"type":"string","description":"Optional filename/path glob."});
+            tool["inputSchema"]["properties"]["max_matches_per_file"] = json!({"type":"integer","minimum":1,"maximum":64,"description":"Optional per-file match cap; prioritizes symbol definitions."});
         }
         if tool["name"] == "code_read" {
             tool["inputSchema"]["properties"]["page"] = json!({"type":"boolean","default":false,
-                "description":"Use for large reads: returns an explicit object with snippets, complete and next_ranges under256KiB. Continue page=true with next_ranges; compare file hashes between pages. Defaultfalse retains atomic snippet-array output."});
+                "description":"Paginate large reads (<256KiB) returning snippets, complete, and next_ranges."});
             tool["inputSchema"]["properties"]["split_ranges"] = json!({
                 "type":"boolean","default":true,
-                "description":"Split broad ranges into explicitly returned snippets of at most500lines, at most64segments total. End is clamped to file EOF. false requires input ranges <=500lines. The256KiBresponse cap still applies."
+                "description":"Split broad ranges into <=500-line segments (max 64 segments, 256KiB)."
             });
         }
         let prefix = match tool["name"].as_str() {
             Some("code_files") => {
-                "Use this FIRST for file discovery by filename or path glob, NOT content. Returns sorted indexed paths, total_matches and truncation. E.g. glob=*Tools.ts or **/README.md."
+                "Use FIRST for filename/path glob discovery, NOT content."
             }
             Some("code_grep") => {
-                "Use this FIRST instead of shell rg/search for saved source. Literal substring search by default, not semantic or keyword search. Set regex=true for alternation such as a|b. Regex or ignore_case scans RAM. Returns sorted matching lines, total count and truncation."
+                "Use FIRST for saved-source search. Literal by default; Set regex=true for alternation (a|b)."
             }
             Some("code_context") => {
-                "Use this FIRST for a symbol plus nearby saved source. Search and fetch context in ONE call, avoiding search then repeated reads. Literal substring search by default, not semantic or keyword search. Set regex=true for alternation such as a|b. Supports paths and glob."
+                "Use FIRST for a symbol plus nearby saved source in ONE call. Literal by default; Set regex=true for alternation (a|b)."
             }
             _ => {
-                "Use this FIRST for known saved-source ranges. Locate actual paths and lines with code_files/code_context first, never guess line numbers. Reads are atomic per batch: any missing/excluded member fails the batch. Do not request hidden paths or excluded datasets; use permitted host reads instead. READ_RANGE_OUT_OF_BOUNDS reports the indexed line count; correct the range, do not repeat it. Returns whole-file hashes and verifies selected live files."
+                "Use FIRST for known saved-source ranges with live SHA-256 verification."
             }
         };
         tool["description"] = json!(format!(
-            "{prefix} Optional nonblocking root cache: CACHE_MISS returns immediately and schedules only the requested root. Continue this lookup with permitted host search/read; do not poll, repeat, switch CCTX transports or run code_sync to wait. CACHE_LOAD_FAILED reports the actual failure. Neither is an empty/absence result. These backend MCP tools avoid native extension-host dispatch when native tools cannot start in a background session; host hooks may still add latency. Do not duplicate a pending native call or run code_sync to repair host dispatch. Watcher changes processed before requests; saved files only, not an atomic filesystem view. Search results carry freshness metadata. STALE_INDEX means indexed source differs from disk: use code_read for known ranges or a host policy-aware live disk read, not the old snippet. Empty results are not proof of absence; use code_sync for an explicitly needed full-source synchronization barrier. Never edit without verifying file hashes."
+            "{prefix} CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read. These backend MCP tools avoid native extension-host dispatch in background sessions. Do not duplicate a pending native call or run code_sync to wait."
         ));
     }
     for (name, description) in [
@@ -126,11 +127,16 @@ fn dispatch_with_root(
                 trace["total_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
                 trace["completed_unix_ms"] = json!(daemon::trace_unix_ms());
                 trace["success"] = json!(result["isError"] == false);
+                let compact_footer = json!({
+                    "trace_id": trace["trace_id"],
+                    "operation": trace["operation"],
+                    "success": trace["success"],
+                });
                 result["content"]
                     .as_array_mut()
                     .expect("tool content")
                     .push(json!({
-                        "type":"text","text":format!("CCTX_TRACE {trace}")
+                        "type":"text","text":format!("CCTX_TRACE {compact_footer}")
                     }));
                 result["_meta"] = json!({"cctx_trace":trace});
             }
@@ -246,7 +252,7 @@ fn tool_call(
 
 pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
     let mut input = input;
-    let default_root = Some(std::env::current_dir()?.canonicalize()?);
+    let default_root = Some(crate::catalog::canonicalize(&std::env::current_dir()?)?);
     let mut client = daemon::Client::connect_traced()?;
     loop {
         let mut bytes = Vec::new();

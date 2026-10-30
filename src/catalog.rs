@@ -4,6 +4,7 @@ use crate::{Result, invalid};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,21 @@ impl Spec {
     }
 }
 
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    {
+        if let Some(text) = canonical.to_str()
+            && let Some(stripped) = text.strip_prefix(r"\\?\")
+            && stripped.as_bytes().get(1) == Some(&b':')
+        {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
 pub fn private_dir(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -70,12 +86,50 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn private_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid(format!(
+                    "directory must be owned, non-symlink and mode 0700: {}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 pub fn state_dir() -> Result<PathBuf> {
     let base = std::env::var_os("CCTX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".local/state/code-context")
+            #[cfg(windows)]
+            {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("USERPROFILE")
+                            .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+                    })
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| PathBuf::from(home).join(".local").join("state"))
+                    })
+                    .unwrap_or_default()
+                    .join("code-context")
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(".local/state/code-context")
+            }
         });
     if !base.is_absolute() {
         return Err(invalid("CCTX_HOME/HOME must resolve to an absolute path").into());
@@ -86,6 +140,7 @@ pub fn state_dir() -> Result<PathBuf> {
 
 pub fn socket_path() -> Result<PathBuf> {
     let path = state_dir()?.join("daemon.sock");
+    #[cfg(unix)]
     if path.as_os_str().len() >= 104 {
         return Err(invalid("Unix socket path too long; use a shorter CCTX_HOME").into());
     }
@@ -166,7 +221,7 @@ pub(crate) fn ensure_capacity(specs: &mut Vec<Spec>) -> Result<()> {
 }
 
 pub fn unregister(root: &Path) -> Result<()> {
-    let root = match root.canonicalize() {
+    let root = match canonicalize(root) {
         Ok(root) => root,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
@@ -191,7 +246,7 @@ pub fn unregister(root: &Path) -> Result<()> {
 }
 
 pub fn resolve_root(path: &Path) -> Result<PathBuf> {
-    let path = path.canonicalize()?;
+    let path = canonicalize(path)?;
     load()?
         .into_iter()
         .filter(|s| path.starts_with(&s.root))
@@ -222,10 +277,12 @@ pub(crate) fn mutate(change: impl FnOnce(&mut Vec<Spec>) -> Result<()>) -> Resul
         return Err(invalid("updated registry would exceed 1 MiB").into());
     }
     let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+    #[cfg(unix)]
     std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))?;
     std::io::Write::write_all(temporary.as_file_mut(), &serialized)?;
     temporary.as_file().sync_all()?;
     temporary.persist(dir.join("workspaces.json"))?;
+    #[cfg(unix)]
     std::fs::File::open(&dir)?.sync_all()?;
     let removed_managed = before.iter().filter(|spec| {
         spec.managed_parent.is_some() && !specs.iter().any(|current| current.root == spec.root)

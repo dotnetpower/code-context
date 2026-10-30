@@ -1,4 +1,4 @@
-use crate::search::{Search, SearchResult, search};
+use crate::search::{Hit, Search, SearchResult, search};
 use crate::workspace::{MAX_RESPONSE, Workspace};
 use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
@@ -212,6 +212,88 @@ pub(crate) fn validate_context(request: &ContextRequest) -> Result<()> {
     Ok(())
 }
 
+fn is_python_top_header(line: &str) -> bool {
+    ["def ", "async def ", "class ", "@", "if __name__"]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
+    if radius < 6 || snippet.lines.len() <= 6 {
+        return;
+    }
+    let mut min_hit = usize::MAX;
+    let mut max_hit = 0usize;
+    for hit in hits {
+        if hit.path == snippet.path && hit.line >= snippet.start && hit.line <= snippet.end {
+            min_hit = min_hit.min(hit.line);
+            max_hit = max_hit.max(hit.line);
+        }
+    }
+    if min_hit > max_hit {
+        return;
+    }
+    let min_idx = min_hit - snippet.start;
+    let max_idx = max_hit - snippet.start;
+    let mut new_start_idx = 0usize;
+    let mut new_end_idx = snippet.lines.len() - 1;
+    if snippet.path.ends_with(".py") || snippet.path.ends_with(".pyi") {
+        for idx in (1..=min_idx).rev() {
+            if is_python_top_header(&snippet.lines[idx]) {
+                let mut header_start = idx;
+                while header_start > 0 && snippet.lines[header_start - 1].starts_with('@') {
+                    header_start -= 1;
+                }
+                if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
+                    new_start_idx = header_start;
+                    break;
+                }
+            }
+        }
+        for idx in (max_idx + 1)..snippet.lines.len() {
+            if is_python_top_header(&snippet.lines[idx])
+                && snippet.lines[idx - 1].trim().is_empty()
+            {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+        }
+    } else {
+        let is_top_close = |line: &str| {
+            let trimmed = line.trim_end();
+            trimmed == "}" || trimmed == "};"
+        };
+        for idx in (0..min_idx).rev() {
+            if is_top_close(&snippet.lines[idx]) {
+                let mut candidate = idx + 1;
+                while candidate < min_idx && snippet.lines[candidate].trim().is_empty() {
+                    candidate += 1;
+                }
+                new_start_idx = candidate;
+                break;
+            }
+        }
+        for idx in max_idx..snippet.lines.len().saturating_sub(1) {
+            if is_top_close(&snippet.lines[idx]) && snippet.lines[idx + 1].trim().is_empty() {
+                new_end_idx = idx;
+                break;
+            }
+        }
+    }
+    if (new_start_idx > 0 || new_end_idx + 1 < snippet.lines.len())
+        && new_start_idx <= min_idx
+        && max_idx <= new_end_idx
+    {
+        snippet.lines = snippet.lines[new_start_idx..=new_end_idx].to_vec();
+        snippet.start += new_start_idx;
+        snippet.end = snippet.start + snippet.lines.len() - 1;
+    }
+}
+
 pub(crate) fn assemble(
     result: SearchResult,
     radius: usize,
@@ -235,11 +317,14 @@ pub(crate) fn assemble(
             });
         }
     }
-    let snippets = if ranges.is_empty() {
+    let mut snippets = if ranges.is_empty() {
         Vec::new()
     } else {
         read(&ranges)?
     };
+    for snippet in &mut snippets {
+        clamp_snippet_to_block(snippet, &result.matches, radius);
+    }
     for hit in &result.matches {
         let current = snippets
             .iter()

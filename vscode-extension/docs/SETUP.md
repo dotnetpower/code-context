@@ -3,13 +3,28 @@
 ## Requirements
 
 - VS Code 1.140 or newer, with a chat agent that supports language model tools.
-- A Linux `cctx` backend: local Linux, a WSL distribution, or a Linux SSH host.
-- A current Rust toolchain to build the backend, `rg` on `PATH`, and cgroup v2
-  for the managed service.
+- A `cctx` backend: local Linux, native Windows (`cctx.exe`), a WSL distribution, or a Linux SSH host.
+- A current Rust toolchain to build the backend, `rg` on `PATH` (or bundled with VS Code on Windows), and cgroup v2 for the managed Linux service.
 - A trusted workspace and registered source coverage.
 
 The extension package does not contain a backend binary. Installing a VSIX
-alone does not install Rust, ripgrep, or a Linux service.
+alone does not install Rust, ripgrep, or a background service.
+
+## Native Windows workspaces (without WSL)
+
+Build and install `cctx.exe` into `%USERPROFILE%\.local\bin\cctx.exe`:
+
+```powershell
+cargo build --locked --release
+New-Item -ItemType Directory -Force "$HOME\.local\bin" | Out-Null
+Copy-Item target\release\cctx.exe "$HOME\.local\bin\cctx.exe" -Force
+```
+
+When opening a trusted local Windows folder (`C:\...`) or running on Windows
+without `codeContextNative.wslDistribution` configured, the extension uses
+`%USERPROFILE%\.local\bin\cctx.exe` (or `codeContextNative.executablePath`),
+automatically starts `cctx.exe daemon` in the background on demand, and stores
+state under `%LOCALAPPDATA%\code-context`.
 
 ## Linux, WSL, and SSH workspaces
 

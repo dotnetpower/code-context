@@ -1,5 +1,6 @@
 ---
 description: "Use when: finding files by name or path, searching code, or reading saved source, documentation, and configuration in a registered workspace"
+applyTo: "**"
 ---
 
 # Code Context source lookup
@@ -19,11 +20,11 @@ Inactive roots, including legacy prewarm registrations, may be evicted after
 15 minutes or earlier under LRU/memory pressure; a later miss lazily loads them.
 Do not enumerate or prepare sibling worktrees speculatively.
 
-Use `#cctxNativeFiles` first for filename/path discovery with a glob; a content
-pattern does not search filenames. Use `#cctxNativeContext` for a symbol or literal plus surrounding saved
-source. Use `#cctxNativeGrep` for exact or regex search and
-`#cctxNativeRead` for known ranges. Prefer one context call over separate search
-and read calls.
+Use `#cctxNativeFiles` (`code-context-native_codeFiles`) first for filename/path discovery with a glob; a content
+pattern does not search filenames. Use `#cctxNativeContext` (`code-context-native_codeContext`) for a symbol or literal plus surrounding saved
+source. Use `#cctxNativeGrep` (`code-context-native_codeGrep`) for exact or regex search and
+`#cctxNativeRead` (`code-context-native_codeRead`) for known ranges. Prefer one context call over separate search
+and read calls. Do not start with built-in `read_file`, `view`, `grep_search`, or `rg` for registered saved source, even when file paths are already known. If Code Context tools are deferred or not yet visible in the active tool list, discover them first with `tool_search` (for example query `"code-context-native codeContext codeRead codeGrep codeFiles"`) before reading or searching files.
 
 Context radius is 0..100 and limit is 1..64. Broad shared reads are split into
 explicit snippets of at most500lines (max64segments total); split_ranges=false

@@ -43,6 +43,8 @@ pub struct Query {
     pub glob: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub max_matches_per_file: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -309,6 +311,7 @@ impl Query {
             paths: Vec::new(),
             glob: None,
             limit: search.limit,
+            max_matches_per_file: None,
         }
     }
 }
@@ -338,7 +341,12 @@ pub fn search_fast(
     if let Some(result) = cache.get_result(resident.stats.generation, query) {
         return Ok(result);
     }
-    if !query.regex && !query.ignore_case && query.paths.is_empty() && query.glob.is_none() {
+    if !query.regex
+        && !query.ignore_case
+        && query.paths.is_empty()
+        && query.glob.is_none()
+        && query.max_matches_per_file.is_none()
+    {
         let result = resident.search(&Search {
             pattern: query.pattern.clone(),
             regex: false,
@@ -372,6 +380,68 @@ fn search_internal(
     let paths = paths(&query.paths)?;
     let glob = glob(query)?;
     let scoped = !paths.is_empty() || query.glob.is_some();
+    if !collect_profile
+        && scoped
+        && allow_plan
+        && let Some(plan) = compiled.plan.as_ref()
+    {
+        let mut evaluation = plan.evaluate(resident);
+        let corpus_bytes = resident.stats.source_bytes;
+        let raw_candidate_bytes = resident.candidate_bytes(&evaluation.ids);
+        let index_cost = raw_candidate_bytes.saturating_add(
+            (evaluation.posting_lookups + evaluation.set_operations)
+                .saturating_mul(INDEX_OPERATION_BYTE_EQUIVALENT),
+        );
+        if index_cost < corpus_bytes
+            && raw_candidate_bytes.saturating_mul(MAX_CANDIDATE_FRACTION_DENOMINATOR)
+                <= corpus_bytes.saturating_mul(MAX_CANDIDATE_FRACTION_NUMERATOR)
+        {
+            evaluation
+                .ids
+                .retain(|id| path_allowed(resident, *id, &paths, &glob, query.glob.is_some()));
+            evaluation.ids.sort_unstable_by(|a, b| {
+                resident.documents[*a]
+                    .path
+                    .cmp(&resident.documents[*b].path)
+            });
+            let filtered_bytes = resident.candidate_bytes(&evaluation.ids);
+            let line_prefilter = query.regex
+                && compiled.manual_line_prefilter
+                && plan.atom_count() <= 16
+                && filtered_bytes.saturating_mul(2) < corpus_bytes;
+            let workers = parallel_workers(filtered_bytes, evaluation.ids.len(), line_prefilter);
+            let (matches, total) = if workers > 1 {
+                scan_parallel(resident, query, compiled, &evaluation.ids, workers)?
+            } else {
+                let mut matches = Vec::new();
+                let mut total = 0;
+                scan(
+                    resident,
+                    query,
+                    compiled,
+                    &evaluation.ids,
+                    line_prefilter.then_some(compiled.plan.as_ref()).flatten(),
+                    &mut matches,
+                    &mut total,
+                )?;
+                (matches, total)
+            };
+            let result = SearchResult {
+                matches,
+                total_matches: total,
+                truncated: total > query.limit,
+                consistency: format!(
+                    "RAM generation {}; saved-file snapshot, watcher-synchronized before shared requests; not a filesystem transaction",
+                    resident.stats.generation
+                ),
+            };
+            check_search_size(&result)?;
+            return Ok(ProfiledResult {
+                result,
+                profile: QueryProfile::default(),
+            });
+        }
+    }
     let eligible = if scoped {
         let mut ids: Vec<_> = resident
             .paths
@@ -560,26 +630,30 @@ fn scan(
     matches: &mut Vec<Hit>,
     total: &mut usize,
 ) -> Result<()> {
+    let mut file_lines = Vec::new();
     if let Some(expression) = &compiled.matcher {
         for id in ids {
             let document = &resident.documents[*id];
+            file_lines.clear();
             if compiled.per_line || line_prefilter.is_some() {
-                scan_lines(
-                    document,
-                    expression,
-                    line_prefilter,
-                    query.limit,
-                    matches,
-                    total,
-                )?;
+                scan_lines(document, expression, line_prefilter, &mut file_lines)?;
             } else {
-                scan_document(document, expression, query.limit, matches, total)?;
+                scan_document(document, expression, &mut file_lines)?;
             }
+            *total += file_lines.len();
+            record_document(
+                document,
+                &file_lines,
+                query.limit,
+                query.max_matches_per_file,
+                matches,
+            );
         }
     } else {
         let finder = Finder::new(query.pattern.as_bytes());
         for id in ids {
             let document = &resident.documents[*id];
+            file_lines.clear();
             let mut previous = None;
             for position in finder.find_iter(document.text.as_bytes()) {
                 let line = document
@@ -590,8 +664,16 @@ fn scan(
                     continue;
                 }
                 previous = Some(line);
-                record(document, line, query.limit, matches, total);
+                file_lines.push(line);
             }
+            *total += file_lines.len();
+            record_document(
+                document,
+                &file_lines,
+                query.limit,
+                query.max_matches_per_file,
+                matches,
+            );
         }
     }
     Ok(())
@@ -654,9 +736,7 @@ fn scan_lines(
     document: &crate::resident::Document,
     expression: &RegexMatcher,
     prefilter: Option<&CandidateExpr>,
-    limit: usize,
-    matches: &mut Vec<Hit>,
-    total: &mut usize,
+    file_lines: &mut Vec<usize>,
 ) -> Result<()> {
     for line in 0..document.starts.len() {
         let start = document.starts[line] as usize;
@@ -674,7 +754,7 @@ fn scan_lines(
             .find(bytes)?
             .is_some_and(|found| found.start() < bytes.len() || !bytes.ends_with(b"\n"))
         {
-            record(document, line, limit, matches, total);
+            file_lines.push(line);
         }
     }
     Ok(())
@@ -683,9 +763,7 @@ fn scan_lines(
 fn scan_document(
     document: &crate::resident::Document,
     expression: &RegexMatcher,
-    limit: usize,
-    matches: &mut Vec<Hit>,
-    total: &mut usize,
+    file_lines: &mut Vec<usize>,
 ) -> Result<()> {
     let mut previous = None;
     expression.find_iter(document.text.as_bytes(), |matched| {
@@ -701,27 +779,118 @@ fn scan_document(
             - 1;
         if previous != Some(line) {
             previous = Some(line);
-            record(document, line, limit, matches, total);
+            file_lines.push(line);
         }
         true
     })?;
     Ok(())
 }
 
-fn record(
+pub(crate) fn is_definition_line(line: &str) -> bool {
+    let mut trimmed = line.trim_start();
+    while let Some(rest) = [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "export ",
+        "default ",
+        "protected ",
+        "private ",
+        "internal ",
+        "public ",
+        "static ",
+        "async ",
+        "unsafe ",
+        "const ",
+        "abstract ",
+        "sealed ",
+        "partial ",
+        "virtual ",
+        "override ",
+    ]
+    .iter()
+    .find_map(|prefix| trimmed.strip_prefix(prefix))
+    {
+        trimmed = rest.trim_start();
+    }
+    [
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "type ",
+        "impl ",
+        "impl<",
+        "mod ",
+        "const ",
+        "static ",
+        "macro_rules!",
+        "def ",
+        "class ",
+        "func ",
+        "function ",
+        "interface ",
+        "namespace ",
+    ]
+    .iter()
+    .any(|keyword| trimmed.starts_with(keyword))
+}
+
+fn record_document(
     document: &crate::resident::Document,
-    line: usize,
+    file_lines: &[usize],
     limit: usize,
+    max_per_file: Option<usize>,
     matches: &mut Vec<Hit>,
-    total: &mut usize,
 ) {
-    *total += 1;
-    if matches.len() < limit {
-        matches.push(Hit {
-            path: document.path.to_string(),
-            line: line + 1,
-            text: document.line(line).into(),
-        });
+    let remaining = limit.saturating_sub(matches.len());
+    if remaining == 0 || file_lines.is_empty() {
+        return;
+    }
+    let cap = max_per_file.unwrap_or(limit).min(remaining);
+    if file_lines.len() <= cap {
+        for &line in file_lines {
+            matches.push(Hit {
+                path: document.path.to_string(),
+                line: line + 1,
+                text: document.line(line).into(),
+            });
+        }
+        return;
+    }
+    if max_per_file.is_some() {
+        let mut selected: Vec<usize> = file_lines
+            .iter()
+            .copied()
+            .filter(|&line| is_definition_line(document.line(line)))
+            .take(cap)
+            .collect();
+        if selected.len() < cap {
+            for &line in file_lines {
+                if !selected.contains(&line) {
+                    selected.push(line);
+                    if selected.len() == cap {
+                        break;
+                    }
+                }
+            }
+            selected.sort_unstable();
+        }
+        for line in selected {
+            matches.push(Hit {
+                path: document.path.to_string(),
+                line: line + 1,
+                text: document.line(line).into(),
+            });
+        }
+    } else {
+        for &line in file_lines.iter().take(cap) {
+            matches.push(Hit {
+                path: document.path.to_string(),
+                line: line + 1,
+                text: document.line(line).into(),
+            });
+        }
     }
 }
 
@@ -731,6 +900,9 @@ fn validate(query: &Query) -> Result<()> {
         || query.pattern.contains(['\n', '\0'])
         || query.limit == 0
         || query.limit > 1000
+        || query
+            .max_matches_per_file
+            .is_some_and(|cap| cap == 0 || cap > 1000)
     {
         return Err(invalid(
             "nonempty single-line pattern <=16KiB, limit 1..1000, up to 64 paths/64KiB required",

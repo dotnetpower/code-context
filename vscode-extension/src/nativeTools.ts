@@ -36,6 +36,7 @@ interface SearchInput extends RootInput {
   regex?: boolean;
   ignore_case?: boolean;
   limit?: number;
+  max_matches_per_file?: number;
   paths?: string[];
   glob?: string;
 }
@@ -258,9 +259,14 @@ class NativeTool<T> implements vscode.LanguageModelTool<T> {
     result.trace.total_ms += result.trace.serialize_ms;
     result.trace.completed_unix_ms = Date.now();
     this.bridge.recordTrace(result.trace, token);
+    const compactTrace = {
+      trace_id: result.trace.trace_id,
+      operation: result.trace.operation,
+      outcome: result.trace.outcome,
+    };
     return new vscode.LanguageModelToolResult([
       new vscode.LanguageModelTextPart(text),
-      new vscode.LanguageModelTextPart(`CCTX_TRACE ${JSON.stringify(result.trace)}`),
+      new vscode.LanguageModelTextPart(`CCTX_TRACE ${JSON.stringify(compactTrace)}`),
     ]);
   }
 
@@ -365,6 +371,9 @@ function searchArguments(input: SearchInput): Record<string, JsonValue> {
   }
   if (input.limit !== undefined) {
     args.limit = input.limit;
+  }
+  if (input.max_matches_per_file !== undefined) {
+    args.max_matches_per_file = input.max_matches_per_file;
   }
   if (input.paths !== undefined) {
     args.paths = input.paths;

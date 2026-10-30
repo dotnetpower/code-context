@@ -162,6 +162,46 @@ Re-render existing samples without remeasuring:
   --output /tmp/cctx-benchmark-figures
 ```
 
+## Token savings and coding-agent acceleration
+
+Figure 1 (panels C and D) also summarizes how replacing two-step `rg` + `view`
+lookups with one block-clamped `code_context` call reduces payload tokens,
+tool-call round trips, and whole-task completion time.
+
+### 1. Rust and Python symbol lookup token suites
+
+Six representative symbols were queried in both the Rust backend corpus
+(`src/`, 20 Rust files) and a 506-file Python corpus (17,312 lines, 547 KiB)
+with `radius=8..12`. Traditional agent lookup (`rg -n` followed by reading
+100-line or 200-line windows around up to three matched files) was compared
+against a single `code_context` call with smart function/block boundary clamping
+and per-file match capping (`max_matches_per_file=5` with definition priority):
+
+| Corpus & suite | Tool calls (`rg+view` → `cctx`) | `rg` + 200-line `view` | `rg` + 100-line `view` | Full-file read | `CCTX code_context` | Token reduction | Retrieval time (`rg+read` → `cctx`) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Rust (6-symbol suite) | 21 → **6 (-71.4%)** | 29,396 tok | 18,907 tok | 117,062 tok | **9,929 tok** | **-47.5% to -66.2%** (-91.5% vs full) | 30.40 ms → **3.27 ms (9.3×)** |
+| Python (6-symbol suite, 506 files) | 15 → **6 (-60.0%)** | 24,126 tok | 13,799 tok | 45,206 tok | **6,971 tok** | **-49.5% to -71.1%** (-84.6% vs full) | 5.58 ms → **0.52 ms (10.65×)** |
+
+On the 506-file Python corpus, warm `cctx` averaged **0.524 ms** versus
+**5.583 ms** for `rg` + buffered reads (**10.65×** faster overall, including
+**12.88×** on `ignore_case: true` queries via ASCII case-folded trigram
+candidates and **13.26×** on `async def` regular expressions).
+
+### 2. End-to-end Copilot CLI agent A/B trials
+
+Using [`scripts/agent_ab.py`](../scripts/agent_ab.py) on a 6,000-file Rust
+corpus with identical prompts (four multi-file codebase questions), identical
+model settings (`gpt-6.1-sol`, `reasoning_effort=medium`), alternating trial
+order, and 100% answer accuracy in both arms:
+
+| Metric (mean per trial) | Built-in tools (`rg` / `glob` / `view`) | With `CCTX` (`code_context`) | Change |
+|---|---:|---:|---:|
+| Tool invocations (`tool_calls`) | 7.00 | **2.67** | **-61.9%** |
+| Model round-trip turns (`model_calls`) | 5.00 | **3.67** | **-26.7%** |
+| Tool result payload tokens (`tool_result_tokens`) | 6,360 tok | **3,177 tok** | **-50.0%** |
+| Total session billing units (`totalNanoAiu`) | 4.76B nanoAIU | **3.55B nanoAIU** | **-25.4% net cost** |
+| End-to-end wall time (`wall_seconds`) | 20.31 s | **15.30 s** | **-24.7% faster** |
+
 ## Downloadable evidence
 
 - [Raw paired observations and summaries (JSON)](../benchmarks/results/aks-store-demo/results.json)

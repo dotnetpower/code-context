@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context by dotnetpower",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -117,12 +117,12 @@
         "codeContextNative.wslDistribution": {
           "type": "string",
           "default": "",
-          "description": "Windows extension hosts: WSL distribution running the shared daemon. Native IPC uses wsl.exe, not MCP or TCP."
+          "description": "Windows extension hosts: optional WSL distribution running the shared Linux daemon. Leave empty to use local Windows cctx.exe."
         },
         "codeContextNative.wslExecutablePath": {
           "type": "string",
           "default": "",
-          "description": "Windows extension hosts: absolute Linux cctx executable supporting native-bridge. Supply an explicit Linux root in Agent Sessions."
+          "description": "Windows extension hosts: absolute Linux cctx executable supporting native-bridge when wslDistribution is set. Supply an explicit Linux root in Agent Sessions."
         },
         "codeContextNative.autoRegisterWorkspace": {
           "type": "boolean",
@@ -132,7 +132,7 @@
         "codeContextNative.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Absolute cctx executable path used for interactive workspace registration. Empty uses ~/.local/bin/cctx."
+          "description": "Absolute cctx executable path used for workspace registration and local Windows native-bridge. Empty uses ~/.local/bin/cctx (or ~/.local/bin/cctx.exe on Windows)."
         },
         "codeContextNative.requestTimeoutMs": {
           "type": "number",
@@ -148,7 +148,7 @@
         "name": "code-context-native_codeFiles",
         "toolReferenceName": "cctxNativeFiles",
         "displayName": "Code Context: Find Files",
-        "modelDescription": "Use this FIRST for filename/path glob discovery, NOT content. This native tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_files; do not repeat pending calls. Respects registration and exclusions.",
+        "modelDescription": "Use FIRST for filename/path glob discovery, NOT content. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_files.",
         "userDescription": "Find indexed filenames and paths without searching file contents.",
         "tags": [
           "files",
@@ -204,7 +204,7 @@
         ],
         "toolReferenceName": "cctxNativeGrep",
         "displayName": "Code Context: Search",
-        "modelDescription": "Use this FIRST for saved-source exact/regex search with path/glob filters. This native tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_grep; do not repeat pending calls.",
+        "modelDescription": "Use FIRST for saved-source exact/regex search. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_grep.",
         "userDescription": "Search indexed workspace source with the native Rust code-context tool.",
         "canBeReferencedInPrompt": true,
         "icon": "$(search)",
@@ -214,17 +214,17 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Optional registered root."
             },
             "pattern": {
               "type": "string",
               "minLength": 1,
-              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation such as a|b or other regex syntax."
+              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation (a|b)."
             },
             "regex": {
               "type": "boolean",
               "default": false,
-              "description": "Enable regular expressions explicitly; otherwise |, parentheses and other operators are literal characters."
+              "description": "Enable regex syntax."
             },
             "ignore_case": {
               "type": "boolean",
@@ -236,17 +236,23 @@
               "maximum": 1000,
               "default": 200
             },
+            "max_matches_per_file": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "description": "Optional per-file match cap; prioritizes symbol definitions."
+            },
             "paths": {
               "type": "array",
               "maxItems": 64,
               "items": {
                 "type": "string"
               },
-              "description": "Optional relative file or directory prefixes."
+              "description": "Optional relative path prefixes."
             },
             "glob": {
               "type": "string",
-              "description": "Optional filename or relative-path glob."
+              "description": "Optional filename/path glob."
             }
           },
           "required": [
@@ -267,7 +273,7 @@
         ],
         "toolReferenceName": "cctxNativeContext",
         "displayName": "Code Context: Search with Context",
-        "modelDescription": "Use this FIRST for symbol/literal/regex lookup with nearby saved source in one native call. This tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not zero matches. If foreground host dispatch is unavailable, prefer backend MCP code_context; do not repeat pending calls.",
+        "modelDescription": "Use FIRST for symbol/literal/regex lookup with nearby saved source in one native call. CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_context.",
         "userDescription": "Search indexed source and return versioned surrounding context.",
         "canBeReferencedInPrompt": true,
         "icon": "$(book)",
@@ -277,17 +283,17 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Optional registered root."
             },
             "pattern": {
               "type": "string",
               "minLength": 1,
-              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation such as a|b or other regex syntax."
+              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation (a|b)."
             },
             "regex": {
               "type": "boolean",
               "default": false,
-              "description": "Enable regular expressions explicitly; otherwise |, parentheses and other operators are literal characters."
+              "description": "Enable regex syntax."
             },
             "ignore_case": {
               "type": "boolean",
@@ -298,6 +304,12 @@
               "minimum": 1,
               "maximum": 64,
               "default": 20
+            },
+            "max_matches_per_file": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "description": "Optional per-file match cap; prioritizes symbol definitions."
             },
             "radius": {
               "type": "integer",
@@ -333,7 +345,7 @@
         ],
         "toolReferenceName": "cctxNativeRead",
         "displayName": "Code Context: Read Ranges",
-        "modelDescription": "Use this for known saved-source ranges and live-verified hashes in a native batch read. This tool is an optional root cache. CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read, not polling, repeated CCTX calls, another CCTX transport or code_sync. A miss is not a missing disk file. If foreground host dispatch is unavailable, prefer backend MCP code_read; do not repeat pending calls.",
+        "modelDescription": "Use FIRST for known saved-source ranges in a native batch read. CACHE_MISS returns immediately; continue with permitted host read. If foreground dispatch is unavailable, prefer backend MCP code_read.",
         "userDescription": "Read multiple indexed source ranges with live hash verification.",
         "canBeReferencedInPrompt": true,
         "icon": "$(file-code)",
@@ -343,17 +355,17 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Optional registered root."
             },
             "page": {
               "type": "boolean",
               "default": false,
-              "description": "Use for large reads. Returns explicit snippets,complete,next_ranges under256KiB. Continue page=true with next_ranges;compare file hashes across pages. false keeps atomic snippet-array output."
+              "description": "Paginate large reads (<256KiB) returning snippets, complete, and next_ranges."
             },
             "split_ranges": {
               "type": "boolean",
               "default": true,
-              "description": "Split broad reads into explicitly returned snippets of at most500lines; max64segments and256KiBtotal. false keeps strict500line input ranges."
+              "description": "Split broad reads into <=500-line segments (max 64 segments, 256KiB)."
             },
             "ranges": {
               "type": "array",

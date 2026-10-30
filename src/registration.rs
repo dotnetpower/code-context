@@ -57,7 +57,7 @@ pub fn migrate(
     add_excludes: &[String],
     apply: bool,
 ) -> Result<Value> {
-    let root = root.canonicalize()?;
+    let root = catalog::canonicalize(root)?;
     let before = catalog::load()?
         .into_iter()
         .find(|s| s.root == root)
@@ -146,7 +146,7 @@ fn validate_source(spec: &Spec) -> Result<()> {
 }
 
 pub fn authorize(root: &Path, allow: bool) -> Result<Value> {
-    let root = root.canonicalize()?;
+    let root = catalog::canonicalize(root)?;
     // This is a local CLI-only trust decision, never an MCP argument.
     if allow {
         worktrees(&root)?;
@@ -255,16 +255,16 @@ fn verify(parent: &Spec, target: &Path) -> Result<PathBuf> {
         &["--show-toplevel", "--git-common-dir", "--absolute-git-dir"],
     )?;
     let root = target_paths[0].clone();
-    if target_paths[1].canonicalize()? != parent_paths[0].canonicalize()?
+    if catalog::canonicalize(&target_paths[1])? != catalog::canonicalize(&parent_paths[0])?
         || !target.starts_with(&root)
     {
         return Err(invalid("target is not a Git worktree of the authorized parent").into());
     }
-    if root.canonicalize()? != root {
+    if catalog::canonicalize(&root)? != root {
         return Err(invalid("symlinked worktree roots are not authorized").into());
     }
-    let git_dir = target_paths[2].canonicalize()?;
-    let common = parent_paths[0].canonicalize()?;
+    let git_dir = catalog::canonicalize(&target_paths[2])?;
+    let common = catalog::canonicalize(&parent_paths[0])?;
     if git_dir != common {
         if git_dir.parent() != Some(common.join("worktrees").as_path()) {
             return Err(
@@ -278,15 +278,15 @@ fn verify(parent: &Spec, target: &Path) -> Result<PathBuf> {
         }
         let linked =
             PathBuf::from(std::fs::read_to_string(backlink)?.trim_end_matches(['\r', '\n']));
-        if linked.canonicalize()? != root.join(".git").canonicalize()? {
+        if catalog::canonicalize(&linked)? != catalog::canonicalize(&root.join(".git"))? {
             return Err(invalid("worktree Git backlink does not match the requested root").into());
         }
     }
-    Ok(root)
+    Ok(catalog::canonicalize(&root)?)
 }
 
 pub fn prepare_root(target: &Path) -> Result<PathBuf> {
-    let target = target.canonicalize()?;
+    let target = catalog::canonicalize(target)?;
     let mut prepared = None;
     catalog::mutate(|specs| {
         if let Some(existing) = specs

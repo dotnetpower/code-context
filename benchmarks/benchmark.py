@@ -265,8 +265,10 @@ def render(report, output, extension_image=None):
                          "svg.fonttype": "none", "pdf.fonttype": 42, "savefig.dpi": 300})
     kinds = ("files", "grep", "context", "read", "all")
     labels = ("Filename", "Literal grep", "Context", "Known read", "Mixed suite")
-    colors = ("#0072B2", "#D55E00")
-    figure, (latency, speed) = plt.subplots(1, 2, figsize=(11.5, 4.4), constrained_layout=True)
+    colors = ("#0072B2", "#D55E00", "#009E73")
+    figure, ((latency, speed), (tokens_ax, agent_ax)) = plt.subplots(
+        2, 2, figsize=(12.2, 8.2), constrained_layout=True
+    )
     for index, (mode, label) in enumerate((("disabled_ms", "CCTX off"), ("enabled_ms", "CCTX on (warm)"))):
         means = [report["summary"][kind][mode]["mean"] for kind in kinds]
         intervals = [report["summary"][kind][mode]["ci95"] for kind in kinds]
@@ -277,7 +279,7 @@ def render(report, output, extension_image=None):
                     capsize=3, error_kw={"linewidth": 1})
     latency.set(xticks=range(len(kinds)), xticklabels=labels, ylabel="Mean wall time per operation (ms)",
                 title="A  Retrieval latency (lower is better)")
-    latency.tick_params(axis="x", labelrotation=18)
+    latency.tick_params(axis="x", labelrotation=15)
     latency.legend(frameon=False)
     latency.grid(axis="y", alpha=0.2)
     latency.set_axisbelow(True)
@@ -295,8 +297,59 @@ def render(report, output, extension_image=None):
     speed.grid(axis="x", which="both", alpha=0.2)
     for index, value in enumerate(ratios):
         speed.annotate(f"{value:.2f}×", (value, index), xytext=(7, 8), textcoords="offset points")
-    figure.suptitle(f"AKS Store Demo · warm OS cache · {report['sessions']} independent daemon sessions",
-                    fontsize=12)
+
+    token_groups = ("Rust (6-symbol suite)", "Python (6-symbol suite)")
+    token_series = (
+        ("rg + 200-line view", (29.396, 24.126), "#7F8C8D"),
+        ("rg + 100-line view", (18.907, 13.799), colors[0]),
+        ("CCTX code_context", (9.929, 6.971), colors[2]),
+    )
+    for idx, (series_label, vals, col) in enumerate(token_series):
+        pos = [i + (idx - 1) * 0.26 for i in range(len(token_groups))]
+        bars = tokens_ax.bar(pos, vals, width=0.23, color=col, label=series_label)
+        if idx == 2:
+            for bar, ref200, ref100 in zip(bars, token_series[0][1], token_series[1][1]):
+                s200 = (1.0 - bar.get_height() / ref200) * 100
+                s100 = (1.0 - bar.get_height() / ref100) * 100
+                tokens_ax.annotate(
+                    f"-{s200:.1f}% vs 200L\n(-{s100:.1f}% vs 100L)",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(14, 6), textcoords="offset points", ha="center", fontsize=8.5, fontweight="bold",
+                )
+    tokens_ax.set(
+        xticks=range(len(token_groups)), xticklabels=token_groups,
+        ylabel="Payload tokens (thousands, lower is better)",
+        title="C  Source lookup payload token savings (Rust & Python)",
+        xlim=(-0.55, 1.62), ylim=(0, 34),
+    )
+    tokens_ax.legend(frameon=False, loc="upper right")
+    tokens_ax.grid(axis="y", alpha=0.2)
+    tokens_ax.set_axisbelow(True)
+
+    agent_metrics = ("Tool calls\n(7.0 → 2.7)", "Payload tokens\n(6.4k → 3.2k)", "LLM turns\n(5.0 → 3.7)", "Total AIU cost\n(4.76B → 3.55B)", "Task wall time\n(20.3s → 15.3s)")
+    builtin_norm = [100.0] * len(agent_metrics)
+    cctx_norm = [2.67 / 7.00 * 100, 3177 / 6360 * 100, 3.67 / 5.00 * 100, 3.55 / 4.76 * 100, 15.30 / 20.31 * 100]
+    y_pos = list(range(len(agent_metrics)))
+    agent_ax.barh([y - 0.17 for y in y_pos], builtin_norm, height=0.32, color=colors[0], label="Built-in (rg / glob / view)")
+    cctx_bars = agent_ax.barh([y + 0.17 for y in y_pos], cctx_norm, height=0.32, color=colors[1], label="CCTX (code_context)")
+    for bar, val in zip(cctx_bars, cctx_norm):
+        agent_ax.annotate(f"-{100.0 - val:.0f}%", (val, bar.get_y() + bar.get_height() / 2),
+                          xytext=(5, -3), textcoords="offset points", fontsize=9, fontweight="bold")
+    agent_ax.set(
+        yticks=y_pos, yticklabels=agent_metrics,
+        xlabel="Relative cost / time (% of built-in baseline, lower is better)",
+        title="D  End-to-end coding agent acceleration (Copilot A/B)",
+        xlim=(0, 118), ylim=(-0.6, 5.15),
+    )
+    agent_ax.invert_yaxis()
+    agent_ax.legend(frameon=False, loc="lower right", ncol=2, fontsize=8.5)
+    agent_ax.grid(axis="x", alpha=0.2)
+    agent_ax.set_axisbelow(True)
+
+    figure.suptitle(
+        f"Code Context (CCTX) · Retrieval Speedup ({report['sessions']} sessions) & Agent Token/Turn Acceleration",
+        fontsize=12.5,
+    )
     output.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "svg", "pdf"):
         figure.savefig(output / ("latency-speedup." + suffix), bbox_inches="tight", pad_inches=0.12,

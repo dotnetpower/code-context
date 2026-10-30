@@ -71,6 +71,7 @@ impl Policy {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn field(text: &str, name: &str) -> Result<usize> {
     text.lines().find_map(|line| line.strip_prefix(name))
         .and_then(|value| value.split_whitespace().next())
@@ -120,11 +121,101 @@ impl Default for Controller {
     }
 }
 
+#[cfg(windows)]
+pub(crate) mod win_mem {
+    #[repr(C)]
+    pub struct MemoryStatusEx {
+        pub length: u32,
+        pub memory_load: u32,
+        pub total_phys: u64,
+        pub avail_phys: u64,
+        pub total_page_file: u64,
+        pub avail_page_file: u64,
+        pub total_virtual: u64,
+        pub avail_virtual: u64,
+        pub avail_extended_virtual: u64,
+    }
+
+    #[repr(C)]
+    pub struct ProcessMemoryCounters {
+        pub cb: u32,
+        pub page_fault_count: u32,
+        pub peak_working_set_size: usize,
+        pub working_set_size: usize,
+        pub quota_peak_paged_pool_usage: usize,
+        pub quota_paged_pool_usage: usize,
+        pub quota_peak_non_paged_pool_usage: usize,
+        pub quota_non_paged_pool_usage: usize,
+        pub pagefile_usage: usize,
+        pub peak_pagefile_usage: usize,
+    }
+
+    unsafe extern "system" {
+        pub fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        pub fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        pub fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    pub fn system_memory() -> crate::Result<(usize, usize)> {
+        let mut status = MemoryStatusEx {
+            length: core::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return Err(crate::invalid("GlobalMemoryStatusEx failed").into());
+        }
+        Ok((
+             usize::try_from(status.total_phys).unwrap_or(usize::MAX),
+            usize::try_from(status.avail_phys).unwrap_or(usize::MAX),
+        ))
+    }
+
+    pub fn process_memory() -> (usize, usize) {
+        let mut counters = ProcessMemoryCounters {
+            cb: core::mem::size_of::<ProcessMemoryCounters>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+        };
+        if unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                counters.cb,
+            )
+        } == 0
+        {
+            return (0, 0);
+        }
+        (counters.working_set_size, counters.pagefile_usage)
+    }
+}
+
 impl Controller {
     pub fn start(group: PathBuf, managed: bool) -> Result<Self> {
         if managed && group.file_name().is_none_or(|name| name != "code-context.service") {
             return Err(invalid("memory guard requires the dedicated code-context.service cgroup").into());
         }
+        #[cfg(windows)]
+        let release = String::new();
+        #[cfg(not(windows))]
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
         let mut value = Self {
             policy: Some(Policy::from_env()?), group: Some(group), managed,
@@ -135,6 +226,18 @@ impl Controller {
         Ok(value)
     }
 
+    #[cfg(windows)]
+    fn sample(&self) -> Result<Limits> {
+        let (total, available) = win_mem::system_memory()?;
+        let (own, anon) = win_mem::process_memory();
+        let policy = self.policy.as_ref().ok_or_else(|| invalid("memory policy is absent"))?;
+        let group = self.group.as_ref().ok_or_else(|| invalid("memory controller has no cgroup"))?;
+        let local = policy.calculate(total, available, anon.max(own), parent_room(group, own, self.managed)?);
+        let host_max = self.host_ceiling(policy, anon.max(own));
+        Limits::fixed(local.max.min(host_max)).page_aligned(4096)
+    }
+
+    #[cfg(not(windows))]
     fn sample(&self) -> Result<Limits> {
         let text = std::fs::read_to_string("/proc/meminfo")?;
         let total = field(&text, "MemTotal:")?;

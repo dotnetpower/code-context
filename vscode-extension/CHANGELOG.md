@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.14.0
+
+- Support native Windows (`cctx.exe`) workspaces without WSL alongside existing
+  Linux, WSL, and SSH hosts, with hidden background daemon auto-start and
+  drive-letter path normalization.
+- Attach contributed chat instructions automatically (`applyTo: "**"`) and
+  guide deferred `tool_search` discovery so new installations use Code Context
+  out of the box.
+- Accelerate `ignore_case` and scoped searches via ASCII case-folded trigram
+  planning and selectivity-first filtering; recover transparently from stale
+  index snapshots on search/context calls.
+- Add `max_matches_per_file` with symbol-definition priority, smart block/Python
+  boundary snippet clamping, and compact trace/notice output to cut payload and
+  schema tokens.
+- Publish the four-panel retrieval speedup, Rust/Python token savings, and
+  end-to-end coding agent acceleration benchmark figure.
+
 ## 0.13.2
 
 - Render native Output traces, status, self-test, and registration as readable

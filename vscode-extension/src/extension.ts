@@ -370,12 +370,18 @@ function registeredNativeTools(): string[] {
 
 function readSettings(): ClientSettings {
   const config = vscode.workspace.getConfiguration('codeContextNative');
+  const localWindowsWorkspace =
+    process.platform === 'win32' &&
+    (vscode.workspace.workspaceFolders ?? []).some(
+      (folder) => folder.uri.scheme === 'file' && /^[A-Za-z]:[\\/]/u.test(folder.uri.fsPath),
+    );
   return {
     socketPath: config.get<string>('socketPath', ''),
     autoStartService: config.get<boolean>('autoStartService', true),
     requestTimeoutMs: config.get<number>('requestTimeoutMs', 40_000),
-    wslDistribution: config.get<string>('wslDistribution', ''),
-    wslExecutablePath: config.get<string>('wslExecutablePath', ''),
+    executablePath: config.get<string>('executablePath', ''),
+    wslDistribution: localWindowsWorkspace ? '' : config.get<string>('wslDistribution', ''),
+    wslExecutablePath: localWindowsWorkspace ? '' : config.get<string>('wslExecutablePath', ''),
   };
 }
 

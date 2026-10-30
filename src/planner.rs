@@ -1,6 +1,6 @@
 use crate::resident::Resident;
 use regex_syntax::hir::{
-    Hir, HirKind,
+    Class, Hir, HirKind,
     literal::{ExtractKind, Extractor},
 };
 use serde::Serialize;
@@ -13,6 +13,7 @@ const MIN_INDEXED_LITERAL_BYTES: usize = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CandidateExpr {
     Literal(Vec<u8>),
+    ByteClasses(Vec<[u8; 2]>),
     And(Vec<CandidateExpr>),
     Or(Vec<CandidateExpr>),
 }
@@ -38,6 +39,11 @@ impl CandidateExpr {
             Self::Literal(bytes) => CandidateEvaluation {
                 ids: resident.candidates_bytes(bytes),
                 posting_lookups: bytes.len().saturating_sub(2),
+                set_operations: 0,
+            },
+            Self::ByteClasses(positions) => CandidateEvaluation {
+                ids: resident.candidates_byte_classes(positions),
+                posting_lookups: positions.len().saturating_sub(2),
                 set_operations: 0,
             },
             Self::And(children) => {
@@ -86,6 +92,13 @@ impl CandidateExpr {
     pub(crate) fn describe(&self) -> String {
         match self {
             Self::Literal(bytes) => format!("lit({})", String::from_utf8_lossy(bytes)),
+            Self::ByteClasses(positions) => {
+                let folded: Vec<u8> = positions
+                    .iter()
+                    .map(|pair| pair[0].to_ascii_lowercase())
+                    .collect();
+                format!("ci({})", String::from_utf8_lossy(&folded))
+            }
             Self::And(children) => format!(
                 "and({})",
                 children
@@ -107,7 +120,7 @@ impl CandidateExpr {
 
     pub(crate) fn atom_count(&self) -> usize {
         match self {
-            Self::Literal(_) => 1,
+            Self::Literal(_) | Self::ByteClasses(_) => 1,
             Self::And(children) | Self::Or(children) => children.iter().map(Self::atom_count).sum(),
         }
     }
@@ -115,6 +128,15 @@ impl CandidateExpr {
     pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
         match self {
             Self::Literal(literal) => memchr::memmem::find(bytes, literal).is_some(),
+            Self::ByteClasses(positions) => {
+                positions.len() <= bytes.len()
+                    && bytes.windows(positions.len()).any(|window| {
+                        window
+                            .iter()
+                            .zip(positions)
+                            .all(|(byte, pair)| *byte == pair[0] || *byte == pair[1])
+                    })
+            }
             Self::And(children) => children.iter().all(|child| child.matches(bytes)),
             Self::Or(children) => children.iter().any(|child| child.matches(bytes)),
         }
@@ -127,7 +149,9 @@ pub(crate) fn build(hir: &Hir) -> Option<CandidateExpr> {
         conditions.push(inner);
     }
     for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
-        if let Some(boundary) = extracted(hir, kind) {
+        if let Some(boundary) = extracted(hir, kind)
+            && (conditions.is_empty() || boundary.atom_count() <= 4)
+        {
             conditions.push(boundary);
         }
     }
@@ -136,6 +160,54 @@ pub(crate) fn build(hir: &Hir) -> Option<CandidateExpr> {
         1 => conditions.pop().map(CandidateExpr::simplify),
         _ => Some(CandidateExpr::And(conditions).simplify()),
     }
+}
+
+fn class_ascii_pair(class: &Class) -> Option<[u8; 2]> {
+    let mut bytes = [0_u8; 2];
+    let mut count = 0usize;
+    match class {
+        Class::Unicode(unicode) => {
+            for range in unicode.iter() {
+                if !range.start().is_ascii() || !range.end().is_ascii() {
+                    return None;
+                }
+                for ch in range.start()..=range.end() {
+                    if count >= 2 {
+                        return None;
+                    }
+                    bytes[count] = ch as u8;
+                    count += 1;
+                }
+            }
+        }
+        Class::Bytes(byte_class) => {
+            for range in byte_class.iter() {
+                for b in range.start()..=range.end() {
+                    if count >= 2 {
+                        return None;
+                    }
+                    bytes[count] = b;
+                    count += 1;
+                }
+            }
+        }
+    }
+    match count {
+        1 => Some([bytes[0], bytes[0]]),
+        2 => Some(bytes),
+        _ => None,
+    }
+}
+
+fn flush_run(run: &mut Vec<[u8; 2]>, conditions: &mut Vec<CandidateExpr>) {
+    if run.len() >= MIN_INDEXED_LITERAL_BYTES && run.len() <= MAX_LITERAL_BYTES {
+        if run.iter().all(|pair| pair[0] == pair[1]) {
+            conditions.push(CandidateExpr::Literal(run.iter().map(|pair| pair[0]).collect()));
+        } else {
+            conditions.push(CandidateExpr::ByteClasses(run.clone()));
+        }
+    }
+    run.clear();
 }
 
 fn mandatory(hir: &Hir, depth: usize) -> Option<CandidateExpr> {
@@ -147,10 +219,31 @@ fn mandatory(hir: &Hir, depth: usize) -> Option<CandidateExpr> {
         HirKind::Capture(capture) => mandatory(&capture.sub, depth + 1),
         HirKind::Repetition(repeat) if repeat.min > 0 => mandatory(&repeat.sub, depth + 1),
         HirKind::Concat(children) => {
-            let conditions: Vec<_> = children
-                .iter()
-                .filter_map(|child| mandatory(child, depth + 1))
-                .collect();
+            let mut conditions = Vec::new();
+            let mut run: Vec<[u8; 2]> = Vec::new();
+            for child in children {
+                match child.kind() {
+                    HirKind::Literal(literal) => {
+                        for &byte in &literal.0 {
+                            run.push([byte, byte]);
+                        }
+                    }
+                    HirKind::Class(class) => {
+                        if let Some(pair) = class_ascii_pair(class) {
+                            run.push(pair);
+                        } else {
+                            flush_run(&mut run, &mut conditions);
+                        }
+                    }
+                    _ => {
+                        flush_run(&mut run, &mut conditions);
+                        if let Some(cond) = mandatory(child, depth + 1) {
+                            conditions.push(cond);
+                        }
+                    }
+                }
+            }
+            flush_run(&mut run, &mut conditions);
             match conditions.len() {
                 0 => None,
                 1 => conditions.into_iter().next(),

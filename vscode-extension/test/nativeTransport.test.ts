@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import test from 'node:test';
 
 import {
-  connectNativeTransport, nativeEndpoint, RequestCancelledError, wslLaunch,
+  connectNativeTransport, nativeEndpoint, RequestCancelledError, usesWslTransport, windowsLocalLaunch, wslLaunch,
 } from '../src/nativeTransport.js';
 import { resolveWslRoot } from '../src/rootResolver.js';
 import type { CancellationLike, ClientSettings, DisposableLike } from '../src/types.js';
@@ -45,6 +45,25 @@ void test('WSL launch uses native IPC without a shell, MCP or a network port', (
   assert.throws(() => wslLaunch({ ...settings, wslDistribution: 'bad\nname' }));
   assert.throws(() => wslLaunch({ ...settings, wslExecutablePath: 'relative/cctx' }));
   assert.throws(() => wslLaunch({ ...settings, socketPath: '/other/daemon.sock' }));
+});
+
+void test('Windows without WSL configuration launches local cctx.exe native-bridge', () => {
+  const localSettings: ClientSettings = {
+    socketPath: '', autoStartService: true, requestTimeoutMs: 1000,
+    executablePath: 'C:\\Users\\test\\.local\\bin\\cctx.exe',
+    wslDistribution: '', wslExecutablePath: '',
+  };
+  assert.equal(usesWslTransport(localSettings, 'win32'), false);
+  assert.equal(usesWslTransport(settings, 'win32'), true);
+  assert.deepEqual(windowsLocalLaunch(localSettings, 'bridge'), {
+    command: 'C:\\Users\\test\\.local\\bin\\cctx.exe',
+    args: ['native-bridge'],
+  });
+  assert.deepEqual(windowsLocalLaunch(localSettings, 'service'), {
+    command: 'C:\\Users\\test\\.local\\bin\\cctx.exe',
+    args: ['daemon'],
+  });
+  assert.ok(nativeEndpoint(localSettings, 'win32').startsWith('win32:C:\\Users\\test\\.local\\bin\\cctx.exe:'));
 });
 
 void test('WSL readiness may be fragmented and the connected stream is bidirectional', async () => {

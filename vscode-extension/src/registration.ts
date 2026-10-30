@@ -1,12 +1,12 @@
 import { execFile } from 'node:child_process';
 import { realpath } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import * as vscode from 'vscode';
 
 import type { NativeToolBridge } from './nativeTools.js';
+import { normalizeExecutablePath } from './nativeTransport.js';
 import {
   allSourceGlobs,
   type AutomaticPlanRegistry,
@@ -22,7 +22,7 @@ import {
   validatePlanResult,
   validateRegisterResult,
 } from './registrationPlan.js';
-import { parseGitIdentity, resolveRegisteredRoot, RootResolutionError } from './rootResolver.js';
+import { normalizeLocalPath, parseGitIdentity, resolveRegisteredRoot, RootResolutionError } from './rootResolver.js';
 import type { JsonValue } from './types.js';
 import { singleLine } from './logFormatter.js';
 
@@ -135,9 +135,9 @@ async function performAutomaticRegistration(
       }
       if (registeredRoot !== undefined) {
         const existing = workspaces.find(
-          (workspace) => resolve(workspace.root) === resolve(folderRoot),
+          (workspace) => normalizeLocalPath(workspace.root) === normalizeLocalPath(folderRoot),
         );
-        const remembered = automaticPlans[resolve(folderRoot)];
+        const remembered = automaticPlans[normalizeLocalPath(folderRoot)];
         if (existing && canUpdateAutomaticRegistration(existing, remembered)) {
           try {
             const inferred = mergeAutomaticPlan({
@@ -162,7 +162,7 @@ async function performAutomaticRegistration(
             );
           }
         } else if (remembered !== undefined) {
-          delete automaticPlans[resolve(folderRoot)];
+          delete automaticPlans[normalizeLocalPath(folderRoot)];
           await state.update(AUTO_PLAN_STATE_KEY, automaticPlans);
           output.appendLine(
             `AUTO_MANAGEMENT_RELEASED root=${folder.uri.fsPath} registration changed outside Code Context auto-registration`,
@@ -228,7 +228,7 @@ async function registerTrustedWorktree(
   const canonicalTarget = await realpath(target);
   const identity = await requestedGitIdentity(canonicalTarget);
   const canonicalRoot = await realpath(identity.root);
-  if (canonicalRoot !== resolve(identity.root)) {
+  if (normalizeLocalPath(canonicalRoot) !== normalizeLocalPath(identity.root)) {
     throw new RootResolutionError('Refusing a symlinked worktree root; open its canonical path explicitly.');
   }
   const targetCommon = await realpath(identity.commonDirectory);
@@ -246,7 +246,7 @@ async function registerTrustedWorktree(
     }
     const { stdout } = await execFileAsync(executablePath(), [
       '--root', canonicalRoot, 'prepare',
-    ], { timeout: 120_000, maxBuffer: 1024 * 1024 });
+    ], { timeout: 120_000, maxBuffer: 1024 * 1024, windowsHide: true });
     const prepared: unknown = JSON.parse(stdout);
     if (typeof prepared !== 'object' || prepared === null ||
         !('root' in prepared) || prepared.root !== canonicalRoot) {
@@ -269,7 +269,7 @@ async function requestedGitIdentity(directory:string):Promise<{root:string;commo
   const {stdout}=await execFileAsync('git',[
     '-c','core.quotePath=false','-C',directory,'rev-parse','--path-format=absolute',
     '--show-toplevel','--git-common-dir',
-  ],{timeout:10_000,maxBuffer:1024*1024,env});
+  ],{timeout:10_000,maxBuffer:1024*1024,env,windowsHide:true});
   return parseGitIdentity(stdout);
 }
 
@@ -400,18 +400,8 @@ async function runCctxRegister(
 function executablePath(): string {
   const configured = vscode.workspace
     .getConfiguration('codeContextNative')
-    .get<string>('executablePath', '')
-    .trim();
-  const value =
-    configured.length === 0
-      ? join(homedir(), '.local/bin/cctx')
-      : configured.startsWith('~/')
-        ? join(homedir(), configured.slice(2))
-        : configured;
-  if (!isAbsolute(value)) {
-    throw new Error('codeContextNative.executablePath must be absolute.');
-  }
-  return resolve(value);
+    .get<string>('executablePath', '');
+  return normalizeExecutablePath(configured);
 }
 
 function parseList(value: string): string[] {

@@ -619,6 +619,8 @@ impl Watched {
             }
             for path in event.paths {
                 if let Ok(path) = path.strip_prefix(&self.spec.root) {
+                    let normalized = crate::workspace::normalize(path);
+                    let path = normalized.as_path();
                     let name = path
                         .to_str()
                         .ok_or_else(|| invalid("non-UTF8 event path"))?;
@@ -965,6 +967,9 @@ impl Watched {
                     .unwrap_or(3);
                 if args.get("limit").is_none() {
                     args["limit"] = json!(20);
+                    if args.get("max_matches_per_file").is_none() {
+                        args["max_matches_per_file"] = json!(5);
+                    }
                 }
                 let query: Query = serde_json::from_value(args)?;
                 if radius > 100 || query.limit > 64 {
@@ -1024,6 +1029,33 @@ impl Watched {
                     "detected_profiles":exclusion_summary.profiles,
                     "effective_exclude_count":workspace.excludes.len()+exclusion_summary.patterns.len(),
                     "idle_timeout_seconds":IDLE_ROOT_TIMEOUT.as_secs()}))
+    }
+
+    pub(crate) fn recover_stale_search(&mut self, error_message: &str) -> Result<bool> {
+        let Some(rest) = error_message.strip_prefix("STALE_INDEX ") else {
+            return Ok(false);
+        };
+        let Some(path_part) = rest
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("path="))
+        else {
+            return Ok(false);
+        };
+        let relative_str = path_part.trim_end_matches(':');
+        if crate::workspace::safe_relative(Path::new(relative_str)).is_err() {
+            return Ok(false);
+        }
+        let relative = crate::workspace::normalize(Path::new(relative_str));
+        let mut directories = BTreeMap::new();
+        directories.insert(
+            relative.parent().unwrap_or(Path::new("")).to_path_buf(),
+            false,
+        );
+        let mut forced = BTreeSet::new();
+        forced.insert(relative.to_string_lossy().into_owned());
+        self.reconcile_directories(&directories, &forced)?;
+        self.transparent_read_recoveries = self.transparent_read_recoveries.saturating_add(1);
+        Ok(true)
     }
 
     fn stale_search_error(&self, path: &str) -> std::io::Error {
