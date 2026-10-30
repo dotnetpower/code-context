@@ -72,4 +72,4 @@ See [method, cold-start chart, token suites, raw samples, and reproduction](docs
 - [Architecture](DESIGN.md)
 - [Packaging and publishing](vscode-extension/docs/PUBLISHING.md)
 - [Releases](https://github.com/dotnetpower/code-context/releases) ·
-  [Issues](https://github.com/dotnetpower/code-context/issues) · [MIT license](vscode-extension/LICENSE)
+  [Issues](https://github.com/dotnetpower/code-context/issues) · [MIT license](LICENSE)
