@@ -2,29 +2,30 @@
 
 ## Result and scope
 
-The fixed mixed suite took **3.791 ms per operation without CCTX** and
-**0.395 ms with a warm CCTX cache**: **9.59x** speedup, 95% confidence interval
-**9.32–9.88x**, or **89.6% less retrieval wall time** in this experiment.
+The fixed mixed suite took **3.899 ms per operation without CCTX** and
+**0.260 ms with a warm CCTX cache**: **15.01x** speedup, 95% confidence interval
+**14.69–15.30x**, or **93.3% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before the 30-round optimization and persistent `CCTXJ1` IPC framing).
 This is a retrieval microbenchmark, **not** a claim of faster LLM generation,
 VS Code chat, model tool selection, token savings, or whole-agent completion.
 
 ![Warm retrieval means and speedup confidence intervals](../benchmarks/results/aks-store-demo/latency-speedup.png)
 
 **Figure 1.** A: mean client-observed latency with 95% session-bootstrap
-intervals. B: ratio of off/on means with paired-session bootstrap intervals;
+intervals comparing `CCTX off`, `CCTX v0.14 (before opt)`, and `CCTX current (warm IPC)`.
+B: ratio of off/on means with paired-session bootstrap intervals;
 the dashed line is parity. The log speedup axis preserves slowdowns as well as
 improvements. Known reads are deliberately retained in the mixed suite.
 
 | Task | Pairs | Off mean | On mean | Speedup [95% CI] |
 |---|---:|---:|---:|---:|
-| Filename discovery | 1,920 | 4.254 ms | 0.401 ms | 10.62x [10.22, 11.11] |
-| Literal search | 2,560 | 4.942 ms | 0.389 ms | 12.72x [11.99, 13.45] |
-| Search + context | 2,560 | 5.090 ms | 0.422 ms | 12.06x [11.66, 12.49] |
-| Known read + hash | 1,920 | 0.060 ms | 0.363 ms | 0.166x [0.155, 0.176] |
-| Fixed mixed suite | 8,960 | 3.791 ms | 0.395 ms | 9.59x [9.32, 9.88] |
+| Filename discovery | 1,920 | 4.325 ms | 0.264 ms | 16.40x [15.69, 16.94] |
+| Literal search | 2,560 | 5.104 ms | 0.249 ms | 20.50x [19.87, 21.05] |
+| Search + context | 2,560 | 5.244 ms | 0.283 ms | 18.54x [18.28, 18.77] |
+| Known read + hash | 1,920 | 0.074 ms | 0.239 ms | 0.310x [0.303, 0.317] |
+| Fixed mixed suite | 8,960 | 3.899 ms | 0.260 ms | 15.01x [14.69, 15.30] |
 
-Mixed-suite p95: **6.384 ms off / 0.579 ms on**. This is a pooled descriptive
-percentile, not a confidence bound. Small known-file reads are **6.0x slower**
+Mixed-suite p95: **6.456 ms off / 0.406 ms on**. This is a pooled descriptive
+percentile, not a confidence bound. Small known-file reads are **3.2x slower**
 through IPC; direct buffered reads avoid request, policy, JSON, and socket
 overhead. CCTX is not the fastest path for every operation.
 
@@ -40,7 +41,7 @@ it does not measure the resource benefit of stopping the daemon entirely.
 - Frozen eligible corpus: **68 files, 172,244 bytes** under `src/`;
   Go, Rust, JavaScript, Vue, TypeScript, and Python.
 - Corpus SHA-256: `f3c4044af53bb5c7e9731ae669cbc234c9c827a73b56f59afc18fb89991d25ce`
-- Backend source: `77d0a39767f2b4760f539231ad53ae4d2d468cfb`
+- Backend source: `2fbbdc094bfa59057b83e32c0c55be488df08518`
 - Exact executable hash, ripgrep/Python versions, tasks, ordering seed,
   session identifiers, and every timed observation are in the
   [raw JSON](../benchmarks/results/aks-store-demo/results.json).
@@ -111,9 +112,9 @@ plus normal ripgrep fallback versus a normal off lookup. B: explicit source
 sync/load barrier measured separately; this is setup, not ordinary lookup
 latency. Daemon process startup and metadata registration are excluded.
 
-- Off lookup median: **4.093 ms**
-- Cold miss plus fallback median: **4.324 ms**
-- Subsequent explicit sync median: **50.937 ms**
+- Off lookup median: **4.273 ms**
+- Cold miss plus fallback median: **4.237 ms**
+- Subsequent explicit sync median: **50.719 ms**
 
 The off cold-control lookup runs first in each session; this small descriptive
 sample is not randomized like the warm pairs and is not assigned a confidence

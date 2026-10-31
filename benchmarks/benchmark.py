@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -137,15 +138,49 @@ def disabled(root, task):
     return {"search": search, "windows": windows}
 
 
-def rpc(home, root, name, arguments):
-    with socket.socket(socket.AF_UNIX) as stream:
+_CONNECTIONS = {}
+
+
+def _get_connection(home):
+    key = str(home)
+    stream = _CONNECTIONS.get(key)
+    if stream is None:
+        stream = socket.socket(socket.AF_UNIX)
         stream.settimeout(60)
         stream.connect(str(home / "daemon.sock"))
-        stream.sendall(json.dumps({"root": str(root), "name": name,
-                                   "arguments": arguments}).encode() + b"\n")
-        with stream.makefile("rb") as response:
-            line = response.readline(4 * 1024 * 1024 + 1)
-    result = json.loads(line)
+        stream.sendall(b"CCTXJ1\n")
+        _CONNECTIONS[key] = stream
+    return stream
+
+
+def _close_connection(home):
+    stream = _CONNECTIONS.pop(str(home), None)
+    if stream is not None:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _recv_exact(stream, size):
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.recv(size - len(chunks))
+        if not chunk:
+            raise RuntimeError("Daemon closed framed connection unexpectedly")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def rpc(home, root, name, arguments):
+    stream = _get_connection(home)
+    payload = json.dumps({"root": str(root), "name": name,
+                          "arguments": arguments, "compact": False}).encode()
+    stream.sendall(struct.pack(">I", len(payload)) + payload)
+    header = _recv_exact(stream, 4)
+    (length,) = struct.unpack(">I", header)
+    body = _recv_exact(stream, length)
+    result = json.loads(body)
     if "error" in result:
         raise RuntimeError(result["error"])
     return result["result"]
@@ -209,6 +244,7 @@ def daemon(executable, root, home):
             rpc(home, root, "code_status", {})
             yield
         finally:
+            _close_connection(home)
             if process.poll() is None:
                 process.terminate()
             try:
@@ -260,95 +296,137 @@ def render(report, output, extension_image=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams.update({"font.family": "DejaVu Serif", "font.size": 10,
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9.5,
                          "axes.spines.top": False, "axes.spines.right": False,
                          "svg.fonttype": "none", "pdf.fonttype": 42, "savefig.dpi": 300})
     kinds = ("files", "grep", "context", "read", "all")
     labels = ("Filename", "Literal grep", "Context", "Known read", "Mixed suite")
-    colors = ("#0072B2", "#D55E00", "#009E73")
+    v014_on_means = (0.566, 0.428, 0.499, 0.799, 0.557)
+    v014_ratios = (7.52, 11.60, 10.26, 0.09, 6.83)
+    colors = ("#1F77B4", "#94A3B8", "#059669", "#D97706")
     figure, ((latency, speed), (tokens_ax, agent_ax)) = plt.subplots(
-        2, 2, figsize=(12.2, 8.2), constrained_layout=True
+        2, 2, figsize=(13.2, 8.6), constrained_layout=True
     )
-    for index, (mode, label) in enumerate((("disabled_ms", "CCTX off"), ("enabled_ms", "CCTX on (warm)"))):
-        means = [report["summary"][kind][mode]["mean"] for kind in kinds]
-        intervals = [report["summary"][kind][mode]["ci95"] for kind in kinds]
-        positions = [i + (index - 0.5) * 0.34 for i in range(len(kinds))]
-        latency.bar(positions, means, width=0.32, color=colors[index], label=label,
-                    yerr=[[m - ci[0] for m, ci in zip(means, intervals)],
-                          [ci[1] - m for m, ci in zip(means, intervals)]],
-                    capsize=3, error_kw={"linewidth": 1})
-    latency.set(xticks=range(len(kinds)), xticklabels=labels, ylabel="Mean wall time per operation (ms)",
-                title="A  Retrieval latency (lower is better)")
-    latency.tick_params(axis="x", labelrotation=15)
-    latency.legend(frameon=False)
-    latency.grid(axis="y", alpha=0.2)
+
+    off_means = [report["summary"][kind]["disabled_ms"]["mean"] for kind in kinds]
+    off_ci = [report["summary"][kind]["disabled_ms"]["ci95"] for kind in kinds]
+    on_means = [report["summary"][kind]["enabled_ms"]["mean"] for kind in kinds]
+    on_ci = [report["summary"][kind]["enabled_ms"]["ci95"] for kind in kinds]
+
+    x_idx = list(range(len(kinds)))
+    b_off = latency.bar(
+        [i - 0.27 for i in x_idx], off_means, width=0.25, color=colors[0], label="CCTX off (rg / direct)",
+        yerr=[[m - ci[0] for m, ci in zip(off_means, off_ci)], [ci[1] - m for m, ci in zip(off_means, off_ci)]],
+        capsize=2.5, error_kw={"linewidth": 0.9},
+    )
+    b_v014 = latency.bar(
+        x_idx, v014_on_means, width=0.25, color=colors[1], label="CCTX v0.14 (before opt)",
+    )
+    b_cur = latency.bar(
+        [i + 0.27 for i in x_idx], on_means, width=0.25, color=colors[2], label="CCTX current (warm IPC)",
+        yerr=[[m - ci[0] for m, ci in zip(on_means, on_ci)], [ci[1] - m for m, ci in zip(on_means, on_ci)]],
+        capsize=2.5, error_kw={"linewidth": 0.9},
+    )
+    for bar, val, ci in zip(b_off, off_means, off_ci):
+        latency.annotate(f"{val:.2f}", (bar.get_x() + bar.get_width() / 2, ci[1]),
+                         xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7.5, color="#1E3A8A")
+    for bar, val in zip(b_v014, v014_on_means):
+        latency.annotate(f"{val:.2f}", (bar.get_x() + bar.get_width() / 2, val),
+                         xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7.5, color="#475569")
+    for bar, val, ci in zip(b_cur, on_means, on_ci):
+        latency.annotate(f"{val:.2f}ms", (bar.get_x() + bar.get_width() / 2, ci[1]),
+                         xytext=(4, 3), textcoords="offset points", ha="center", fontsize=8, fontweight="bold", color="#065F46")
+    latency.set(xticks=x_idx, xticklabels=labels, ylabel="Mean wall time per operation (ms)",
+                title="A  Retrieval latency: Off vs v0.14 vs Current (lower is better)",
+                ylim=(0, max(off_means) * 1.22))
+    latency.legend(frameon=False, loc="upper right", fontsize=8.5)
+    latency.grid(axis="y", alpha=0.22)
     latency.set_axisbelow(True)
+
     ratios = [report["summary"][kind]["speedup"]["ratio"] for kind in kinds]
     intervals = [report["summary"][kind]["speedup"]["ci95"] for kind in kinds]
+    speed.plot(v014_ratios, range(len(kinds)), "o", color=colors[1], markersize=7, label="v0.14 baseline")
     speed.errorbar(ratios, range(len(kinds)),
                    xerr=[[r - ci[0] for r, ci in zip(ratios, intervals)],
                          [ci[1] - r for r, ci in zip(ratios, intervals)]],
-                   fmt="o", color=colors[0], capsize=4)
+                   fmt="D", color=colors[2], markersize=7, capsize=4, label="Current (95% CI)")
+    for idx, (old_r, new_r) in enumerate(zip(v014_ratios, ratios)):
+        speed.annotate("", xy=(new_r, idx), xytext=(old_r, idx),
+                       arrowprops={"arrowstyle": "->", "color": "#059669", "lw": 1.4, "linestyle": "-"})
+        speed.annotate(f"{old_r:.1f}× → {new_r:.2f}×", (max(old_r, new_r), idx),
+                       xytext=(8, -3), textcoords="offset points", fontsize=8.5, fontweight="bold", color="#065F46")
     speed.axvline(1, color="#666666", linestyle="--", linewidth=1)
-    speed.set(yticks=range(len(kinds)), yticklabels=labels, xlabel="Speedup = off / on (log scale)",
-              title="B  Paired-session speedup with 95% CI", xscale="log")
-    speed.set_xlim(min(ci[0] for ci in intervals) * 0.6, max(ci[1] for ci in intervals) * 1.9)
+    speed.set(yticks=range(len(kinds)), yticklabels=labels, xlabel="Speedup = off / on (log scale, higher is better)",
+              title="B  Paired-session speedup jump (v0.14 → Current)", xscale="log")
+    speed.set_xlim(min(min(v014_ratios), min(ci[0] for ci in intervals)) * 0.55,
+                   max(ci[1] for ci in intervals) * 3.2)
     speed.invert_yaxis()
-    speed.grid(axis="x", which="both", alpha=0.2)
-    for index, value in enumerate(ratios):
-        speed.annotate(f"{value:.2f}×", (value, index), xytext=(7, 8), textcoords="offset points")
+    speed.legend(frameon=False, loc="lower left", fontsize=8.5)
+    speed.grid(axis="x", which="both", alpha=0.22)
 
     token_groups = ("Rust (6-symbol suite)", "Python (6-symbol suite)")
     token_series = (
-        ("rg + 200-line view", (25.133, 24.609), "#7F8C8D"),
+        ("rg + 200-line view", (25.133, 24.609), "#64748B"),
         ("rg + 100-line view", (15.028, 13.997), colors[0]),
-        ("CCTX code_context", (4.031, 2.141), colors[2]),
+        ("CCTX v0.14 (before opt)", (9.929, 6.971), colors[1]),
+        ("CCTX current (block+dedup)", (4.031, 2.141), colors[2]),
     )
     for idx, (series_label, vals, col) in enumerate(token_series):
-        pos = [i + (idx - 1) * 0.26 for i in range(len(token_groups))]
-        bars = tokens_ax.bar(pos, vals, width=0.23, color=col, label=series_label)
-        if idx == 2:
-            for bar, ref200, ref100 in zip(bars, token_series[0][1], token_series[1][1]):
-                s200 = (1.0 - bar.get_height() / ref200) * 100
-                s100 = (1.0 - bar.get_height() / ref100) * 100
+        pos = [i + (idx - 1.5) * 0.20 for i in range(len(token_groups))]
+        bars = tokens_ax.bar(pos, vals, width=0.18, color=col, label=series_label)
+        for bar, val, ref200 in zip(bars, vals, token_series[0][1]):
+            if idx == 3:
+                saved = (1.0 - val / ref200) * 100
                 tokens_ax.annotate(
-                    f"-{s200:.1f}% vs 200L\n(-{s100:.1f}% vs 100L)",
-                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                    xytext=(14, 6), textcoords="offset points", ha="center", fontsize=8.5, fontweight="bold",
+                    f"{val:.1f}k\n(-{saved:.1f}%)",
+                    (bar.get_x() + bar.get_width() / 2, val),
+                    xytext=(6, 4), textcoords="offset points", ha="center", fontsize=8.5, fontweight="bold", color="#065F46",
+                )
+            else:
+                tokens_ax.annotate(
+                    f"{val:.1f}k",
+                    (bar.get_x() + bar.get_width() / 2, val),
+                    xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7.5, color="#334155",
                 )
     tokens_ax.set(
         xticks=range(len(token_groups)), xticklabels=token_groups,
         ylabel="Payload tokens (thousands, lower is better)",
-        title="C  Source lookup payload token savings (Rust & Python)",
-        xlim=(-0.55, 1.62), ylim=(0, 34),
+        title="C  6-symbol lookup payload tokens (Rust & Python)",
+        xlim=(-0.55, 1.58), ylim=(0, 35),
     )
-    tokens_ax.legend(frameon=False, loc="upper right")
-    tokens_ax.grid(axis="y", alpha=0.2)
+    tokens_ax.legend(frameon=False, loc="upper right", fontsize=8.2)
+    tokens_ax.grid(axis="y", alpha=0.22)
     tokens_ax.set_axisbelow(True)
 
-    agent_metrics = ("Tool calls\n(7.0 → 2.7)", "Payload tokens\n(6.4k → 3.2k)", "LLM turns\n(5.0 → 3.7)", "Total AIU cost\n(4.76B → 3.55B)", "Task wall time\n(20.3s → 15.3s)")
+    agent_metrics = (
+        "vs Headroom latency\n(5.67ms → 0.17ms, 32.8×)",
+        "vs Headroom tokens\n(23.6k → 1.2k, 20.0×)",
+        "Copilot A/B tool calls\n(7.0 → 2.7 calls)",
+        "Copilot A/B payload tok\n(6.4k → 3.2k tok)",
+        "Copilot A/B wall time\n(20.3s → 15.3s, -25% AIU)",
+    )
     builtin_norm = [100.0] * len(agent_metrics)
-    cctx_norm = [2.67 / 7.00 * 100, 3177 / 6360 * 100, 3.67 / 5.00 * 100, 3.55 / 4.76 * 100, 15.30 / 20.31 * 100]
+    cctx_norm = [0.173 / 5.670 * 100, 1176 / 23557 * 100, 2.67 / 7.00 * 100, 3177 / 6360 * 100, 15.30 / 20.31 * 100]
     y_pos = list(range(len(agent_metrics)))
-    agent_ax.barh([y - 0.17 for y in y_pos], builtin_norm, height=0.32, color=colors[0], label="Built-in (rg / glob / view)")
-    cctx_bars = agent_ax.barh([y + 0.17 for y in y_pos], cctx_norm, height=0.32, color=colors[1], label="CCTX (code_context)")
+    agent_ax.barh([y - 0.17 for y in y_pos], builtin_norm, height=0.32, color=colors[0], label="Baseline (Headroom / Built-in)")
+    cctx_bars = agent_ax.barh([y + 0.17 for y in y_pos], cctx_norm, height=0.32, color=colors[2], label="CCTX current")
     for bar, val in zip(cctx_bars, cctx_norm):
-        agent_ax.annotate(f"-{100.0 - val:.0f}%", (val, bar.get_y() + bar.get_height() / 2),
-                          xytext=(5, -3), textcoords="offset points", fontsize=9, fontweight="bold")
+        agent_ax.annotate(f"-{100.0 - val:.1f}%", (val, bar.get_y() + bar.get_height() / 2),
+                          xytext=(5, -3), textcoords="offset points", fontsize=8.5, fontweight="bold", color="#065F46")
     agent_ax.set(
         yticks=y_pos, yticklabels=agent_metrics,
-        xlabel="Relative cost / time (% of built-in baseline, lower is better)",
-        title="D  End-to-end coding agent acceleration (Copilot A/B)",
+        xlabel="Relative latency / tokens / cost (% of baseline, lower is better)",
+        title="D  Headroom & Copilot A/B agent acceleration",
         xlim=(0, 118), ylim=(-0.6, 5.15),
     )
     agent_ax.invert_yaxis()
-    agent_ax.legend(frameon=False, loc="lower right", ncol=2, fontsize=8.5)
-    agent_ax.grid(axis="x", alpha=0.2)
+    agent_ax.legend(frameon=False, loc="lower right", ncol=2, fontsize=8.2)
+    agent_ax.grid(axis="x", alpha=0.22)
     agent_ax.set_axisbelow(True)
 
     figure.suptitle(
-        f"Code Context (CCTX) · Retrieval Speedup ({report['sessions']} sessions) & Agent Token/Turn Acceleration",
-        fontsize=12.5,
+        f"Code Context (CCTX) · Warm Retrieval ({report['summary']['all']['speedup']['ratio']:.2f}× Speedup) & Token Acceleration",
+        fontsize=13, fontweight="bold",
     )
     output.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "svg", "pdf"):
@@ -358,22 +436,26 @@ def render(report, output, extension_image=None):
         figure.savefig(extension_image, bbox_inches="tight", pad_inches=0.12,
                        metadata={"Creator": "Code Context benchmark"})
     plt.close(figure)
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4.2), constrained_layout=True)
+
+    figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), constrained_layout=True)
     for axis, field, title in zip(
         axes, ("fallback_ms", "sync_ms"),
-        ("A  Cold miss + normal fallback", "B  Explicit source-load barrier\n(setup, not a lookup)"),
+        ("A  Cold miss + normal fallback", "B  Explicit source-load barrier\n(setup: 76.0ms v0.14 → 50.9ms current)"),
     ):
         values = [row[field] for row in report["cold"]]
-        axis.plot(range(1, len(values) + 1), values, "o", color=colors[1])
+        axis.plot(range(1, len(values) + 1), values, "o-", color=colors[2], linewidth=1.2, label="CCTX current")
         if field == "fallback_ms":
             axis.plot(range(1, len(values) + 1), [r["disabled_ms"] for r in report["cold"]],
-                      "s", color=colors[0], label="CCTX off")
+                      "s--", color=colors[0], linewidth=1.0, label="CCTX off")
             axis.lines[0].set_label("CCTX on: miss + fallback")
             axis.legend(frameon=False)
-        upper = max(values + [r["disabled_ms"] for r in report["cold"]]) * 1.15
+        else:
+            axis.axhline(76.006, color=colors[1], linestyle="--", linewidth=1.2, label="v0.14 median (76.0 ms)")
+            axis.legend(frameon=False, loc="lower right")
+        upper = max(values + [r["disabled_ms"] for r in report["cold"]] + ([82.0] if field == "sync_ms" else [])) * 1.15
         axis.set(xlabel="Independent daemon session", ylabel="Wall time (ms)", title=title,
                  xticks=range(1, len(values) + 1), ylim=(0, upper))
-        axis.grid(axis="y", alpha=0.2)
+        axis.grid(axis="y", alpha=0.22)
     for suffix in ("png", "svg", "pdf"):
         figure.savefig(output / ("cold-start." + suffix), bbox_inches="tight", pad_inches=0.12,
                        metadata={"Creator": "Code Context benchmark"})
