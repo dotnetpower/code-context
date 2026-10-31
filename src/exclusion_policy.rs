@@ -178,12 +178,6 @@ struct ProfileRule {
     patterns: &'static [&'static str],
 }
 
-impl ProfileRule {
-    fn matches(&self, root: &Path) -> bool {
-        any_file(root, self.files) || root_has_extension(root, self.extensions)
-    }
-}
-
 const PROFILE_RULES: &[ProfileRule] = &[
     ProfileRule {
         name: "node",
@@ -354,6 +348,79 @@ pub struct EffectiveExclusions {
     pub patterns: Vec<String>,
 }
 
+struct RootSnapshot {
+    files: std::collections::HashSet<String>,
+    extensions: std::collections::HashSet<String>,
+    has_project_settings: bool,
+    has_packages: bool,
+}
+
+impl RootSnapshot {
+    fn scan(root: &Path) -> Self {
+        let mut files = std::collections::HashSet::new();
+        let mut extensions = std::collections::HashSet::new();
+        let mut has_project_settings = false;
+        let mut has_packages = false;
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let name_os = entry.file_name();
+                let Some(name) = name_os.to_str() else {
+                    continue;
+                };
+                let is_file = match entry.file_type() {
+                    Ok(ft) if ft.is_file() => true,
+                    Ok(ft) if ft.is_dir() => {
+                        if name == "ProjectSettings" {
+                            has_project_settings = true;
+                        } else if name == "packages" {
+                            has_packages = true;
+                        }
+                        false
+                    }
+                    _ => {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if name == "ProjectSettings" {
+                                has_project_settings = true;
+                            } else if name == "packages" {
+                                has_packages = true;
+                            }
+                            false
+                        } else {
+                            path.is_file()
+                        }
+                    }
+                };
+                if is_file {
+                    files.insert(name.to_owned());
+                    if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+                        extensions.insert(ext.to_owned());
+                    }
+                }
+            }
+        }
+        Self {
+            files,
+            extensions,
+            has_project_settings,
+            has_packages,
+        }
+    }
+
+    fn matches(&self, root: &Path, rule: &ProfileRule) -> bool {
+        rule.files.iter().any(|&name| {
+            if name == "ProjectSettings/ProjectVersion.txt" {
+                self.has_project_settings && root.join(name).is_file()
+            } else {
+                self.files.contains(name)
+            }
+        }) || rule
+            .extensions
+            .iter()
+            .any(|&ext| self.extensions.contains(ext))
+    }
+}
+
 pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
     let mut roots = vec![(String::new(), root.to_path_buf())];
     roots.extend(
@@ -371,9 +438,10 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
     patterns.extend(UNIVERSAL_GLOBS.iter().map(|pattern| (*pattern).to_owned()));
 
     for (prefix, project_root) in roots {
+        let snapshot = RootSnapshot::scan(project_root.as_path());
         for rule in PROFILE_RULES {
             apply_scoped(
-                rule.matches(project_root.as_path()),
+                snapshot.matches(project_root.as_path(), rule),
                 prefix.as_str(),
                 rule.name,
                 rule.patterns,
@@ -382,16 +450,19 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             );
         }
         apply_scoped(
-            project_root.join("DESCRIPTION").is_file()
-                && (project_root.join("NAMESPACE").is_file()
-                    || root_has_extension(project_root.as_path(), &["R", "r"])),
+            snapshot.files.contains("DESCRIPTION")
+                && (snapshot.files.contains("NAMESPACE")
+                    || snapshot.extensions.contains("R")
+                    || snapshot.extensions.contains("r")),
             prefix.as_str(),
             "r",
             R_PROJECT,
             &mut profiles,
             &mut patterns,
         );
-        if project_root.join("packages/repositories.config").is_file() {
+        if snapshot.has_packages
+            && project_root.join("packages/repositories.config").is_file()
+        {
             patterns.insert(scoped_pattern(prefix.as_str(), "packages/**"));
         }
     }
@@ -441,22 +512,4 @@ fn scoped_pattern(prefix: &str, pattern: &str) -> String {
     } else {
         format!("{prefix}/{pattern}")
     }
-}
-
-fn any_file(root: &Path, names: &[&str]) -> bool {
-    names.iter().any(|name| root.join(name).is_file())
-}
-
-fn root_has_extension(root: &Path, extensions: &[&str]) -> bool {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return false;
-    };
-    entries.filter_map(std::result::Result::ok).any(|entry| {
-        entry.path().is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extensions.contains(&extension))
-    })
 }

@@ -67,7 +67,7 @@ export class TracedRequestError extends Error {
 export class DaemonClient {
   private socket: Duplex | undefined;
   private socketPath: string | undefined;
-  private receiveBuffer = Buffer.alloc(0);
+  private receiveBuffer: Buffer = Buffer.alloc(0);
   private pending: PendingResponse | undefined;
   private queue: Promise<void> = Promise.resolve();
   private disposed = false;
@@ -293,13 +293,14 @@ export class DaemonClient {
     if (this.pending) {
       throw new Error('Code Context protocol allows only one in-flight request.');
     }
-    const payload = Buffer.from(JSON.stringify(request), 'utf8');
-    if (payload.byteLength > MAX_FRAME_BYTES) {
+    const json = JSON.stringify(request);
+    const byteLength = Buffer.byteLength(json, 'utf8');
+    if (byteLength > MAX_FRAME_BYTES) {
       throw new Error('Code Context native request exceeds 2 MiB.');
     }
-    const frame = Buffer.allocUnsafe(payload.byteLength + 4);
-    frame.writeUInt32BE(payload.byteLength, 0);
-    payload.copy(frame, 4);
+    const frame = Buffer.allocUnsafe(byteLength + 4);
+    frame.writeUInt32BE(byteLength, 0);
+    frame.write(json, 4, byteLength, 'utf8');
     const timeoutMs = this.settings().requestTimeoutMs;
     return new Promise<JsonValue>((resolveResponse, rejectResponse) => {
       const timer = setTimeout(() => {
@@ -328,7 +329,10 @@ export class DaemonClient {
     if (this.socket !== socket) {
       return;
     }
-    this.receiveBuffer = Buffer.concat([this.receiveBuffer, chunk]);
+    this.receiveBuffer =
+      this.receiveBuffer.byteLength === 0
+        ? chunk
+        : Buffer.concat([this.receiveBuffer, chunk]);
     if (this.receiveBuffer.byteLength > MAX_FRAME_BYTES + 4) {
       this.disconnect(new Error('Code Context daemon response exceeds 2 MiB.'));
       return;

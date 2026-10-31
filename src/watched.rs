@@ -1,9 +1,9 @@
 use crate::catalog::Spec;
-use crate::context::{ReadRequest, Snippet, assemble};
+use crate::context::{ReadRequest, Snippet, assemble_trusted};
 use crate::exclusion_policy;
 use crate::incremental::{Stamp, stamp, stamps, validate_stamps};
 use crate::policy::WORKER_STACK_BYTES;
-use crate::query::{Query, QueryCache, search_fast, search_profiled, search_profiled_mode};
+use crate::query::{Query, QueryCache, search_fast_arc, search_profiled, search_profiled_mode};
 use crate::resident::Resident;
 use crate::{Result, invalid};
 use globset::{Glob, GlobSetBuilder};
@@ -338,6 +338,7 @@ pub struct Watched {
     resident: Resident,
     watcher: RecommendedWatcher,
     watched_dirs: BTreeSet<std::path::PathBuf>,
+    watched_dir_bytes: usize,
     events: Receiver<notify::Result<Event>>,
     overflow: Arc<AtomicBool>,
     stamps: BTreeMap<String, Stamp>,
@@ -354,7 +355,12 @@ pub struct Watched {
     transparent_read_recoveries: u64,
     transparent_read_recovery_failures: u64,
     io_profile: IoProfile,
-    read_policy: Option<crate::workspace::CandidatePolicy>,
+    cached_workspace: Option<(Spec, crate::workspace::Workspace)>,
+    read_policy: Option<(
+        Spec,
+        crate::workspace::Workspace,
+        crate::workspace::CandidatePolicy,
+    )>,
 }
 
 impl Watched {
@@ -445,11 +451,17 @@ impl Watched {
             inventory,
         )?;
         let stamps = stamps(&workspace, &spec.policy)?;
+        let cached_workspace = Some((spec.clone(), workspace.clone()));
+        let watched_dir_bytes = watched_dirs
+            .iter()
+            .map(|path| path.as_os_str().len() + 64)
+            .sum::<usize>();
         let mut watched = Self {
             spec,
             resident,
             watcher,
             watched_dirs,
+            watched_dir_bytes,
             events,
             overflow,
             stamps,
@@ -469,6 +481,7 @@ impl Watched {
                 full_inventory_scans: 2,
                 ..IoProfile::default()
             },
+            cached_workspace,
             read_policy: None,
         };
         // Inventory precedes watch installation so ignored dependency trees are
@@ -515,19 +528,14 @@ impl Watched {
 
     pub fn estimated_bytes(&self) -> usize {
         let stamp_bytes = self
-            .stamps
-            .keys()
-            .map(|path| path.capacity() + std::mem::size_of::<Stamp>() + 64)
-            .sum::<usize>();
-        let watch_bytes = self
-            .watched_dirs
-            .iter()
-            .map(|path| path.as_os_str().len() + 64)
-            .sum::<usize>();
+            .resident
+            .stats
+            .path_bytes
+            .saturating_add(self.stamps.len().saturating_mul(std::mem::size_of::<Stamp>() + 64));
         self.resident.stats.estimated_owned_bytes.saturating_add(
             ROOT_RUNTIME_HEADROOM.max(
                 stamp_bytes
-                    .saturating_add(watch_bytes)
+                    .saturating_add(self.watched_dir_bytes)
                     .saturating_add(self.query_cache.estimated_bytes()),
             ),
         )
@@ -535,7 +543,22 @@ impl Watched {
 
     pub fn release_caches(&mut self) {
         self.query_cache.clear_memory();
-        self.read_policy=None;
+        self.cached_workspace = None;
+        self.read_policy = None;
+    }
+
+    fn workspace(&self) -> Result<std::borrow::Cow<'_, crate::workspace::Workspace>> {
+        if let Some((saved_spec, ws)) = &self.cached_workspace
+            && saved_spec == &self.spec
+        {
+            return Ok(std::borrow::Cow::Borrowed(ws));
+        }
+        if let Some((saved_spec, ws, _)) = &self.read_policy
+            && saved_spec == &self.spec
+        {
+            return Ok(std::borrow::Cow::Borrowed(ws));
+        }
+        Ok(std::borrow::Cow::Owned(self.spec.workspace()?))
     }
 
     fn refresh_watch_directories<'a>(
@@ -573,6 +596,10 @@ impl Watched {
             }
             removed.push(directory.clone());
         }
+        self.watched_dir_bytes = desired
+            .iter()
+            .map(|path| path.as_os_str().len() + 64)
+            .sum::<usize>();
         self.watched_dirs = desired;
         Ok(())
     }
@@ -706,6 +733,11 @@ impl Watched {
         }
         self.io_profile.full_inventory_scans += 1;
         let current = stamps(&workspace, &self.spec.policy)?;
+        if let Some((_, _, cached_policy)) = &self.read_policy
+            && workspace.candidate_policy_key() != cached_policy.key
+        {
+            self.read_policy = None;
+        }
         self.refresh_watch_directories(&workspace, current.keys().map(std::path::Path::new))?;
         for (path, stamp) in &current {
             if self.stamps.get(path) != Some(stamp) {
@@ -808,6 +840,11 @@ impl Watched {
             }
         }
         validate_stamps(&current, &self.spec.policy)?;
+        if let Some((_, _, cached_policy)) = &self.read_policy
+            && workspace.candidate_policy_key() != cached_policy.key
+        {
+            self.read_policy = None;
+        }
         let mut changed = forced.clone();
         for (name, metadata) in &current {
             if self.stamps.get(name) != Some(metadata) {
@@ -916,6 +953,10 @@ impl Watched {
     }
 
     pub fn call(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.call_with_mode(name, arguments, false)
+    }
+
+    pub fn call_with_mode(&mut self, name: &str, arguments: Value, compact: bool) -> Result<Value> {
         self.last_used = Instant::now();
         self.synchronize_or_block(name == "code_sync")?;
         match name {
@@ -932,9 +973,24 @@ impl Watched {
             "code_grep" => {
                 let query: Query = serde_json::from_value(arguments)?;
                 self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
-                let result = search_fast(&self.resident, &query, &mut self.query_cache)?;
+                let result = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
                 self.check_search_paths(result.matches.iter().map(|hit| hit.path.as_str()))?;
-                let mut value = serde_json::to_value(result)?;
+                if compact {
+                    #[derive(serde::Serialize)]
+                    struct CompactGrep<'a> {
+                        matches: &'a [crate::search::Hit],
+                        total_matches: usize,
+                        truncated: bool,
+                        freshness: Value,
+                    }
+                    return Ok(serde_json::to_value(CompactGrep {
+                        matches: &result.matches,
+                        total_matches: result.total_matches,
+                        truncated: result.truncated,
+                        freshness: self.search_freshness("metadata"),
+                    })?);
+                }
+                let mut value = serde_json::to_value(&*result)?;
                 value["freshness"] = self.search_freshness("metadata");
                 Ok(value)
             }
@@ -980,17 +1036,21 @@ impl Watched {
                     self.query_cache
                         .get_context(self.resident.stats.generation, &query, radius)
                 {
-                    return self.verified_context(result);
+                    return self.verified_context(&result, compact);
                 }
-                let result = search_fast(&self.resident, &query, &mut self.query_cache)?;
-                let result = assemble(result, radius, |ranges| self.resident.read_many(ranges))?;
+                let search_arc = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
+                let search_owned =
+                    Arc::try_unwrap(search_arc).unwrap_or_else(|shared| (*shared).clone());
+                let result = Arc::new(assemble_trusted(search_owned, radius, |ranges| {
+                    self.resident.read_many(ranges)
+                })?);
                 self.query_cache.put_context(
                     self.resident.stats.generation,
                     query,
                     radius,
                     result.clone(),
                 );
-                self.verified_context(result)
+                self.verified_context(&result, compact)
             }
             "code_read" => {
                 let request: ReadRequest = serde_json::from_value(arguments)?;
@@ -1067,28 +1127,51 @@ impl Watched {
 
     fn check_search_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let mut checked = BTreeSet::new();
+        let mut checked_dirs: BTreeSet<&'a Path> = BTreeSet::new();
+        let mut last_path: Option<&'a str> = None;
         for path in paths {
-            if !checked.insert(path) {
+            if last_path == Some(path) || !checked.insert(path) {
                 continue;
             }
-            crate::workspace::safe_relative(Path::new(path))?;
-            let expected = self
-                .stamps
-                .get(path)
-                .ok_or_else(|| self.stale_search_error(path))?;
-            let absolute = self.spec.root.join(path);
-            let current = match stamp(&absolute) {
-                Ok(current) => current,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
+            last_path = Some(path);
+            let rel_path = Path::new(path);
+            let Some(expected) = self.stamps.get(path) else {
+                crate::workspace::safe_relative(rel_path)?;
+                return Err(self.stale_search_error(path).into());
+            };
+            if let Some(parent) = rel_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                for ancestor in parent.ancestors() {
+                    if ancestor.as_os_str().is_empty() || !checked_dirs.insert(ancestor) {
+                        break;
+                    }
+                    let dir_meta = match std::fs::symlink_metadata(self.spec.root.join(ancestor)) {
+                        Ok(meta) => meta,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(self.stale_search_error(path).into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    if dir_meta.file_type().is_symlink() {
+                        return Err(
+                            invalid("symlinks are unsupported in this local experiment").into(),
+                        );
+                    }
+                }
+            }
+            let absolute = self.spec.root.join(rel_path);
+            let meta = match std::fs::symlink_metadata(&absolute) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(self.stale_search_error(path).into());
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
-            crate::workspace::reject_symlinks(&self.spec.root, Path::new(path))?;
+            if meta.file_type().is_symlink() {
+                return Err(invalid("symlinks are unsupported in this local experiment").into());
+            }
+            let current = crate::incremental::stamp_from_metadata(&meta)?;
             if &current != expected {
                 return Err(self.stale_search_error(path).into());
             }
@@ -1097,6 +1180,9 @@ impl Watched {
     }
 
     fn check_explicit_search_targets(&self, paths: &[String], glob: Option<&str>) -> Result<()> {
+        if paths.is_empty() && glob.is_none() {
+            return Ok(());
+        }
         for path in crate::query::paths(paths)? {
             let name = path.to_string_lossy();
             if self.stamps.contains_key(name.as_ref()) {
@@ -1145,9 +1231,51 @@ impl Watched {
         })
     }
 
-    fn verified_context(&self, result: crate::context::ContextResult) -> Result<Value> {
-        if let Some(path) = self.stale_snippet_path(&result.snippets)? {
+    fn verified_context(
+        &self,
+        result: &crate::context::ContextResult,
+        compact: bool,
+    ) -> Result<Value> {
+        let ws = self.workspace()?;
+        if let Some(path) = self.stale_snippet_path_with_workspace(ws.as_ref(), &result.snippets)? {
             return Err(self.stale_search_error(&path).into());
+        }
+        if compact {
+            #[derive(serde::Serialize)]
+            struct CompactHit<'a> {
+                path: &'a str,
+                line: usize,
+            }
+            #[derive(serde::Serialize)]
+            struct CompactSearch<'a> {
+                matches: Vec<CompactHit<'a>>,
+                total_matches: usize,
+                truncated: bool,
+            }
+            #[derive(serde::Serialize)]
+            struct CompactContext<'a> {
+                search: CompactSearch<'a>,
+                snippets: &'a [Snippet],
+                freshness: Value,
+            }
+            let matches = result
+                .search
+                .matches
+                .iter()
+                .map(|hit| CompactHit {
+                    path: hit.path.as_str(),
+                    line: hit.line,
+                })
+                .collect();
+            return Ok(serde_json::to_value(CompactContext {
+                search: CompactSearch {
+                    matches,
+                    total_matches: result.search.total_matches,
+                    truncated: result.search.truncated,
+                },
+                snippets: &result.snippets,
+                freshness: self.search_freshness("sha256"),
+            })?);
         }
         let mut value = serde_json::to_value(result)?;
         value["freshness"] = self.search_freshness("sha256");
@@ -1171,31 +1299,49 @@ impl Watched {
         } else {
             crate::context::validate_ranges(&request.ranges)?;
         }
-        let workspace = self.spec.workspace()?;
-        let key=workspace.candidate_policy_key();
-        if self.read_policy.as_ref().is_none_or(|policy|policy.key!=key) {
-            let policy=match crate::workspace::CandidatePolicy::compile(key) {
-                Ok(policy)=>policy,
-                Err(error)=>{
-                    self.io_profile.read_policy_rejections+=1;
-                    return Err(error);
-                }
-            };
-            self.read_policy=Some(policy);
-            self.io_profile.read_policy_compilations+=1;
+        let needs_compile = self
+            .read_policy
+            .as_ref()
+            .is_none_or(|(saved_spec, _, _)| saved_spec != &self.spec);
+        if needs_compile {
+            let workspace = self.workspace()?.into_owned();
+            let key = workspace.candidate_policy_key();
+            if self
+                .read_policy
+                .as_ref()
+                .is_none_or(|(_, _, policy)| policy.key != key)
+            {
+                let policy = match crate::workspace::CandidatePolicy::compile(key) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        self.io_profile.read_policy_rejections += 1;
+                        return Err(error);
+                    }
+                };
+                self.cached_workspace = Some((self.spec.clone(), workspace.clone()));
+                self.read_policy = Some((self.spec.clone(), workspace, policy));
+                self.io_profile.read_policy_compilations += 1;
+            } else {
+                let (_, _, policy) = self.read_policy.take().expect("cached policy");
+                self.cached_workspace = Some((self.spec.clone(), workspace.clone()));
+                self.read_policy = Some((self.spec.clone(), workspace, policy));
+                self.io_profile.read_policy_cache_hits += 1;
+            }
         } else {
-            self.io_profile.read_policy_cache_hits+=1;
+            self.io_profile.read_policy_cache_hits += 1;
         }
         let mut requested = BTreeSet::new();
         let mut directories = BTreeMap::new();
         for range in &request.ranges {
-            match self.read_policy.as_ref().expect("compiled read policy").candidate_path(&range.path) {
+            let (_, _, policy) = self.read_policy.as_ref().expect("compiled read policy");
+            match policy.candidate_path(&range.path) {
                 Ok(true) => {}
                 Ok(false) => {
+                    let reason = policy
+                        .rejection_reason(&range.path)?
+                        .unwrap_or("not_admitted");
                     self.io_profile.read_policy_rejections += 1;
                     self.transparent_read_recovery_failures += 1;
-                    let reason = self.read_policy.as_ref().expect("compiled policy")
-                        .rejection_reason(&range.path)?.unwrap_or("not_admitted");
                     return Err(invalid(format!(
                         "READ_POLICY_DENIED root={} path={} reason={reason}: no source was read. Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.",
                         self.spec.root.display(), range.path,
@@ -1210,25 +1356,36 @@ impl Watched {
             directories.insert(path.parent().unwrap_or(Path::new("")).to_path_buf(), false);
             requested.insert(path.to_string_lossy().into_owned());
         }
+        let workspace = self
+            .read_policy
+            .as_ref()
+            .expect("compiled read policy")
+            .1
+            .clone();
         let mut recovering = false;
         let mut unstable_paths = BTreeSet::new();
-        let indexed_before_recovery:BTreeSet<_>=requested.iter()
-            .filter(|path|self.stamps.contains_key(path.as_str())).cloned().collect();
+        let indexed_before_recovery: BTreeSet<_> = requested
+            .iter()
+            .filter(|path| self.stamps.contains_key(path.as_str()))
+            .cloned()
+            .collect();
         for attempt in 0..3 {
             let ranges = self.plan_read_ranges(request)?;
             match self.resident.read_many(&ranges) {
-                Ok(snippets) => match self.stale_snippet_path(&snippets)? {
-                    None => {
-                        if recovering {
-                            self.transparent_read_recoveries =
-                                self.transparent_read_recoveries.saturating_add(1);
+                Ok(snippets) => {
+                    match self.stale_snippet_path_with_workspace(&workspace, &snippets)? {
+                        None => {
+                            if recovering {
+                                self.transparent_read_recoveries =
+                                    self.transparent_read_recoveries.saturating_add(1);
+                            }
+                            return Ok(snippets);
                         }
-                        return Ok(snippets);
+                        Some(path) => {
+                            unstable_paths.insert(path);
+                        }
                     }
-                    Some(path) => {
-                        unstable_paths.insert(path);
-                    }
-                },
+                }
                 Err(error) if crate::resident::is_snapshot_miss(error.as_ref()) => {}
                 Err(error)
                     if crate::resident::is_snapshot_range_error(error.as_ref()) && attempt == 0 => {
@@ -1295,35 +1452,158 @@ impl Watched {
     }
 
     fn stale_snippet_path(&self, snippets: &[Snippet]) -> Result<Option<String>> {
-        let workspace = self.spec.workspace()?;
-        let mut verified = BTreeSet::new();
-        for snippet in snippets {
-            if !verified.insert(&snippet.path) {
-                continue;
-            }
+        let ws = self.workspace()?;
+        self.stale_snippet_path_with_workspace(ws.as_ref(), snippets)
+    }
 
-            if !self.stamps.contains_key(&snippet.path) {
-                return Err(invalid(
-                    "file is outside configured scope, ignored, or excluded by glob",
-                )
+    fn stale_snippet_path_with_workspace(
+        &self,
+        workspace: &crate::workspace::Workspace,
+        snippets: &[Snippet],
+    ) -> Result<Option<String>> {
+        let mut unique: Vec<&Snippet> = Vec::with_capacity(snippets.len());
+        let mut seen = BTreeSet::new();
+        for snippet in snippets {
+            if seen.insert(snippet.path.as_str()) {
+                if !self.stamps.contains_key(&snippet.path) {
+                    return Err(invalid(
+                        "file is outside configured scope, ignored, or excluded by glob",
+                    )
+                    .into());
+                }
+                unique.push(snippet);
+            }
+        }
+        let mut checked_dirs: BTreeSet<&Path> = BTreeSet::new();
+        for snippet in &unique {
+            let rel_path = Path::new(&snippet.path);
+            if let Some(parent) = rel_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                for ancestor in parent.ancestors() {
+                    if ancestor.as_os_str().is_empty() || !checked_dirs.insert(ancestor) {
+                        break;
+                    }
+                    let dir_meta = match std::fs::symlink_metadata(workspace.root.join(ancestor)) {
+                        Ok(meta) => meta,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(Some(snippet.path.clone()));
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    if dir_meta.file_type().is_symlink() {
+                        return Err(
+                            invalid("symlinks are unsupported in this local experiment").into(),
+                        );
+                    }
+                }
+            }
+        }
+        let resident = &self.resident;
+        let stamps = &self.stamps;
+        let max_file_bytes = self.spec.policy.max_file_bytes;
+        let verify_with_buf = |snippet: &Snippet, buf: &mut Vec<u8>| -> Result<bool> {
+            let rel_path = Path::new(&snippet.path);
+            let absolute = workspace.root.join(rel_path);
+            let meta = match std::fs::symlink_metadata(&absolute) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error.into()),
+            };
+            if meta.file_type().is_symlink() {
+                return Err(invalid("symlinks are unsupported in this local experiment").into());
+            }
+            if meta.len() > max_file_bytes as u64 {
+                return Err(invalid(format!(
+                    "binary file or file larger than configured limit is unsupported: {}",
+                    rel_path.display()
+                ))
                 .into());
             }
-            let bytes = match workspace.read_known_with_limit(
-                std::path::Path::new(&snippet.path),
-                self.spec.policy.max_file_bytes,
-            ) {
-                Ok(bytes) => bytes,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    return Ok(Some(snippet.path.clone()));
+            let known_doc = resident
+                .paths
+                .get(snippet.path.as_str())
+                .map(|&id| &resident.documents[id])
+                .filter(|doc| doc.sha256_hex.as_ref() == snippet.sha256);
+            if let Some(doc) = known_doc {
+                if meta.len() as usize != doc.text.len() {
+                    return Ok(true);
                 }
-                Err(error) => return Err(error),
-            };
+                if meta.len() > 4096
+                    && let Ok(current_stamp) = crate::incremental::stamp_from_metadata(&meta)
+                    && stamps.get(&snippet.path) == Some(&current_stamp)
+                {
+                    return Ok(false);
+                }
+            }
+            buf.clear();
+            let needed = (meta.len() as usize).min(max_file_bytes).saturating_add(1);
+            if buf.capacity() < needed {
+                buf.reserve(needed - buf.len());
+            }
+            use std::io::Read;
+            match std::fs::File::open(&absolute) {
+                Ok(file) => {
+                    file.take(max_file_bytes as u64 + 1).read_to_end(buf)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error.into()),
+            }
+            if buf.len() > max_file_bytes || memchr::memchr(0, buf).is_some() {
+                return Err(invalid(format!(
+                    "binary file or file larger than configured limit is unsupported: {}",
+                    rel_path.display()
+                ))
+                .into());
+            }
             use sha2::{Digest, Sha256};
-            if format!("{:x}", Sha256::digest(bytes)) != snippet.sha256 {
+            let digest: [u8; 32] = Sha256::digest(&*buf).into();
+            if let Some(doc) = known_doc {
+                return Ok(digest != doc.sha256);
+            }
+            Ok(crate::resident::digest_hex(&digest) != snippet.sha256)
+        };
+        if unique.len() >= 4 {
+            let workers = unique.len().min(4);
+            let chunk_size = unique.len().div_ceil(workers);
+            let outcomes = std::thread::scope(|scope| {
+                let handles: Vec<_> = unique
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        std::thread::Builder::new()
+                            .name("cctx-verify".into())
+                            .stack_size(WORKER_STACK_BYTES)
+                            .spawn_scoped(scope, move || {
+                                let mut buf = Vec::new();
+                                let mut results = Vec::with_capacity(chunk.len());
+                                for &snippet in chunk {
+                                    results.push((snippet.path.as_str(), verify_with_buf(snippet, &mut buf)?));
+                                }
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
+                            })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .map_err(|_| invalid("snippet verification worker panicked").into())
+                            .and_then(|r| r)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for group in outcomes {
+                for (path, is_stale) in group {
+                    if is_stale {
+                        return Ok(Some(path.to_owned()));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        let mut buf = Vec::new();
+        for snippet in unique {
+            if verify_with_buf(snippet, &mut buf)? {
                 return Ok(Some(snippet.path.clone()));
             }
         }

@@ -53,13 +53,14 @@ impl CandidateExpr {
                     .collect();
                 let posting_lookups = parts.iter().map(|part| part.posting_lookups).sum();
                 let mut set_operations = parts.iter().map(|part| part.set_operations).sum();
-                parts.sort_by_key(|part| part.ids.len());
-                let Some(first) = parts.first() else {
+                parts.sort_unstable_by_key(|part| part.ids.len());
+                let mut iter = parts.into_iter();
+                let Some(first) = iter.next() else {
                     return CandidateEvaluation::default();
                 };
-                let mut ids = first.ids.clone();
-                for part in &parts[1..] {
-                    ids = intersect(&ids, &part.ids);
+                let mut ids = first.ids;
+                for part in iter {
+                    intersect_in_place(&mut ids, &part.ids);
                     set_operations += 1;
                     if ids.is_empty() {
                         break;
@@ -129,13 +130,35 @@ impl CandidateExpr {
         match self {
             Self::Literal(literal) => memchr::memmem::find(bytes, literal).is_some(),
             Self::ByteClasses(positions) => {
-                positions.len() <= bytes.len()
-                    && bytes.windows(positions.len()).any(|window| {
-                        window
-                            .iter()
-                            .zip(positions)
-                            .all(|(byte, pair)| *byte == pair[0] || *byte == pair[1])
-                    })
+                let Some(&[b0, b1]) = positions.first() else {
+                    return true;
+                };
+                if positions.len() > bytes.len() {
+                    return false;
+                }
+                let rest = &positions[1..];
+                let last_start = bytes.len() - positions.len();
+                let mut pos = 0usize;
+                while pos <= last_start {
+                    let found = if b0 == b1 {
+                        memchr::memchr(b0, &bytes[pos..=last_start])
+                    } else {
+                        memchr::memchr2(b0, b1, &bytes[pos..=last_start])
+                    };
+                    let Some(rel) = found else {
+                        return false;
+                    };
+                    let start = pos + rel;
+                    if bytes[start + 1..start + 1 + rest.len()]
+                        .iter()
+                        .zip(rest)
+                        .all(|(&b, &[p0, p1])| b == p0 || b == p1)
+                    {
+                        return true;
+                    }
+                    pos = start + 1;
+                }
+                false
             }
             Self::And(children) => children.iter().all(|child| child.matches(bytes)),
             Self::Or(children) => children.iter().any(|child| child.matches(bytes)),
@@ -311,6 +334,14 @@ fn simplify_group(children: Vec<CandidateExpr>, and: bool) -> CandidateExpr {
     }
     let mut seen = BTreeSet::new();
     flattened.retain(|child| seen.insert(child.describe()));
+    if and && flattened.len() > 1 {
+        flattened.sort_by_key(|child| match child {
+            CandidateExpr::Literal(bytes) => (0_u8, std::cmp::Reverse(bytes.len())),
+            CandidateExpr::ByteClasses(pos) => (1_u8, std::cmp::Reverse(pos.len())),
+            CandidateExpr::And(_) => (2_u8, std::cmp::Reverse(0)),
+            CandidateExpr::Or(_) => (3_u8, std::cmp::Reverse(0)),
+        });
+    }
     if flattened.len() == 1 {
         flattened.pop().expect("one element")
     } else if and {
@@ -320,21 +351,23 @@ fn simplify_group(children: Vec<CandidateExpr>, and: bool) -> CandidateExpr {
     }
 }
 
-fn intersect(left: &[usize], right: &[usize]) -> Vec<usize> {
-    let (mut a, mut b) = (0, 0);
-    let mut output = Vec::with_capacity(left.len().min(right.len()));
-    while a < left.len() && b < right.len() {
-        match left[a].cmp(&right[b]) {
-            std::cmp::Ordering::Less => a += 1,
-            std::cmp::Ordering::Greater => b += 1,
-            std::cmp::Ordering::Equal => {
-                output.push(left[a]);
-                a += 1;
-                b += 1;
+fn intersect_in_place(left: &mut Vec<usize>, right: &[usize]) {
+    let mut cursor = right;
+    left.retain(|id| {
+        if cursor.is_empty() {
+            return false;
+        }
+        match cursor.binary_search(id) {
+            Ok(pos) => {
+                cursor = &cursor[pos + 1..];
+                true
+            }
+            Err(pos) => {
+                cursor = &cursor[pos..];
+                false
             }
         }
-    }
-    output
+    });
 }
 
 fn union<'a>(parts: impl Iterator<Item = &'a [usize]>) -> Vec<usize> {

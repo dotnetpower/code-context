@@ -59,6 +59,17 @@ void test('search results become direct path-line text', () => {
     }),
     'matches=1 truncated=false\nsrc/main.rs:7 fn main() {}',
   );
+  assert.equal(
+    formatToolResult('code_grep', {
+      total_matches: 2,
+      truncated: false,
+      matches: [
+        { path: 'src/main.rs', line: 7, text: 'fn main() {}' },
+        { path: 'src/main.rs', line: 12, text: 'fn helper() {}' },
+      ],
+    }),
+    'matches=2 truncated=false\nsrc/main.rs:7 fn main() {}\n:12 fn helper() {}',
+  );
 });
 
 void test('self-test cannot report old daemon capabilities as ready', () => {
@@ -99,6 +110,20 @@ void test('context results include numbered source without JSON processing', () 
   assert.match(output, /--- src\/main\.rs:6-8 sha256=abc/);
   assert.match(output, /7: fn main\(\) \{\}/);
   assert.doesNotMatch(output, /^\{/);
+
+  const multiHit = formatToolResult('code_context', {
+    search: {
+      total_matches: 3,
+      truncated: false,
+      matches: [
+        { path: 'src/main.rs', line: 7 },
+        { path: 'src/main.rs', line: 12 },
+        { path: 'src/lib.rs', line: 4 },
+      ],
+    },
+    snippets: [],
+  });
+  assert.match(multiHit, /src\/main\.rs:7,12\nsrc\/lib\.rs:4/);
 });
 
 void test('read ranges retain path, hash, and line numbers', () => {
@@ -113,6 +138,25 @@ void test('read ranges retain path, hash, and line numbers', () => {
       },
     ]),
     '--- src/lib.rs:10-11 sha256=def\n10: pub fn ready() {\n11: }',
+  );
+  assert.equal(
+    formatToolResult('code_read', [
+      {
+        path: 'src/lib.rs',
+        start: 10,
+        end: 11,
+        sha256: 'def',
+        lines: ['pub fn ready() {', '}'],
+      },
+      {
+        path: 'src/lib.rs',
+        start: 20,
+        end: 20,
+        sha256: 'def',
+        lines: ['pub fn done() {}'],
+      },
+    ]),
+    '--- src/lib.rs:10-11 sha256=def\n10: pub fn ready() {\n11: }\n--- src/lib.rs:20-20\n20: pub fn done() {}',
   );
 });
 

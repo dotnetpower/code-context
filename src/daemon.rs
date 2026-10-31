@@ -37,6 +37,7 @@ const SERVICE_READ_BPS: u64 = 32_000_000;
 const SERVICE_WRITE_BPS: u64 = 1_000_000;
 type WireResult = std::result::Result<Value, String>;
 pub(crate) const TRACE_ARGUMENT: &str = "_cctx_trace";
+pub(crate) const PREV_TRACE_ARGUMENT: &str = "_cctx_prev_trace";
 
 #[cfg(unix)]
 fn current_cgroup_dir()->Result<PathBuf> {
@@ -254,18 +255,29 @@ fn validate_trace_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn unwrap_trace(mut value: Value, trace_id: &str) -> Result<(Value, Value)> {
-    if value["_cctx_trace"]["trace_id"] != trace_id {
+#[derive(Deserialize)]
+struct TracedRawEnvelope<'a> {
+    _cctx_trace: Value,
+    #[serde(borrow)]
+    value: &'a serde_json::value::RawValue,
+}
+
+pub(crate) fn unwrap_trace_raw<'a>(
+    bytes: &'a [u8],
+    trace_id: &str,
+) -> Result<(&'a serde_json::value::RawValue, Value)> {
+    let envelope: TracedRawEnvelope<'a> = serde_json::from_slice(bytes)?;
+    if envelope._cctx_trace["trace_id"] != trace_id {
         return Err(invalid("daemon trace is missing or does not match the request").into());
     }
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| invalid("traced daemon response must be an object"))?;
-    let trace = object.remove("_cctx_trace").expect("validated trace");
-    let value = object
-        .remove("value")
-        .ok_or_else(|| invalid("traced response is missing value"))?;
-    Ok((value, trace))
+    Ok((envelope.value, envelope._cctx_trace))
+}
+
+#[cfg(test)]
+fn unwrap_trace(value: Value, trace_id: &str) -> Result<(Value, Value)> {
+    let bytes = serde_json::to_vec(&value)?;
+    let (raw, trace) = unwrap_trace_raw(&bytes, trace_id)?;
+    Ok((serde_json::from_str(raw.get())?, trace))
 }
 
 #[derive(Debug)]
@@ -304,12 +316,6 @@ struct BinaryRequest {
     compact: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BinaryResponse {
-    ok: bool,
-    payload: Vec<u8>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -327,6 +333,7 @@ struct Envelope {
     queued_at: Instant,
     id: u64,
     trace_id: Option<String>,
+    prev_trace: Option<Value>,
     first_dispatch: bool,
 }
 
@@ -443,6 +450,7 @@ pub struct Client {
     stream: RpcStream,
     reader: BufReader<RpcStream>,
     tracing: bool,
+    write_buf: Vec<u8>,
 }
 
 impl Client {
@@ -457,6 +465,7 @@ impl Client {
             stream,
             reader,
             tracing: false,
+            write_buf: Vec::with_capacity(512),
         })
     }
 
@@ -477,33 +486,55 @@ impl Client {
         self.tracing
     }
 
-    pub fn call(&mut self, request: &Request) -> Result<Value> {
-        let bytes = bincode::serialize(&BinaryRequest {
-            root: request.root.clone(),
-            name: request.name.clone(),
-            arguments_json: serde_json::to_vec(&request.arguments)?,
-            compact: request.compact,
-        })?;
-        if bytes.len() > MAX_WIRE {
+    pub(crate) fn call_raw(&mut self, request: &Request) -> Result<Vec<u8>> {
+        self.write_buf.clear();
+        self.write_buf.extend_from_slice(&[0_u8; 4]);
+        bincode::serialize_into(
+            &mut self.write_buf,
+            &BinaryRequest {
+                root: request.root.clone(),
+                name: request.name.clone(),
+                arguments_json: serde_json::to_vec(&request.arguments)?,
+                compact: request.compact,
+            },
+        )?;
+        let body_len = self.write_buf.len() - 4;
+        if body_len > MAX_WIRE {
             return Err(invalid("request too large").into());
         }
-        self.stream
-            .write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-        self.stream.write_all(&bytes)?;
-        let mut length = [0_u8; 4];
-        std::io::Read::read_exact(&mut self.reader, &mut length)?;
-        let length = u32::from_be_bytes(length) as usize;
-        if length > MAX_WIRE {
+        let len_bytes = u32::try_from(body_len)?.to_be_bytes();
+        self.write_buf[..4].copy_from_slice(&len_bytes);
+        self.stream.write_all(&self.write_buf)?;
+        let mut header = [0_u8; 13];
+        std::io::Read::read_exact(&mut self.reader, &mut header)?;
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if !(9..=MAX_WIRE).contains(&length) {
             return Err(invalid("missing or oversized daemon response").into());
         }
-        let mut response = vec![0_u8; length];
-        std::io::Read::read_exact(&mut self.reader, &mut response)?;
-        let response: BinaryResponse = bincode::deserialize(&response)?;
-        if response.ok {
-            Ok(serde_json::from_slice(&response.payload)?)
-        } else {
-            Err(ApplicationError(String::from_utf8(response.payload)?).into())
+        let ok = match header[4] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("invalid binary response status").into()),
+        };
+        let payload_len = u64::from_le_bytes([
+            header[5], header[6], header[7], header[8], header[9], header[10], header[11],
+            header[12],
+        ]) as usize;
+        if payload_len != length - 9 {
+            return Err(invalid("corrupt binary response payload length").into());
         }
+        let mut payload = vec![0_u8; payload_len];
+        std::io::Read::read_exact(&mut self.reader, &mut payload)?;
+        if ok {
+            Ok(payload)
+        } else {
+            Err(ApplicationError(String::from_utf8(payload)?).into())
+        }
+    }
+
+    pub fn call(&mut self, request: &Request) -> Result<Value> {
+        let payload = self.call_raw(request)?;
+        Ok(serde_json::from_slice(&payload)?)
     }
 }
 
@@ -584,19 +615,30 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
     }
     while let Some(bytes) = read_native_frame(&mut input)? {
         let request: Request = serde_json::from_slice(&bytes)?;
-        let response = match client.call(&request) {
-            Ok(value) => json!({"result":value}),
+        let mut frame = match client.call_raw(&request) {
+            Ok(payload) => {
+                let mut out = Vec::with_capacity(payload.len() + 15);
+                out.extend_from_slice(&[0_u8; 4]);
+                out.extend_from_slice(b"{\"result\":");
+                out.extend_from_slice(&payload);
+                out.push(b'}');
+                out
+            }
             Err(error) if is_application_error(error.as_ref()) => {
-                json!({"error":error.to_string()})
+                let mut out = Vec::with_capacity(128);
+                out.extend_from_slice(&[0_u8; 4]);
+                serde_json::to_writer(&mut out, &json!({"error":error.to_string()}))?;
+                out
             }
             Err(error) => return Err(error),
         };
-        let bytes = serde_json::to_vec(&response)?;
-        if bytes.len() > MAX_WIRE {
+        let body_len = frame.len() - 4;
+        if body_len > MAX_WIRE {
             return Err(invalid("native bridge response exceeds2MiB").into());
         }
-        output.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-        output.write_all(&bytes)?;
+        let len_bytes = u32::try_from(body_len)?.to_be_bytes();
+        frame[..4].copy_from_slice(&len_bytes);
+        output.write_all(&frame)?;
         output.flush()?;
     }
     Ok(())
@@ -624,6 +666,7 @@ pub struct Server {
     outcome_counts: BTreeMap<String, u64>,
     roots: BTreeMap<PathBuf, Watched>,
     registry: Vec<Spec>,
+    registry_path: Option<PathBuf>,
     registry_stamp: Option<(u64, u64, std::time::SystemTime)>,
     root_size_hints: BTreeMap<PathBuf, (Spec, usize)>,
     root_loads: BTreeMap<PathBuf, u64>,
@@ -640,6 +683,7 @@ pub struct Server {
     cache_misses: u64,
     background_results: BTreeMap<u64, WireResult>,
     last_pressure_check: Option<std::time::Instant>,
+    last_idle_maintenance: Option<std::time::Instant>,
     idle_timeout: Duration,
     active_connections: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     protocol_calls: BTreeMap<String, u64>,
@@ -654,6 +698,7 @@ impl Default for Server {
             outcome_counts: BTreeMap::new(),
             roots: BTreeMap::new(),
             registry: Vec::new(),
+            registry_path: None,
             registry_stamp: None,
             root_size_hints: BTreeMap::new(),
             root_loads: BTreeMap::new(),
@@ -670,6 +715,7 @@ impl Default for Server {
             cache_misses: 0,
             background_results: BTreeMap::new(),
             last_pressure_check: None,
+            last_idle_maintenance: None,
             idle_timeout: IDLE_ROOT_TIMEOUT,
             active_connections: None,
             protocol_calls: BTreeMap::new(),
@@ -681,6 +727,13 @@ impl Default for Server {
 
 impl Server {
     pub fn call(&mut self, request: Request) -> Result<Value> {
+        if request.name == "code_trace" {
+            if request.root.is_some() {
+                return Err(invalid("code_trace takes no root").into());
+            }
+            self.record_client_timing(request.arguments)?;
+            return Ok(json!({"recorded":true}));
+        }
         self.refresh_registry()?;
         if self.evict_idle_roots() {
             release_allocator_memory();
@@ -697,14 +750,6 @@ impl Server {
                     "active_connections":self.active_connections.as_ref().map_or(0, |value|
                         value.load(std::sync::atomic::Ordering::Acquire))}),
                 );
-            }
-
-            "code_trace" => {
-                if request.root.is_some() {
-                    return Err(invalid("code_trace takes no root").into());
-                }
-                self.record_client_timing(request.arguments)?;
-                return Ok(json!({"recorded":true}));
             }
             "code_workspaces" => return Ok(serde_json::to_value(&self.registry)?),
             "code_status" => {
@@ -757,23 +802,41 @@ impl Server {
         let requested_root = request
             .root
             .ok_or_else(|| invalid("root is required; use code_workspaces"))?;
-        if matches!(
+        let canonical = if matches!(
+            request.name.as_str(),
+            "code_files" | "code_grep" | "code_context" | "code_read"
+        ) && self.roots.contains_key(&requested_root)
+            && self
+                .registry
+                .iter()
+                .any(|spec| spec.root == requested_root && !spec.allow_worktrees)
+        {
+            requested_root
+        } else {
+            catalog::canonicalize(&requested_root)?
+        };
+        let spec = if matches!(
             request.name.as_str(),
             "code_files" | "code_grep" | "code_context" | "code_read"
         ) {
-            let canonical = catalog::canonicalize(&requested_root)?;
-            let expected = self.requested_registration(&canonical)?;
-            if expected.as_ref().is_none_or(|spec| {
-                self.roots
-                    .get(&spec.root)
-                    .is_none_or(|entry| entry.spec != *spec)
-            }) {
-                let target = expected.map_or(canonical, |spec| spec.root);
-                return Err(self.request_cache(target)?.into());
+            match self.requested_registration(&canonical)? {
+                Some(spec)
+                    if self
+                        .roots
+                        .get(&spec.root)
+                        .is_some_and(|entry| entry.spec == spec) =>
+                {
+                    self.cache_hits = self.cache_hits.saturating_add(1);
+                    spec
+                }
+                other => {
+                    let target = other.map_or(canonical, |spec| spec.root);
+                    return Err(self.request_cache(target)?.into());
+                }
             }
-            self.cache_hits = self.cache_hits.saturating_add(1);
-        }
-        let spec = self.source_spec(&requested_root)?;
+        } else {
+            self.source_spec_canonical(&canonical)?
+        };
         let root = spec.root.clone();
         if self
             .roots
@@ -800,7 +863,7 @@ impl Server {
             .get_mut(&root)
             .ok_or_else(|| invalid("missing registered root"))?;
         let previous = entry.restrict_admission(root_budget);
-        let mut outcome = entry.call(&request.name, request.arguments.clone());
+        let mut outcome = entry.call_with_mode(&request.name, request.arguments.clone(), compact);
         if let Err(ref error) = outcome
             && matches!(
                 request.name.as_str(),
@@ -808,15 +871,21 @@ impl Server {
             )
             && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
         {
-            outcome = entry.call(&request.name, request.arguments);
+            outcome = entry.call_with_mode(&request.name, request.arguments, compact);
         }
         entry.restore_admission(previous);
         let result = outcome?;
         if let Some(watched) = self.roots.get(&root) {
-            self.root_size_hints.insert(
-                root.clone(),
-                (watched.spec.clone(), watched.estimated_bytes()),
-            );
+            let estimated = watched.estimated_bytes();
+            match self.root_size_hints.get_mut(&root) {
+                Some((saved_spec, bytes)) if *saved_spec == watched.spec => {
+                    *bytes = estimated;
+                }
+                _ => {
+                    self.root_size_hints
+                        .insert(root.clone(), (watched.spec.clone(), estimated));
+                }
+            }
         }
         while self.roots.len() > 1
             && self
@@ -958,8 +1027,7 @@ impl Server {
             .transpose()
     }
 
-    fn source_spec(&mut self, requested: &std::path::Path) -> Result<Spec> {
-        let canonical = catalog::canonicalize(requested)?;
+    fn source_spec_canonical(&mut self, canonical: &std::path::Path) -> Result<Spec> {
         let registered = self
             .registry
             .iter()
@@ -970,7 +1038,7 @@ impl Server {
         }) {
             spec.root.clone()
         } else {
-            let root = crate::registration::prepare_root(&canonical)?;
+            let root = crate::registration::prepare_root(canonical)?;
             self.refresh_registry()?;
             root
         };
@@ -1620,7 +1688,14 @@ impl Server {
     }
 
     fn refresh_registry(&mut self) -> Result<()> {
-        let path = catalog::state_dir()?.join("workspaces.json");
+        let path = match &self.registry_path {
+            Some(path) => path.clone(),
+            None => {
+                let path = catalog::state_dir()?.join("workspaces.json");
+                self.registry_path = Some(path.clone());
+                path
+            }
+        };
         let stamp = match std::fs::metadata(&path) {
             Ok(metadata) => {
                 #[cfg(unix)]
@@ -1671,14 +1746,22 @@ impl Server {
         }
     }
 
-    fn maintain_idle_roots(&mut self)->Result<()> {
-        if let Some(runtime)=self.runtime.as_mut() {runtime.check()?;}
-        if let Err(error) = self.refresh_registry() {
-            eprintln!("background registry refresh failed: {error}");
-            return Ok(());
+    fn maintain_idle_roots(&mut self) -> Result<()> {
+        self.maintain_idle_roots_inner(false)
+    }
+
+    fn maintain_idle_roots_inner(&mut self, already_refreshed: bool) -> Result<()> {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.check()?;
         }
-        if self.evict_idle_roots() {
-            release_allocator_memory();
+        if !already_refreshed {
+            if let Err(error) = self.refresh_registry() {
+                eprintln!("background registry refresh failed: {error}");
+                return Ok(());
+            }
+            if self.evict_idle_roots() {
+                release_allocator_memory();
+            }
         }
         self.drive_lazy_loads();
         for entry in self.roots.values_mut() {
@@ -1909,40 +1992,144 @@ fn respond(stream: &mut RpcStream, result: WireResult) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct TraceMeta<'a> {
+    trace_id: &'a str,
+    daemon_request_id: u64,
+    queue_ms: f64,
+    execute_ms: f64,
+}
+
+#[derive(Serialize)]
+struct TracedRef<'a> {
+    value: &'a Value,
+    _cctx_trace: TraceMeta<'a>,
+}
+
 fn respond_protocol(
     stream: &mut RpcStream,
     protocol: Protocol,
     result: &WireResult,
 ) -> Result<(f64, f64)> {
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut frame = Vec::with_capacity(512);
+    respond_protocol_buf(stream, protocol, result, None, &mut frame)
+}
+
+fn respond_protocol_buf(
+    stream: &mut RpcStream,
+    protocol: Protocol,
+    result: &WireResult,
+    trace: Option<TraceMeta<'_>>,
+    frame: &mut Vec<u8>,
+) -> Result<(f64, f64)> {
     let started = Instant::now();
-    let mut bytes = match protocol {
-        Protocol::Bincode => bincode::serialize(&match result {
-            Ok(value) => BinaryResponse {
-                ok: true,
-                payload: serde_json::to_vec(value)?,
-            },
-            Err(error) => BinaryResponse {
-                ok: false,
-                payload: error.as_bytes().to_vec(),
-            },
-        })?,
-        _ => serde_json::to_vec(&match result {
-            Ok(value) => json!({"result":value}),
-            Err(error) => json!({"error":error}),
-        })?,
-    };
-    if bytes.len() > MAX_WIRE {
-        return Err(invalid("response exceeds2MiB").into());
+    frame.clear();
+    match protocol {
+        Protocol::Bincode => {
+            frame.extend_from_slice(&[0_u8; 4]);
+            match result {
+                Ok(value) => {
+                    frame.push(1);
+                    frame.extend_from_slice(&[0_u8; 8]);
+                    if let Some(_cctx_trace) = trace {
+                        serde_json::to_writer(&mut *frame, &TracedRef { value, _cctx_trace })?;
+                    } else {
+                        serde_json::to_writer(&mut *frame, value)?;
+                    }
+                    let payload_len = (frame.len() - 13) as u64;
+                    frame[5..13].copy_from_slice(&payload_len.to_le_bytes());
+                }
+                Err(error) => {
+                    frame.push(0);
+                    if let Some(meta) = trace {
+                        use std::io::Write as _;
+                        frame.extend_from_slice(&[0_u8; 8]);
+                        write!(frame, "{error} [cctx_trace={}]", meta.trace_id)?;
+                        let payload_len = (frame.len() - 13) as u64;
+                        frame[5..13].copy_from_slice(&payload_len.to_le_bytes());
+                    } else {
+                        let payload = error.as_bytes();
+                        frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                        frame.extend_from_slice(payload);
+                    }
+                }
+            }
+            let body_len = frame.len() - 4;
+            if body_len > MAX_WIRE {
+                return Err(invalid("response exceeds2MiB").into());
+            }
+            let len_bytes = u32::try_from(body_len)?.to_be_bytes();
+            frame[..4].copy_from_slice(&len_bytes);
+        }
+        Protocol::FramedJson => {
+            frame.extend_from_slice(&[0_u8; 4]);
+            match result {
+                Ok(value) => {
+                    if let Some(_cctx_trace) = trace {
+                        #[derive(Serialize)]
+                        struct FramedTracedOk<'a> {
+                            result: TracedRef<'a>,
+                        }
+                        serde_json::to_writer(
+                            &mut *frame,
+                            &FramedTracedOk {
+                                result: TracedRef { value, _cctx_trace },
+                            },
+                        )?;
+                    } else {
+                        #[derive(Serialize)]
+                        struct FramedOk<'a> {
+                            result: &'a Value,
+                        }
+                        serde_json::to_writer(&mut *frame, &FramedOk { result: value })?;
+                    }
+                }
+                Err(error) => {
+                    if let Some(meta) = trace {
+                        let msg = format!("{error} [cctx_trace={}]", meta.trace_id);
+                        serde_json::to_writer(&mut *frame, &json!({"error": msg}))?;
+                    } else {
+                        serde_json::to_writer(&mut *frame, &json!({"error": error}))?;
+                    }
+                }
+            }
+            let body_len = frame.len() - 4;
+            if body_len > MAX_WIRE {
+                return Err(invalid("response exceeds2MiB").into());
+            }
+            let len_bytes = u32::try_from(body_len)?.to_be_bytes();
+            frame[..4].copy_from_slice(&len_bytes);
+        }
+        Protocol::JsonLines => {
+            match result {
+                Ok(value) => {
+                    if let Some(_cctx_trace) = trace {
+                        serde_json::to_writer(
+                            &mut *frame,
+                            &json!({"result": TracedRef { value, _cctx_trace }}),
+                        )?;
+                    } else {
+                        serde_json::to_writer(&mut *frame, &json!({"result":value}))?;
+                    }
+                }
+                Err(error) => {
+                    if let Some(meta) = trace {
+                        let msg = format!("{error} [cctx_trace={}]", meta.trace_id);
+                        serde_json::to_writer(&mut *frame, &json!({"error": msg}))?;
+                    } else {
+                        serde_json::to_writer(&mut *frame, &json!({"error":error}))?;
+                    }
+                }
+            }
+            if frame.len() > MAX_WIRE {
+                return Err(invalid("response exceeds2MiB").into());
+            }
+            frame.push(b'\n');
+        }
     }
     let serialize_ms = started.elapsed().as_secs_f64() * 1000.0;
     let write_started = Instant::now();
-    if matches!(protocol, Protocol::JsonLines) {
-        bytes.push(b'\n');
-    } else {
-        stream.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-    }
-    stream.write_all(&bytes)?;
+    stream.write_all(frame)?;
     Ok((serialize_ms, write_started.elapsed().as_secs_f64() * 1000.0))
 }
 
@@ -2008,11 +2195,16 @@ fn handle_connection(
             }
         }
     };
+    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+        let _ = respond(&mut stream, Err(error.to_string()));
+        return;
+    }
+    if let Err(error) = stream.set_write_timeout(Some(Duration::from_secs(2))) {
+        let _ = respond(&mut stream, Err(error.to_string()));
+        return;
+    }
+    let mut write_buf = Vec::with_capacity(4096);
     loop {
-        if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
-            let _ = respond(&mut stream, Err(error.to_string()));
-            break;
-        }
         let received = if let Some(request) = pending.take() {
             Ok(Some(request))
         } else {
@@ -2037,6 +2229,10 @@ fn handle_connection(
                 break;
             }
         };
+        let prev_trace = request
+            .arguments
+            .as_object_mut()
+            .and_then(|args| args.remove(PREV_TRACE_ARGUMENT));
         let trace_id = match request
             .arguments
             .as_object_mut()
@@ -2066,6 +2262,7 @@ fn handle_connection(
                 reply,
                 queued_at: Instant::now(),
                 trace_id,
+                prev_trace,
                 first_dispatch: true,
                 id: {
                     static NEXT_ID: std::sync::atomic::AtomicU64 =
@@ -2085,16 +2282,24 @@ fn handle_connection(
         match response.recv_timeout(Duration::from_secs(35)) {
             Ok(mut reply) => {
                 let started = Instant::now();
-                if let Some(trace_id) = &reply.sample.trace_id {
-                    reply.result = match reply.result {
-                        Ok(value) => Ok(json!({"value":value,"_cctx_trace":{
-                            "trace_id":trace_id,"daemon_request_id":reply.sample.id,
-                            "queue_ms":reply.sample.queue_ms,"execute_ms":reply.sample.execute_ms
-                        }})),
-                        Err(error) => Err(format!("{error} [cctx_trace={trace_id}]")),
-                    };
-                }
-                let sent = respond_protocol(&mut stream, protocol, &reply.result);
+                let trace_meta =
+                    reply
+                        .sample
+                        .trace_id
+                        .as_deref()
+                        .map(|trace_id| TraceMeta {
+                            trace_id,
+                            daemon_request_id: reply.sample.id,
+                            queue_ms: reply.sample.queue_ms,
+                            execute_ms: reply.sample.execute_ms,
+                        });
+                let sent = respond_protocol_buf(
+                    &mut stream,
+                    protocol,
+                    &reply.result,
+                    trace_meta,
+                    &mut write_buf,
+                );
                 reply.sample.response_ms = started.elapsed().as_secs_f64() * 1000.0;
                 if let Ok((encode, write)) = &sent {
                     reply.sample.serialize_ms = *encode;
@@ -2231,12 +2436,26 @@ pub fn serve() -> Result<()> {
             .retain(|id, _| deferred.iter().any(|envelope| envelope.id == *id));
         match rx.recv_timeout(server.poll_interval(!deferred.is_empty())) {
             Ok(envelope) => {
+                let is_trace = envelope.request.name == "code_trace";
                 server.record_call(envelope.protocol, &envelope.request.name);
                 dispatch_envelope(&mut server, &mut deferred, envelope);
-                server.maintain_idle_roots()?;
+                if !is_trace
+                    && (server.background.is_some()
+                        || server.preparation.is_some()
+                        || !server.pending_roots.is_empty()
+                        || server
+                            .last_idle_maintenance
+                            .is_none_or(|last| last.elapsed() >= Duration::from_millis(250)))
+                {
+                    server.last_idle_maintenance = Some(Instant::now());
+                    server.maintain_idle_roots_inner(true)?;
+                }
             }
 
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => server.maintain_idle_roots()?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                server.last_idle_maintenance = Some(Instant::now());
+                server.maintain_idle_roots()?;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -2250,6 +2469,24 @@ fn dispatch_envelope(
     deferred: &mut VecDeque<Envelope>,
     mut envelope: Envelope,
 ) {
+    if let Some(prev) = envelope.prev_trace.take() {
+        let items = match prev {
+            Value::Array(items) => items,
+            single => vec![single],
+        };
+        for prev_trace in items {
+            server.record_call(envelope.protocol, "code_trace");
+            if server.record_client_timing(prev_trace).is_ok() {
+                *server.outcome_counts.entry("success".to_owned()).or_default() += 1;
+            } else {
+                server.record_failure(envelope.protocol, "code_trace");
+                *server
+                    .outcome_counts
+                    .entry("invalid_request".to_owned())
+                    .or_default() += 1;
+            }
+        }
+    }
     let prepared = if envelope.queued_at.elapsed() > Duration::from_secs(28) {
         Err(invalid("REQUEST_DEADLINE_EXCEEDED: source initialization/queue exceeded28s; no stale or partial success returned").into())
     } else if server.background_results.contains_key(&envelope.id) {
@@ -2342,6 +2579,7 @@ mod tests {
             queued_at: Instant::now() - Duration::from_secs(29),
             id,
             trace_id: None,
+            prev_trace: None,
             first_dispatch: false,
         };
         dispatch_envelope(&mut server, &mut VecDeque::new(), envelope);
@@ -2370,6 +2608,7 @@ mod tests {
             queued_at: Instant::now() - Duration::from_secs(29),
             id,
             trace_id: None,
+            prev_trace: None,
             first_dispatch: false,
         });
         assert!(receiver.recv().unwrap().result.is_err());
@@ -2398,6 +2637,7 @@ mod tests {
                 queued_at: Instant::now() - Duration::from_secs(29),
                 id,
                 trace_id: None,
+                prev_trace: None,
                 first_dispatch: false,
             });
             assert!(receiver.recv().unwrap().result.is_err());

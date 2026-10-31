@@ -53,14 +53,38 @@ function formatSearch(value: JsonValue, includeFreshness = true): string {
   const lines = [
     `matches=${total} truncated=${booleanValue(search.truncated, 'truncated')}`,
   ];
+  let previousPath: string | undefined;
+  let pendingLines: number[] = [];
+  const flushPending = (): void => {
+    if (previousPath !== undefined && pendingLines.length > 0) {
+      lines.push(`${previousPath}:${pendingLines.join(',')}`);
+      pendingLines = [];
+    }
+  };
   for (const [index, match] of matches.entries()) {
     const item = recordValue(match, `search match ${index}`);
     const path = stringValue(item.path, `search match ${index} path`);
     const line = integerValue(item.line, `search match ${index} line`, 1);
-    const text =
-      item.text === undefined ? '' : ` ${stringValue(item.text, `search match ${index} text`)}`;
-    lines.push(`${path}:${line}${text}`);
+    if (item.text === undefined) {
+      if (previousPath === path) {
+        pendingLines.push(line);
+      } else {
+        flushPending();
+        previousPath = path;
+        pendingLines = [line];
+      }
+    } else {
+      flushPending();
+      const text = ` ${stringValue(item.text, `search match ${index} text`)}`;
+      if (previousPath === path) {
+        lines.push(`:${line}${text}`);
+      } else {
+        lines.push(`${path}:${line}${text}`);
+        previousPath = path;
+      }
+    }
   }
+  flushPending();
   if (includeFreshness && search.freshness !== undefined) {
     lines.splice(1, 0, formatFreshness(search.freshness, total === 0));
   }
@@ -92,6 +116,8 @@ function formatFreshness(value: JsonValue, includeNotice = true): string {
 function formatSnippets(value: JsonValue): string {
   const snippets = arrayValue(value, 'snippets');
   const output: string[] = [];
+  let previousPath: string | undefined;
+  let previousSha: string | undefined;
   for (const [index, snippet] of snippets.entries()) {
     const label = `snippet ${index}`;
     const item = recordValue(snippet, label);
@@ -105,10 +131,18 @@ function formatSnippets(value: JsonValue): string {
         `Invalid Code Context ${label}: expected ${end - start + 1} lines, received ${lines.length}.`,
       );
     }
-    output.push(`--- ${path}:${start}-${end} sha256=${sha}`);
-    lines.forEach((line, index) => {
-      output.push(`${start + index}: ${stringValue(line, `${label} line ${index}`)}`);
-    });
+    if (previousPath === path && previousSha === sha) {
+      output.push(`--- ${path}:${start}-${end}`);
+    } else {
+      output.push(`--- ${path}:${start}-${end} sha256=${sha}`);
+      previousPath = path;
+      previousSha = sha;
+    }
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      output.push(
+        `${start + lineIndex}: ${stringValue(lines[lineIndex], `${label} line ${lineIndex}`)}`,
+      );
+    }
   }
   return output.length > 0 ? output.join('\n') : 'snippets=0';
 }

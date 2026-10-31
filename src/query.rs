@@ -96,7 +96,7 @@ struct CacheEntry {
 struct ResultEntry {
     generation: u64,
     query: Query,
-    result: SearchResult,
+    result: std::sync::Arc<SearchResult>,
     owned_bytes: usize,
 }
 
@@ -104,7 +104,7 @@ struct ContextEntry {
     generation: u64,
     query: Query,
     radius: usize,
-    result: ContextResult,
+    result: std::sync::Arc<ContextResult>,
     owned_bytes: usize,
 }
 
@@ -120,19 +120,25 @@ pub struct QueryCache {
 
 impl QueryCache {
     fn get_or_compile(&mut self, query: &Query) -> Result<(&Compiled, bool, u64)> {
+        if let Some(position) = self.entries.iter().position(|entry| {
+            entry.key.regex == query.regex
+                && entry.key.ignore_case == query.ignore_case
+                && entry.key.pattern == query.pattern
+        }) {
+            if position + 1 != self.entries.len() {
+                let entry = self
+                    .entries
+                    .remove(position)
+                    .expect("cache position exists");
+                self.entries.push_back(entry);
+            }
+            return Ok((&self.entries.back().expect("cache entry").compiled, true, 0));
+        }
         let key = CacheKey {
             pattern: query.pattern.clone(),
             regex: query.regex,
             ignore_case: query.ignore_case,
         };
-        if let Some(position) = self.entries.iter().position(|entry| entry.key == key) {
-            let entry = self
-                .entries
-                .remove(position)
-                .expect("cache position exists");
-            self.entries.push_back(entry);
-            return Ok((&self.entries.back().expect("cache entry").compiled, true, 0));
-        }
         let started = Instant::now();
         let compiled = compile(&key)?;
         let compile_us = micros(started);
@@ -190,18 +196,21 @@ impl QueryCache {
         self.context_bytes = 0;
     }
 
-    fn get_result(&mut self, generation: u64, query: &Query) -> Option<SearchResult> {
+    fn get_result(&mut self, generation: u64, query: &Query) -> Option<std::sync::Arc<SearchResult>> {
         let position = self
             .results
             .iter()
             .position(|entry| entry.generation == generation && &entry.query == query)?;
+        if position + 1 == self.results.len() || self.results.len() < RESULT_CACHE_ENTRIES / 2 {
+            return Some(self.results[position].result.clone());
+        }
         let entry = self.results.remove(position)?;
         let result = entry.result.clone();
         self.results.push_back(entry);
         Some(result)
     }
 
-    fn put_result(&mut self, generation: u64, query: Query, result: SearchResult) {
+    fn put_result(&mut self, generation: u64, query: Query, result: std::sync::Arc<SearchResult>) {
         let owned_bytes = query_owned_bytes(&query)
             + result.consistency.capacity()
             + result.matches.capacity() * std::mem::size_of::<Hit>()
@@ -232,10 +241,13 @@ impl QueryCache {
         generation: u64,
         query: &Query,
         radius: usize,
-    ) -> Option<ContextResult> {
+    ) -> Option<std::sync::Arc<ContextResult>> {
         let position = self.contexts.iter().position(|entry| {
             entry.generation == generation && &entry.query == query && entry.radius == radius
         })?;
+        if position + 1 == self.contexts.len() || self.contexts.len() < CONTEXT_CACHE_ENTRIES / 2 {
+            return Some(self.contexts[position].result.clone());
+        }
         let entry = self.contexts.remove(position)?;
         let result = entry.result.clone();
         self.contexts.push_back(entry);
@@ -247,7 +259,7 @@ impl QueryCache {
         generation: u64,
         query: Query,
         radius: usize,
-        result: ContextResult,
+        result: std::sync::Arc<ContextResult>,
     ) {
         let owned_bytes = query_owned_bytes(&query)
             + result.consistency.capacity()
@@ -333,11 +345,11 @@ pub fn search_profiled_mode(
     search_internal(resident, query, cache, allow_plan, true)
 }
 
-pub fn search_fast(
+pub(crate) fn search_fast_arc(
     resident: &Resident,
     query: &Query,
     cache: &mut QueryCache,
-) -> Result<SearchResult> {
+) -> Result<std::sync::Arc<SearchResult>> {
     if let Some(result) = cache.get_result(resident.stats.generation, query) {
         return Ok(result);
     }
@@ -347,18 +359,27 @@ pub fn search_fast(
         && query.glob.is_none()
         && query.max_matches_per_file.is_none()
     {
-        let result = resident.search(&Search {
+        let result = std::sync::Arc::new(resident.search(&Search {
             pattern: query.pattern.clone(),
             regex: false,
             ignore_case: false,
             limit: query.limit,
-        })?;
+        })?);
         cache.put_result(resident.stats.generation, query.clone(), result.clone());
         return Ok(result);
     }
-    let result = search_internal(resident, query, cache, true, false)?.result;
+    let result = std::sync::Arc::new(search_internal(resident, query, cache, true, false)?.result);
     cache.put_result(resident.stats.generation, query.clone(), result.clone());
     Ok(result)
+}
+
+pub fn search_fast(
+    resident: &Resident,
+    query: &Query,
+    cache: &mut QueryCache,
+) -> Result<SearchResult> {
+    let arc = search_fast_arc(resident, query, cache)?;
+    Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone()))
 }
 
 fn search_internal(
@@ -398,12 +419,14 @@ fn search_internal(
         {
             evaluation
                 .ids
-                .retain(|id| path_allowed(resident, *id, &paths, &glob, query.glob.is_some()));
-            evaluation.ids.sort_unstable_by(|a, b| {
-                resident.documents[*a]
-                    .path
-                    .cmp(&resident.documents[*b].path)
-            });
+                .retain(|id| path_allowed(resident, *id, &paths, &glob));
+            if !resident.ids_are_path_sorted {
+                evaluation.ids.sort_unstable_by(|a, b| {
+                    resident.documents[*a]
+                        .path
+                        .cmp(&resident.documents[*b].path)
+                });
+            }
             let filtered_bytes = resident.candidate_bytes(&evaluation.ids);
             let line_prefilter = query.regex
                 && compiled.manual_line_prefilter
@@ -447,7 +470,7 @@ fn search_internal(
             .paths
             .values()
             .copied()
-            .filter(|id| path_allowed(resident, *id, &paths, &glob, query.glob.is_some()))
+            .filter(|id| path_allowed(resident, *id, &paths, &glob))
             .collect();
         ids.sort_unstable();
         ids
@@ -505,7 +528,7 @@ fn search_internal(
         if index_cost < eligible_bytes && selective {
             ids = candidates;
             candidate_bytes = planned_candidate_bytes;
-            path_sorted = false;
+            path_sorted = resident.ids_are_path_sorted;
             line_prefilter = query.regex
                 && compiled.manual_line_prefilter
                 && plan.atom_count() <= 16
@@ -653,18 +676,30 @@ fn scan(
         let finder = Finder::new(query.pattern.as_bytes());
         for id in ids {
             let document = &resident.documents[*id];
+            if document.starts.is_empty() {
+                continue;
+            }
             file_lines.clear();
-            let mut previous = None;
-            for position in finder.find_iter(document.text.as_bytes()) {
-                let line = document
-                    .starts
-                    .partition_point(|start| (*start as usize) <= position)
+            let bytes = document.text.as_bytes();
+            let mut search_pos = 0usize;
+            let mut line_cursor = 0usize;
+            while search_pos < bytes.len() {
+                let Some(rel) = finder.find(&bytes[search_pos..]) else {
+                    break;
+                };
+                let position = search_pos + rel;
+                let line = line_cursor
+                    + document.starts[line_cursor..]
+                        .partition_point(|start| (*start as usize) <= position)
                     - 1;
-                if previous == Some(line) {
-                    continue;
-                }
-                previous = Some(line);
                 file_lines.push(line);
+                line_cursor = line + 1;
+                search_pos = document
+                    .starts
+                    .get(line_cursor)
+                    .copied()
+                    .map(|start| start as usize)
+                    .unwrap_or(bytes.len());
             }
             *total += file_lines.len();
             record_document(
@@ -765,75 +800,85 @@ fn scan_document(
     expression: &RegexMatcher,
     file_lines: &mut Vec<usize>,
 ) -> Result<()> {
-    let mut previous = None;
+    if document.starts.is_empty() {
+        return Ok(());
+    }
+    let mut line_cursor = 0usize;
+    let mut next_line_start = 0usize;
     expression.find_iter(document.text.as_bytes(), |matched| {
         let offset = matched.start();
-        if document.starts.is_empty()
-            || (offset == document.text.len() && document.text.ends_with('\n'))
-        {
+        if offset == document.text.len() && document.text.ends_with('\n') {
             return true;
         }
-        let line = document
-            .starts
-            .partition_point(|start| (*start as usize) <= offset)
-            - 1;
-        if previous != Some(line) {
-            previous = Some(line);
-            file_lines.push(line);
+        if offset < next_line_start {
+            return true;
         }
+        let line = line_cursor
+            + document.starts[line_cursor..]
+                .partition_point(|start| (*start as usize) <= offset)
+            - 1;
+        file_lines.push(line);
+        line_cursor = line + 1;
+        next_line_start = document
+            .starts
+            .get(line_cursor)
+            .copied()
+            .map(|start| start as usize)
+            .unwrap_or(usize::MAX);
         true
     })?;
     Ok(())
 }
 
+fn strip_modifier(trimmed: &str) -> Option<&str> {
+    let bytes = trimmed.as_bytes();
+    let prefixes: &[&str] = match bytes.first()? {
+        b'p' => &[
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "protected ",
+            "private ",
+            "public ",
+            "partial ",
+        ],
+        b'e' => &["export "],
+        b'd' => &["default "],
+        b'i' => &["internal "],
+        b's' => &["static ", "sealed "],
+        b'a' => &["async ", "abstract "],
+        b'u' => &["unsafe "],
+        b'c' => &["const "],
+        b'v' => &["virtual "],
+        b'o' => &["override "],
+        _ => return None,
+    };
+    prefixes
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
+}
+
 pub(crate) fn is_definition_line(line: &str) -> bool {
     let mut trimmed = line.trim_start();
-    while let Some(rest) = [
-        "pub(crate) ",
-        "pub(super) ",
-        "pub ",
-        "export ",
-        "default ",
-        "protected ",
-        "private ",
-        "internal ",
-        "public ",
-        "static ",
-        "async ",
-        "unsafe ",
-        "const ",
-        "abstract ",
-        "sealed ",
-        "partial ",
-        "virtual ",
-        "override ",
-    ]
-    .iter()
-    .find_map(|prefix| trimmed.strip_prefix(prefix))
-    {
+    while let Some(rest) = strip_modifier(trimmed) {
         trimmed = rest.trim_start();
     }
-    [
-        "fn ",
-        "struct ",
-        "enum ",
-        "trait ",
-        "type ",
-        "impl ",
-        "impl<",
-        "mod ",
-        "const ",
-        "static ",
-        "macro_rules!",
-        "def ",
-        "class ",
-        "func ",
-        "function ",
-        "interface ",
-        "namespace ",
-    ]
-    .iter()
-    .any(|keyword| trimmed.starts_with(keyword))
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    let keywords: &[&str] = match first {
+        b'f' => &["fn ", "func ", "function "],
+        b's' => &["struct ", "static "],
+        b'e' => &["enum "],
+        b't' => &["trait ", "type "],
+        b'i' => &["impl ", "impl<", "interface "],
+        b'm' => &["mod ", "macro_rules!"],
+        b'c' => &["const ", "class "],
+        b'd' => &["def "],
+        b'n' => &["namespace "],
+        _ => return false,
+    };
+    keywords.iter().any(|keyword| trimmed.starts_with(keyword))
 }
 
 fn record_document(
@@ -866,11 +911,38 @@ fn record_document(
             .take(cap)
             .collect();
         if selected.len() < cap {
-            for &line in file_lines {
-                if !selected.contains(&line) {
-                    selected.push(line);
-                    if selected.len() == cap {
-                        break;
+            // Anchor-aware selection (first + last + evenly strided middle),
+            // preventing top-of-file imports from starving bottom-of-file call sites.
+            if let Some(&first) = file_lines.first()
+                && !selected.contains(&first)
+            {
+                selected.push(first);
+            }
+            if selected.len() < cap
+                && file_lines.len() > 2
+                && let Some(&last) = file_lines.last()
+                && !selected.contains(&last)
+            {
+                selected.push(last);
+            }
+            if selected.len() < cap {
+                let needed = cap - selected.len();
+                let span = file_lines.len();
+                for slot in 1..=needed {
+                    let idx = (slot * span) / (needed + 1);
+                    let candidate = file_lines[idx.min(span - 1)];
+                    if !selected.contains(&candidate) {
+                        selected.push(candidate);
+                    }
+                }
+            }
+            if selected.len() < cap {
+                for &line in file_lines {
+                    if !selected.contains(&line) {
+                        selected.push(line);
+                        if selected.len() == cap {
+                            break;
+                        }
                     }
                 }
             }
@@ -930,29 +1002,52 @@ pub(crate) fn paths(prefixes: &[String]) -> Result<Vec<std::path::PathBuf>> {
         .collect()
 }
 
-fn glob(query: &Query) -> Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    if let Some(glob) = &query.glob {
-        if glob.len() > 1024 {
-            return Err(invalid("glob exceeds 1024 bytes").into());
-        }
-        builder.add(Glob::new(glob)?);
+enum GlobFilter<'a> {
+    None,
+    Extension(&'a str),
+    Compiled(GlobSet),
+}
+
+fn glob(query: &Query) -> Result<GlobFilter<'_>> {
+    let Some(glob) = query.glob.as_deref() else {
+        return Ok(GlobFilter::None);
+    };
+    if glob.len() > 1024 {
+        return Err(invalid("glob exceeds 1024 bytes").into());
     }
-    Ok(builder.build()?)
+    if let Some(ext) = glob.strip_prefix("*.") {
+        let suffix = &glob[1..];
+        if !ext.is_empty()
+            && ext
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Ok(GlobFilter::Extension(suffix));
+        }
+    }
+    let mut builder = GlobSetBuilder::new();
+    builder.add(Glob::new(glob)?);
+    Ok(GlobFilter::Compiled(builder.build()?))
 }
 
 fn path_allowed(
     resident: &Resident,
     id: usize,
     paths: &[std::path::PathBuf],
-    glob: &GlobSet,
-    has_glob: bool,
+    glob: &GlobFilter<'_>,
 ) -> bool {
-    let path = Path::new(resident.documents[id].path.as_ref());
-    path_matches(path, paths)
-        && (!has_glob
-            || glob.is_match(path)
-            || path.file_name().is_some_and(|name| glob.is_match(name)))
+    let raw_path = resident.documents[id].path.as_ref();
+    let path = Path::new(raw_path);
+    if !path_matches(path, paths) {
+        return false;
+    }
+    match glob {
+        GlobFilter::None => true,
+        GlobFilter::Extension(suffix) => raw_path.ends_with(suffix),
+        GlobFilter::Compiled(set) => {
+            set.is_match(path) || path.file_name().is_some_and(|name| set.is_match(name))
+        }
+    }
 }
 
 pub(crate) fn path_matches(path: &Path, paths: &[std::path::PathBuf]) -> bool {

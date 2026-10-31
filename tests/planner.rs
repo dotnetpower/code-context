@@ -222,3 +222,42 @@ fn result_cache_is_bounded_and_generation_aware() {
     }
     assert!(cache.stats()["result_entries"].as_u64().unwrap() <= 32);
 }
+
+#[test]
+fn max_matches_per_file_retains_front_and_back_anchors_with_definitions() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("src")).unwrap();
+    let mut lines = Vec::new();
+    for i in 1..=10 {
+        if i == 5 {
+            lines.push("pub fn anchor_sym() {}".to_string());
+        } else {
+            lines.push(format!("let _ = anchor_sym({i});"));
+        }
+    }
+    std::fs::write(
+        directory.path().join("src/anchors.rs"),
+        lines.join("\n") + "\n",
+    )
+    .unwrap();
+    let workspace =
+        Workspace::new(directory.path(), vec!["src".into()], vec!["*.rs".into()]).unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+    let mut input = query("anchor_sym", false, false);
+    input.limit = 4;
+    input.max_matches_per_file = Some(4);
+    let result = search_fast(&resident, &input, &mut cache).unwrap();
+    let matched_lines: Vec<usize> = result.matches.iter().map(|h| h.line).collect();
+    assert!(matched_lines.contains(&1), "front anchor retained: {matched_lines:?}");
+    assert!(matched_lines.contains(&5), "definition retained: {matched_lines:?}");
+    assert!(matched_lines.contains(&10), "back anchor retained: {matched_lines:?}");
+}
+
+#[test]
+fn leading_repetition_case_insensitive_regex_prefilters_and_matches_oracle() {
+    let (_directory, workspace, resident) = fixture();
+    for pattern in [r"^\s*async\s+def\s+work", r"^\w+.*KERNEL", r"^.*foo.*bar"] {
+        compare(&workspace, &resident, &query(pattern, true, true));
+    }
+}

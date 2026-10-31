@@ -67,13 +67,31 @@ pub fn tools() -> Value {
 }
 
 pub fn dispatch(request: Value) -> Option<Value> {
-    dispatch_with_root(request, None, None)
+    let mut pending_traces = std::collections::VecDeque::new();
+    dispatch_with_root(request, None, None, &mut pending_traces)
+}
+
+fn flush_pending_traces(
+    client: &mut daemon::Client,
+    pending_traces: &mut std::collections::VecDeque<Value>,
+) {
+    while let Some(trace) = pending_traces.pop_front() {
+        if let Err(error) = client.call(&Request {
+            root: None,
+            name: "code_trace".into(),
+            arguments: trace,
+            compact: true,
+        }) {
+            eprintln!("CCTX_TRACE_REPORT_FAILED: {error}");
+        }
+    }
 }
 
 fn dispatch_with_root(
     request: Value,
     default_root: Option<&PathBuf>,
     client: Option<&mut daemon::Client>,
+    pending_traces: &mut std::collections::VecDeque<Value>,
 ) -> Option<Value> {
     if !request.is_object() || request["jsonrpc"] != "2.0" || !request["method"].is_string() {
         return Some(
@@ -105,7 +123,13 @@ fn dispatch_with_root(
                 "serialize_ms":0.0,"write_ms":0.0,"total_ms":0.0,"success":false,
                 "daemon":null,
             }));
-            let outcome = tool_call(&request["params"], default_root, client, &mut trace);
+            let outcome = tool_call(
+                &request["params"],
+                default_root,
+                client,
+                &mut trace,
+                pending_traces,
+            );
             if let Some(trace) = trace.as_mut() {
                 trace["prepare_ms"] = json!(
                     (started.elapsed().as_secs_f64() * 1000.0
@@ -115,8 +139,8 @@ fn dispatch_with_root(
             }
             let formatting = Instant::now();
             let mut result = match outcome {
-                Ok(value) => {
-                    json!({"content":[{"type":"text","text":value.to_string()}],"isError":false})
+                Ok(text) => {
+                    json!({"content":[{"type":"text","text":text}],"isError":false})
                 }
                 Err(error) => {
                     json!({"content":[{"type":"text","text":error.to_string()}],"isError":true})
@@ -157,7 +181,8 @@ fn tool_call(
     default_root: Option<&PathBuf>,
     client: Option<&mut daemon::Client>,
     trace: &mut Option<Value>,
-) -> Result<Value> {
+    pending_traces: &mut std::collections::VecDeque<Value>,
+) -> Result<String> {
     let prepare_started = Instant::now();
     let name = params["name"]
         .as_str()
@@ -199,8 +224,14 @@ fn tool_call(
                 .ok_or_else(|| invalid("current directory is not inside a registered workspace"))?,
         })
     };
-    if arguments.contains_key(daemon::TRACE_ARGUMENT) {
+    if arguments.contains_key(daemon::TRACE_ARGUMENT)
+        || arguments.contains_key(daemon::PREV_TRACE_ARGUMENT)
+    {
         return Err(invalid("reserved internal trace argument").into());
+    }
+    if (name == "code_status" || pending_traces.len() >= 64) && !pending_traces.is_empty() {
+        let items: Vec<Value> = pending_traces.drain(..).collect();
+        arguments.insert(daemon::PREV_TRACE_ARGUMENT.into(), Value::Array(items));
     }
     if let Some(trace) = trace.as_mut() {
         trace["root"] = json!(root);
@@ -214,9 +245,9 @@ fn tool_call(
         compact: true,
     };
     let ipc_started = Instant::now();
-    let result = match client {
-        Some(client) => match client.call(&request) {
-            Ok(value) => Ok(value),
+    if let Some(client) = client {
+        let raw_result = match client.call_raw(&request) {
+            Ok(bytes) => Ok(bytes),
             Err(error) if daemon::is_application_error(error.as_ref()) => Err(error),
             Err(first) => {
                 *client = daemon::Client::connect_traced().map_err(|reconnect| {
@@ -224,55 +255,84 @@ fn tool_call(
                         "daemon request failed ({first}); reconnect failed ({reconnect})"
                     ))
                 })?;
-                client.call(&request)
+                client.call_raw(&request)
             }
-        },
-        None => daemon::request(&request),
-    };
-    if let Some(trace) = trace.as_mut() {
-        trace["ipc_ms"] = json!(ipc_started.elapsed().as_secs_f64() * 1000.0);
+        };
+        if let Some(trace) = trace.as_mut() {
+            trace["ipc_ms"] = json!(ipc_started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let raw_bytes = raw_result?;
+        let text = if let Some(trace) = trace.as_mut() {
+            let expected_id = trace["trace_id"].as_str().expect("generated trace ID");
+            let (raw_value, daemon_trace) = daemon::unwrap_trace_raw(&raw_bytes, expected_id)?;
+            trace["daemon"] = daemon_trace;
+            raw_value.get().to_owned()
+        } else {
+            String::from_utf8(raw_bytes)?
+        };
+        if name == "code_status" {
+            let mut value: Value = serde_json::from_str(&text)?;
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| invalid("daemon status is not an object"))?;
+            object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
+            return Ok(serde_json::to_string(&value)?);
+        }
+        return Ok(text);
     }
-    let mut value = result?;
-    if let Some(trace) = trace.as_mut() {
-        let (unwrapped, daemon_trace) = daemon::unwrap_trace(
-            value,
-            trace["trace_id"].as_str().expect("generated trace ID"),
-        )?;
-        value = unwrapped;
-        trace["daemon"] = daemon_trace;
-    }
+    let mut value = daemon::request(&request)?;
     if name == "code_status" {
         let object = value
             .as_object_mut()
             .ok_or_else(|| invalid("daemon status is not an object"))?;
         object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
     }
-    Ok(value)
+    Ok(serde_json::to_string(&value)?)
 }
 
 pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
     let mut input = input;
     let default_root = Some(crate::catalog::canonicalize(&std::env::current_dir()?)?);
     let mut client = daemon::Client::connect_traced()?;
+    let mut pending_traces: std::collections::VecDeque<Value> =
+        std::collections::VecDeque::with_capacity(64);
+    let trace_stderr = std::env::var_os("CCTX_TRACE_STDERR").is_some();
+    let mut bytes = Vec::with_capacity(512);
+    let mut out_buf = Vec::with_capacity(4096);
     loop {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let count = std::io::Read::take(&mut input, MAX_MESSAGE as u64 + 1)
             .read_until(b'\n', &mut bytes)?;
         if count == 0 {
+            flush_pending_traces(&mut client, &mut pending_traces);
             return Ok(());
         }
         if count > MAX_MESSAGE {
+            flush_pending_traces(&mut client, &mut pending_traces);
             return Err(invalid("MCP input exceeds 1 MiB").into());
         }
         let started = Instant::now();
         let response = match serde_json::from_slice(&bytes) {
-            Ok(value) => dispatch_with_root(value, default_root.as_ref(), Some(&mut client)),
+            Ok(value) => dispatch_with_root(
+                value,
+                default_root.as_ref(),
+                Some(&mut client),
+                &mut pending_traces,
+            ),
             Err(error) => Some(
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}),
             ),
         };
         if let Some(response) = response {
-            let (serialize_ms, write_ms) = crate::mcp::write_response(&mut output, &response)?;
+            let ser_started = Instant::now();
+            out_buf.clear();
+            serde_json::to_writer(&mut out_buf, &response)?;
+            out_buf.push(b'\n');
+            let serialize_ms = ser_started.elapsed().as_secs_f64() * 1000.0;
+            let write_started = Instant::now();
+            output.write_all(&out_buf)?;
+            output.flush()?;
+            let write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
             if let Some(mut trace) = response["result"]["_meta"].get("cctx_trace").cloned() {
                 trace["serialize_ms"] = json!(
                     trace["serialize_ms"]
@@ -283,15 +343,13 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
                 trace["write_ms"] = json!(write_ms);
                 trace["total_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
                 trace["completed_unix_ms"] = json!(daemon::trace_unix_ms());
-                eprintln!("CCTX_CLIENT_TRACE {trace}");
-                if let Err(error) = client.call(&Request {
-                    root: None,
-                    name: "code_trace".into(),
-                    arguments: trace,
-                    compact: true,
-                }) {
-                    eprintln!("CCTX_TRACE_REPORT_FAILED: {error}");
+                if trace_stderr {
+                    eprintln!("CCTX_CLIENT_TRACE {trace}");
                 }
+                if pending_traces.len() >= 64 {
+                    pending_traces.pop_front();
+                }
+                pending_traces.push_back(trace);
             }
         }
     }

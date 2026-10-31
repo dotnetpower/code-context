@@ -164,3 +164,28 @@ fn file_discovery_rejects_invalid_filters_and_has_explicit_empty_results() {
         0
     );
 }
+
+#[test]
+fn simple_extension_glob_requires_dot_boundary_and_supports_single_char_extensions() {
+    let candidates = ["src/bars", "src/a.rs", "src/main.c", "src/lib.h"];
+    let rs = code_context::files::find(
+        candidates,
+        &FileQuery {
+            glob: "*.rs".into(),
+            paths: Vec::new(),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert_eq!(rs.paths, ["src/a.rs"]);
+    let c = code_context::files::find(
+        candidates,
+        &FileQuery {
+            glob: "*.c".into(),
+            paths: Vec::new(),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert_eq!(c.paths, ["src/main.c"]);
+}

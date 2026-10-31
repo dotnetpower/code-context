@@ -6,11 +6,52 @@ use crate::{Result, invalid};
 use memchr::memmem::Finder;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
+use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TrigramBuildHasher;
+
+#[derive(Default)]
+pub(crate) struct TrigramHasher(u64);
+
+impl Hasher for TrigramHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x517cc1b727220a95);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        let mut x = u64::from(i).wrapping_mul(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        self.0 = x ^ (x >> 27);
+    }
+}
+
+impl BuildHasher for TrigramBuildHasher {
+    type Hasher = TrigramHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        TrigramHasher(0)
+    }
+}
+
+pub(crate) type TrigramMap<V> = HashMap<u32, V, TrigramBuildHasher>;
 
 pub(crate) const MAX_POSTINGS: usize = 64 * 1024 * 1024;
 const DENSE_TRIGRAM_SLOTS: usize = 1 << 24;
@@ -120,6 +161,25 @@ pub(crate) struct Document {
     pub text: String,
     pub starts: Vec<u32>,
     pub sha256: [u8; 32],
+    pub sha256_hex: Arc<str>,
+}
+
+pub(crate) fn build_line_starts(text: &str) -> Result<Vec<u32>> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = text.as_bytes();
+    let mut starts = Vec::with_capacity((bytes.len() / 36).max(1));
+    starts.push(0);
+    for i in memchr::memchr_iter(b'\n', bytes) {
+        if i + 1 < bytes.len() {
+            starts.push(u32::try_from(i + 1)?);
+        }
+    }
+    if starts.capacity() > starts.len().saturating_add(64) {
+        starts.shrink_to_fit();
+    }
+    Ok(starts)
 }
 
 impl Document {
@@ -158,9 +218,10 @@ pub struct Stats {
 pub struct Resident {
     pub(crate) documents: Vec<Document>,
     pub(crate) paths: BTreeMap<Arc<str>, usize>,
-    pub(crate) postings: Option<HashMap<u32, Vec<u32>>>,
+    pub(crate) postings: Option<TrigramMap<Vec<u32>>>,
     pub(crate) policy: MemoryPolicy,
     pub(crate) max_owned_bytes: usize,
+    pub(crate) ids_are_path_sorted: bool,
     pub stats: Stats,
 }
 
@@ -232,16 +293,9 @@ impl Resident {
             digest.update((bytes.len() as u64).to_le_bytes());
             digest.update(&bytes);
             let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+            let sha256_hex: Arc<str> = Arc::from(digest_hex(&sha256));
             let text = String::from_utf8(bytes)?;
-            let mut starts = Vec::new();
-            if !text.is_empty() {
-                starts.push(0);
-            }
-            for (i, byte) in text.bytes().enumerate() {
-                if byte == b'\n' && i + 1 < text.len() {
-                    starts.push(u32::try_from(i + 1)?);
-                }
-            }
+            let starts = build_line_starts(&text)?;
             line_count = line_count.saturating_add(starts.len());
             if line_count > policy.max_total_lines {
                 return Err(invalid("resident line count exceeds configured limit").into());
@@ -251,6 +305,7 @@ impl Resident {
                 text,
                 starts,
                 sha256,
+                sha256_hex,
             });
             let floor = source_bytes
                 .saturating_add(inventory.total_path_bytes.saturating_mul(2))
@@ -292,6 +347,7 @@ impl Resident {
             postings: None,
             policy,
             max_owned_bytes,
+            ids_are_path_sorted: true,
             stats,
         };
         if indexed {
@@ -311,14 +367,133 @@ impl Resident {
 
     fn build_index(&mut self) -> Result<()> {
         let start = Instant::now();
-        let mut index: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut count = 0usize;
         let base_owned = self.estimated_bytes();
+        let estimated_trigrams = (self.stats.source_bytes / 2)
+            .max(64)
+            .min(self.policy.max_unique_trigrams)
+            .min(131_072);
+        let prealloc_map_bytes = estimated_trigrams.saturating_mul(40);
+        let mut index: TrigramMap<Vec<u32>> =
+            if base_owned.saturating_add(prealloc_map_bytes) <= self.max_owned_bytes {
+                TrigramMap::with_capacity_and_hasher(estimated_trigrams, TrigramBuildHasher)
+            } else {
+                TrigramMap::default()
+            };
+        let mut count = 0usize;
         let dense_bytes = DENSE_TRIGRAM_SLOTS * std::mem::size_of::<u16>();
         let mut dense_seen = (self.stats.source_bytes >= DENSE_TRIGRAM_MIN_SOURCE
             && base_owned.saturating_add(dense_bytes) <= self.max_owned_bytes)
             .then(|| vec![0_u16; DENSE_TRIGRAM_SLOTS]);
         let mut dense_epoch = 1_u16;
+        if dense_seen.is_none()
+            && self.documents.len() >= 16
+            && self.stats.source_bytes >= 2 * 1024 * 1024
+            && base_owned.saturating_add(self.stats.source_bytes.saturating_mul(4))
+                <= self.max_owned_bytes
+        {
+            let max_per_file = self.policy.max_unique_trigrams_per_file;
+            let docs = &self.documents;
+            let workers = docs.len().min(4);
+            let chunk_size = docs.len().div_ceil(workers);
+            let per_doc_keys = std::thread::scope(|scope| {
+                let handles: Vec<_> = docs
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        std::thread::Builder::new()
+                            .name("cctx-idx".into())
+                            .stack_size(crate::policy::WORKER_STACK_BYTES)
+                            .spawn_scoped(scope, move || {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                let mut recent = [u32::MAX; 4096];
+                                for doc in chunk {
+                                    recent.fill(u32::MAX);
+                                    let bytes = doc.text.as_bytes();
+                                    let mut keys = Vec::with_capacity(
+                                        (bytes.len() / 2)
+                                            .min(max_per_file.saturating_add(1))
+                                            .min(16_384),
+                                    );
+                                    let mut compact_threshold = 16_384usize;
+                                    for key in bytes.windows(3).map(trigram) {
+                                        let slot = &mut recent
+                                            [((key.wrapping_mul(0x9e3779b9)) >> 20) as usize];
+                                        if *slot == key {
+                                            continue;
+                                        }
+                                        *slot = key;
+                                        keys.push(key);
+                                        if keys.len() >= compact_threshold {
+                                            keys.sort_unstable();
+                                            keys.dedup();
+                                            if keys.len() > max_per_file {
+                                                return Err(invalid(format!(
+                                                    "file exceeds max_unique_trigrams_per_file: {}",
+                                                    doc.path
+                                                ))
+                                                .into());
+                                            }
+                                            compact_threshold =
+                                                (keys.len() + 16_384).max(compact_threshold);
+                                        }
+                                    }
+                                    keys.sort_unstable();
+                                    keys.dedup();
+                                    if keys.len() > max_per_file {
+                                        return Err(invalid(format!(
+                                            "file exceeds max_unique_trigrams_per_file: {}",
+                                            doc.path
+                                        ))
+                                        .into());
+                                    }
+                                    out.push(keys);
+                                }
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(out)
+                            })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .map_err(|_| invalid("index worker panicked").into())
+                            .and_then(|r| r)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for (id, keys) in per_doc_keys.into_iter().flatten().enumerate() {
+                count += keys.len();
+                if count > MAX_POSTINGS {
+                    return Err(invalid("resident index budget exceeds 64M postings").into());
+                }
+                let doc_id = u32::try_from(id)?;
+                for key in keys {
+                    if index.len() >= self.policy.max_unique_trigrams && !index.contains_key(&key) {
+                        return Err(invalid("root exceeds max_unique_trigrams").into());
+                    }
+                    index.entry(key).or_default().push(doc_id);
+                }
+                let projected = self
+                    .stats
+                    .document_bytes
+                    .saturating_add(self.stats.path_bytes.saturating_mul(2))
+                    .saturating_add(self.stats.line_offset_bytes)
+                    .saturating_add(count.saturating_mul(std::mem::size_of::<u32>()))
+                    .saturating_add(index.len().saturating_mul(64));
+                if projected > self.max_owned_bytes {
+                    return Err(ResidentAdmissionError::new(
+                        "resident admission budget exceeded while building index",
+                        projected,
+                    )
+                    .into());
+                }
+            }
+            self.stats.index_build_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.stats.unique_trigrams = index.len();
+            self.stats.postings = count;
+            self.postings = Some(index);
+            return Ok(());
+        }
+        let mut recent = [u32::MAX; 4096];
         for (id, document) in self.documents.iter().enumerate() {
             let keys = if let Some(seen) = dense_seen.as_mut() {
                 let key_capacity = document
@@ -361,19 +536,25 @@ impl Resident {
                 }
                 keys
             } else {
-                let mut unique = HashSet::new();
-                for key in document.text.as_bytes().windows(3).map(trigram) {
-                    let inserted = unique.insert(key);
-                    if inserted && unique.len() > self.policy.max_unique_trigrams_per_file {
-                        return Err(invalid(format!(
-                            "file exceeds max_unique_trigrams_per_file: {}",
-                            document.path
-                        ))
-                        .into());
+                recent.fill(u32::MAX);
+                let bytes = document.text.as_bytes();
+                let window_count = bytes.len().saturating_sub(2);
+                let mut keys = Vec::with_capacity(
+                    (window_count / 2)
+                        .min(self.policy.max_unique_trigrams_per_file.saturating_add(1))
+                        .min(16_384),
+                );
+                let mut compact_threshold = 16_384usize;
+                for key in bytes.windows(3).map(trigram) {
+                    let slot = &mut recent[((key.wrapping_mul(0x9e3779b9)) >> 20) as usize];
+                    if *slot == key {
+                        continue;
                     }
-                    if inserted && unique.len() % 16_384 == 0 {
+                    *slot = key;
+                    keys.push(key);
+                    if keys.len() >= compact_threshold {
                         let transient = base_owned
-                            .saturating_add(unique.capacity().saturating_mul(36))
+                            .saturating_add(keys.capacity().saturating_mul(std::mem::size_of::<u32>()))
                             .saturating_add(index.capacity().saturating_mul(40))
                             .saturating_add(count.saturating_mul(std::mem::size_of::<u32>()));
                         if transient > self.max_owned_bytes {
@@ -383,21 +564,49 @@ impl Resident {
                             )
                             .into());
                         }
+                        keys.sort_unstable();
+                        keys.dedup();
+                        if keys.len() > self.policy.max_unique_trigrams_per_file {
+                            return Err(invalid(format!(
+                                "file exceeds max_unique_trigrams_per_file: {}",
+                                document.path
+                            ))
+                            .into());
+                        }
+                        compact_threshold = (keys.len() + 16_384).max(compact_threshold);
                     }
                 }
-                let mut keys: Vec<u32> = unique.into_iter().collect();
                 keys.sort_unstable();
+                keys.dedup();
+                if keys.len() > self.policy.max_unique_trigrams_per_file {
+                    return Err(invalid(format!(
+                        "file exceeds max_unique_trigrams_per_file: {}",
+                        document.path
+                    ))
+                    .into());
+                }
                 keys
             };
             count += keys.len();
             if count > MAX_POSTINGS {
                 return Err(invalid("resident index budget exceeds 64M postings").into());
             }
+            let doc_id = u32::try_from(id)?;
+            let max_unique_trigrams = self.policy.max_unique_trigrams;
+            let mut current_len = index.len();
             for key in keys {
-                if index.len() >= self.policy.max_unique_trigrams && !index.contains_key(&key) {
-                    return Err(invalid("root exceeds max_unique_trigrams").into());
+                match index.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().push(doc_id);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        if current_len >= max_unique_trigrams {
+                            return Err(invalid("root exceeds max_unique_trigrams").into());
+                        }
+                        current_len += 1;
+                        entry.insert(vec![doc_id]);
+                    }
                 }
-                index.entry(key).or_default().push(u32::try_from(id)?);
             }
             let projected = self
                 .stats
@@ -430,6 +639,7 @@ impl Resident {
                     + d.path.len()
                     + d.text.capacity()
                     + d.sha256.len()
+                    + d.sha256_hex.len()
                     + d.starts.capacity() * std::mem::size_of::<u32>()
             })
             .sum();
@@ -464,20 +674,52 @@ impl Resident {
         let mut keys: Vec<_> = pattern.windows(3).map(trigram).collect();
         keys.sort_unstable();
         keys.dedup();
-        let Some(mut lists) = keys
+        let Some(mut keyed_lists) = keys
             .iter()
-            .map(|k| index.get(k))
+            .map(|&k| index.get(&k).map(|v| (k, v.as_slice())))
             .collect::<Option<Vec<_>>>()
         else {
             return Vec::new();
         };
-        lists.sort_by_key(|list| list.len());
-        lists.truncate(MAX_QUERY_POSTING_INTERSECTIONS);
-        lists[0]
-            .iter()
-            .filter(|id| lists[1..].iter().all(|list| list.binary_search(id).is_ok()))
-            .map(|id| *id as usize)
-            .collect()
+        if keyed_lists.iter().any(|(_, list)| list.is_empty()) {
+            return Vec::new();
+        }
+        // Prefer shortest posting lists first; break ties by preferring ASCII trigrams
+        // over UTF-8 continuation-heavy trigrams for higher selectivity.
+        keyed_lists.sort_unstable_by_key(|&(k, list)| {
+            let b0 = (k & 0xff) as u8;
+            let b1 = ((k >> 8) & 0xff) as u8;
+            let b2 = ((k >> 16) & 0xff) as u8;
+            let non_ascii = usize::from(b0 >= 0x80) + usize::from(b1 >= 0x80) + usize::from(b2 >= 0x80);
+            (list.len(), non_ascii)
+        });
+        if keyed_lists.len() > MAX_QUERY_POSTING_INTERSECTIONS {
+            keyed_lists.truncate(MAX_QUERY_POSTING_INTERSECTIONS);
+        }
+        if keyed_lists.len() == 1 {
+            return keyed_lists[0].1.iter().map(|&id| id as usize).collect();
+        }
+        let first = keyed_lists[0].1;
+        let mut cursors: Vec<&[u32]> = keyed_lists[1..].iter().map(|&(_, list)| list).collect();
+        let mut out = Vec::with_capacity(first.len());
+        'outer: for &id in first {
+            for cursor in &mut cursors {
+                match cursor.binary_search(&id) {
+                    Ok(pos) => {
+                        *cursor = &cursor[pos + 1..];
+                    }
+                    Err(pos) => {
+                        if pos == cursor.len() {
+                            break 'outer;
+                        }
+                        *cursor = &cursor[pos..];
+                        continue 'outer;
+                    }
+                }
+            }
+            out.push(id as usize);
+        }
+        out
     }
 
     pub(crate) fn candidates_byte_classes(&self, positions: &[[u8; 2]]) -> Vec<usize> {
@@ -494,19 +736,21 @@ impl Resident {
                 continue;
             }
             seen_windows.push(window);
-            let mut trigram_keys = Vec::with_capacity(8);
+            let mut trigram_keys = [0_u32; 8];
+            let mut trigram_len = 0usize;
             for b0 in [window[0][0], window[0][1]] {
                 for b1 in [window[1][0], window[1][1]] {
                     for b2 in [window[2][0], window[2][1]] {
                         let key = trigram(&[b0, b1, b2]);
-                        if !trigram_keys.contains(&key) {
-                            trigram_keys.push(key);
+                        if !trigram_keys[..trigram_len].contains(&key) {
+                            trigram_keys[trigram_len] = key;
+                            trigram_len += 1;
                         }
                     }
                 }
             }
             let mut merged = Vec::new();
-            for key in trigram_keys {
+            for &key in &trigram_keys[..trigram_len] {
                 if let Some(list) = index.get(&key) {
                     merged.extend_from_slice(list);
                 }
@@ -514,21 +758,38 @@ impl Resident {
             if merged.is_empty() {
                 return Vec::new();
             }
-            merged.sort_unstable();
-            merged.dedup();
+            if trigram_len > 1 {
+                merged.sort_unstable();
+                merged.dedup();
+            }
             window_lists.push(merged);
         }
-        window_lists.sort_by_key(|list| list.len());
+        window_lists.sort_unstable_by_key(|list| list.len());
         window_lists.truncate(MAX_QUERY_POSTING_INTERSECTIONS);
-        window_lists[0]
-            .iter()
-            .filter(|id| {
-                window_lists[1..]
-                    .iter()
-                    .all(|list| list.binary_search(id).is_ok())
-            })
-            .map(|id| *id as usize)
-            .collect()
+        if window_lists.len() == 1 {
+            return window_lists[0].iter().map(|&id| id as usize).collect();
+        }
+        let first = window_lists[0].as_slice();
+        let mut cursors: Vec<&[u32]> = window_lists[1..].iter().map(Vec::as_slice).collect();
+        let mut out = Vec::with_capacity(first.len());
+        'outer: for &id in first {
+            for cursor in &mut cursors {
+                match cursor.binary_search(&id) {
+                    Ok(pos) => {
+                        *cursor = &cursor[pos + 1..];
+                    }
+                    Err(pos) => {
+                        if pos == cursor.len() {
+                            break 'outer;
+                        }
+                        *cursor = &cursor[pos..];
+                        continue 'outer;
+                    }
+                }
+            }
+            out.push(id as usize);
+        }
+        out
     }
 
     pub(crate) fn candidate_bytes(&self, ids: &[usize]) -> usize {
@@ -550,19 +811,26 @@ impl Resident {
         let mut matches = Vec::new();
         let mut total_matches = 0;
         let mut candidates = self.candidates(&request.pattern);
-        candidates.sort_unstable_by(|a, b| self.documents[*a].path.cmp(&self.documents[*b].path));
+        if !self.ids_are_path_sorted {
+            candidates.sort_unstable_by(|a, b| self.documents[*a].path.cmp(&self.documents[*b].path));
+        }
         for id in candidates {
             let document = &self.documents[id];
-            let mut previous_line = None;
-            for offset in finder.find_iter(document.text.as_bytes()) {
-                let line = document
-                    .starts
-                    .partition_point(|start| (*start as usize) <= offset)
+            if document.starts.is_empty() {
+                continue;
+            }
+            let bytes = document.text.as_bytes();
+            let mut search_pos = 0usize;
+            let mut line_cursor = 0usize;
+            while search_pos < bytes.len() {
+                let Some(rel) = finder.find(&bytes[search_pos..]) else {
+                    break;
+                };
+                let offset = search_pos + rel;
+                let line = line_cursor
+                    + document.starts[line_cursor..]
+                        .partition_point(|start| (*start as usize) <= offset)
                     - 1;
-                if previous_line == Some(line) {
-                    continue;
-                }
-                previous_line = Some(line);
                 total_matches += 1;
                 if matches.len() < request.limit {
                     matches.push(Hit {
@@ -571,6 +839,13 @@ impl Resident {
                         text: document.line(line).into(),
                     });
                 }
+                line_cursor = line + 1;
+                search_pos = document
+                    .starts
+                    .get(line_cursor)
+                    .copied()
+                    .map(|start| start as usize)
+                    .unwrap_or(bytes.len());
             }
         }
         let result = SearchResult {
@@ -588,19 +863,27 @@ impl Resident {
 
     pub fn read_many(&self, ranges: &[ReadRange]) -> Result<Vec<Snippet>> {
         validate_ranges(ranges)?;
-        let mut snippets = Vec::new();
+        let mut snippets = Vec::with_capacity(ranges.len());
         for range in ranges {
-            safe_relative(Path::new(&range.path))?;
-            let path = normalize(Path::new(&range.path));
-            let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
-            let id = self
-                .paths
-                .get(name)
-                .ok_or_else(|| SnapshotMissError { path: name.into() })?;
-            let document = &self.documents[*id];
+            let (name_cow, id) = if let Some(&id) = self.paths.get(range.path.as_str()) {
+                (std::borrow::Cow::Borrowed(range.path.as_str()), id)
+            } else {
+                safe_relative(Path::new(&range.path))?;
+                let path = normalize(Path::new(&range.path));
+                let name = path
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF8 path"))?
+                    .to_owned();
+                let id = *self
+                    .paths
+                    .get(name.as_str())
+                    .ok_or_else(|| SnapshotMissError { path: name.clone() })?;
+                (std::borrow::Cow::Owned(name), id)
+            };
+            let document = &self.documents[id];
             if range.start > document.starts.len() {
                 return Err(SnapshotRangeError {
-                    path: name.into(),
+                    path: name_cow.into_owned(),
                     start: range.start,
                     end: range.end,
                     lines: document.starts.len(),
@@ -608,14 +891,16 @@ impl Resident {
                 .into());
             }
             let end = range.end.min(document.starts.len());
+            let mut lines = Vec::with_capacity(end - range.start + 1);
+            for line in (range.start - 1)..end {
+                lines.push(document.line(line).into());
+            }
             snippets.push(Snippet {
-                path: name.into(),
+                path: name_cow.into_owned(),
                 start: range.start,
                 end,
-                sha256: digest_hex(&document.sha256),
-                lines: (range.start - 1..end)
-                    .map(|line| document.line(line).into())
-                    .collect(),
+                sha256: document.sha256_hex.to_string(),
+                lines,
             });
         }
         check_snippets_size(&snippets)?;
@@ -634,10 +919,11 @@ pub(crate) fn trigram(bytes: &[u8]) -> u32 {
 }
 
 pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(output, "{byte:02x}");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, &byte) in digest.iter().enumerate() {
+        out[i * 2] = HEX[(byte >> 4) as usize];
+        out[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
     }
-    output
+    String::from_utf8(out.to_vec()).expect("ASCII hex digits")
 }

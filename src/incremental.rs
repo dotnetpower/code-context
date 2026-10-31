@@ -1,9 +1,9 @@
 use crate::policy::MemoryPolicy;
-use crate::resident::{Document, MAX_POSTINGS, Resident, trigram};
+use crate::resident::{Document, MAX_POSTINGS, Resident, TrigramMap, trigram};
 use crate::workspace::Workspace;
 use crate::{Result, invalid};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,10 @@ pub(crate) struct Stamp {
 
 pub(crate) fn stamp(path: &Path) -> Result<Stamp> {
     let metadata = std::fs::metadata(path)?;
+    stamp_from_metadata(&metadata)
+}
+
+pub(crate) fn stamp_from_metadata(metadata: &std::fs::Metadata) -> Result<Stamp> {
     Ok(Stamp {
         length: metadata.len(),
         modified: metadata.modified()?,
@@ -64,19 +68,33 @@ pub(crate) fn validate_stamps(
 }
 
 fn keys(text: &str, limit: usize) -> Result<Vec<u32>> {
-    let mut unique = HashSet::new();
-    for key in text.as_bytes().windows(3).map(trigram) {
-        if unique.insert(key) && unique.len() > limit {
-            return Err(invalid("changed file exceeds max_unique_trigrams_per_file").into());
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::with_capacity((bytes.len() - 2).min(limit.saturating_add(1)).min(16_384));
+    let mut compact_threshold = 16_384usize;
+    for key in bytes.windows(3).map(trigram) {
+        keys.push(key);
+        if keys.len() >= compact_threshold {
+            keys.sort_unstable();
+            keys.dedup();
+            if keys.len() > limit {
+                return Err(invalid("changed file exceeds max_unique_trigrams_per_file").into());
+            }
+            compact_threshold = (keys.len() + 16_384).max(compact_threshold);
         }
     }
-    let mut keys: Vec<_> = unique.into_iter().collect();
     keys.sort_unstable();
+    keys.dedup();
+    if keys.len() > limit {
+        return Err(invalid("changed file exceeds max_unique_trigrams_per_file").into());
+    }
     Ok(keys)
 }
 
 fn adjust_delta(
-    deltas: &mut HashMap<u32, i64>,
+    deltas: &mut TrigramMap<i64>,
     key: u32,
     amount: i64,
     max_entries: usize,
@@ -93,7 +111,7 @@ fn adjust_delta(
 }
 
 fn accumulate_differences(
-    deltas: &mut HashMap<u32, i64>,
+    deltas: &mut TrigramMap<i64>,
     old: &[u32],
     new: &[u32],
     max_entries: usize,
@@ -126,21 +144,15 @@ fn accumulate_differences(
 
 fn document(path: String, bytes: Vec<u8>) -> Result<Document> {
     let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let sha256_hex: Arc<str> = Arc::from(crate::resident::digest_hex(&sha256));
     let text = String::from_utf8(bytes)?;
-    let mut starts = Vec::new();
-    if !text.is_empty() {
-        starts.push(0);
-        for (index, byte) in text.bytes().enumerate() {
-            if byte == b'\n' && index + 1 < text.len() {
-                starts.push(u32::try_from(index + 1)?);
-            }
-        }
-    }
+    let starts = crate::resident::build_line_starts(&text)?;
     Ok(Document {
         path: Arc::from(path),
         text,
         starts,
         sha256,
+        sha256_hex,
     })
 }
 
@@ -171,7 +183,7 @@ impl Resident {
         let mut staged_postings = 0usize;
         let current_owned = self.estimated_bytes();
         let mut staged_work_bytes = 0usize;
-        let mut key_delta: HashMap<u32, i64> = HashMap::new();
+        let mut key_delta: TrigramMap<i64> = TrigramMap::default();
         let mut source_files_read = 0usize;
         let mut source_bytes_read = 0usize;
         let targets: BTreeSet<_> = if verify_all {
@@ -215,6 +227,7 @@ impl Resident {
                     d.text.capacity()
                         + d.starts.capacity() * std::mem::size_of::<u32>()
                         + d.path.len()
+                        + d.sha256_hex.len()
                         + std::mem::size_of::<Document>()
                 }))
                 .saturating_add(
@@ -270,7 +283,7 @@ impl Resident {
             )
             .into());
         }
-        let mut unique_trigrams = self.postings.as_ref().map_or(0, HashMap::len);
+        let mut unique_trigrams = self.postings.as_ref().map_or(0, |p| p.len());
         if let Some(postings) = &self.postings {
             for (key, delta) in &key_delta {
                 let before = postings.get(key).map_or(0_i64, |ids| ids.len() as i64);
@@ -329,9 +342,13 @@ impl Resident {
                     text: String::new(),
                     starts: Vec::new(),
                     sha256: [0; 32],
+                    sha256_hex: Arc::from(""),
                 };
             }
             if let Some(new) = new {
+                if old_id.is_none() {
+                    self.ids_are_path_sorted = false;
+                }
                 let id = old_id
                     .or_else(|| self.documents.iter().position(|d| d.path.is_empty()))
                     .unwrap_or(self.documents.len());
@@ -379,14 +396,16 @@ mod tests {
 
     #[test]
     fn trigram_delta_tracks_only_set_differences() {
-        let mut deltas = HashMap::new();
+        let mut deltas = TrigramMap::default();
         accumulate_differences(&mut deltas, &[1, 2, 3, 4], &[1, 2, 4, 5], 2).unwrap();
-        assert_eq!(deltas, HashMap::from([(3, -1), (5, 1)]));
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas.get(&3), Some(&-1));
+        assert_eq!(deltas.get(&5), Some(&1));
     }
 
     #[test]
     fn trigram_delta_checks_budget_before_growth() {
-        let mut deltas = HashMap::new();
+        let mut deltas = TrigramMap::default();
         let error = accumulate_differences(&mut deltas, &[], &[1, 2], 1)
             .err()
             .unwrap();

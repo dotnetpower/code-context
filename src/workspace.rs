@@ -363,7 +363,7 @@ impl Workspace {
             let text = std::str::from_utf8(path)?;
             let path = Path::new(text);
             safe_relative(path)?;
-            reject_symlinks(&self.root, path)?;
+            let metadata = reject_symlinks_metadata(&self.root, path)?;
             let normalized = normalize(path);
             if paths.insert(normalized.clone()) {
                 total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());
@@ -381,7 +381,6 @@ impl Workspace {
                     ))
                     .into());
                 }
-                let metadata = std::fs::metadata(self.root.join(&normalized))?;
                 if metadata.len() > policy.max_file_bytes as u64 {
                     return Err(invalid(format!(
                         "file exceeds configured max_file_bytes: {}",
@@ -454,16 +453,21 @@ impl Workspace {
 
     pub fn read_known_with_limit(&self, path: &Path, max_file_bytes: usize) -> Result<Vec<u8>> {
         safe_relative(path)?;
-        reject_symlinks(&self.root, path)?;
-        let absolute = self.root.join(path);
-        if !crate::catalog::canonicalize(&absolute)?.starts_with(&self.root) {
-            return Err(invalid("resolved file is outside root").into());
+        let metadata = reject_symlinks_metadata(&self.root, path)?;
+        if metadata.len() > max_file_bytes as u64 {
+            return Err(invalid(format!(
+                "binary file or file larger than configured limit is unsupported: {}",
+                path.display()
+            ))
+            .into());
         }
-        let mut bytes = Vec::new();
+        let absolute = self.root.join(path);
+        let capacity = (metadata.len() as usize).min(max_file_bytes).saturating_add(1);
+        let mut bytes = Vec::with_capacity(capacity);
         std::fs::File::open(absolute)?
             .take(max_file_bytes as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > max_file_bytes || bytes.contains(&0) {
+        if bytes.len() > max_file_bytes || memchr::memchr(0, &bytes).is_some() {
             return Err(invalid(format!(
                 "binary file or file larger than configured limit is unsupported: {}",
                 path.display()
@@ -577,17 +581,25 @@ pub fn safe_relative(path: &Path) -> Result<()> {
 }
 
 pub fn reject_symlinks(root: &Path, path: &Path) -> Result<()> {
+    let _ = reject_symlinks_metadata(root, path)?;
+    Ok(())
+}
+
+pub(crate) fn reject_symlinks_metadata(root: &Path, path: &Path) -> Result<std::fs::Metadata> {
     let mut current = root.to_path_buf();
+    let mut last_meta = None;
     for component in path.components() {
         current.push(component);
-        if std::fs::symlink_metadata(&current)?
-            .file_type()
-            .is_symlink()
-        {
+        let meta = std::fs::symlink_metadata(&current)?;
+        if meta.file_type().is_symlink() {
             return Err(invalid("symlinks are unsupported in this local experiment").into());
         }
+        last_meta = Some(meta);
     }
-    Ok(())
+    match last_meta {
+        Some(meta) => Ok(meta),
+        None => Ok(std::fs::symlink_metadata(&current)?),
+    }
 }
 
 pub fn capture(command: &mut Command) -> Result<Vec<u8>> {

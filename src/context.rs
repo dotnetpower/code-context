@@ -109,7 +109,7 @@ pub(crate) fn is_response_budget(error: &(dyn std::error::Error + 'static)) -> b
     error.downcast_ref::<ResponseBudgetError>().is_some()
 }
 
-fn string_bound(value: &str) -> usize {
+pub(crate) fn string_bound(value: &str) -> usize {
     2 + value.len()
         + value
             .bytes()
@@ -218,8 +218,41 @@ fn is_python_top_header(line: &str) -> bool {
         .any(|prefix| line.starts_with(prefix))
 }
 
+fn leading_indent_cols(line: &str) -> usize {
+    let mut cols = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => cols += 1,
+            b'\t' => cols += 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
+fn is_block_definition_header(line: &str) -> bool {
+    if line.trim().is_empty() || leading_indent_cols(line) > 4 {
+        return false;
+    }
+    crate::query::is_definition_line(line)
+}
+
+fn is_leading_doc_or_attr(line: &str) -> bool {
+    if leading_indent_cols(line) > 4 {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    trimmed.starts_with("#[")
+        || trimmed.starts_with("///")
+        || trimmed.starts_with("/**")
+        || trimmed == "*"
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('@')
+}
+
 fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
-    if radius < 6 || snippet.lines.len() <= 6 {
+    if radius < 6 || snippet.lines.len() <= 2 {
         return;
     }
     let mut min_hit = usize::MAX;
@@ -238,10 +271,16 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
     let mut new_start_idx = 0usize;
     let mut new_end_idx = snippet.lines.len() - 1;
     if snippet.path.ends_with(".py") || snippet.path.ends_with(".pyi") {
+        let is_py_header = |line: &str| {
+            leading_indent_cols(line) <= 4 && is_python_top_header(line.trim_start())
+        };
         for idx in (1..=min_idx).rev() {
-            if is_python_top_header(&snippet.lines[idx]) {
+            if is_py_header(&snippet.lines[idx]) {
                 let mut header_start = idx;
-                while header_start > 0 && snippet.lines[header_start - 1].starts_with('@') {
+                while header_start > 0
+                    && leading_indent_cols(&snippet.lines[header_start - 1]) <= 4
+                    && snippet.lines[header_start - 1].trim_start().starts_with('@')
+                {
                     header_start -= 1;
                 }
                 if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
@@ -251,7 +290,7 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
         }
         for idx in (max_idx + 1)..snippet.lines.len() {
-            if is_python_top_header(&snippet.lines[idx])
+            if is_py_header(&snippet.lines[idx])
                 && snippet.lines[idx - 1].trim().is_empty()
             {
                 let mut end_idx = idx - 1;
@@ -263,12 +302,25 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
         }
     } else {
-        let is_top_close = |line: &str| {
-            let trimmed = line.trim_end();
+        let is_block_close = |line: &str| {
+            if leading_indent_cols(line) > 4 {
+                return false;
+            }
+            let trimmed = line.trim();
             trimmed == "}" || trimmed == "};"
         };
-        for idx in (0..min_idx).rev() {
-            if is_top_close(&snippet.lines[idx]) {
+        for idx in (1..=min_idx).rev() {
+            if is_block_definition_header(&snippet.lines[idx]) {
+                let mut header_start = idx;
+                while header_start > 0 && is_leading_doc_or_attr(&snippet.lines[header_start - 1]) {
+                    header_start -= 1;
+                }
+                if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
+                    new_start_idx = header_start;
+                    break;
+                }
+            }
+            if idx < min_idx && is_block_close(&snippet.lines[idx]) {
                 let mut candidate = idx + 1;
                 while candidate < min_idx && snippet.lines[candidate].trim().is_empty() {
                     candidate += 1;
@@ -277,9 +329,27 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 break;
             }
         }
+        if new_start_idx == 0 && min_idx > 0 && is_block_close(&snippet.lines[0]) {
+            let mut candidate = 1;
+            while candidate < min_idx && snippet.lines[candidate].trim().is_empty() {
+                candidate += 1;
+            }
+            new_start_idx = candidate;
+        }
         for idx in max_idx..snippet.lines.len().saturating_sub(1) {
-            if is_top_close(&snippet.lines[idx]) && snippet.lines[idx + 1].trim().is_empty() {
+            if is_block_close(&snippet.lines[idx]) && snippet.lines[idx + 1].trim().is_empty() {
                 new_end_idx = idx;
+                break;
+            }
+            if idx > max_idx
+                && is_block_definition_header(&snippet.lines[idx])
+                && snippet.lines[idx - 1].trim().is_empty()
+            {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
                 break;
             }
         }
@@ -288,7 +358,10 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
         && new_start_idx <= min_idx
         && max_idx <= new_end_idx
     {
-        snippet.lines = snippet.lines[new_start_idx..=new_end_idx].to_vec();
+        snippet.lines.truncate(new_end_idx + 1);
+        if new_start_idx > 0 {
+            snippet.lines.drain(..new_start_idx);
+        }
         snippet.start += new_start_idx;
         snippet.end = snippet.start + snippet.lines.len() - 1;
     }
@@ -299,14 +372,49 @@ pub(crate) fn assemble(
     radius: usize,
     read: impl FnOnce(&[ReadRange]) -> Result<Vec<Snippet>>,
 ) -> Result<ContextResult> {
-    let mut ranges: Vec<ReadRange> = Vec::new();
+    assemble_inner(result, radius, true, read)
+}
+
+pub(crate) fn assemble_trusted(
+    result: SearchResult,
+    radius: usize,
+    read: impl FnOnce(&[ReadRange]) -> Result<Vec<Snippet>>,
+) -> Result<ContextResult> {
+    assemble_inner(result, radius, false, read)
+}
+
+fn assemble_inner(
+    result: SearchResult,
+    radius: usize,
+    verify_lines: bool,
+    read: impl FnOnce(&[ReadRange]) -> Result<Vec<Snippet>>,
+) -> Result<ContextResult> {
+    let has_definition_hit = radius >= 6
+        && result.matches.iter().any(|hit| {
+            crate::query::is_definition_line(&hit.text)
+                || is_python_top_header(hit.text.trim_start())
+        });
+    let mut ranges: Vec<ReadRange> = Vec::with_capacity(result.matches.len());
     for hit in &result.matches {
-        let start = hit.line.saturating_sub(radius).max(1);
-        let end = hit.line.saturating_add(radius);
+        let (above, below, max_span) = if has_definition_hit {
+            let is_def = crate::query::is_definition_line(&hit.text)
+                || is_python_top_header(hit.text.trim_start());
+            if is_def {
+                (1usize, radius.min(5), 16usize)
+            } else if hit.text.trim_end().ends_with(['(', ',', '{']) {
+                (0usize, 2usize, 4usize)
+            } else {
+                (0usize, 0usize, 2usize)
+            }
+        } else {
+            (radius, radius, 500usize)
+        };
+        let start = hit.line.saturating_sub(above).max(1);
+        let end = hit.line.saturating_add(below);
         if let Some(last) = ranges.last_mut()
             && last.path == hit.path
             && start <= last.end.saturating_add(1)
-            && end - last.start < 500
+            && end - last.start < max_span
         {
             last.end = last.end.max(end);
         } else {
@@ -325,13 +433,17 @@ pub(crate) fn assemble(
     for snippet in &mut snippets {
         clamp_snippet_to_block(snippet, &result.matches, radius);
     }
-    for hit in &result.matches {
-        let current = snippets
-            .iter()
-            .find(|s| s.path == hit.path && s.start <= hit.line && s.end >= hit.line)
-            .and_then(|s| s.lines.get(hit.line - s.start));
-        if current != Some(&hit.text) {
-            return Err(invalid("file changed between search and read; retry the request").into());
+    if verify_lines {
+        for hit in &result.matches {
+            let current = snippets
+                .iter()
+                .find(|s| s.path == hit.path && s.start <= hit.line && s.end >= hit.line)
+                .and_then(|s| s.lines.get(hit.line - s.start));
+            if current != Some(&hit.text) {
+                return Err(
+                    invalid("file changed between search and read; retry the request").into(),
+                );
+            }
         }
     }
     let consistency = format!(
