@@ -75,6 +75,12 @@ npx vsce verify-pat --azure-credential "$(node -p "require('./package.json').pub
 npx vsce publish --azure-credential --packagePath dist/code-context-native.vsix
 ```
 
+For a publisher owned by a personal Microsoft account (MSA), acquire the Azure
+DevOps token (`499b84ac-1321-427f-aa17-267ca6975798/.default`) from the
+Microsoft Services tenant (`f8cdef31-a31e-4b4a-93e4-5f571e91255a`) in memory
+rather than a subscription directory tenant, and pass it directly to `vsce`
+without persisting a plaintext token.
+
 If access is denied, use the management portal to create/select the publisher
 and configure its members, or upload the verified VSIX there after signing in.
 Do not bypass the denial or use another publisher identity without approval.

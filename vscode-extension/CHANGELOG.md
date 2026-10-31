@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.15.0
+
+- Eliminate multi-project VS Code startup contention with registry seeding,
+  coalesced `code_workspaces` discovery, jittered service auto-start, lock-free
+  registered-root preparation, and small-root background queue prioritization.
+- Prioritize native VS Code Language Model Tools (`#cctxNative*`) first and add
+  smart multi-root workspace resolution across visible editors, tab groups,
+  relative path existence checks, folder basenames, file URIs, and `:line` /
+  `#Lline` suffixes.
+- Accelerate resident trigram lookups (`15.01×` mixed warm speedup, `0.260 ms`
+  mean across 8,960 pairs; `20.50×` literal search) with inline `PostingList`
+  storage, SplitMix64 trigram maps, galloping line search, zero-copy `CCTXJ1` /
+  `CCTXB1` IPC framing, and adaptive definition vs. call-site snippet clamping.
+- Update the four-panel benchmark chart to compare `CCTX off`, `v0.14`, and
+  current warm IPC side-by-side with explicit latency, speedup, and token labels.
+
 ## 0.14.0
 
 - Support native Windows (`cctx.exe`) workspaces without WSL alongside existing
