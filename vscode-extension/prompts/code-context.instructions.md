@@ -5,6 +5,13 @@ applyTo: "**"
 
 # Code Context source lookup
 
+**NATIVE-FIRST PRIORITY IN VS CODE**: Whenever `#cctxNativeContext`, `#cctxNativeRead`,
+`#cctxNativeGrep`, and `#cctxNativeFiles` (`code-context-native_*`) are callable in
+the current VS Code session, ALWAYS use those Native tools FIRST before MCP
+(`code_context`/`code_read`/`code_grep`/`code_files`) or built-in search/read tools.
+Native tools use persistent framed IPC with pre-formatted text output, avoiding
+JSON wrapper overhead and multi-project startup contention.
+
 CCTX is an optional accelerator, not a prerequisite for Copilot to continue.
 It is a root-level memory cache: startup and registry/status inspection do not
 prewarm source. A first cold lookup returns `CACHE_MISS` immediately and schedules
@@ -24,7 +31,7 @@ Use `#cctxNativeFiles` (`code-context-native_codeFiles`) first for filename/path
 pattern does not search filenames. Use `#cctxNativeContext` (`code-context-native_codeContext`) for a symbol or literal plus surrounding saved
 source. Use `#cctxNativeGrep` (`code-context-native_codeGrep`) for exact or regex search and
 `#cctxNativeRead` (`code-context-native_codeRead`) for known ranges. Prefer one context call over separate search
-and read calls. Do not start with built-in `read_file`, `view`, `grep_search`, or `rg` for registered saved source, even when file paths are already known. If Code Context tools are deferred or not yet visible in the active tool list, discover them first with `tool_search` (for example query `"code-context-native codeContext codeRead codeGrep codeFiles"`) before reading or searching files.
+and read calls. Always pass the explicit absolute `root` parameter when the workspace or worktree path is known (especially in Windows/WSL Agent Sessions and multi-root setups). Keep each `#cctxNativeRead` / `code_read` call to `<=150` total lines (`<8KiB`) and set `max_matches_per_file` on broad searches so responses stay inline instead of being offloaded to temporary `/tmp` files by the host. When delegating to subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`), include the target `root` and instruct the subagent to use `#cctxNative*` or `code-context` MCP tools first. Do not start with built-in `read_file`, `view`, `grep_search`, or `rg` for registered saved source, even when file paths are already known. If Code Context tools are deferred or not yet visible in the active tool list, discover them first with `tool_search` (for example query `"code-context-native codeContext codeRead codeGrep codeFiles"`) before reading or searching files.
 
 Context radius is 0..100 and limit is 1..64. Broad shared reads are split into
 explicit snippets of at most500lines (max64segments total); split_ranges=false

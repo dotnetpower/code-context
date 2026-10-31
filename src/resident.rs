@@ -53,6 +53,123 @@ impl BuildHasher for TrigramBuildHasher {
 
 pub(crate) type TrigramMap<V> = HashMap<u32, V, TrigramBuildHasher>;
 
+#[derive(Clone, Debug)]
+pub(crate) enum PostingList {
+    Inline { len: u8, ids: [u32; 4] },
+    Heap(Vec<u32>),
+}
+
+impl Default for PostingList {
+    #[inline]
+    fn default() -> Self {
+        Self::Inline {
+            len: 0,
+            ids: [0; 4],
+        }
+    }
+}
+
+impl PostingList {
+    #[inline]
+    pub(crate) fn single(id: u32) -> Self {
+        Self::Inline {
+            len: 1,
+            ids: [id, 0, 0, 0],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, ids } => &ids[..usize::from(*len)],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => usize::from(*len),
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(v) => v.capacity() * std::mem::size_of::<u32>(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, id: u32) {
+        match self {
+            Self::Inline { len, ids } => {
+                let l = usize::from(*len);
+                if l < 4 {
+                    ids[l] = id;
+                    *len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(8);
+                    v.extend_from_slice(ids);
+                    v.push(id);
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.push(id),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn insert_sorted(&mut self, id: u32) {
+        match self {
+            Self::Inline { len, ids } => {
+                let l = usize::from(*len);
+                let pos = ids[..l].binary_search(&id).unwrap_or_else(|i| i);
+                if l < 4 {
+                    ids.copy_within(pos..l, pos + 1);
+                    ids[pos] = id;
+                    *len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(8);
+                    v.extend_from_slice(&ids[..pos]);
+                    v.push(id);
+                    v.extend_from_slice(&ids[pos..4]);
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => {
+                let pos = v.binary_search(&id).unwrap_or_else(|i| i);
+                v.insert(pos, id);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove_sorted(&mut self, id: u32) {
+        match self {
+            Self::Inline { len, ids } => {
+                let l = usize::from(*len);
+                if let Ok(pos) = ids[..l].binary_search(&id) {
+                    ids.copy_within((pos + 1)..l, pos);
+                    *len -= 1;
+                }
+            }
+            Self::Heap(v) => {
+                if let Ok(pos) = v.binary_search(&id) {
+                    v.remove(pos);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) const MAX_POSTINGS: usize = 64 * 1024 * 1024;
 const DENSE_TRIGRAM_SLOTS: usize = 1 << 24;
 const DENSE_TRIGRAM_MIN_SOURCE: usize = 16 * 1024 * 1024;
@@ -183,17 +300,19 @@ pub(crate) fn build_line_starts(text: &str) -> Result<Vec<u32>> {
 }
 
 impl Document {
+    #[inline]
     pub(crate) fn line(&self, index: usize) -> &str {
-        let end = self
+        let mut end = self
             .starts
             .get(index + 1)
             .copied()
             .map(|offset| offset as usize)
             .unwrap_or(self.text.len());
         let start = self.starts[index] as usize;
-        self.text[start..end]
-            .strip_suffix('\n')
-            .unwrap_or(&self.text[start..end])
+        if end > start && self.text.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+        }
+        &self.text[start..end]
     }
 }
 
@@ -218,7 +337,8 @@ pub struct Stats {
 pub struct Resident {
     pub(crate) documents: Vec<Document>,
     pub(crate) paths: BTreeMap<Arc<str>, usize>,
-    pub(crate) postings: Option<TrigramMap<Vec<u32>>>,
+    pub(crate) postings: Option<TrigramMap<PostingList>>,
+    pub(crate) free_ids: Vec<usize>,
     pub(crate) policy: MemoryPolicy,
     pub(crate) max_owned_bytes: usize,
     pub(crate) ids_are_path_sorted: bool,
@@ -345,6 +465,7 @@ impl Resident {
             documents,
             paths,
             postings: None,
+            free_ids: Vec::new(),
             policy,
             max_owned_bytes,
             ids_are_path_sorted: true,
@@ -373,7 +494,7 @@ impl Resident {
             .min(self.policy.max_unique_trigrams)
             .min(131_072);
         let prealloc_map_bytes = estimated_trigrams.saturating_mul(40);
-        let mut index: TrigramMap<Vec<u32>> =
+        let mut index: TrigramMap<PostingList> =
             if base_owned.saturating_add(prealloc_map_bytes) <= self.max_owned_bytes {
                 TrigramMap::with_capacity_and_hasher(estimated_trigrams, TrigramBuildHasher)
             } else {
@@ -604,7 +725,7 @@ impl Resident {
                             return Err(invalid("root exceeds max_unique_trigrams").into());
                         }
                         current_len += 1;
-                        entry.insert(vec![doc_id]);
+                        entry.insert(PostingList::single(doc_id));
                     }
                 }
             }
@@ -644,18 +765,23 @@ impl Resident {
             })
             .sum();
         let index = self.postings.as_ref().map_or(0, |p| {
-            p.capacity() * (std::mem::size_of::<(u32, Vec<u32>)>() + 1)
-                + p.values().map(|v| v.capacity() * 4).sum::<usize>()
+            p.capacity() * (std::mem::size_of::<(u32, PostingList)>() + 1)
+                + p.values().map(PostingList::heap_bytes).sum::<usize>()
         });
-        source + index + self.paths.keys().map(|p| p.len() + 64).sum::<usize>()
+        source
+            + index
+            + self
+                .stats
+                .path_bytes
+                .saturating_add(self.paths.len().saturating_mul(64))
     }
 
     pub(crate) fn posting_bytes_estimate(&self) -> usize {
         self.postings.as_ref().map_or(0, |postings| {
-            postings.capacity() * (std::mem::size_of::<(u32, Vec<u32>)>() + 1)
+            postings.capacity() * (std::mem::size_of::<(u32, PostingList)>() + 1)
                 + postings
                     .values()
-                    .map(|ids| ids.capacity() * std::mem::size_of::<u32>())
+                    .map(PostingList::heap_bytes)
                     .sum::<usize>()
         })
     }
@@ -670,6 +796,67 @@ impl Resident {
         };
         if pattern.len() < 3 {
             return (0..self.documents.len()).collect();
+        }
+        let window_count = pattern.len() - 2;
+        if window_count <= 8 {
+            let mut stack_keys = [0_u32; 8];
+            let mut key_len = 0usize;
+            for window in pattern.windows(3) {
+                let k = trigram(window);
+                if !stack_keys[..key_len].contains(&k) {
+                    stack_keys[key_len] = k;
+                    key_len += 1;
+                }
+            }
+            let mut keyed_lists: [(u32, &[u32]); 8] = [(0, &[]); 8];
+            for (i, &k) in stack_keys[..key_len].iter().enumerate() {
+                let Some(list) = index.get(&k) else {
+                    return Vec::new();
+                };
+                let slice = list.as_slice();
+                if slice.is_empty() {
+                    return Vec::new();
+                }
+                keyed_lists[i] = (k, slice);
+            }
+            let active = &mut keyed_lists[..key_len];
+            active.sort_unstable_by_key(|&(k, list)| {
+                let b0 = (k & 0xff) as u8;
+                let b1 = ((k >> 8) & 0xff) as u8;
+                let b2 = ((k >> 16) & 0xff) as u8;
+                let non_ascii =
+                    usize::from(b0 >= 0x80) + usize::from(b1 >= 0x80) + usize::from(b2 >= 0x80);
+                (list.len(), non_ascii)
+            });
+            if key_len == 1 {
+                return active[0].1.iter().map(|&id| id as usize).collect();
+            }
+            let first = active[0].1;
+            let mut cursors: [&[u32]; 7] = [&[]; 7];
+            let cursor_len = key_len - 1;
+            for (i, &(_, list)) in active[1..].iter().enumerate() {
+                cursors[i] = list;
+            }
+            let active_cursors = &mut cursors[..cursor_len];
+            let mut out = Vec::with_capacity(first.len());
+            'outer_small: for &id in first {
+                for cursor in active_cursors.iter_mut() {
+                    match cursor.binary_search(&id) {
+                        Ok(pos) => {
+                            *cursor = &cursor[pos + 1..];
+                        }
+                        Err(pos) => {
+                            if pos == cursor.len() {
+                                break 'outer_small;
+                            }
+                            *cursor = &cursor[pos..];
+                            continue 'outer_small;
+                        }
+                    }
+                }
+                out.push(id as usize);
+            }
+            return out;
         }
         let mut keys: Vec<_> = pattern.windows(3).map(trigram).collect();
         keys.sort_unstable();
@@ -700,10 +887,15 @@ impl Resident {
             return keyed_lists[0].1.iter().map(|&id| id as usize).collect();
         }
         let first = keyed_lists[0].1;
-        let mut cursors: Vec<&[u32]> = keyed_lists[1..].iter().map(|&(_, list)| list).collect();
+        let mut cursors: [&[u32]; MAX_QUERY_POSTING_INTERSECTIONS] = [&[]; MAX_QUERY_POSTING_INTERSECTIONS];
+        let cursor_len = keyed_lists.len() - 1;
+        for (i, &(_, list)) in keyed_lists[1..].iter().enumerate() {
+            cursors[i] = list;
+        }
+        let active_cursors = &mut cursors[..cursor_len];
         let mut out = Vec::with_capacity(first.len());
         'outer: for &id in first {
-            for cursor in &mut cursors {
+            for cursor in active_cursors.iter_mut() {
                 match cursor.binary_search(&id) {
                     Ok(pos) => {
                         *cursor = &cursor[pos + 1..];
@@ -752,15 +944,16 @@ impl Resident {
             let mut merged = Vec::new();
             for &key in &trigram_keys[..trigram_len] {
                 if let Some(list) = index.get(&key) {
-                    merged.extend_from_slice(list);
+                    let slice = list.as_slice();
+                    if merged.is_empty() {
+                        merged.extend_from_slice(slice);
+                    } else {
+                        merge_u32_in_place(&mut merged, slice);
+                    }
                 }
             }
             if merged.is_empty() {
                 return Vec::new();
-            }
-            if trigram_len > 1 {
-                merged.sort_unstable();
-                merged.dedup();
             }
             window_lists.push(merged);
         }
@@ -793,13 +986,15 @@ impl Resident {
     }
 
     pub(crate) fn candidate_bytes(&self, ids: &[usize]) -> usize {
+        if ids.len() == self.stats.files && self.free_ids.is_empty() {
+            return self.stats.source_bytes;
+        }
         ids.iter().map(|id| self.documents[*id].text.len()).sum()
     }
 
     pub fn search(&self, request: &Search) -> Result<SearchResult> {
         if request.pattern.is_empty()
-            || request.pattern.contains('\n')
-            || request.pattern.contains('\0')
+            || memchr::memchr2(b'\n', b'\0', request.pattern.as_bytes()).is_some()
             || request.regex
             || request.ignore_case
             || request.limit == 0
@@ -827,10 +1022,7 @@ impl Resident {
                     break;
                 };
                 let offset = search_pos + rel;
-                let line = line_cursor
-                    + document.starts[line_cursor..]
-                        .partition_point(|start| (*start as usize) <= offset)
-                    - 1;
+                let line = find_line_gallop(&document.starts, line_cursor, offset);
                 total_matches += 1;
                 if matches.len() < request.limit {
                     matches.push(Hit {
@@ -912,6 +1104,50 @@ impl Resident {
         let bytes = ids.iter().map(|id| self.documents[*id].text.len()).sum();
         (ids.len(), bytes)
     }
+}
+
+#[inline]
+pub(crate) fn find_line_gallop(starts: &[u32], cursor: usize, offset: usize) -> usize {
+    let rem = &starts[cursor..];
+    if rem.len() <= 1 || (rem[1] as usize) > offset {
+        return cursor;
+    }
+    if rem.len() == 2 || (rem[2] as usize) > offset {
+        return cursor + 1;
+    }
+    if rem.len() == 3 || (rem[3] as usize) > offset {
+        return cursor + 2;
+    }
+    cursor + 3 + rem[3..].partition_point(|&start| (start as usize) <= offset) - 1
+}
+
+fn merge_u32_in_place(target: &mut Vec<u32>, right: &[u32]) {
+    if right.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(target.len() + right.len());
+    let left = target.as_slice();
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(left[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(right[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&left[i..]);
+    out.extend_from_slice(&right[j..]);
+    *target = out;
 }
 
 pub(crate) fn trigram(bytes: &[u8]) -> u32 {

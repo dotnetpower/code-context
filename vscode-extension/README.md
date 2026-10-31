@@ -22,22 +22,22 @@ For VSIX-only installations, use the links above instead.
 ## Performance
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-retrieval mix averaged **6.83× faster** with a warm CCTX cache
-(95% CI **6.65–7.06×**): **3.809 → 0.557 ms per operation**.
-Replacing separate `rg` + `view` calls with one block-clamped `code_context` call cuts **lookup payload tokens by 47.5–71.1%** and reduces end-to-end coding agent wall time by **24.7%**.
+retrieval mix averaged **9.59× faster** with a warm CCTX cache
+(95% CI **9.32–9.88×**): **3.791 → 0.395 ms per operation**.
+Replacing separate `rg` + `view` calls with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%** and reduces end-to-end coding agent wall time by **24.7%**.
 
 | Task | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.257 ms | 0.566 ms | 7.52× |
-| Literal search | 4.965 ms | 0.428 ms | 11.60× |
-| Search + context | 5.122 ms | 0.499 ms | 10.26× |
-| Known read + hash | **0.070 ms** | 0.799 ms | **0.09× — slower** |
-| Fixed mixed suite | 3.809 ms | 0.557 ms | 6.83× |
+| Filename discovery | 4.254 ms | 0.401 ms | 10.62× |
+| Literal search | 4.942 ms | 0.389 ms | 12.72× |
+| Search + context | 5.090 ms | 0.422 ms | 12.06× |
+| Known read + hash | **0.060 ms** | 0.363 ms | **0.17× — slower** |
+| Fixed mixed suite | 3.791 ms | 0.395 ms | 9.59× |
 
 | Token & agent acceleration suite | Baseline (`rg` + `view`) | With CCTX (`code_context`) | Savings / speedup |
 |---|---:|---:|---:|
-| Rust 6-symbol lookup tokens | 18,907 tok (100L) / 29,396 tok (200L) | **9,929 tok** (6 calls vs 21) | **-47.5% to -66.2% tokens** |
-| Python 6-symbol lookup tokens | 13,799 tok (100L) / 24,126 tok (200L) | **6,971 tok** (**10.65×** faster) | **-49.5% to -71.1% tokens** |
+| Rust 6-symbol lookup tokens | 15,028 tok (100L) / 25,133 tok (200L) | **4,031 tok** (6 calls vs 20, **10.3×** faster) | **-73.2% to -84.0% tokens** |
+| Python 6-symbol lookup tokens | 13,997 tok (100L) / 24,609 tok (200L) | **2,141 tok** (**13.16×** faster) | **-84.7% to -91.3% tokens** |
 | Copilot A/B agent turns & cost | 7.00 calls / 5.00 turns / 20.31 s | **2.67 calls / 3.67 turns / 15.30 s** | **-50.0% tok · -25.4% AIU · -24.7% time** |
 
 ![Warm retrieval latency, speedup, Rust/Python token savings, and agent acceleration](resources/benchmark.png)

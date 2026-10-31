@@ -91,7 +91,9 @@ pub fn search(workspace: &Workspace, request: &Search) -> Result<SearchResult> {
         truncated: total_matches > request.limit,
         consistency: "live filesystem search; not an atomic repository snapshot".into(),
     };
-    if serde_json::to_vec(&result)?.len() > MAX_RESPONSE {
+    if crate::context::check_search_size(&result).is_err()
+        && serde_json::to_vec(&result)?.len() > MAX_RESPONSE
+    {
         return Err(invalid("response exceeds 256 KiB; narrow the search").into());
     }
     Ok(result)

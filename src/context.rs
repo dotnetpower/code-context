@@ -101,7 +101,7 @@ fn ensure_size_bound(bound: usize) -> Result<()> {
 struct ResponseBudgetError;
 impl std::fmt::Display for ResponseBudgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RESPONSE_BUDGET_EXCEEDED: response exceeds 256 KiB; narrow the request. For context reduce limit/radius or select one file; for reads use page=true or fewer ranges. No partial success was returned.")
+        f.write_str("RESPONSE_BUDGET_EXCEEDED: response exceeds 256 KiB; narrow the request. For context reduce limit/radius, set max_matches_per_file=2, or select one file; for reads use page=true or fewer ranges (<=150 lines per call). No partial success was returned.")
     }
 }
 impl std::error::Error for ResponseBudgetError {}
@@ -354,6 +354,12 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
         }
     }
+    while new_start_idx < min_idx && snippet.lines[new_start_idx].trim().is_empty() {
+        new_start_idx += 1;
+    }
+    while new_end_idx > max_idx && snippet.lines[new_end_idx].trim().is_empty() {
+        new_end_idx -= 1;
+    }
     if (new_start_idx > 0 || new_end_idx + 1 < snippet.lines.len())
         && new_start_idx <= min_idx
         && max_idx <= new_end_idx
@@ -401,7 +407,7 @@ fn assemble_inner(
                 || is_python_top_header(hit.text.trim_start());
             if is_def {
                 (1usize, radius.min(5), 16usize)
-            } else if hit.text.trim_end().ends_with(['(', ',', '{']) {
+            } else if result.matches.len() <= 8 && hit.text.trim_end().ends_with(['(', ',', '{']) {
                 (0usize, 2usize, 4usize)
             } else {
                 (0usize, 0usize, 2usize)
@@ -413,7 +419,7 @@ fn assemble_inner(
         let end = hit.line.saturating_add(below);
         if let Some(last) = ranges.last_mut()
             && last.path == hit.path
-            && start <= last.end.saturating_add(1)
+            && start <= last.end.saturating_add(if has_definition_hit { 2 } else { 1 })
             && end - last.start < max_span
         {
             last.end = last.end.max(end);

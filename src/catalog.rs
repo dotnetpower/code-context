@@ -151,7 +151,11 @@ pub fn load() -> Result<Vec<Spec>> {
     let path = state_dir()?.join("workspaces.json");
     match std::fs::File::open(&path) {
         Ok(file) => {
-            let mut bytes = Vec::new();
+            let cap = file
+                .metadata()
+                .map(|m| (m.len() as usize).min(1024 * 1024 + 1))
+                .unwrap_or(512);
+            let mut bytes = Vec::with_capacity(cap);
             file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
             if bytes.len() > 1024 * 1024 {
                 return Err(invalid("registry exceeds 1 MiB").into());
@@ -247,14 +251,29 @@ pub fn unregister(root: &Path) -> Result<()> {
 
 pub fn resolve_root(path: &Path) -> Result<PathBuf> {
     let path = canonicalize(path)?;
-    load()?
-        .into_iter()
+    let specs = load()?;
+    if let Some(root) = specs
+        .iter()
         .filter(|s| path.starts_with(&s.root))
         .max_by_key(|s| s.root.components().count())
-        .map(|s| s.root)
-        .ok_or_else(|| {
-            invalid("no registered workspace contains this directory; use cctx register").into()
-        })
+        .map(|s| s.root.clone())
+    {
+        return Ok(root);
+    }
+    let listed: Vec<String> = specs
+        .iter()
+        .take(5)
+        .map(|s| s.root.display().to_string())
+        .collect();
+    let suffix = if listed.is_empty() {
+        String::new()
+    } else {
+        format!(" (registered roots: {})", listed.join(", "))
+    };
+    Err(invalid(format!(
+        "no registered workspace contains this directory; use cctx register{suffix}"
+    ))
+    .into())
 }
 
 pub(crate) fn mutate(change: impl FnOnce(&mut Vec<Spec>) -> Result<()>) -> Result<()> {

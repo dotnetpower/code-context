@@ -9,14 +9,19 @@ use std::time::Instant;
 const CACHE_GUIDANCE: &str = "CCTX is an optional nonblocking root cache. CACHE_MISS returns immediately and queues only the requested root; continue that lookup with permitted host search/read. Do not poll/repeat, switch CCTX transports or run code_sync to wait for warmup. CACHE_LOAD_FAILED reports the load failure. Neither means zero matches or a missing disk file. Startup and legacy prewarm flags do not load/pin source. Inactive roots expire after15minutes and may be evicted earlier by LRU/memory limits. Do not enumerate sibling worktrees speculatively. Explicitly needed code_sync remains a waiting barrier.";
 
 pub fn tools() -> Value {
+    static TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(build_tools).clone()
+}
+
+fn build_tools() -> Value {
     let mut tools = crate::mcp::tools();
     let items = tools["tools"]
         .as_array_mut()
         .expect("static tool schema is an array");
     for tool in items.iter_mut() {
-        tool["inputSchema"]["properties"]["root"] = json!({"type":"string","description":"Optional absolute registered project root. Omit for the current workspace; the server resolves only an explicitly registered ancestor."});
+        tool["inputSchema"]["properties"]["root"] = json!({"type":"string","description":"Optional absolute registered project/worktree root. Pass explicitly when known; if omitted, resolves from the current workspace."});
         if tool["name"] != "code_read" && tool["name"] != "code_files" {
-            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Optional relative path prefixes."});
+            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Optional non-hidden relative path prefixes within root."});
             tool["inputSchema"]["properties"]["glob"] = json!({"type":"string","description":"Optional filename/path glob."});
             tool["inputSchema"]["properties"]["max_matches_per_file"] = json!({"type":"integer","minimum":1,"maximum":64,"description":"Optional per-file match cap; prioritizes symbol definitions."});
         }
@@ -39,7 +44,7 @@ pub fn tools() -> Value {
                 "Use FIRST for a symbol plus nearby saved source in ONE call. Literal by default; Set regex=true for alternation (a|b)."
             }
             _ => {
-                "Use FIRST for known saved-source ranges with live SHA-256 verification."
+                "Use FIRST for known saved-source ranges (keep <=150 lines per call to stay inline) with live SHA-256 verification."
             }
         };
         tool["description"] = json!(format!(
@@ -87,6 +92,84 @@ fn flush_pending_traces(
     }
 }
 
+fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Option<PathBuf> {
+    let mut candidate_path: Option<&str> = None;
+    if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+        candidate_path = paths.iter().find_map(Value::as_str).filter(|p| p.starts_with('/'));
+    }
+    if candidate_path.is_none()
+        && let Some(ranges) = arguments.get("ranges").and_then(Value::as_array)
+    {
+        candidate_path = ranges
+            .iter()
+            .filter_map(|r| r.get("path").and_then(Value::as_str))
+            .find(|p| p.starts_with('/'));
+    }
+    let target = std::path::Path::new(candidate_path?);
+    let specs = crate::catalog::load().ok()?;
+    specs
+        .into_iter()
+        .filter(|spec| target.starts_with(&spec.root))
+        .max_by_key(|spec| spec.root.components().count())
+        .map(|spec| spec.root)
+}
+
+fn normalize_mcp_argument_aliases(name: &str, arguments: &mut serde_json::Map<String, Value>) {
+    if matches!(name, "code_grep" | "code_context")
+        && !arguments.contains_key("pattern")
+        && let Some(query) = arguments.remove("query")
+    {
+        arguments.insert("pattern".into(), query);
+    }
+    if name == "code_files"
+        && !arguments.contains_key("glob")
+        && let Some(pattern) = arguments.remove("pattern")
+    {
+        arguments.insert("glob".into(), pattern);
+    }
+    if matches!(name, "code_files" | "code_grep" | "code_context")
+        && !arguments.contains_key("paths")
+        && let Some(single_path) = arguments.remove("path")
+    {
+        if single_path.is_string() {
+            arguments.insert("paths".into(), Value::Array(vec![single_path]));
+        } else if single_path.is_array() {
+            arguments.insert("paths".into(), single_path);
+        }
+    }
+    if name == "code_read"
+        && !arguments.contains_key("ranges")
+        && let Some(path) = arguments
+            .remove("path")
+            .or_else(|| arguments.remove("filePath"))
+        && path.is_string()
+    {
+        let mut start = arguments
+            .remove("start")
+            .or_else(|| arguments.remove("start_line"))
+            .or_else(|| arguments.remove("startLine"));
+        let mut end = arguments
+            .remove("end")
+            .or_else(|| arguments.remove("end_line"))
+            .or_else(|| arguments.remove("endLine"));
+        if let Some(Value::Array(vr)) = arguments.remove("view_range")
+            && vr.len() == 2
+        {
+            start = start.or_else(|| vr.first().cloned());
+            end = end.or_else(|| vr.get(1).cloned());
+        }
+        let s = start.and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+        let e = end
+            .and_then(|v| v.as_u64())
+            .unwrap_or(s + 119)
+            .max(s);
+        arguments.insert(
+            "ranges".into(),
+            json!([{"path": path, "start": s, "end": e}]),
+        );
+    }
+}
+
 fn dispatch_with_root(
     request: Value,
     default_root: Option<&PathBuf>,
@@ -109,7 +192,7 @@ fn dispatch_with_root(
         "initialize" => Ok(
             json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
             "serverInfo":{"name":"code-context","version":env!("CARGO_PKG_VERSION")},
-            "instructions":format!("{CACHE_GUIDANCE} Use these tools before shell search/read for saved files in a registered workspace. Use code_files for filename/path glob discovery, not a content pattern. Omit root for the current workspace. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search.")}),
+            "instructions":format!("{CACHE_GUIDANCE} Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search.")}),
         ),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools()),
@@ -204,6 +287,7 @@ fn tool_call(
         .as_object()
         .ok_or_else(|| invalid("arguments must be an object"))?
         .clone();
+    normalize_mcp_argument_aliases(name, &mut arguments);
     let root = arguments
         .remove("root")
         .map(serde_json::from_value::<PathBuf>)
@@ -219,8 +303,8 @@ fn tool_call(
     } else {
         Some(match root {
             Some(root) => root,
-            None => default_root
-                .cloned()
+            None => infer_root_from_arguments(&arguments)
+                .or_else(|| default_root.cloned())
                 .ok_or_else(|| invalid("current directory is not inside a registered workspace"))?,
         })
     };

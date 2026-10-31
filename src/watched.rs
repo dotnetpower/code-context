@@ -606,13 +606,17 @@ impl Watched {
 
     fn synchronize(&mut self, strict: bool) -> Result<()> {
         self.apply_maintenance()?;
-        let mut changed: BTreeSet<String> = BTreeSet::new();
-        let mut directories = BTreeMap::new();
         let verify_all =
             strict || self.overflow.swap(false, Ordering::AcqRel) || self.blocked.is_some();
+        let mut iter = self.events.try_iter().take(4096).peekable();
+        if !verify_all && iter.peek().is_none() {
+            return Ok(());
+        }
+        let mut changed: BTreeSet<String> = BTreeSet::new();
+        let mut directories = BTreeMap::new();
         let mut reconcile = verify_all || self.blocked.is_some();
         let mut watcher_rescan = false;
-        for event in self.events.try_iter().take(4096) {
+        for event in iter {
             let event = event.map_err(|e| invalid(format!("filesystem watcher failed: {e}")))?;
             if matches!(
                 event.kind,
@@ -688,13 +692,25 @@ impl Watched {
         }
         if !reconcile && changed.iter().all(|name| self.stamps.contains_key(name)) {
             let mut previous = Vec::with_capacity(changed.len());
+            let mut actual_changed = BTreeSet::new();
             for name in &changed {
-                match stamp(&workspace.root.join(name)) {
+                let target_path = workspace.root.join(name);
+                let mut current_stamp = stamp(&target_path);
+                if current_stamp.as_ref().is_ok_and(|s| s.length == 0)
+                    && self.stamps.get(name).is_some_and(|old| old.length > 0)
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                    current_stamp = stamp(&target_path);
+                }
+                match current_stamp {
                     Ok(stamp) => {
                         let old = self
                             .stamps
-                            .insert(name.clone(), stamp)
+                            .insert(name.clone(), stamp.clone())
                             .expect("known stamp exists");
+                        if verify_all || old != stamp {
+                            actual_changed.insert(name.clone());
+                        }
                         previous.push((name.clone(), old));
                     }
                     Err(error) => {
@@ -710,9 +726,13 @@ impl Watched {
                 }
             }
             if !reconcile {
+                if actual_changed.is_empty() {
+                    self.blocked = None;
+                    return Ok(());
+                }
                 match self
                     .resident
-                    .update(&workspace, &changed, &self.stamps, verify_all)
+                    .update(&workspace, &actual_changed, &self.stamps, verify_all)
                 {
                     Ok(update) => {
                         self.record_update(update);
@@ -834,9 +854,8 @@ impl Watched {
                 &targets.into_iter().collect::<Vec<_>>(),
                 !recursive,
             )?;
-            for path in inventory.files {
-                let metadata = stamp(&workspace.root.join(&path))?;
-                current.insert(path.to_string_lossy().into_owned(), metadata);
+            for (name, metadata) in inventory.stamps {
+                current.insert(name, metadata);
             }
         }
         validate_stamps(&current, &self.spec.policy)?;
@@ -956,9 +975,10 @@ impl Watched {
         self.call_with_mode(name, arguments, false)
     }
 
-    pub fn call_with_mode(&mut self, name: &str, arguments: Value, compact: bool) -> Result<Value> {
+    pub fn call_with_mode(&mut self, name: &str, mut arguments: Value, compact: bool) -> Result<Value> {
         self.last_used = Instant::now();
         self.synchronize_or_block(name == "code_sync")?;
+        self.normalize_root_prefixed_arguments(&mut arguments);
         match name {
             "code_files" => {
                 let request: crate::files::FileQuery = serde_json::from_value(arguments)?;
@@ -966,6 +986,21 @@ impl Watched {
                 let result =
                     crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?;
                 self.check_search_paths(result.paths.iter().map(String::as_str))?;
+                if compact {
+                    #[derive(serde::Serialize)]
+                    struct CompactFiles<'a> {
+                        paths: &'a [String],
+                        total_matches: usize,
+                        truncated: bool,
+                        freshness: Value,
+                    }
+                    return Ok(serde_json::to_value(CompactFiles {
+                        paths: &result.paths,
+                        total_matches: result.total_matches,
+                        truncated: result.truncated,
+                        freshness: self.search_freshness("metadata"),
+                    })?);
+                }
                 let mut value = serde_json::to_value(result)?;
                 value["freshness"] = self.search_freshness("metadata");
                 Ok(value)
@@ -977,14 +1012,37 @@ impl Watched {
                 self.check_search_paths(result.matches.iter().map(|hit| hit.path.as_str()))?;
                 if compact {
                     #[derive(serde::Serialize)]
+                    struct CompactGrepHit<'a> {
+                        path: &'a str,
+                        line: usize,
+                        text: std::borrow::Cow<'a, str>,
+                    }
+                    #[derive(serde::Serialize)]
                     struct CompactGrep<'a> {
-                        matches: &'a [crate::search::Hit],
+                        matches: Vec<CompactGrepHit<'a>>,
                         total_matches: usize,
                         truncated: bool,
                         freshness: Value,
                     }
+                    let matches = result
+                        .matches
+                        .iter()
+                        .map(|hit| {
+                            let text = if hit.text.len() > 512 {
+                                let end = hit.text.floor_char_boundary(512);
+                                std::borrow::Cow::Owned(format!("{}...", &hit.text[..end]))
+                            } else {
+                                std::borrow::Cow::Borrowed(hit.text.as_str())
+                            };
+                            CompactGrepHit {
+                                path: hit.path.as_str(),
+                                line: hit.line,
+                                text,
+                            }
+                        })
+                        .collect();
                     return Ok(serde_json::to_value(CompactGrep {
-                        matches: &result.matches,
+                        matches,
                         total_matches: result.total_matches,
                         truncated: result.truncated,
                         freshness: self.search_freshness("metadata"),
@@ -1070,6 +1128,98 @@ impl Watched {
         }
     }
 
+    fn normalize_root_prefixed_arguments(&self, arguments: &mut Value) {
+        let Some(root_str) = self.spec.root.to_str() else {
+            return;
+        };
+        let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+        let root_basename_prefix = self
+            .spec
+            .root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(|n| format!("{n}/"));
+        let strip_one = |raw: &mut String| {
+            if let Some(rest) = raw.strip_prefix("file://") {
+                *raw = rest.to_owned();
+            }
+            if raw == root_str {
+                *raw = ".".into();
+                return;
+            }
+            if let Some(rest) = raw.strip_prefix(&root_prefix)
+                && !rest.is_empty()
+            {
+                *raw = rest.to_owned();
+            }
+            while let Some(rest) = raw.strip_prefix("./") {
+                if !rest.is_empty() {
+                    *raw = rest.to_owned();
+                } else {
+                    break;
+                }
+            }
+            if !self.stamps.contains_key(raw.as_str()) {
+                if let Some((base, suffix)) = raw.rsplit_once('#')
+                    && suffix.starts_with('L')
+                    && suffix[1..].bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'L')
+                    && (self.stamps.contains_key(base) || self.spec.root.join(base).exists())
+                {
+                    *raw = base.to_owned();
+                } else if let Some((base, suffix)) = raw.rsplit_once(':')
+                    && !suffix.is_empty()
+                    && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                    && (self.stamps.contains_key(base) || self.spec.root.join(base).exists())
+                {
+                    *raw = base.to_owned();
+                }
+            }
+            if !self.stamps.contains_key(raw.as_str())
+                && !self.spec.root.join(raw.as_str()).exists()
+            {
+                if let Some(ref b_prefix) = root_basename_prefix
+                    && let Some(rest) = raw.strip_prefix(b_prefix.as_str())
+                    && !rest.is_empty()
+                    && (self.stamps.contains_key(rest) || self.spec.root.join(rest).exists())
+                {
+                    *raw = rest.to_owned();
+                } else if let Some(rest) = raw
+                    .strip_prefix("a/")
+                    .or_else(|| raw.strip_prefix("b/"))
+                    && !rest.is_empty()
+                    && self.stamps.contains_key(rest)
+                {
+                    *raw = rest.to_owned();
+                }
+            }
+        };
+        if let Some(paths) = arguments.get_mut("paths").and_then(Value::as_array_mut) {
+            for item in paths {
+                if let Some(text) = item.as_str() {
+                    let mut owned = text.to_owned();
+                    strip_one(&mut owned);
+                    if owned != text {
+                        *item = Value::String(owned);
+                    }
+                }
+            }
+        }
+        if let Some(ranges) = arguments.get_mut("ranges").and_then(Value::as_array_mut) {
+            for range in ranges {
+                if let Some(path_val) = range.get_mut("path")
+                    && let Some(text) = path_val.as_str()
+                {
+                    let mut owned = text.to_owned();
+                    strip_one(&mut owned);
+                    if owned != text {
+                        *path_val = Value::String(owned);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn status_snapshot(&self) -> Result<Value> {
         let workspace = self.spec.workspace()?;
         let exclusion_summary = workspace.exclusion_summary();
@@ -1092,7 +1242,13 @@ impl Watched {
     }
 
     pub(crate) fn recover_stale_search(&mut self, error_message: &str) -> Result<bool> {
-        let Some(rest) = error_message.strip_prefix("STALE_INDEX ") else {
+        let rest = if let Some(rest) = error_message.strip_prefix("STALE_INDEX ") {
+            rest
+        } else if let Some(rest) = error_message.strip_prefix("TARGET_NOT_INDEXED ")
+            && error_message.contains("reason=not_yet_indexed")
+        {
+            rest
+        } else {
             return Ok(false);
         };
         let Some(path_part) = rest
@@ -1192,9 +1348,14 @@ impl Watched {
                     Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                         let reason = self.spec.workspace()?.unindexed_reason(&name, &self.spec.policy)?;
                         let action = if reason == "not_yet_indexed" {
-                            "Use code_read for known saved ranges or a permitted host read; do not interpret this as absence."
+                            "Use code_read for known saved ranges or a permitted host read; do not interpret this as absence.".into()
+                        } else if reason == "unsupported_glob" {
+                            format!(
+                                "Do not retry this target with code_context/code_grep/code_read or switch CCTX transports. Use a policy-aware host read only if allowed; do not widen access automatically. (To admit standard source/config globs on a legacy registration, run: cctx --root {} migrate --apply)",
+                                self.spec.root.display()
+                            )
                         } else {
-                            "Do not retry this target with code_context/code_grep/code_read or switch CCTX transports. Use a policy-aware host read only if allowed; do not widen access automatically."
+                            "Do not retry this target with code_context/code_grep/code_read or switch CCTX transports. Use a policy-aware host read only if allowed; do not widen access automatically.".into()
                         };
                         return Err(invalid(format!(
                             "TARGET_NOT_INDEXED root={} path={name} reason={reason}: no indexed version. {action}",
@@ -1227,7 +1388,7 @@ impl Watched {
         json!({
             "basis":"watcher_snapshot", "generation":self.resident.stats.generation,
             "returned_file_check":returned_file_check, "full_disk_verified":false,
-            "notice":"Recently saved files may not yet be indexed. Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence. Not an atomic filesystem view."
+            "notice":"Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence."
         })
     }
 
@@ -1342,8 +1503,13 @@ impl Watched {
                         .unwrap_or("not_admitted");
                     self.io_profile.read_policy_rejections += 1;
                     self.transparent_read_recovery_failures += 1;
+                    let migrate_hint = if reason == "unsupported_glob" {
+                        format!(" (To admit standard source/config globs on a legacy registration, run: cctx --root {} migrate --apply)", self.spec.root.display())
+                    } else {
+                        String::new()
+                    };
                     return Err(invalid(format!(
-                        "READ_POLICY_DENIED root={} path={} reason={reason}: no source was read. Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.",
+                        "READ_POLICY_DENIED root={} path={} reason={reason}: no source was read. Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.{migrate_hint}",
                         self.spec.root.display(), range.path,
                     )).into());
                 }
@@ -1444,9 +1610,20 @@ impl Watched {
                 break;
             }
         }
+        let valid_indexed: Vec<&str> = requested
+            .iter()
+            .filter(|path| self.stamps.contains_key(path.as_str()) && !unstable_paths.contains(path.as_str()))
+            .take(8)
+            .map(String::as_str)
+            .collect();
+        let valid_hint = if valid_indexed.is_empty() {
+            String::new()
+        } else {
+            format!(" Valid indexed members in this batch: [{}].", valid_indexed.join(", "))
+        };
         Err(invalid(format!(
-            "READ_UNAVAILABLE root={}: file is unavailable after automatic recovery; {}. Batch failed atomically; no partial success. Discover actual paths with code_files/code_context; use a host policy-aware read for permitted non-indexed files. Do not repeat missing/excluded paths.{}",
-            self.spec.root.display(), reasons.join("; "),
+            "READ_UNAVAILABLE root={}: file is unavailable after automatic recovery; {}. Batch failed atomically; no partial success. Discover actual paths with code_files/code_context; use a host policy-aware read for permitted non-indexed files. Do not repeat missing/excluded paths.{}{}",
+            self.spec.root.display(), reasons.join("; "), valid_hint,
             if requested.len() > 8 { " Additional requested paths omitted from this diagnostic." } else { "" }
         )).into())
     }

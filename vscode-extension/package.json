@@ -155,13 +155,16 @@
         "name": "code-context-native_codeFiles",
         "toolReferenceName": "cctxNativeFiles",
         "displayName": "Code Context: Find Files",
-        "modelDescription": "Use FIRST for filename/path glob discovery, NOT content. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_files.",
+        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for filename/path glob discovery, NOT content. Pass explicit root in WSL/multi-root sessions. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_files.",
         "userDescription": "Find indexed filenames and paths without searching file contents.",
         "tags": [
           "files",
+          "glob",
+          "find",
           "search",
           "paths",
           "native",
+          "cctx",
           "code-context"
         ],
         "canBeReferencedInPrompt": true,
@@ -172,7 +175,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known (required in Windows/WSL Agent Sessions with multiple roots)."
             },
             "glob": {
               "type": "string",
@@ -185,13 +188,14 @@
               "maxItems": 64,
               "items": {
                 "type": "string"
-              }
+              },
+              "description": "Optional non-hidden relative path prefixes within root."
             },
             "limit": {
               "type": "integer",
               "minimum": 1,
               "maximum": 1000,
-              "default": 200
+              "default": 100
             }
           },
           "required": [
@@ -204,14 +208,18 @@
         "tags": [
           "files",
           "search",
+          "grep",
+          "rg",
+          "ripgrep",
           "saved-source",
           "ram-index",
           "fast",
+          "cctx",
           "code-context"
         ],
         "toolReferenceName": "cctxNativeGrep",
         "displayName": "Code Context: Search",
-        "modelDescription": "Use FIRST for saved-source exact/regex search. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_grep.",
+        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for saved-source exact/regex search. Pass explicit root when known and set max_matches_per_file to stay inline (<8KiB). This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_grep.",
         "userDescription": "Search indexed workspace source with the native Rust code-context tool.",
         "canBeReferencedInPrompt": true,
         "icon": "$(search)",
@@ -221,7 +229,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root."
+              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
             },
             "pattern": {
               "type": "string",
@@ -241,7 +249,7 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 1000,
-              "default": 200
+              "default": 50
             },
             "max_matches_per_file": {
               "type": "integer",
@@ -255,7 +263,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional relative path prefixes."
+              "description": "Optional non-hidden relative path prefixes within root."
             },
             "glob": {
               "type": "string",
@@ -273,14 +281,18 @@
           "files",
           "search",
           "read",
+          "symbol",
+          "definition",
+          "context",
           "saved-source",
           "ram-index",
           "fast",
+          "cctx",
           "code-context"
         ],
         "toolReferenceName": "cctxNativeContext",
         "displayName": "Code Context: Search with Context",
-        "modelDescription": "Use FIRST for symbol/literal/regex lookup with nearby saved source in one native call. CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_context.",
+        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for symbol/literal/regex lookup with nearby saved source in one native call. Pass explicit root when known; radius 0..100, limit 1..64. CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_context.",
         "userDescription": "Search indexed source and return versioned surrounding context.",
         "canBeReferencedInPrompt": true,
         "icon": "$(book)",
@@ -290,7 +302,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root."
+              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
             },
             "pattern": {
               "type": "string",
@@ -310,12 +322,13 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 64,
-              "default": 20
+              "default": 12
             },
             "max_matches_per_file": {
               "type": "integer",
               "minimum": 1,
               "maximum": 64,
+              "default": 4,
               "description": "Optional per-file match cap; prioritizes symbol definitions."
             },
             "radius": {
@@ -329,10 +342,12 @@
               "maxItems": 64,
               "items": {
                 "type": "string"
-              }
+              },
+              "description": "Optional non-hidden relative path prefixes within root."
             },
             "glob": {
-              "type": "string"
+              "type": "string",
+              "description": "Optional filename/path glob."
             }
           },
           "required": [
@@ -345,14 +360,18 @@
         "tags": [
           "files",
           "read",
+          "view",
+          "cat",
+          "lines",
           "saved-source",
           "ram-index",
           "fast",
+          "cctx",
           "code-context"
         ],
         "toolReferenceName": "cctxNativeRead",
         "displayName": "Code Context: Read Ranges",
-        "modelDescription": "Use FIRST for known saved-source ranges in a native batch read. CACHE_MISS returns immediately; continue with permitted host read. If foreground dispatch is unavailable, prefer backend MCP code_read.",
+        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for known saved-source ranges in a native batch read. Pass explicit root when known and keep total lines <=150 per call (<8KiB) so output stays inline. CACHE_MISS returns immediately; continue with permitted host read. If foreground dispatch is unavailable, prefer backend MCP code_read.",
         "userDescription": "Read multiple indexed source ranges with live hash verification.",
         "canBeReferencedInPrompt": true,
         "icon": "$(file-code)",
@@ -362,7 +381,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root."
+              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
             },
             "page": {
               "type": "boolean",
@@ -378,21 +397,25 @@
               "type": "array",
               "minItems": 1,
               "maxItems": 64,
+              "description": "1-based inclusive line ranges for non-hidden workspace-relative paths. Keep total lines <=150 per call (<8KiB) to avoid host output offloading.",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                   "path": {
                     "type": "string",
-                    "minLength": 1
+                    "minLength": 1,
+                    "description": "Non-hidden workspace-relative file path (do not pass .github/.vscode dotfiles)."
                   },
                   "start": {
                     "type": "integer",
-                    "minimum": 1
+                    "minimum": 1,
+                    "description": "1-based inclusive start line."
                   },
                   "end": {
                     "type": "integer",
-                    "minimum": 1
+                    "minimum": 1,
+                    "description": "1-based inclusive end line."
                   }
                 },
                 "required": [

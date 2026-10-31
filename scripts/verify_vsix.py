@@ -69,7 +69,7 @@ def verify(path: Path) -> dict:
                                             for title in ("Resources", "Performance", "Install"))
         if not 0 <= resources < performance < install:
             raise ValueError("Resources and benchmarks must precede installation")
-        if "| Fixed mixed suite |" not in readme or "6.83" not in readme or "slower" not in readme:
+        if "| Fixed mixed suite |" not in readme or "9.59" not in readme or "slower" not in readme:
             raise ValueError("Missing readable benchmark table")
         if "https://raw.githubusercontent.com/dotnetpower/code-context/main/vscode-extension/resources/benchmark.png" not in readme:
             raise ValueError("Missing resolvable packaged benchmark image")

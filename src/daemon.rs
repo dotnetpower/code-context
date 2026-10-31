@@ -298,21 +298,20 @@ enum Protocol {
     FramedJson,
 }
 
-impl Protocol {
-    fn label(self) -> &'static str {
-        match self {
-            Self::JsonLines => "json_lines",
-            Self::Bincode => "bincode",
-            Self::FramedJson => "framed_json",
-        }
-    }
+#[derive(Serialize)]
+struct BinaryRequestRef<'a> {
+    root: &'a Option<PathBuf>,
+    name: &'a str,
+    arguments_json: &'a [u8],
+    compact: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BinaryRequest {
+#[derive(Deserialize)]
+struct BinaryRequestBorrow<'a> {
     root: Option<PathBuf>,
     name: String,
-    arguments_json: Vec<u8>,
+    #[serde(borrow)]
+    arguments_json: &'a [u8],
     compact: bool,
 }
 
@@ -451,6 +450,7 @@ pub struct Client {
     reader: BufReader<RpcStream>,
     tracing: bool,
     write_buf: Vec<u8>,
+    args_buf: Vec<u8>,
 }
 
 impl Client {
@@ -466,6 +466,7 @@ impl Client {
             reader,
             tracing: false,
             write_buf: Vec::with_capacity(512),
+            args_buf: Vec::with_capacity(256),
         })
     }
 
@@ -487,14 +488,16 @@ impl Client {
     }
 
     pub(crate) fn call_raw(&mut self, request: &Request) -> Result<Vec<u8>> {
+        self.args_buf.clear();
+        serde_json::to_writer(&mut self.args_buf, &request.arguments)?;
         self.write_buf.clear();
         self.write_buf.extend_from_slice(&[0_u8; 4]);
         bincode::serialize_into(
             &mut self.write_buf,
-            &BinaryRequest {
-                root: request.root.clone(),
-                name: request.name.clone(),
-                arguments_json: serde_json::to_vec(&request.arguments)?,
+            &BinaryRequestRef {
+                root: &request.root,
+                name: &request.name,
+                arguments_json: &self.args_buf,
                 compact: request.compact,
             },
         )?;
@@ -613,25 +616,51 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
     if magic != FRAMED_JSON_MAGIC {
         return Err(invalid("native bridge requires CCTXJ1 framed IPC, not MCP").into());
     }
-    while let Some(bytes) = read_native_frame(&mut input)? {
-        let request: Request = serde_json::from_slice(&bytes)?;
-        let mut frame = match client.call_raw(&request) {
+    let mut read_buf = Vec::with_capacity(512);
+    let mut frame = Vec::with_capacity(4096);
+    while read_native_frame_buf(&mut input, &mut read_buf)? {
+        let request: Request = serde_json::from_slice(&read_buf)?;
+        frame.clear();
+        frame.extend_from_slice(&[0_u8; 4]);
+        let call_outcome = match client.call_raw(&request) {
+            Ok(payload) => Ok(payload),
+            Err(error) if is_application_error(error.as_ref()) => Err(error),
+            Err(_transport_error) => {
+                if let Ok(reconnected) = Client::connect() {
+                    client = reconnected;
+                    client.call_raw(&request)
+                } else {
+                    #[cfg(windows)]
+                    if std::env::var_os("CCTX_NO_AUTO_START").is_none() {
+                        let _ = start_windows_daemon();
+                        if let Ok(reconnected) = Client::connect() {
+                            client = reconnected;
+                            client.call_raw(&request)
+                        } else {
+                            Err(_transport_error)
+                        }
+                    } else {
+                        Err(_transport_error)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        Err(_transport_error)
+                    }
+                }
+            }
+        };
+        match call_outcome {
             Ok(payload) => {
-                let mut out = Vec::with_capacity(payload.len() + 15);
-                out.extend_from_slice(&[0_u8; 4]);
-                out.extend_from_slice(b"{\"result\":");
-                out.extend_from_slice(&payload);
-                out.push(b'}');
-                out
+                frame.reserve(payload.len() + 11);
+                frame.extend_from_slice(b"{\"result\":");
+                frame.extend_from_slice(&payload);
+                frame.push(b'}');
             }
             Err(error) if is_application_error(error.as_ref()) => {
-                let mut out = Vec::with_capacity(128);
-                out.extend_from_slice(&[0_u8; 4]);
-                serde_json::to_writer(&mut out, &json!({"error":error.to_string()}))?;
-                out
+                serde_json::to_writer(&mut frame, &json!({"error":error.to_string()}))?;
             }
             Err(error) => return Err(error),
-        };
+        }
         let body_len = frame.len() - 4;
         if body_len > MAX_WIRE {
             return Err(invalid("native bridge response exceeds2MiB").into());
@@ -644,11 +673,21 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn read_native_frame(input: &mut impl std::io::Read) -> Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    if read_native_frame_buf(input, &mut buf)? {
+        Ok(Some(buf))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_native_frame_buf(input: &mut impl std::io::Read, buf: &mut Vec<u8>) -> Result<bool> {
     let mut size = [0; 4];
     match input.read_exact(&mut size[..1]) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(error) => return Err(error.into()),
     }
     input.read_exact(&mut size[1..])?;
@@ -656,9 +695,9 @@ fn read_native_frame(input: &mut impl std::io::Read) -> Result<Option<Vec<u8>>> 
     if size == 0 || size > MAX_WIRE {
         return Err(invalid("native bridge frame must contain1..2MiB").into());
     }
-    let mut bytes = vec![0; size];
-    input.read_exact(&mut bytes)?;
-    Ok(Some(bytes))
+    buf.resize(size, 0);
+    input.read_exact(buf)?;
+    Ok(true)
 }
 
 pub struct Server {
@@ -849,29 +888,36 @@ impl Server {
         if !self.roots.contains_key(&root) {
             return Err(self.request_cache(root)?.into());
         }
-        let operation = request.name.clone();
         let compact = request.compact;
-        let root_budget = self.available_cache_budget().saturating_sub(
-            self.roots
-                .iter()
-                .filter(|(path, _)| **path != root)
-                .map(|(_, entry)| entry.estimated_bytes())
-                .sum::<usize>(),
-        );
+        let root_budget = if self.roots.len() <= 1 {
+            self.available_cache_budget()
+        } else {
+            self.available_cache_budget().saturating_sub(
+                self.roots
+                    .iter()
+                    .filter(|(path, _)| **path != root)
+                    .map(|(_, entry)| entry.estimated_bytes())
+                    .sum::<usize>(),
+            )
+        };
         let entry = self
             .roots
             .get_mut(&root)
             .ok_or_else(|| invalid("missing registered root"))?;
         let previous = entry.restrict_admission(root_budget);
         let mut outcome = entry.call_with_mode(&request.name, request.arguments.clone(), compact);
-        if let Err(ref error) = outcome
-            && matches!(
-                request.name.as_str(),
-                "code_files" | "code_grep" | "code_context"
-            )
-            && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
-        {
-            outcome = entry.call_with_mode(&request.name, request.arguments, compact);
+        for _ in 0..3 {
+            if let Err(ref error) = outcome
+                && matches!(
+                    request.name.as_str(),
+                    "code_files" | "code_grep" | "code_context"
+                )
+                && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
+            {
+                outcome = entry.call_with_mode(&request.name, request.arguments.clone(), compact);
+            } else {
+                break;
+            }
         }
         entry.restore_admission(previous);
         let result = outcome?;
@@ -903,7 +949,7 @@ impl Server {
             }
         }
         if compact {
-            Ok(Self::compact_result(&operation, result))
+            Ok(Self::compact_result(&request.name, result))
         } else {
             Ok(json!({"root":root,"data":result}))
         }
@@ -977,12 +1023,16 @@ impl Server {
             .root_size_hints
             .get(&spec.root)
             .filter(|(saved, _)| saved == spec)
+            .map(|(_, bytes)| *bytes)
             .or_else(|| {
-                spec.managed_parent
-                    .as_ref()
-                    .and_then(|parent| self.root_size_hints.get(parent))
+                spec.managed_parent.as_ref().and_then(|parent| {
+                    self.root_size_hints
+                        .get(parent)
+                        .map(|(_, bytes)| *bytes)
+                        .or_else(|| self.roots.get(parent).map(Watched::estimated_bytes))
+                })
             });
-        if let Some((_, bytes)) = hint {
+        if let Some(bytes) = hint {
             return bytes
                 .saturating_add(spec.policy.max_staged_bytes)
                 .min(self.memory.limits.target);
@@ -1143,10 +1193,11 @@ impl Server {
     }
 
     fn drive_lazy_loads(&mut self) {
-        if self.background.is_some() {
-            return;
-        }
         if let Some(job) = self.preparation.take() {
+            if self.background.is_some() {
+                self.preparation = Some(job);
+                return;
+            }
             let outcome = match job.receiver.try_recv() {
                 Ok(value) => value,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1198,9 +1249,44 @@ impl Server {
         if self.background.is_some() || self.preparation.is_some() {
             return;
         }
+        if self.pending_roots.len() > 1
+            && let Some(idx) = self.pending_roots.iter().position(|candidate| {
+                self.root_size_hints
+                    .get(&candidate.requested)
+                    .is_some_and(|(_, bytes)| *bytes <= 220 * 1024 * 1024)
+            })
+            && idx > 0
+            && let Some(small_job) = self.pending_roots.remove(idx)
+        {
+            self.pending_roots.push_front(small_job);
+        }
         let Some(job) = self.pending_roots.pop_front() else {
             return;
         };
+        if let Some(direct_spec) = self
+            .registry
+            .iter()
+            .find(|spec| spec.root == job.requested && spec.managed_parent.is_none())
+            .cloned()
+        {
+            let outcome = crate::registration::effective_spec(&direct_spec, &self.registry)
+                .and_then(|spec| {
+                    self.root_aliases
+                        .insert(job.requested.clone(), spec.root.clone());
+                    if self
+                        .roots
+                        .get(&spec.root)
+                        .is_none_or(|entry| entry.spec != spec)
+                    {
+                        self.start_root_job(spec, None, job.retry)?;
+                    }
+                    Ok(())
+                });
+            if let Err(error) = outcome {
+                self.record_cache_failure(job.requested, error.to_string());
+            }
+            return;
+        }
         let requested = job.requested.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
@@ -1640,29 +1726,77 @@ impl Server {
 
     fn record_call(&mut self, protocol: Protocol, operation: &str) {
         let key = Self::protocol_metric_key(protocol, operation);
-        *self.protocol_calls.entry(key).or_default() += 1;
+        if let Some(count) = self.protocol_calls.get_mut(key) {
+            *count += 1;
+        } else {
+            self.protocol_calls.insert(key.to_owned(), 1);
+        }
     }
 
     fn record_failure(&mut self, protocol: Protocol, operation: &str) {
         let key = Self::protocol_metric_key(protocol, operation);
-        *self.protocol_failures.entry(key).or_default() += 1;
+        if let Some(count) = self.protocol_failures.get_mut(key) {
+            *count += 1;
+        } else {
+            self.protocol_failures.insert(key.to_owned(), 1);
+        }
     }
 
-    fn protocol_metric_key(protocol: Protocol, operation: &str) -> String {
-        let operation = match operation {
-            "ping" | "code_workspaces" | "code_files" | "code_grep" | "code_context"
-            | "code_read" | "code_status" | "code_sync" | "code_trace" | "code_profile"
-            | "code_profile_full" => operation,
-            _ => "unknown",
-        };
-        format!("{}:{operation}", protocol.label())
+    fn protocol_metric_key(protocol: Protocol, operation: &str) -> &'static str {
+        match (protocol, operation) {
+            (Protocol::Bincode, "ping") => "bincode:ping",
+            (Protocol::Bincode, "code_workspaces") => "bincode:code_workspaces",
+            (Protocol::Bincode, "code_files") => "bincode:code_files",
+            (Protocol::Bincode, "code_grep") => "bincode:code_grep",
+            (Protocol::Bincode, "code_context") => "bincode:code_context",
+            (Protocol::Bincode, "code_read") => "bincode:code_read",
+            (Protocol::Bincode, "code_status") => "bincode:code_status",
+            (Protocol::Bincode, "code_sync") => "bincode:code_sync",
+            (Protocol::Bincode, "code_trace") => "bincode:code_trace",
+            (Protocol::Bincode, "code_profile") => "bincode:code_profile",
+            (Protocol::Bincode, "code_profile_full") => "bincode:code_profile_full",
+            (Protocol::Bincode, _) => "bincode:unknown",
+            (Protocol::FramedJson, "ping") => "framed_json:ping",
+            (Protocol::FramedJson, "code_workspaces") => "framed_json:code_workspaces",
+            (Protocol::FramedJson, "code_files") => "framed_json:code_files",
+            (Protocol::FramedJson, "code_grep") => "framed_json:code_grep",
+            (Protocol::FramedJson, "code_context") => "framed_json:code_context",
+            (Protocol::FramedJson, "code_read") => "framed_json:code_read",
+            (Protocol::FramedJson, "code_status") => "framed_json:code_status",
+            (Protocol::FramedJson, "code_sync") => "framed_json:code_sync",
+            (Protocol::FramedJson, "code_trace") => "framed_json:code_trace",
+            (Protocol::FramedJson, "code_profile") => "framed_json:code_profile",
+            (Protocol::FramedJson, "code_profile_full") => "framed_json:code_profile_full",
+            (Protocol::FramedJson, _) => "framed_json:unknown",
+            (Protocol::JsonLines, "ping") => "json_lines:ping",
+            (Protocol::JsonLines, "code_workspaces") => "json_lines:code_workspaces",
+            (Protocol::JsonLines, "code_files") => "json_lines:code_files",
+            (Protocol::JsonLines, "code_grep") => "json_lines:code_grep",
+            (Protocol::JsonLines, "code_context") => "json_lines:code_context",
+            (Protocol::JsonLines, "code_read") => "json_lines:code_read",
+            (Protocol::JsonLines, "code_status") => "json_lines:code_status",
+            (Protocol::JsonLines, "code_sync") => "json_lines:code_sync",
+            (Protocol::JsonLines, "code_trace") => "json_lines:code_trace",
+            (Protocol::JsonLines, "code_profile") => "json_lines:code_profile",
+            (Protocol::JsonLines, "code_profile_full") => "json_lines:code_profile_full",
+            (Protocol::JsonLines, _) => "json_lines:unknown",
+        }
     }
 
     fn eviction_candidate(&self, protected: Option<&PathBuf>) -> Option<PathBuf> {
         self.roots
             .iter()
             .filter(|(path, _)| protected != Some(*path))
-            .max_by_key(|(_, entry)| entry.idle_age())
+            .max_by_key(|(_, entry)| {
+                let age = entry.idle_age();
+                let stale_worktree_bonus =
+                    u8::from(age >= Duration::from_secs(60) && entry.spec.managed_parent.is_some());
+                (
+                    u8::from(age >= Duration::from_secs(10)),
+                    stale_worktree_bonus,
+                    age,
+                )
+            })
             .map(|(path, _)| path.clone())
     }
 
@@ -1933,7 +2067,10 @@ fn parse_json_frame(bytes: &[u8]) -> Result<Request> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-fn receive_binary(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> {
+fn receive_binary_buf(
+    reader: &mut BufReader<RpcStream>,
+    buf: &mut Vec<u8>,
+) -> Result<Option<Request>> {
     let mut length = [0_u8; 4];
     match std::io::Read::read_exact(reader, &mut length) {
         Ok(()) => {}
@@ -1944,28 +2081,21 @@ fn receive_binary(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> 
     if length > MAX_WIRE {
         return Err(invalid("binary request exceeds 2MiB").into());
     }
-    let mut bytes = vec![0_u8; length];
-    std::io::Read::read_exact(reader, &mut bytes)?;
-    let request: BinaryRequest = bincode::deserialize(&bytes)?;
+    buf.resize(length, 0);
+    std::io::Read::read_exact(reader, buf)?;
+    let request: BinaryRequestBorrow<'_> = bincode::deserialize(buf)?;
     Ok(Some(Request {
         root: request.root,
         name: request.name,
-        arguments: serde_json::from_slice(&request.arguments_json)?,
+        arguments: serde_json::from_slice(request.arguments_json)?,
         compact: request.compact,
     }))
 }
 
-fn receive_framed_json(reader: &mut BufReader<RpcStream>) -> Result<Option<Request>> {
-    let Some(bytes) = receive_length_prefixed(reader, "framed JSON request")? else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
-fn receive_length_prefixed(
+fn receive_framed_json_buf(
     reader: &mut BufReader<RpcStream>,
-    label: &str,
-) -> Result<Option<Vec<u8>>> {
+    buf: &mut Vec<u8>,
+) -> Result<Option<Request>> {
     let mut length = [0_u8; 4];
     match std::io::Read::read_exact(reader, &mut length) {
         Ok(()) => {}
@@ -1974,11 +2104,11 @@ fn receive_length_prefixed(
     }
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_WIRE {
-        return Err(invalid(format!("{label} exceeds 2MiB")).into());
+        return Err(invalid("framed JSON request exceeds 2MiB").into());
     }
-    let mut bytes = vec![0_u8; length];
-    std::io::Read::read_exact(reader, &mut bytes)?;
-    Ok(Some(bytes))
+    buf.resize(length, 0);
+    std::io::Read::read_exact(reader, buf)?;
+    Ok(Some(serde_json::from_slice(buf)?))
 }
 
 fn respond(stream: &mut RpcStream, result: WireResult) -> Result<()> {
@@ -2195,7 +2325,12 @@ fn handle_connection(
             }
         }
     };
-    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+    let idle_read_timeout = if matches!(protocol, Protocol::Bincode | Protocol::FramedJson) {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(30)
+    };
+    if let Err(error) = stream.set_read_timeout(Some(idle_read_timeout)) {
         let _ = respond(&mut stream, Err(error.to_string()));
         return;
     }
@@ -2203,14 +2338,16 @@ fn handle_connection(
         let _ = respond(&mut stream, Err(error.to_string()));
         return;
     }
+    let mut read_buf = Vec::with_capacity(512);
     let mut write_buf = Vec::with_capacity(4096);
+    let (reply_tx, response) = std::sync::mpsc::sync_channel(1);
     loop {
         let received = if let Some(request) = pending.take() {
             Ok(Some(request))
         } else {
             match protocol {
-                Protocol::Bincode => receive_binary(&mut reader),
-                Protocol::FramedJson => receive_framed_json(&mut reader),
+                Protocol::Bincode => receive_binary_buf(&mut reader, &mut read_buf),
+                Protocol::FramedJson => receive_framed_json_buf(&mut reader, &mut read_buf),
                 Protocol::JsonLines => receive(&mut reader),
             }
         };
@@ -2254,12 +2391,11 @@ fn handle_connection(
                 }
             },
         };
-        let (reply, response) = std::sync::mpsc::sync_channel(0);
         if tx
             .try_send(Envelope {
                 request,
                 protocol,
-                reply,
+                reply: reply_tx.clone(),
                 queued_at: Instant::now(),
                 trace_id,
                 prev_trace,
@@ -2371,8 +2507,8 @@ pub fn serve() -> Result<()> {
         (listener, secret)
     };
     eprintln!("code-context daemon ready at {}", socket.display());
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Envelope>(32);
-    let (timing_tx, timing_rx) = std::sync::mpsc::sync_channel::<RequestTiming>(64);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Envelope>(128);
+    let (timing_tx, timing_rx) = std::sync::mpsc::sync_channel::<RequestTiming>(128);
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut server = Server {
         memory,
@@ -2387,7 +2523,7 @@ pub fn serve() -> Result<()> {
             use std::sync::atomic::Ordering;
             for stream in listener.incoming() {
                 let stream = stream?;
-                if active.fetch_add(1, Ordering::AcqRel) >= 32 {
+                if active.fetch_add(1, Ordering::AcqRel) >= 128 {
                     active.fetch_sub(1, Ordering::AcqRel);
                     let mut stream = stream;
                     let _ = respond(&mut stream, Err("too many RPC connections".into()));
@@ -2476,14 +2612,16 @@ fn dispatch_envelope(
         };
         for prev_trace in items {
             server.record_call(envelope.protocol, "code_trace");
-            if server.record_client_timing(prev_trace).is_ok() {
-                *server.outcome_counts.entry("success".to_owned()).or_default() += 1;
+            let outcome_key = if server.record_client_timing(prev_trace).is_ok() {
+                "success"
             } else {
                 server.record_failure(envelope.protocol, "code_trace");
-                *server
-                    .outcome_counts
-                    .entry("invalid_request".to_owned())
-                    .or_default() += 1;
+                "invalid_request"
+            };
+            if let Some(count) = server.outcome_counts.get_mut(outcome_key) {
+                *count += 1;
+            } else {
+                server.outcome_counts.insert(outcome_key.to_owned(), 1);
             }
         }
     }
@@ -2501,7 +2639,7 @@ fn dispatch_envelope(
     let root = envelope.request.root.clone();
     let result = match prepared {
         Ok(false) => {
-            if deferred.len() < 32 {
+            if deferred.len() < 64 {
                 deferred.push_back(envelope);
                 return;
             }
@@ -2534,7 +2672,13 @@ fn dispatch_envelope(
         success: result.is_ok(),
         outcome: crate::outcome::classify(result.as_ref().err().map(String::as_str)),
     };
-    *server.outcome_counts.entry(sample.outcome.to_owned()).or_default() += 1;
+    if let Some(count) = server.outcome_counts.get_mut(sample.outcome) {
+        *count += 1;
+    } else {
+        server
+            .outcome_counts
+            .insert(sample.outcome.to_owned(), 1);
+    }
     server.abandon_background_reply(envelope.id);
     let _ = envelope.reply.send(TimedReply { result, sample });
 }
@@ -3010,9 +3154,8 @@ mod tests {
             respond_protocol(&mut server, Protocol::FramedJson, &Err("queue full".into())).unwrap();
         assert!(stats.0 >= 0.0 && stats.1 >= 0.0);
         let mut reader = BufReader::new(client);
-        let frame = receive_length_prefixed(&mut reader, "test")
-            .unwrap()
-            .unwrap();
+        let mut frame = Vec::new();
+        assert!(read_native_frame_buf(&mut reader, &mut frame).unwrap());
         assert_eq!(
             serde_json::from_slice::<Value>(&frame).unwrap()["error"],
             "queue full"

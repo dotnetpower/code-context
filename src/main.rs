@@ -193,10 +193,23 @@ fn run() -> Result<()> {
             };
             policy.max_staged_bytes = policy.max_staged_bytes.min(policy.max_source_bytes);
             policy.validate().map_err(code_context::invalid)?;
+            let requested_scopes = if args.scope.is_empty() && !args.preserve_registration_settings {
+                vec![".".into()]
+            } else {
+                args.scope
+            };
+            let requested_globs = if args.glob.is_empty() && !args.preserve_registration_settings {
+                code_context::registration::DEFAULT_SOURCE_GLOBS
+                    .iter()
+                    .map(|s| (*s).into())
+                    .collect()
+            } else {
+                args.glob
+            };
             let requested_spec = catalog::Spec {
                 root: args.root,
-                scopes: args.scope,
-                globs: args.glob,
+                scopes: requested_scopes,
+                globs: requested_globs,
                 excludes: args.exclude,
                 default_excludes: !args.no_default_excludes,
                 prewarm: args.prewarm,
@@ -328,7 +341,7 @@ fn run() -> Result<()> {
                 page,
             } => (
                 "code_read",
-                serde_json::json!({"ranges":[{"path":path,"start":start,"end":end}],"page":page}),
+                serde_json::json!({"ranges":[{"path":path,"start":start,"end":end}],"page":page,"split_ranges":true}),
             ),
             Action::Sync => ("code_sync", serde_json::json!({})),
             Action::Status => ("code_status", serde_json::json!({})),

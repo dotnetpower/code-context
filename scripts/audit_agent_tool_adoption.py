@@ -97,16 +97,31 @@ def result_usefulness(value, depth: int = 0) -> bool | None:
     if depth > 6:
         return None
     if isinstance(value, str):
+        cleaned = re.sub(r"\n?CCTX_TRACE \{[^\n]*\}\s*$", "", value)
+        if cleaned.startswith("Output too large to read at once"):
+            marker = "Preview (first 500 chars):\n"
+            if marker in cleaned:
+                preview = cleaned.split(marker, 1)[1]
+                header = re.match(r"^(?:matches|files)=(\d+)\s+truncated=(?:true|false)", preview)
+                if header:
+                    return int(header[1]) > 0
+                if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{64})?\n", preview):
+                    return True
+                if preview.startswith(("{", "[")) and '"total_matches":0' not in preview and '"snippets":[]' not in preview:
+                    return True
+            return None
         try:
-            parsed = json.loads(value)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError:
-            header = re.match(r"^(?:matches|files)=(\d+)\s+truncated=(?:true|false)", value)
+            header = re.match(r"^(?:matches|files)=(\d+)\s+truncated=(?:true|false)", cleaned)
             if header:
                 return int(header[1]) > 0
-            if value == "snippets=0":
+            if cleaned == "snippets=0":
                 return False
-            if re.match(r"^--- .+:\d+-\d+ sha256=[0-9a-f]{64}\n", value):
+            if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{64})?\n", cleaned):
                 return True
+            if cleaned.startswith("page=true complete="):
+                return "--- " in cleaned
             return None
         return result_usefulness(parsed, depth + 1)
     if isinstance(value, dict):
@@ -167,7 +182,7 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
             ranges = arguments.get("ranges", [])
             paths = [item["path"] for item in ranges if isinstance(item, dict) and isinstance(item.get("path"), str)]
     else:
-        values = arguments.get("paths")
+        values = arguments.get("paths", arguments.get("path"))
         if isinstance(values, str):
             paths = [values]
         elif isinstance(values, list):
@@ -178,6 +193,9 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
         return unknown
     verdicts = []
     for target in paths:
+        if is_read and tool in {"view", "read_file"} and "copilot-tool-output" in target:
+            verdicts.append(("legitimate_fallback", "copilot_offloaded_tool_output"))
+            continue
         path = Path(target)
         if not path.is_absolute():
             if not target_root or not Path(target_root).is_absolute():
@@ -225,7 +243,7 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
                 selected = [p for p in selected if fnmatch.fnmatchcase(p, glob) or fnmatch.fnmatchcase(Path(p).name, glob)]
             # Scope-wide built-in searches can include excluded files; do not call
             # them equivalent merely because some indexed files overlap.
-            if tool in {"rg", "glob", "grep_search", "file_search"}:
+            if tool in {"rg", "grep", "glob", "grep_search", "file_search"}:
                 verdicts.append(("unknown", "builtin_search_corpus_not_proven_equivalent"))
             elif selected:
                 verdicts.append(("eligible", "admitted_search_corpus"))
@@ -450,6 +468,27 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
         "selection_percent": round(100 * len(cctx_calls) / len(lookup_calls), 2) if lookup_calls else None,
         **outcome_counts(cctx_calls),
     }
+    failure_breakdown = Counter()
+    for call in cctx_calls:
+        if call.get("success") is False:
+            err = json.dumps(call.get("error"), ensure_ascii=False)
+            if "CACHE_MISS root=" in err:
+                failure_breakdown["cache_miss"] += 1
+            elif "CACHE_LOAD_FAILED root=" in err:
+                failure_breakdown["cache_load_failed"] += 1
+            elif "explicit absolute Linux root" in err or "not inside a registered workspace" in err or "not explicitly registered" in err:
+                failure_breakdown["missing_or_unregistered_root"] += 1
+            elif "READ_POLICY_DENIED" in err or "TARGET_NOT_INDEXED" in err or "only non-hidden" in err:
+                failure_breakdown["policy_or_hidden_target"] += 1
+            elif "READ_RANGE_" in err or "radius 0.." in err or "exceeds snapshot EOF" in err or "maximum 500 lines" in err:
+                failure_breakdown["range_or_limit_bounds"] += 1
+            elif "RESPONSE_BUDGET_EXCEEDED" in err:
+                failure_breakdown["response_budget_exceeded"] += 1
+            elif "READ_UNAVAILABLE" in err or "unavailable after automatic recovery" in err:
+                failure_breakdown["file_unavailable"] += 1
+            else:
+                failure_breakdown["other_error"] += 1
+    report["cctx_failure_breakdown"] = dict(failure_breakdown)
     report["schema"] = 5
     report["per_session"] = {
         channel: session_adoption([call for call in calls.values() if call["channel"] == channel], sample_limit)

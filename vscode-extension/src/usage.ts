@@ -8,11 +8,23 @@ export interface UsageEvent {
 
 export function classifyOutcome(error?: string): Outcome {
   if (error === undefined) { return 'success'; }
-  if (/CACHE_MISS |STALE_INDEX|reason=not_yet_indexed/u.test(error)) { return 'cache_not_ready'; }
-  if (/READ_POLICY_DENIED|reason=(outside_scope|excluded_by_rule|unsupported_glob|ignored_by_discovery|symlink_not_allowed)|only non-hidden/u.test(error)) {
+  if (
+    error.startsWith('CACHE_MISS ') ||
+    error.startsWith('STALE_INDEX ') ||
+    /CACHE_MISS |STALE_INDEX|reason=not_yet_indexed/u.test(error)
+  ) {
+    return 'cache_not_ready';
+  }
+  if (
+    error.startsWith('READ_POLICY_DENIED ') ||
+    /READ_POLICY_DENIED|reason=(outside_scope|excluded_by_rule|unsupported_glob|ignored_by_discovery|symlink_not_allowed)|only non-hidden/u.test(error)
+  ) {
     return 'policy_denied';
   }
-  if (/READ_RANGE_OUT_OF_BOUNDS|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root/u.test(error)) {
+  if (
+    error.startsWith('READ_RANGE_OUT_OF_BOUNDS ') ||
+    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root/u.test(error)
+  ) {
     return 'invalid_request';
   }
   return 'system_error';
@@ -24,12 +36,23 @@ export class UsageSummary {
   };
   public last: (UsageEvent & { outcome: Outcome; at: number }) | undefined;
   public lastRoot: string | undefined;
+  public readonly recentRoots: string[] = [];
 
   public record(event: UsageEvent, at = Date.now()): void {
     const outcome = classifyOutcome(event.error);
     this.counts[outcome] += 1;
     this.last = { ...event, outcome, at };
-    if (event.root) { this.lastRoot = event.root; }
+    if (event.root) {
+      this.lastRoot = event.root;
+      const existingIdx = this.recentRoots.indexOf(event.root);
+      if (existingIdx >= 0) {
+        this.recentRoots.splice(existingIdx, 1);
+      }
+      this.recentRoots.push(event.root);
+      while (this.recentRoots.length > 4) {
+        this.recentRoots.shift();
+      }
+    }
   }
 
   public text(): string {
@@ -39,11 +62,17 @@ export class UsageSummary {
 
   public tooltip(): string {
     const c = this.counts;
+    const multiRoots =
+      this.recentRoots.length > 1
+        ? `Recent roots (${this.recentRoots.length}): ${this.recentRoots.join(', ')}`
+        : this.lastRoot
+          ? `Last requested root: ${this.lastRoot}`
+          : 'Pass an explicit Linux root in Windows Agent Sessions.';
     return [
       'Native calls in this extension host (including metadata), not all sessions.',
       `Success ${c.success}; cache not ready ${c.cache_not_ready}; policy denied ${c.policy_denied}; invalid input ${c.invalid_request}; system errors ${c.system_error}.`,
       this.last ? `Last: ${new Date(this.last.at).toISOString()} ${this.last.operation} ${this.last.outcome}` : 'No calls observed yet.',
-      this.lastRoot ? `Last requested root: ${this.lastRoot}` : 'Pass an explicit Linux root in Windows Agent Sessions.',
+      multiRoots,
       'Click for daemon status, adaptive memory and aggregate native/MCP outcomes.',
     ].join('\n');
   }

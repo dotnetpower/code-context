@@ -22,15 +22,19 @@ export type AutomaticPlanRegistry = Record<string, RegistrationPlan>;
 export const MAX_AUTOMATIC_PLANS = 64;
 
 const SOURCE_EXTENSION_LIST = [
+  'astro',
   'bash',
+  'bicep',
   'c',
   'cc',
   'cjs',
   'clj',
   'cljc',
   'cljs',
+  'cmake',
   'cpp',
   'cs',
+  'cts',
   'cxx',
   'dart',
   'erl',
@@ -38,9 +42,12 @@ const SOURCE_EXTENSION_LIST = [
   'exs',
   'fs',
   'go',
+  'gql',
   'gradle',
+  'graphql',
   'groovy',
   'h',
+  'hcl',
   'hh',
   'hpp',
   'hs',
@@ -52,23 +59,33 @@ const SOURCE_EXTENSION_LIST = [
   'jsx',
   'kt',
   'kts',
+  'less',
   'lua',
   'mjs',
+  'mk',
   'ml',
   'mli',
+  'mts',
   'nim',
+  'nix',
   'php',
+  'prisma',
+  'proto',
   'ps1',
+  'psd1',
+  'psm1',
   'py',
   'pyi',
   'r',
   'rb',
   'rs',
+  'sass',
   'scala',
   'sh',
   'sql',
   'swift',
   'tf',
+  'tftpl',
   'ts',
   'tsx',
   'vb',
@@ -94,7 +111,25 @@ const SOURCE_EXTENSION_LIST = [
 ] as const;
 const SOURCE_EXTENSIONS = new Set<string>(SOURCE_EXTENSION_LIST);
 const SOURCE_GLOB_CASE_ALIASES = ['*.C', '*.H', '*.R'] as const;
-const DEVELOPMENT_FILENAMES = ['Makefile', 'GNUmakefile', 'Dockerfile', 'Containerfile', 'CMakeLists.txt', 'Justfile'] as const;
+const DEVELOPMENT_FILENAMES = [
+  'Makefile',
+  'GNUmakefile',
+  'Dockerfile',
+  'Containerfile',
+  'CMakeLists.txt',
+  'Justfile',
+  'Vagrantfile',
+  'Procfile',
+  'Brewfile',
+  'BUILD',
+  'WORKSPACE',
+] as const;
+const DEVELOPMENT_FILENAME_SET = new Set<string>(DEVELOPMENT_FILENAMES);
+const ALL_SOURCE_GLOBS: readonly string[] = [
+  ...SOURCE_EXTENSION_LIST.map((extension) => `*.${extension}`),
+  ...SOURCE_GLOB_CASE_ALIASES,
+  ...DEVELOPMENT_FILENAMES,
+];
 
 export function inferScopes(): string[] {
   return ['.'];
@@ -102,14 +137,19 @@ export function inferScopes(): string[] {
 
 export function inferGlobs(paths: readonly string[]): string[] {
   const extensions = new Set<string>();
+  const devNames: string[] = [];
   for (const path of paths) {
+    const base = basename(path);
+    if (DEVELOPMENT_FILENAME_SET.has(base)) {
+      devNames.push(base);
+    }
     const extension = extname(path).slice(1);
     if (SOURCE_EXTENSIONS.has(extension.toLowerCase())) {
       extensions.add(extension);
     }
   }
   return [...new Set([
-    ...paths.filter((path) => DEVELOPMENT_FILENAMES.some((name) => name === basename(path))).map((path) => basename(path)),
+    ...devNames,
     ...[...extensions]
     .sort((left, right) => left.localeCompare(right))
     .map((extension) => `*.${extension}`),
@@ -117,18 +157,14 @@ export function inferGlobs(paths: readonly string[]): string[] {
 }
 
 export function allSourceGlobs(): string[] {
-  return [
-    ...SOURCE_EXTENSION_LIST.map((extension) => `*.${extension}`),
-    ...SOURCE_GLOB_CASE_ALIASES,
-    ...DEVELOPMENT_FILENAMES,
-  ];
+  return [...ALL_SOURCE_GLOBS];
 }
 
 export function isSupportedSourcePath(path: string): boolean {
   return (
     !hasHiddenComponent(path) &&
     (SOURCE_EXTENSIONS.has(extname(path).slice(1).toLowerCase()) ||
-      DEVELOPMENT_FILENAMES.some((name) => name === basename(path)))
+      DEVELOPMENT_FILENAME_SET.has(basename(path)))
   );
 }
 

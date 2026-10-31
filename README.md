@@ -39,30 +39,30 @@ use the same extension identity.
 ## Measured performance & token acceleration
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-mixed retrieval suite averaged **6.83× faster with a warm CCTX cache**
-(95% CI **6.65–7.06×**): **3.809 → 0.557 ms per operation**.
-Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 47.5–71.1%** and accelerates end-to-end coding agent completion by **24.7%**.
+mixed retrieval suite averaged **9.59× faster with a warm CCTX cache**
+(95% CI **9.32–9.88×**): **3.791 → 0.395 ms per operation**.
+Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%** and accelerates end-to-end coding agent completion by **24.7%**.
 
 ![Retrieval latency, paired-session speedup, Rust/Python token savings, and agent acceleration](benchmarks/results/aks-store-demo/latency-speedup.png)
 
 | Retrieval task (AKS Store Demo) | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.257 ms | 0.566 ms | 7.52× |
-| Literal search | 4.965 ms | 0.428 ms | 11.60× |
-| Search + context | 5.122 ms | 0.499 ms | 10.26× |
-| Known file read + hash | **0.070 ms** | 0.799 ms | **0.09× — slower** |
-| Fixed mixed suite | 3.809 ms | 0.557 ms | 6.83× |
+| Filename discovery | 4.254 ms | 0.401 ms | 10.62× |
+| Literal search | 4.942 ms | 0.389 ms | 12.72× |
+| Search + context | 5.090 ms | 0.422 ms | 12.06× |
+| Known file read + hash | **0.060 ms** | 0.363 ms | **0.17× — slower** |
+| Fixed mixed suite | 3.791 ms | 0.395 ms | 9.59× |
 
 | Token & agent acceleration benchmark | Baseline (`rg` + `view`) | With CCTX (`code_context`) | Reduction / speedup |
 |---|---:|---:|---:|
-| Rust 6-symbol lookup payload tokens | 18,907 tok (100L) / 29,396 tok (200L) | **9,929 tok** (6 calls vs 21) | **-47.5% to -66.2% tokens** |
-| Python 6-symbol lookup payload tokens | 13,799 tok (100L) / 24,126 tok (200L) | **6,971 tok** (6 calls vs 15, **10.65×** faster) | **-49.5% to -71.1% tokens** |
+| Rust 6-symbol lookup payload tokens | 15,028 tok (100L) / 25,133 tok (200L) | **4,031 tok** (6 calls vs 20, **10.3×** faster) | **-73.2% to -84.0% tokens** |
+| Python 6-symbol lookup payload tokens | 13,997 tok (100L) / 24,609 tok (200L) | **2,141 tok** (6 calls vs 15, **13.16×** faster) | **-84.7% to -91.3% tokens** |
 | Copilot A/B agent tool calls & LLM turns | 7.00 calls / 5.00 turns | **2.67 calls / 3.67 turns** | **-61.9% calls · -26.7% turns** |
 | Copilot A/B agent payload tokens & AIU cost | 6,360 tok / 4.76B nanoAIU | **3,177 tok / 3.55B nanoAIU** | **-50.0% tokens · -25.4% cost** |
 | Copilot A/B end-to-end task wall time | 20.31 s | **15.30 s** (100% accuracy both) | **-24.7% completion time** |
 
 Eight daemon sessions, 40 rounds, 28 tasks, **8,960 correctness-checked pairs**.
-Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.325 ms median**, not a warm-cache speedup.
+Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.324 ms median**, not a warm-cache speedup.
 See [method, cold-start chart, token suites, raw samples, and reproduction](docs/BENCHMARKS.md) for uncertainty and limitations.
 
 ## Learn more

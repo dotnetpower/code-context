@@ -1,16 +1,30 @@
 pub fn classify(error: Option<&str>) -> &'static str {
     let Some(message) = error else { return "success"; };
-    if message.contains("CACHE_MISS ") || message.contains("STALE_INDEX")
-        || message.contains("reason=not_yet_indexed") {
+    if message.starts_with("CACHE_MISS ")
+        || message.starts_with("STALE_INDEX ")
+        || message.contains("CACHE_MISS ")
+        || message.contains("STALE_INDEX")
+        || message.contains("reason=not_yet_indexed")
+    {
         "cache_not_ready"
-    } else if message.contains("READ_POLICY_DENIED") || message.contains("reason=outside_scope")
-        || message.contains("reason=excluded_by_rule") || message.contains("reason=unsupported_glob")
-        || message.contains("reason=ignored_by_discovery") || message.contains("reason=symlink_not_allowed")
-        || message.contains("only non-hidden") {
+    } else if message.starts_with("READ_POLICY_DENIED ")
+        || message.contains("READ_POLICY_DENIED")
+        || message.contains("reason=outside_scope")
+        || message.contains("reason=excluded_by_rule")
+        || message.contains("reason=unsupported_glob")
+        || message.contains("reason=ignored_by_discovery")
+        || message.contains("reason=symlink_not_allowed")
+        || message.contains("only non-hidden")
+    {
         "policy_denied"
-    } else if message.contains("READ_RANGE_OUT_OF_BOUNDS") || message.contains("reason=missing_on_disk")
-        || message.contains("regex parse error") || message.contains("limit 1..64")
-        || message.contains("invalid range") || message.contains("unknown field") {
+    } else if message.starts_with("READ_RANGE_OUT_OF_BOUNDS ")
+        || message.contains("READ_RANGE_OUT_OF_BOUNDS")
+        || message.contains("reason=missing_on_disk")
+        || message.contains("regex parse error")
+        || message.contains("limit 1..64")
+        || message.contains("invalid range")
+        || message.contains("unknown field")
+    {
         "invalid_request"
     } else {
         "system_error"

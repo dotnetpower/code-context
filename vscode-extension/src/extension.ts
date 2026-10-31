@@ -128,7 +128,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await showStatus(bridge, status, output, usage.lastRoot);
     }),
     vscode.commands.registerCommand('codeContextNative.selfTest', async (root?: string) => {
-      await runSelfTest(bridge, output, context.extension, root);
+      await runSelfTest(bridge, output, context.extension, root ?? usage.lastRoot);
     }),
     vscode.commands.registerCommand(
       'codeContextNative.registerWorkspace',

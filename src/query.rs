@@ -83,6 +83,7 @@ struct CacheKey {
 
 struct Compiled {
     matcher: Option<RegexMatcher>,
+    finder: Option<memchr::memmem::Finder<'static>>,
     per_line: bool,
     manual_line_prefilter: bool,
     plan: Option<CandidateExpr>,
@@ -90,7 +91,7 @@ struct Compiled {
 
 struct CacheEntry {
     key: CacheKey,
-    compiled: Compiled,
+    compiled: std::sync::Arc<Compiled>,
 }
 
 struct ResultEntry {
@@ -108,6 +109,14 @@ struct ContextEntry {
     owned_bytes: usize,
 }
 
+struct EligibleEntry {
+    generation: u64,
+    paths: Vec<String>,
+    glob: Option<String>,
+    ids: Vec<usize>,
+    bytes: usize,
+}
+
 #[derive(Default)]
 pub struct QueryCache {
     entries: VecDeque<CacheEntry>,
@@ -116,10 +125,11 @@ pub struct QueryCache {
     result_bytes: usize,
     contexts: VecDeque<ContextEntry>,
     context_bytes: usize,
+    last_eligible: Option<EligibleEntry>,
 }
 
 impl QueryCache {
-    fn get_or_compile(&mut self, query: &Query) -> Result<(&Compiled, bool, u64)> {
+    fn get_or_compile(&mut self, query: &Query) -> Result<(std::sync::Arc<Compiled>, bool, u64)> {
         if let Some(position) = self.entries.iter().position(|entry| {
             entry.key.regex == query.regex
                 && entry.key.ignore_case == query.ignore_case
@@ -132,7 +142,11 @@ impl QueryCache {
                     .expect("cache position exists");
                 self.entries.push_back(entry);
             }
-            return Ok((&self.entries.back().expect("cache entry").compiled, true, 0));
+            return Ok((
+                self.entries.back().expect("cache entry").compiled.clone(),
+                true,
+                0,
+            ));
         }
         let key = CacheKey {
             pattern: query.pattern.clone(),
@@ -140,20 +154,19 @@ impl QueryCache {
             ignore_case: query.ignore_case,
         };
         let started = Instant::now();
-        let compiled = compile(&key)?;
+        let compiled = std::sync::Arc::new(compile(&key)?);
         let compile_us = micros(started);
         self.pattern_bytes += key.pattern.len();
-        self.entries.push_back(CacheEntry { key, compiled });
+        self.entries.push_back(CacheEntry {
+            key,
+            compiled: compiled.clone(),
+        });
         while self.entries.len() > CACHE_ENTRIES || self.pattern_bytes > CACHE_PATTERN_BYTES {
             if let Some(entry) = self.entries.pop_front() {
                 self.pattern_bytes = self.pattern_bytes.saturating_sub(entry.key.pattern.len());
             }
         }
-        Ok((
-            &self.entries.back().expect("new cache entry").compiled,
-            false,
-            compile_us,
-        ))
+        Ok((compiled, false, compile_us))
     }
 
     pub fn stats(&self) -> serde_json::Value {
@@ -185,6 +198,13 @@ impl QueryCache {
         self.result_bytes = self.results.iter().map(|entry| entry.owned_bytes).sum();
         self.contexts.retain(|entry| entry.generation == generation);
         self.context_bytes = self.contexts.iter().map(|entry| entry.owned_bytes).sum();
+        if self
+            .last_eligible
+            .as_ref()
+            .is_some_and(|e| e.generation != generation)
+        {
+            self.last_eligible = None;
+        }
     }
 
     pub fn clear_memory(&mut self) {
@@ -194,6 +214,7 @@ impl QueryCache {
         self.result_bytes = 0;
         self.contexts.clear();
         self.context_bytes = 0;
+        self.last_eligible = None;
     }
 
     fn get_result(&mut self, generation: u64, query: &Query) -> Option<std::sync::Arc<SearchResult>> {
@@ -391,7 +412,8 @@ fn search_internal(
 ) -> Result<ProfiledResult> {
     validate(query)?;
     let mut profile = QueryProfile::default();
-    let (compiled, cache_hit, compile_us) = cache.get_or_compile(query)?;
+    let (compiled_arc, cache_hit, compile_us) = cache.get_or_compile(query)?;
+    let compiled = compiled_arc.as_ref();
     if collect_profile {
         profile.cache_hit = cache_hit;
         profile.compile_us = compile_us;
@@ -465,27 +487,40 @@ fn search_internal(
             });
         }
     }
-    let eligible = if scoped {
-        let mut ids: Vec<_> = resident
-            .paths
-            .values()
-            .copied()
-            .filter(|id| path_allowed(resident, *id, &paths, &glob))
-            .collect();
-        ids.sort_unstable();
-        ids
+    let (eligible, eligible_bytes) = if scoped {
+        if let Some(entry) = cache.last_eligible.as_ref()
+            && entry.generation == resident.stats.generation
+            && entry.paths == query.paths
+            && entry.glob == query.glob
+        {
+            (entry.ids.clone(), entry.bytes)
+        } else {
+            let mut ids: Vec<_> = resident
+                .paths
+                .values()
+                .copied()
+                .filter(|id| path_allowed(resident, *id, &paths, &glob))
+                .collect();
+            ids.sort_unstable();
+            let bytes = resident.candidate_bytes(&ids);
+            if query.paths.len() <= 8 {
+                cache.last_eligible = Some(EligibleEntry {
+                    generation: resident.stats.generation,
+                    paths: query.paths.clone(),
+                    glob: query.glob.clone(),
+                    ids: ids.clone(),
+                    bytes,
+                });
+            }
+            (ids, bytes)
+        }
     } else {
-        Vec::new()
+        (Vec::new(), resident.stats.source_bytes)
     };
     let eligible_files = if scoped {
         eligible.len()
     } else {
         resident.stats.files
-    };
-    let eligible_bytes = if scoped {
-        resident.candidate_bytes(&eligible)
-    } else {
-        resident.stats.source_bytes
     };
     if collect_profile {
         profile.eligible_files = eligible_files;
@@ -611,6 +646,7 @@ fn compile(key: &CacheKey) -> Result<Compiled> {
     if !key.regex && !key.ignore_case {
         return Ok(Compiled {
             matcher: None,
+            finder: Some(memchr::memmem::Finder::new(key.pattern.as_bytes()).into_owned()),
             per_line: false,
             manual_line_prefilter: false,
             plan: Some(CandidateExpr::Literal(key.pattern.as_bytes().to_vec())),
@@ -638,6 +674,7 @@ fn compile(key: &CacheKey) -> Result<Compiled> {
         .build(&key.pattern)?;
     Ok(Compiled {
         matcher: Some(matcher),
+        finder: None,
         per_line,
         manual_line_prefilter,
         plan: planner::build(&hir),
@@ -673,7 +710,14 @@ fn scan(
             );
         }
     } else {
-        let finder = Finder::new(query.pattern.as_bytes());
+        let fallback_finder;
+        let finder = match &compiled.finder {
+            Some(f) => f.as_ref(),
+            None => {
+                fallback_finder = Finder::new(query.pattern.as_bytes());
+                fallback_finder
+            }
+        };
         for id in ids {
             let document = &resident.documents[*id];
             if document.starts.is_empty() {
@@ -688,10 +732,7 @@ fn scan(
                     break;
                 };
                 let position = search_pos + rel;
-                let line = line_cursor
-                    + document.starts[line_cursor..]
-                        .partition_point(|start| (*start as usize) <= position)
-                    - 1;
+                let line = crate::resident::find_line_gallop(&document.starts, line_cursor, position);
                 file_lines.push(line);
                 line_cursor = line + 1;
                 search_pos = document
@@ -773,6 +814,9 @@ fn scan_lines(
     prefilter: Option<&CandidateExpr>,
     file_lines: &mut Vec<usize>,
 ) -> Result<()> {
+    if prefilter.is_some_and(|plan| !plan.matches(document.text.as_bytes())) {
+        return Ok(());
+    }
     for line in 0..document.starts.len() {
         let start = document.starts[line] as usize;
         let end = document
@@ -813,10 +857,7 @@ fn scan_document(
         if offset < next_line_start {
             return true;
         }
-        let line = line_cursor
-            + document.starts[line_cursor..]
-                .partition_point(|start| (*start as usize) <= offset)
-            - 1;
+        let line = crate::resident::find_line_gallop(&document.starts, line_cursor, offset);
         file_lines.push(line);
         line_cursor = line + 1;
         next_line_start = document
@@ -881,6 +922,14 @@ pub(crate) fn is_definition_line(line: &str) -> bool {
     keywords.iter().any(|keyword| trimmed.starts_with(keyword))
 }
 
+fn is_import_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("use ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("from ")
+        || trimmed.starts_with("#include")
+}
+
 fn record_document(
     document: &crate::resident::Document,
     file_lines: &[usize],
@@ -911,33 +960,43 @@ fn record_document(
             .take(cap)
             .collect();
         if selected.len() < cap {
+            let non_imports: Vec<usize> = file_lines
+                .iter()
+                .copied()
+                .filter(|&line| !is_import_line(document.line(line)))
+                .collect();
+            let pool: &[usize] = if non_imports.is_empty() {
+                file_lines
+            } else {
+                &non_imports
+            };
             // Anchor-aware selection (first + last + evenly strided middle),
             // preventing top-of-file imports from starving bottom-of-file call sites.
-            if let Some(&first) = file_lines.first()
+            if let Some(&first) = pool.first()
                 && !selected.contains(&first)
             {
                 selected.push(first);
             }
             if selected.len() < cap
-                && file_lines.len() > 2
-                && let Some(&last) = file_lines.last()
+                && pool.len() > 2
+                && let Some(&last) = pool.last()
                 && !selected.contains(&last)
             {
                 selected.push(last);
             }
-            if selected.len() < cap {
+            if selected.len() < cap && !pool.is_empty() {
                 let needed = cap - selected.len();
-                let span = file_lines.len();
+                let span = pool.len();
                 for slot in 1..=needed {
                     let idx = (slot * span) / (needed + 1);
-                    let candidate = file_lines[idx.min(span - 1)];
+                    let candidate = pool[idx.min(span - 1)];
                     if !selected.contains(&candidate) {
                         selected.push(candidate);
                     }
                 }
             }
             if selected.len() < cap {
-                for &line in file_lines {
+                for &line in pool.iter().chain(file_lines.iter()) {
                     if !selected.contains(&line) {
                         selected.push(line);
                         if selected.len() == cap {
@@ -969,7 +1028,7 @@ fn record_document(
 fn validate(query: &Query) -> Result<()> {
     if query.pattern.is_empty()
         || query.pattern.len() > 16 * 1024
-        || query.pattern.contains(['\n', '\0'])
+        || memchr::memchr2(b'\n', b'\0', query.pattern.as_bytes()).is_some()
         || query.limit == 0
         || query.limit > 1000
         || query
@@ -1005,7 +1064,27 @@ pub(crate) fn paths(prefixes: &[String]) -> Result<Vec<std::path::PathBuf>> {
 enum GlobFilter<'a> {
     None,
     Extension(&'a str),
+    BraceExtensions(Vec<String>),
     Compiled(GlobSet),
+}
+
+pub(crate) fn brace_extension_suffixes(glob: &str) -> Option<Vec<String>> {
+    let inner = glob.strip_prefix("*.{")?.strip_suffix('}')?;
+    if inner.is_empty() {
+        return None;
+    }
+    let mut suffixes = Vec::with_capacity(4);
+    for part in inner.split(',') {
+        if part.is_empty()
+            || !part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return None;
+        }
+        suffixes.push(format!(".{part}"));
+    }
+    (suffixes.len() >= 2 && suffixes.len() <= 8).then_some(suffixes)
 }
 
 fn glob(query: &Query) -> Result<GlobFilter<'_>> {
@@ -1025,6 +1104,9 @@ fn glob(query: &Query) -> Result<GlobFilter<'_>> {
             return Ok(GlobFilter::Extension(suffix));
         }
     }
+    if let Some(suffixes) = brace_extension_suffixes(glob) {
+        return Ok(GlobFilter::BraceExtensions(suffixes));
+    }
     let mut builder = GlobSetBuilder::new();
     builder.add(Glob::new(glob)?);
     Ok(GlobFilter::Compiled(builder.build()?))
@@ -1037,22 +1119,41 @@ fn path_allowed(
     glob: &GlobFilter<'_>,
 ) -> bool {
     let raw_path = resident.documents[id].path.as_ref();
-    let path = Path::new(raw_path);
-    if !path_matches(path, paths) {
+    if !path_matches_str(raw_path, paths) {
         return false;
     }
     match glob {
         GlobFilter::None => true,
         GlobFilter::Extension(suffix) => raw_path.ends_with(suffix),
+        GlobFilter::BraceExtensions(suffixes) => {
+            suffixes.iter().any(|suffix| raw_path.ends_with(suffix.as_str()))
+        }
         GlobFilter::Compiled(set) => {
+            let path = Path::new(raw_path);
             set.is_match(path) || path.file_name().is_some_and(|name| set.is_match(name))
         }
     }
 }
 
-pub(crate) fn path_matches(path: &Path, paths: &[std::path::PathBuf]) -> bool {
-    !path.as_os_str().is_empty()
-        && (paths.is_empty() || paths.iter().any(|prefix| path.starts_with(prefix)))
+pub(crate) fn path_matches_str(raw_path: &str, paths: &[std::path::PathBuf]) -> bool {
+    if raw_path.is_empty() {
+        return false;
+    }
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|prefix| {
+        if let Some(p) = prefix.to_str() {
+            if p == "." || p.is_empty() {
+                return true;
+            }
+            raw_path.starts_with(p)
+                && (raw_path.len() == p.len()
+                    || raw_path.as_bytes().get(p.len()) == Some(&b'/'))
+        } else {
+            Path::new(raw_path).starts_with(prefix)
+        }
+    })
 }
 
 fn text_anchored(hir: &Hir) -> bool {

@@ -322,8 +322,17 @@ fn atom(bytes: &[u8]) -> Option<CandidateExpr> {
         .then(|| CandidateExpr::Literal(bytes.to_vec()))
 }
 
-fn simplify_group(children: Vec<CandidateExpr>, and: bool) -> CandidateExpr {
-    let mut flattened = Vec::new();
+fn simplify_group(mut children: Vec<CandidateExpr>, and: bool) -> CandidateExpr {
+    if children.len() == 1 {
+        let single = children.pop().expect("one element");
+        return match (and, single) {
+            (true, CandidateExpr::And(nested)) | (false, CandidateExpr::Or(nested)) => {
+                simplify_group(nested, and)
+            }
+            (_, single) => single,
+        };
+    }
+    let mut flattened = Vec::with_capacity(children.len());
     for child in children {
         match (and, child) {
             (true, CandidateExpr::And(nested)) | (false, CandidateExpr::Or(nested)) => {
@@ -371,8 +380,64 @@ fn intersect_in_place(left: &mut Vec<usize>, right: &[usize]) {
 }
 
 fn union<'a>(parts: impl Iterator<Item = &'a [usize]>) -> Vec<usize> {
-    let mut output: Vec<_> = parts.flatten().copied().collect();
-    output.sort_unstable();
-    output.dedup();
-    output
+    let slices: Vec<&'a [usize]> = parts.filter(|s| !s.is_empty()).collect();
+    match slices.len() {
+        0 => Vec::new(),
+        1 => slices[0].to_vec(),
+        2 => {
+            let (left, right) = (slices[0], slices[1]);
+            let mut out = Vec::with_capacity(left.len() + right.len());
+            let (mut i, mut j) = (0, 0);
+            while i < left.len() && j < right.len() {
+                match left[i].cmp(&right[j]) {
+                    std::cmp::Ordering::Less => {
+                        out.push(left[i]);
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.push(right[j]);
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        out.push(left[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            out.extend_from_slice(&left[i..]);
+            out.extend_from_slice(&right[j..]);
+            out
+        }
+        _ => {
+            let max_id = slices
+                .iter()
+                .filter_map(|s| s.last().copied())
+                .max()
+                .unwrap_or(0);
+            if max_id < 65_536 {
+                let mut words = vec![0_u64; (max_id / 64) + 1];
+                for slice in &slices {
+                    for &id in *slice {
+                        words[id / 64] |= 1_u64 << (id % 64);
+                    }
+                }
+                let mut out = Vec::new();
+                for (word_idx, &word) in words.iter().enumerate() {
+                    let mut w = word;
+                    while w != 0 {
+                        let bit = w.trailing_zeros() as usize;
+                        out.push(word_idx * 64 + bit);
+                        w &= w - 1;
+                    }
+                }
+                out
+            } else {
+                let mut output: Vec<_> = slices.into_iter().flatten().copied().collect();
+                output.sort_unstable();
+                output.dedup();
+                output
+            }
+        }
+    }
 }

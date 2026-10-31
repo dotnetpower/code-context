@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CAPABILITY_SCHEMA: u32 = 3;
 
@@ -23,35 +23,36 @@ pub fn executable_hash(path: &Path) -> Result<String> {
 }
 
 pub fn capabilities() -> Result<Value> {
-    static HASH: std::sync::OnceLock<std::result::Result<String, String>> =
+    static CAPABILITIES: std::sync::OnceLock<std::result::Result<Value, String>> =
         std::sync::OnceLock::new();
-    let hash = HASH
+    Ok(CAPABILITIES
         .get_or_init(|| {
-            #[cfg(unix)]
-            {
-                executable_hash(Path::new("/proc/self/exe")).map_err(|e| e.to_string())
-            }
-            #[cfg(not(unix))]
-            {
-                std::env::current_exe()
-                    .map_err(|e| e.to_string())
-                    .and_then(|path| executable_hash(&path).map_err(|e| e.to_string()))
-            }
+            let hash = {
+                #[cfg(unix)]
+                {
+                    executable_hash(Path::new("/proc/self/exe")).map_err(|e| e.to_string())?
+                }
+                #[cfg(not(unix))]
+                {
+                    let path = std::env::current_exe().map_err(|e| e.to_string())?;
+                    executable_hash(&path).map_err(|e| e.to_string())?
+                }
+            };
+            Ok(json!({"schema":CAPABILITY_SCHEMA,"executable_sha256":hash,
+                "package_version":env!("CARGO_PKG_VERSION"),"tool_count":7,
+                "code_files":true,"context_radius_max":100,"authorized_worktrees":true,
+                "registration_migration":true,"read_pages":true,"background_workers":1,"request_tracing":true,
+                "cache_peak_admission":"minimum_lru","prewarm_priority":"disabled","trace_clock":"unix_ms",
+                "source_cache":"nonblocking_root_cache","cache_pending_roots":8,"cache_miss":"CACHE_MISS",
+                "read_policy_cache":true,"adaptive_memory":true,
+                "client_trace_outcomes":true,"host_memory_reporting":true,
+                "idle_maintenance_interval_ms":1000,
+                "active_poll_interval_ms":25,"runtime_identity_guard":true,
+                "max_registered_roots":crate::catalog::MAX_REGISTERED_ROOTS,
+                "idle_source_lease_seconds":crate::watched::IDLE_ROOT_TIMEOUT.as_secs()}))
         })
-        .as_ref()
-        .map_err(|e| invalid(e.clone()))?;
-    Ok(json!({"schema":CAPABILITY_SCHEMA,"executable_sha256":hash,
-        "package_version":env!("CARGO_PKG_VERSION"),"tool_count":7,
-        "code_files":true,"context_radius_max":100,"authorized_worktrees":true,
-        "registration_migration":true,"read_pages":true,"background_workers":1,"request_tracing":true,
-        "cache_peak_admission":"minimum_lru","prewarm_priority":"disabled","trace_clock":"unix_ms",
-        "source_cache":"nonblocking_root_cache","cache_pending_roots":8,"cache_miss":"CACHE_MISS",
-        "read_policy_cache":true,"adaptive_memory":true,
-        "client_trace_outcomes":true,"host_memory_reporting":true,
-        "idle_maintenance_interval_ms":1000,
-        "active_poll_interval_ms":25,"runtime_identity_guard":true,
-        "max_registered_roots":crate::catalog::MAX_REGISTERED_ROOTS,
-        "idle_source_lease_seconds":crate::watched::IDLE_ROOT_TIMEOUT.as_secs()}))
+        .clone()
+        .map_err(invalid)?)
 }
 
 pub fn doctor(root: &Path) -> Result<Value> {
@@ -172,10 +173,21 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .and_then(|value| value.get("capabilities"))
         .and_then(|value| value.get("executable_sha256"))
         .map(|hash| hash == &local["executable_sha256"]);
+    let legacy_glob_roots: Vec<PathBuf> = specs
+        .iter()
+        .filter(|spec| {
+            spec.managed_parent.is_none()
+                && !spec.globs.iter().any(|g| g == "*.md")
+        })
+        .map(|spec| spec.root.clone())
+        .collect();
+    let missing_managed_worktrees = catalog::missing_managed_roots(&specs).unwrap_or_default();
     Ok(
         json!({"client":local,"daemon":remote,"daemon_error":daemon_error,
         "root_resolution":root_resolution,"registrations":specs,"processes":processes,
         "stale_mcp_processes":stale,"daemon_matches_client":daemon_matches_client,
+        "legacy_glob_roots":legacy_glob_roots,
+        "missing_managed_worktrees":missing_managed_worktrees,
         "inspection_errors":inspection_errors,
         "chat_exposure":"unverified; executable/cwd is not a session-to-process mapping",
         "recovery":{
@@ -210,7 +222,12 @@ pub fn coverage() -> Result<Value> {
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect();
                 files.sort();
-                roots.push(json!({"registration":spec,"files":files}));
+                roots.push(json!({
+                    "registration":spec,
+                    "glob_count":spec.globs.len(),
+                    "allow_worktrees":spec.allow_worktrees,
+                    "files":files
+                }));
             }
             Err(error) => roots.push(json!({"registration":spec,"error":error.to_string()})),
         }

@@ -421,6 +421,19 @@ impl RootSnapshot {
     }
 }
 
+fn base_universal_patterns() -> &'static BTreeSet<String> {
+    static BASE: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let mut patterns = BTreeSet::new();
+        for directory in UNIVERSAL_EXCLUDED_DIRS {
+            patterns.insert(format!("**/{directory}"));
+            patterns.insert(format!("**/{directory}/**"));
+        }
+        patterns.extend(UNIVERSAL_GLOBS.iter().map(|pattern| (*pattern).to_owned()));
+        patterns
+    })
+}
+
 pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
     let mut roots = vec![(String::new(), root.to_path_buf())];
     roots.extend(
@@ -430,12 +443,7 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             .map(|scope| (scope.clone(), root.join(scope))),
     );
     let mut profiles = BTreeSet::new();
-    let mut patterns = BTreeSet::new();
-    for directory in UNIVERSAL_EXCLUDED_DIRS {
-        patterns.insert(format!("**/{directory}"));
-        patterns.insert(format!("**/{directory}/**"));
-    }
-    patterns.extend(UNIVERSAL_GLOBS.iter().map(|pattern| (*pattern).to_owned()));
+    let mut patterns = base_universal_patterns().clone();
 
     for (prefix, project_root) in roots {
         let snapshot = RootSnapshot::scan(project_root.as_path());
@@ -478,14 +486,62 @@ pub fn is_profile_marker(path: &Path) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    let extension = path.extension().and_then(|extension| extension.to_str());
-    PROFILE_RULES.iter().any(|rule| {
-        rule.files.iter().any(|marker| {
-            Path::new(marker)
-                .file_name()
-                .is_some_and(|marker| marker == name)
-        }) || extension.is_some_and(|extension| rule.extensions.contains(&extension))
-    }) || matches!(name, "DESCRIPTION" | "NAMESPACE" | "repositories.config")
+    if matches!(
+        name,
+        "package.json"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "CMakeLists.txt"
+            | "Package.swift"
+            | "mix.exs"
+            | "rebar.config"
+            | "cabal.project"
+            | "stack.yaml"
+            | "Gemfile"
+            | "composer.json"
+            | "go.mod"
+            | "Makefile.PL"
+            | "Build.PL"
+            | "cpanfile"
+            | "ProjectVersion.txt"
+            | "pubspec.yaml"
+            | "Project.toml"
+            | "AndroidManifest.xml"
+            | "package.xml"
+            | "dune-project"
+            | "project.clj"
+            | "deps.edn"
+            | "Cargo.toml"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "build.sbt"
+            | "project.godot"
+            | "build.zig"
+            | "DESCRIPTION"
+            | "NAMESPACE"
+            | "repositories.config"
+    ) {
+        return true;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "py" | "sln"
+                    | "csproj"
+                    | "fsproj"
+                    | "vbproj"
+                    | "cabal"
+                    | "uproject"
+                    | "opam"
+                    | "tf"
+                    | "nimble"
+            )
+        })
 }
 
 fn apply_scoped(

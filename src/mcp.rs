@@ -144,7 +144,8 @@ pub fn serve(workspace: &Workspace, input: impl BufRead, mut output: impl Write)
 
 pub(crate) fn write_response(output: &mut impl Write, response: &Value) -> Result<(f64, f64)> {
     let started = std::time::Instant::now();
-    let mut bytes = serde_json::to_vec(response)?;
+    let mut bytes = Vec::with_capacity(512);
+    serde_json::to_writer(&mut bytes, response)?;
     bytes.push(b'\n');
     let serialize_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = std::time::Instant::now();

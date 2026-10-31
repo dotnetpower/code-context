@@ -2,9 +2,9 @@
 
 ## Result and scope
 
-The fixed mixed suite took **3.809 ms per operation without CCTX** and
-**0.557 ms with a warm CCTX cache**: **6.83x** speedup, 95% confidence interval
-**6.65–7.06x**, or **85.4% less retrieval wall time** in this experiment.
+The fixed mixed suite took **3.791 ms per operation without CCTX** and
+**0.395 ms with a warm CCTX cache**: **9.59x** speedup, 95% confidence interval
+**9.32–9.88x**, or **89.6% less retrieval wall time** in this experiment.
 This is a retrieval microbenchmark, **not** a claim of faster LLM generation,
 VS Code chat, model tool selection, token savings, or whole-agent completion.
 
@@ -17,14 +17,14 @@ improvements. Known reads are deliberately retained in the mixed suite.
 
 | Task | Pairs | Off mean | On mean | Speedup [95% CI] |
 |---|---:|---:|---:|---:|
-| Filename discovery | 1,920 | 4.257 ms | 0.566 ms | 7.52x [7.30, 7.82] |
-| Literal search | 2,560 | 4.965 ms | 0.428 ms | 11.60x [11.23, 12.02] |
-| Search + context | 2,560 | 5.122 ms | 0.499 ms | 10.26x [9.87, 10.69] |
-| Known read + hash | 1,920 | 0.070 ms | 0.799 ms | 0.088x [0.087, 0.090] |
-| Fixed mixed suite | 8,960 | 3.809 ms | 0.557 ms | 6.83x [6.65, 7.06] |
+| Filename discovery | 1,920 | 4.254 ms | 0.401 ms | 10.62x [10.22, 11.11] |
+| Literal search | 2,560 | 4.942 ms | 0.389 ms | 12.72x [11.99, 13.45] |
+| Search + context | 2,560 | 5.090 ms | 0.422 ms | 12.06x [11.66, 12.49] |
+| Known read + hash | 1,920 | 0.060 ms | 0.363 ms | 0.166x [0.155, 0.176] |
+| Fixed mixed suite | 8,960 | 3.791 ms | 0.395 ms | 9.59x [9.32, 9.88] |
 
-Mixed-suite p95: **6.290 ms off / 0.948 ms on**. This is a pooled descriptive
-percentile, not a confidence bound. Small known-file reads are **11.3x slower**
+Mixed-suite p95: **6.384 ms off / 0.579 ms on**. This is a pooled descriptive
+percentile, not a confidence bound. Small known-file reads are **6.0x slower**
 through IPC; direct buffered reads avoid request, policy, JSON, and socket
 overhead. CCTX is not the fastest path for every operation.
 
@@ -111,9 +111,9 @@ plus normal ripgrep fallback versus a normal off lookup. B: explicit source
 sync/load barrier measured separately; this is setup, not ordinary lookup
 latency. Daemon process startup and metadata registration are excluded.
 
-- Off lookup median: **4.174 ms**
-- Cold miss plus fallback median: **4.325 ms**
-- Subsequent explicit sync median: **76.006 ms**
+- Off lookup median: **4.093 ms**
+- Cold miss plus fallback median: **4.324 ms**
+- Subsequent explicit sync median: **50.937 ms**
 
 The off cold-control lookup runs first in each session; this small descriptive
 sample is not randomized like the warm pairs and is not assigned a confidence
@@ -179,13 +179,13 @@ and per-file match capping (`max_matches_per_file=5` with definition priority):
 
 | Corpus & suite | Tool calls (`rg+view` → `cctx`) | `rg` + 200-line `view` | `rg` + 100-line `view` | Full-file read | `CCTX code_context` | Token reduction | Retrieval time (`rg+read` → `cctx`) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Rust (6-symbol suite) | 21 → **6 (-71.4%)** | 29,396 tok | 18,907 tok | 117,062 tok | **9,929 tok** | **-47.5% to -66.2%** (-91.5% vs full) | 30.40 ms → **3.27 ms (9.3×)** |
-| Python (6-symbol suite, 506 files) | 15 → **6 (-60.0%)** | 24,126 tok | 13,799 tok | 45,206 tok | **6,971 tok** | **-49.5% to -71.1%** (-84.6% vs full) | 5.58 ms → **0.52 ms (10.65×)** |
+| Rust (6-symbol suite) | 20 → **6 (-70.0%)** | 25,133 tok | 15,028 tok | 157,268 tok | **4,031 tok** | **-73.2% to -84.0%** (-97.4% vs full) | 26.24 ms → **2.56 ms (10.3×)** |
+| Python (6-symbol suite, 506 files) | 15 → **6 (-60.0%)** | 24,609 tok | 13,997 tok | 48,029 tok | **2,141 tok** | **-84.7% to -91.3%** (-95.5% vs full) | 5.33 ms → **0.40 ms (13.16×)** |
 
-On the 506-file Python corpus, warm `cctx` averaged **0.524 ms** versus
-**5.583 ms** for `rg` + buffered reads (**10.65×** faster overall, including
-**12.88×** on `ignore_case: true` queries via ASCII case-folded trigram
-candidates and **13.26×** on `async def` regular expressions).
+On the 506-file Python corpus, warm `cctx` averaged **0.405 ms** versus
+**5.327 ms** for `rg` + buffered reads (**13.16×** faster overall, including
+**16.45×** on `ignore_case: true` queries via ASCII case-folded trigram
+candidates and **16.49×** on `async def` regular expressions).
 
 ### 2. End-to-end Copilot CLI agent A/B trials
 

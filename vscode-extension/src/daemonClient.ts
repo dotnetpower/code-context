@@ -20,6 +20,7 @@ import type {
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 const FRAMED_JSON_MAGIC = Buffer.from('CCTXJ1\n', 'ascii');
+const EMPTY_BUFFER = Buffer.alloc(0);
 
 interface PendingResponse {
   resolve(value: JsonValue): void;
@@ -67,13 +68,15 @@ export class TracedRequestError extends Error {
 export class DaemonClient {
   private socket: Duplex | undefined;
   private socketPath: string | undefined;
-  private receiveBuffer: Buffer = Buffer.alloc(0);
+  private receiveBuffer: Buffer = EMPTY_BUFFER;
   private pending: PendingResponse | undefined;
   private queue: Promise<void> = Promise.resolve();
   private disposed = false;
   private tracingAvailable: boolean | undefined;
   private traceOutcomesAvailable = false;
   private hostMemoryReportingAvailable = false;
+  private startingService: Promise<void> | undefined;
+  private lastServiceStartAt = 0;
 
   public constructor(
     private readonly settings: () => ClientSettings,
@@ -165,7 +168,8 @@ export class DaemonClient {
       throw new RequestCancelledError();
     }
     let firstError: Error | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const maxAttempts = this.settings().autoStartService ? 3 : 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         const preparing = performance.now();
         await this.ensureConnected(cancellation);
@@ -192,14 +196,18 @@ export class DaemonClient {
             delete trace.host_memory;
           }
         }
-        const argumentsForDaemon = { ...request.arguments };
+        const needsArgMutation = request.name === 'code_trace' || Boolean(trace && this.tracingAvailable);
+        const argumentsForDaemon = needsArgMutation ? { ...request.arguments } : request.arguments;
         if (request.name === 'code_trace') {
           if (!this.traceOutcomesAvailable) { delete argumentsForDaemon.outcome; }
           if (!this.hostMemoryReportingAvailable) { delete argumentsForDaemon.host_memory; }
         }
-        const outgoing = trace && this.tracingAvailable
-          ? { ...request, arguments: { ...argumentsForDaemon, _cctx_trace: trace.trace_id } }
-          : { ...request, arguments: argumentsForDaemon };
+        if (trace && this.tracingAvailable) {
+          argumentsForDaemon._cctx_trace = trace.trace_id;
+        }
+        const outgoing = needsArgMutation
+          ? { ...request, arguments: argumentsForDaemon }
+          : request;
         const ipcStarted = performance.now();
         let value: JsonValue;
         try {
@@ -229,14 +237,27 @@ export class DaemonClient {
         firstError ??= failure;
         this.disconnect(failure);
         if (attempt === 0 && this.settings().autoStartService) {
-          await this.serviceStarter(this.settings());
-          await delay(100, cancellation);
+          await this.startServiceCoalesced();
+          await delay(80 + (process.pid % 40), cancellation);
+        } else if (attempt === 1 && maxAttempts === 3) {
+          await delay(120, cancellation);
         }
       }
     }
     throw new Error(
       `Code Context daemon request failed after reconnect: ${firstError?.message ?? 'unknown error'}`,
     );
+  }
+
+  private async startServiceCoalesced(): Promise<void> {
+    if (Date.now() - this.lastServiceStartAt < 2_000 && !this.startingService) {
+      return;
+    }
+    this.startingService ??= this.serviceStarter(this.settings()).finally(() => {
+      this.lastServiceStartAt = Date.now();
+      this.startingService = undefined;
+    });
+    await this.startingService;
   }
 
   private async ensureConnected(cancellation: CancellationLike): Promise<void> {
@@ -256,7 +277,7 @@ export class DaemonClient {
     }
     this.socket = socket;
     this.socketPath = expectedPath;
-    this.receiveBuffer = Buffer.alloc(0);
+    this.receiveBuffer = EMPTY_BUFFER;
     socket.on('data', (chunk: Buffer) => this.onData(socket, chunk));
     socket.on('error', (error: Error) => {
       if (this.socket === socket) {
@@ -349,7 +370,10 @@ export class DaemonClient {
       return;
     }
     const frame = this.receiveBuffer.subarray(4, length + 4);
-    this.receiveBuffer = this.receiveBuffer.subarray(length + 4);
+    this.receiveBuffer =
+      this.receiveBuffer.byteLength === length + 4
+        ? EMPTY_BUFFER
+        : this.receiveBuffer.subarray(length + 4);
     const pending = this.takePending();
     if (!pending) {
       this.disconnect(new Error('Code Context daemon sent an unsolicited response.'));
@@ -396,7 +420,7 @@ export class DaemonClient {
     this.tracingAvailable = undefined;
     this.traceOutcomesAvailable = false;
     this.hostMemoryReportingAvailable = false;
-    this.receiveBuffer = Buffer.alloc(0);
+    this.receiveBuffer = EMPTY_BUFFER;
     const pending = this.takePending();
     pending?.reject(error);
     if (socket && !socket.destroyed) {

@@ -1,4 +1,4 @@
-use crate::query::{path_matches, paths};
+use crate::query::paths;
 use crate::workspace::MAX_RESPONSE;
 use crate::{Result, invalid};
 use globset::Glob;
@@ -52,7 +52,12 @@ pub fn find<'a>(
     }
     let prefixes = paths(&request.paths)?;
     let ext_suffix = simple_extension_suffix(&request.glob);
-    let glob = if ext_suffix.is_none() {
+    let brace_suffixes = if ext_suffix.is_none() {
+        crate::query::brace_extension_suffixes(&request.glob)
+    } else {
+        None
+    };
+    let glob = if ext_suffix.is_none() && brace_suffixes.is_none() {
         Some(Glob::new(&request.glob)?.compile_matcher())
     } else {
         None
@@ -60,13 +65,15 @@ pub fn find<'a>(
     let mut matches: Vec<&'a str> = candidates
         .into_iter()
         .filter(|candidate| {
-            let path = Path::new(candidate);
-            if !path_matches(path, &prefixes) {
+            if !crate::query::path_matches_str(candidate, &prefixes) {
                 return false;
             }
             if let Some(suffix) = ext_suffix {
                 candidate.ends_with(suffix)
+            } else if let Some(suffixes) = &brace_suffixes {
+                suffixes.iter().any(|s| candidate.ends_with(s.as_str()))
             } else {
+                let path = Path::new(candidate);
                 let glob = glob.as_ref().expect("compiled glob");
                 glob.is_match(path) || path.file_name().is_some_and(|name| glob.is_match(name))
             }

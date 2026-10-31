@@ -10,8 +10,10 @@ use std::time::Instant;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Stamp {
-    length: u64,
+    pub(crate) length: u64,
     modified: std::time::SystemTime,
+    #[cfg(unix)]
+    ino: u64,
 }
 
 pub(crate) fn stamp(path: &Path) -> Result<Stamp> {
@@ -20,9 +22,13 @@ pub(crate) fn stamp(path: &Path) -> Result<Stamp> {
 }
 
 pub(crate) fn stamp_from_metadata(metadata: &std::fs::Metadata) -> Result<Stamp> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     Ok(Stamp {
         length: metadata.len(),
         modified: metadata.modified()?,
+        #[cfg(unix)]
+        ino: metadata.ino(),
     })
 }
 
@@ -30,35 +36,32 @@ pub(crate) fn stamps(
     workspace: &Workspace,
     policy: &MemoryPolicy,
 ) -> Result<BTreeMap<String, Stamp>> {
-    workspace
-        .files_limited(policy)?
-        .files
-        .iter()
-        .map(|path| {
-            Ok((
-                path.to_str()
-                    .ok_or_else(|| invalid("non-UTF8 path"))?
-                    .into(),
-                stamp(&workspace.root.join(path))?,
-            ))
-        })
-        .collect()
+    Ok(workspace.files_limited(policy)?.stamps)
 }
 
 pub(crate) fn validate_stamps(
     current: &BTreeMap<String, Stamp>,
     policy: &MemoryPolicy,
 ) -> Result<()> {
-    if current.len() > policy.max_files
-        || current
-            .values()
-            .map(|stamp| stamp.length as u128)
-            .sum::<u128>()
-            > policy.max_source_bytes as u128
-        || current.keys().map(String::len).sum::<usize>() > policy.max_total_path_bytes
-        || current
-            .values()
-            .any(|stamp| stamp.length > policy.max_file_bytes as u64)
+    if current.len() > policy.max_files {
+        return Err(
+            invalid("incremental inventory exceeds configured file/source/path budget").into(),
+        );
+    }
+    let mut total_source: u128 = 0;
+    let mut total_path_bytes: usize = 0;
+    let max_file = policy.max_file_bytes as u64;
+    for (path, stamp) in current {
+        if stamp.length > max_file {
+            return Err(
+                invalid("incremental inventory exceeds configured file/source/path budget").into(),
+            );
+        }
+        total_source += stamp.length as u128;
+        total_path_bytes += path.len();
+    }
+    if total_source > policy.max_source_bytes as u128
+        || total_path_bytes > policy.max_total_path_bytes
     {
         return Err(
             invalid("incremental inventory exceeds configured file/source/path budget").into(),
@@ -72,9 +75,15 @@ fn keys(text: &str, limit: usize) -> Result<Vec<u32>> {
     if bytes.len() < 3 {
         return Ok(Vec::new());
     }
-    let mut keys = Vec::with_capacity((bytes.len() - 2).min(limit.saturating_add(1)).min(16_384));
+    let mut recent = [u32::MAX; 4096];
+    let mut keys = Vec::with_capacity((bytes.len() / 2).min(limit.saturating_add(1)).min(16_384));
     let mut compact_threshold = 16_384usize;
     for key in bytes.windows(3).map(trigram) {
+        let slot = &mut recent[((key.wrapping_mul(0x9e3779b9)) >> 20) as usize];
+        if *slot == key {
+            continue;
+        }
+        *slot = key;
         keys.push(key);
         if keys.len() >= compact_threshold {
             keys.sort_unstable();
@@ -328,9 +337,7 @@ impl Resident {
                 if let Some(index) = &mut self.postings {
                     for key in old_keys {
                         if let Some(list) = index.get_mut(&key) {
-                            if let Ok(position) = list.binary_search(&(id as u32)) {
-                                list.remove(position);
-                            }
+                            list.remove_sorted(id as u32);
                             if list.is_empty() {
                                 index.remove(&key);
                             }
@@ -344,19 +351,33 @@ impl Resident {
                     sha256: [0; 32],
                     sha256_hex: Arc::from(""),
                 };
+                if new.is_none() {
+                    self.free_ids.push(id);
+                }
             }
             if let Some(new) = new {
-                if old_id.is_none() {
-                    self.ids_are_path_sorted = false;
-                }
-                let id = old_id
-                    .or_else(|| self.documents.iter().position(|d| d.path.is_empty()))
-                    .unwrap_or(self.documents.len());
+                let id = match old_id {
+                    Some(id) => id,
+                    None => {
+                        if let Some(reused) = self.free_ids.pop() {
+                            self.ids_are_path_sorted = false;
+                            reused
+                        } else {
+                            let next_id = self.documents.len();
+                            if self.ids_are_path_sorted
+                                && let Some(prev) =
+                                    self.documents.iter().rev().find(|d| !d.path.is_empty())
+                                && prev.path.as_ref() >= path.as_str()
+                            {
+                                self.ids_are_path_sorted = false;
+                            }
+                            next_id
+                        }
+                    }
+                };
                 if let Some(index) = &mut self.postings {
                     for key in new_keys {
-                        let list = index.entry(key).or_default();
-                        let position = list.binary_search(&(id as u32)).unwrap_or_else(|i| i);
-                        list.insert(position, id as u32);
+                        index.entry(key).or_default().insert_sorted(id as u32);
                     }
                 }
                 self.paths.insert(Arc::from(path), id);
@@ -372,7 +393,7 @@ impl Resident {
         self.stats.files = self.paths.len();
         self.stats.line_count = line_count;
         self.stats.line_offset_bytes = line_count * std::mem::size_of::<u32>();
-        self.stats.path_bytes = self.paths.keys().map(|path| path.len()).sum();
+        self.stats.path_bytes = projected_path_bytes;
         self.stats.document_bytes = source_bytes;
         self.stats.unique_trigrams = self.postings.as_ref().map_or(0, |p| p.len());
         self.stats.posting_bytes_estimate = self.posting_bytes_estimate();

@@ -64,6 +64,7 @@ mod candidate_policy_tests {
 
 pub struct FileInventory {
     pub files: HashSet<PathBuf>,
+    pub(crate) stamps: std::collections::BTreeMap<String, crate::incremental::Stamp>,
     pub total_path_bytes: usize,
     pub metadata_source_bytes: u64,
 }
@@ -357,13 +358,15 @@ impl Workspace {
         command.args(["--files", "--null", "--"]).args(targets);
         let output = capture(&mut command)?;
         let mut paths = HashSet::new();
+        let mut stamps = std::collections::BTreeMap::new();
+        let mut checked_dirs: HashSet<PathBuf> = HashSet::new();
         let mut total_path_bytes = 0usize;
         let mut metadata_source_bytes = 0u64;
         for path in output.split(|b| *b == 0).filter(|p| !p.is_empty()) {
             let text = std::str::from_utf8(path)?;
             let path = Path::new(text);
             safe_relative(path)?;
-            let metadata = reject_symlinks_metadata(&self.root, path)?;
+            let metadata = reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs)?;
             let normalized = normalize(path);
             if paths.insert(normalized.clone()) {
                 total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());
@@ -396,10 +399,19 @@ impl Workspace {
                     ))
                     .into());
                 }
+                let normalized_name = normalized
+                    .to_str()
+                    .ok_or_else(|| invalid("non-UTF8 path"))?
+                    .to_owned();
+                stamps.insert(
+                    normalized_name,
+                    crate::incremental::stamp_from_metadata(&metadata)?,
+                );
             }
         }
         Ok(FileInventory {
             files: paths,
+            stamps,
             total_path_bytes,
             metadata_source_bytes,
         })
@@ -546,6 +558,17 @@ fn rg_executable() -> &'static std::ffi::OsStr {
 pub fn normalize(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
+        if let Some(raw) = path.to_str()
+            && !raw.is_empty()
+            && !raw.contains('\\')
+            && !raw.contains("//")
+            && !raw.starts_with("./")
+            && !raw.contains("/./")
+            && !raw.ends_with("/.")
+            && raw != "."
+        {
+            return path.to_path_buf();
+        }
         let mut out = std::ffi::OsString::new();
         for part in path.components().filter(|part| *part != Component::CurDir) {
             if !out.is_empty() {
@@ -557,6 +580,16 @@ pub fn normalize(path: &Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
+        if let Some(raw) = path.to_str()
+            && !raw.is_empty()
+            && !raw.contains("//")
+            && !raw.starts_with("./")
+            && !raw.contains("/./")
+            && !raw.ends_with("/.")
+            && raw != "."
+        {
+            return path.to_path_buf();
+        }
         path.components()
             .filter(|part| *part != Component::CurDir)
             .collect()
@@ -564,6 +597,15 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 pub fn safe_relative(path: &Path) -> Result<()> {
+    if let Some(raw) = path.to_str()
+        && !raw.is_empty()
+        && !raw.starts_with(['/', '\\', '.'])
+        && !raw.contains(['\\', ':'])
+        && !raw.contains("/.")
+        && !raw.contains("//")
+    {
+        return Ok(());
+    }
     if path.as_os_str().is_empty()
         || path.components().any(|c| match c {
             Component::Normal(name) => name.to_string_lossy().starts_with('.'),
@@ -572,7 +614,7 @@ pub fn safe_relative(path: &Path) -> Result<()> {
         })
     {
         return Err(invalid(format!(
-            "only non-hidden, relative paths without traversal are allowed: {}",
+            "only non-hidden, relative paths without traversal are allowed: {} (hidden paths like .github/.vscode are excluded by policy; use a permitted host read/search tool directly without retrying CCTX)",
             path.display()
         ))
         .into());
@@ -600,6 +642,32 @@ pub(crate) fn reject_symlinks_metadata(root: &Path, path: &Path) -> Result<std::
         Some(meta) => Ok(meta),
         None => Ok(std::fs::symlink_metadata(&current)?),
     }
+}
+
+fn reject_symlinks_metadata_cached(
+    root: &Path,
+    path: &Path,
+    checked_dirs: &mut HashSet<PathBuf>,
+) -> Result<std::fs::Metadata> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        for ancestor in parent.ancestors() {
+            if ancestor.as_os_str().is_empty() || checked_dirs.contains(ancestor) {
+                break;
+            }
+            let meta = std::fs::symlink_metadata(root.join(ancestor))?;
+            if meta.file_type().is_symlink() {
+                return Err(invalid("symlinks are unsupported in this local experiment").into());
+            }
+            checked_dirs.insert(ancestor.to_path_buf());
+        }
+    }
+    let meta = std::fs::symlink_metadata(root.join(path))?;
+    if meta.file_type().is_symlink() {
+        return Err(invalid("symlinks are unsupported in this local experiment").into());
+    }
+    Ok(meta)
 }
 
 pub fn capture(command: &mut Command) -> Result<Vec<u8>> {

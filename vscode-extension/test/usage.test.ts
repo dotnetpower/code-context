@@ -9,6 +9,8 @@ void test('usage distinguishes unavailable caches from refusals and actual failu
   assert.equal(classifyOutcome('TARGET_NOT_INDEXED reason=excluded_by_rule'), 'policy_denied');
   assert.equal(classifyOutcome('READ_POLICY_DENIED reason=unsupported_glob'), 'policy_denied');
   assert.equal(classifyOutcome('READ_RANGE_OUT_OF_BOUNDS'), 'invalid_request');
+  assert.equal(classifyOutcome('READ_RANGE_LIMIT: provide 1..64'), 'invalid_request');
+  assert.equal(classifyOutcome('RESPONSE_BUDGET_EXCEEDED: response exceeds 256 KiB'), 'invalid_request');
   assert.equal(classifyOutcome('CACHE_LOAD_FAILED: admission'), 'system_error');
   assert.equal(classifyOutcome('Windows Agent Sessions require an explicit absolute Linux root'), 'invalid_request');
   assert.equal(classifyOutcome('WSL Code Context root must be an absolute Linux path.'), 'invalid_request');

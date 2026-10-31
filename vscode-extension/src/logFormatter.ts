@@ -5,6 +5,17 @@ import type { Outcome } from './usage.js';
 export type LogLevel = 'info' | 'warn' | 'error';
 
 export function singleLine(value: string): string {
+  let hasControl = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 32 || code === 127) {
+      hasControl = true;
+      break;
+    }
+  }
+  if (!hasControl) {
+    return value;
+  }
   return Array.from(value, (character) => {
     if (character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127) { return character; }
     return character === '\n' ? '\\n' : character === '\r' ? '\\r' : character === '\t' ? '\\t' : '?';

@@ -70,6 +70,7 @@ void test('ambiguous registry without matching editor requires an explicit root'
     () => resolveRegisteredRoot(workspaces, undefined, ['/unregistered']),
     /current VS Code workspace is not registered/,
   );
+  assert.equal(resolveRegisteredRoot(workspaces, 'other', []), '/other');
 });
 
 void test('path-prefix collisions are not treated as descendants', () => {

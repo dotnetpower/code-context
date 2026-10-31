@@ -31,6 +31,7 @@ const SEARCH_EXCLUDE =
   '**/{node_modules,target,dist,build,out,coverage,__pycache__,venv,.venv,.git}/**';
 const AUTO_PLAN_STATE_KEY = 'automaticRegistrationPlans';
 let registrationQueue: Promise<string[]> = Promise.resolve([]);
+const inFlightMissingWorkspaces = new Map<string, Promise<void>>();
 
 export async function registerCurrentWorkspace(
   bridge: NativeToolBridge,
@@ -205,15 +206,26 @@ export async function prepareMissingWorkspace(
     throw new RootResolutionError('Automatic registration requires a trusted workspace and autoRegisterWorkspace enabled.');
   }
   const canonicalTarget = await realpath(target);
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    const root = await realpath(folder.uri.fsPath);
-    const child = relative(root, canonicalTarget);
-    if (child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))) {
-      await autoRegisterWorkspaceFolders(bridge, output, state, [folder]);
-      return;
-    }
+  const key = normalizeLocalPath(canonicalTarget);
+  const existing = inFlightMissingWorkspaces.get(key);
+  if (existing) {
+    return existing;
   }
-  await registerTrustedWorktree(canonicalTarget, bridge, output);
+  const operation = (async (): Promise<void> => {
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      const root = await realpath(folder.uri.fsPath);
+      const child = relative(root, canonicalTarget);
+      if (child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))) {
+        await autoRegisterWorkspaceFolders(bridge, output, state, [folder]);
+        return;
+      }
+    }
+    await registerTrustedWorktree(canonicalTarget, bridge, output);
+  })().finally(() => {
+    inFlightMissingWorkspaces.delete(key);
+  });
+  inFlightMissingWorkspaces.set(key, operation);
+  return operation;
 }
 
 async function registerTrustedWorktree(

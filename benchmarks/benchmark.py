@@ -300,9 +300,9 @@ def render(report, output, extension_image=None):
 
     token_groups = ("Rust (6-symbol suite)", "Python (6-symbol suite)")
     token_series = (
-        ("rg + 200-line view", (29.396, 24.126), "#7F8C8D"),
-        ("rg + 100-line view", (18.907, 13.799), colors[0]),
-        ("CCTX code_context", (9.929, 6.971), colors[2]),
+        ("rg + 200-line view", (25.133, 24.609), "#7F8C8D"),
+        ("rg + 100-line view", (15.028, 13.997), colors[0]),
+        ("CCTX code_context", (4.031, 2.141), colors[2]),
     )
     for idx, (series_label, vals, col) in enumerate(token_series):
         pos = [i + (idx - 1) * 0.26 for i in range(len(token_groups))]

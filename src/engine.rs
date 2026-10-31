@@ -75,9 +75,15 @@ impl Engine {
 
     pub fn context(&self, request: &ContextRequest) -> Result<ContextResult> {
         context::validate_context(request)?;
-        context::assemble(self.search(&request.search)?, request.radius, |ranges| {
-            self.read_many(ranges)
-        })
+        if self.resident.is_some() {
+            context::assemble_trusted(self.search(&request.search)?, request.radius, |ranges| {
+                self.read_many(ranges)
+            })
+        } else {
+            context::assemble(self.search(&request.search)?, request.radius, |ranges| {
+                self.read_many(ranges)
+            })
+        }
     }
 
     pub fn status(&self) -> Value {

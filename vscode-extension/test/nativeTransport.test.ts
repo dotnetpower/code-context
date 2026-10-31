@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   connectNativeTransport, nativeEndpoint, RequestCancelledError, usesWslTransport, windowsLocalLaunch, wslLaunch,
 } from '../src/nativeTransport.js';
-import { resolveWslRoot } from '../src/rootResolver.js';
+import { resolveWslRoot, wslCandidateToLinuxPath } from '../src/rootResolver.js';
 import type { CancellationLike, ClientSettings, DisposableLike } from '../src/types.js';
 
 const settings: ClientSettings = {
@@ -135,4 +135,13 @@ void test('WSL roots preserve Linux paths and delegate access checks to the daem
   assert.throws(() => resolveWslRoot(roots, 'C:\\Users\\test'), /absolute Linux path/);
   assert.throws(() => resolveWslRoot(roots, '\\\\wsl$\\Ubuntu\\home'), /absolute Linux path/);
   assert.equal(resolveWslRoot([roots[0]!], undefined), '/home/test/repo');
+  assert.equal(resolveWslRoot(roots, undefined, ['/home/test/other/src/lib.rs']), '/home/test/other');
+  assert.equal(
+    resolveWslRoot(roots, undefined, ['\\\\wsl.localhost\\Ubuntu-22.04\\home\\test\\repo\\src\\main.rs']),
+    '/home/test/repo',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('\\\\wsl$\\Ubuntu\\home\\test\\repo\\src'),
+    '/home/test/repo/src',
+  );
 });
