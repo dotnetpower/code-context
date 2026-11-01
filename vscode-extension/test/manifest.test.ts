@@ -76,8 +76,8 @@ void test('extension details expose resources and numeric benchmarks before inst
     assert.ok(readme.includes(`[${link}](`));
   }
   assert.match(readme, /native right-hand Resources panel uses Marketplace metadata/);
-  for (const text of ['4.325 ms', '0.264 ms', '5.104 ms', '0.249 ms', '5.244 ms',
-    '0.283 ms', '0.074 ms', '0.239 ms', '3.899', '0.260', '15.01', 'slower']) {
+  for (const text of ['4.601 ms', '0.287 ms', '5.365 ms', '0.265 ms', '5.514 ms',
+    '0.303 ms', '0.083 ms', '0.234 ms', '4.112', '0.274', '15.02', 'slower']) {
     assert.ok(readme.includes(text), text);
   }
   assert.match(readme, /!\[.*\]\(resources\/benchmark\.png\)/);

@@ -39,19 +39,19 @@ use the same extension identity.
 ## Measured performance & token acceleration
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-mixed retrieval suite averaged **15.01× faster with a warm CCTX cache**
-(95% CI **14.69–15.30×**, up from 6.83× in v0.14): **3.899 → 0.260 ms per operation**.
+mixed retrieval suite averaged **15.02× faster with a warm CCTX cache**
+(95% CI **14.70–15.36×**, up from 6.83× in v0.14): **4.112 → 0.274 ms per operation**.
 Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%** and accelerates end-to-end coding agent completion by **24.7%**.
 
 ![Retrieval latency, paired-session speedup, Rust/Python token savings, and agent acceleration](benchmarks/results/aks-store-demo/latency-speedup.png)
 
 | Retrieval task (AKS Store Demo) | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.325 ms | 0.264 ms | 16.40× |
-| Literal search | 5.104 ms | 0.249 ms | 20.50× |
-| Search + context | 5.244 ms | 0.283 ms | 18.54× |
-| Known file read + hash | **0.074 ms** | 0.239 ms | **0.31× — slower** |
-| Fixed mixed suite | 3.899 ms | 0.260 ms | 15.01× |
+| Filename discovery | 4.601 ms | 0.287 ms | 16.02× |
+| Literal search | 5.365 ms | 0.265 ms | 20.26× |
+| Search + context | 5.514 ms | 0.303 ms | 18.21× |
+| Known file read + hash | **0.083 ms** | 0.234 ms | **0.35× — slower** |
+| Fixed mixed suite | 4.112 ms | 0.274 ms | 15.02× |
 
 | Token & agent acceleration benchmark | Baseline (`rg` + `view`) | With CCTX (`code_context`) | Reduction / speedup |
 |---|---:|---:|---:|
@@ -62,7 +62,7 @@ Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` c
 | Copilot A/B end-to-end task wall time | 20.31 s | **15.30 s** (100% accuracy both) | **-24.7% completion time** |
 
 Eight daemon sessions, 40 rounds, 28 tasks, **8,960 correctness-checked pairs**.
-Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.237 ms median**, not a warm-cache speedup.
+Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.638 ms median**, not a warm-cache speedup.
 See [method, cold-start chart, token suites, raw samples, and reproduction](docs/BENCHMARKS.md) for uncertainty and limitations.
 
 ## Learn more
