@@ -164,6 +164,17 @@ impl PostingList {
             Self::Heap(v) => {
                 if let Ok(pos) = v.binary_search(&id) {
                     v.remove(pos);
+                    if v.len() <= 5 {
+                        let mut ids = [0_u32; 5];
+                        ids[..v.len()].copy_within(0..v.len(), 0);
+                        for (i, &val) in v.iter().enumerate() {
+                            ids[i] = val;
+                        }
+                        *self = Self::Inline {
+                            len: v.len() as u8,
+                            ids,
+                        };
+                    }
                 }
             }
         }

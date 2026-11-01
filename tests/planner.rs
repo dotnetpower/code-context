@@ -999,3 +999,116 @@ fn two_small_classes_conflict_markers_toml_yaml_and_negated_globs_work() {
     assert_eq!(y_lines.first().copied(), Some("  /api/v1/users:"));
     assert!(!y_lines.iter().any(|l| l.contains("/api/v1/orders:")));
 }
+
+#[test]
+fn whole_word_symbol_priority_and_impl_first_last_method_clamping_work() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    // 1. File where substring definition `pub fn search_helper()` appears BEFORE exact whole-word `pub fn search()`
+    std::fs::write(
+        directory.path().join("src/search_api.rs"),
+        concat!(
+            "pub fn search_helper() -> usize { 1 }\n",
+            "pub fn search_extended() -> usize { 2 }\n",
+            "pub fn search() -> usize { 42 }\n",
+        ),
+    )
+    .unwrap();
+
+    // 2. Impl block where first method immediately follows `impl Engine {` and last method precedes `}`
+    std::fs::write(
+        directory.path().join("src/engine_impl.rs"),
+        concat!(
+            "pub struct Engine;\n\n",
+            "impl Engine {\n",
+            "    pub fn first_impl_method(&self) -> u32 {\n",
+            "        let x = 10;\n",
+            "        x + 1\n",
+            "    }\n",
+            "    pub fn last_impl_method(&self) -> u32 {\n",
+            "        let y = 20;\n",
+            "        y + 2\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let workspace = Workspace::new(
+        directory.path(),
+        vec!["src".into()],
+        vec!["*.rs".into()],
+    )
+    .unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+
+    let mut q = query("search", false, false);
+    q.paths = vec!["src/search_api.rs".into()];
+    q.max_matches_per_file = Some(1);
+    let res = search_fast(&resident, &q, &mut cache).unwrap();
+    assert_eq!(res.matches.len(), 1);
+    assert_eq!(
+        res.matches[0].text, "pub fn search() -> usize { 42 }",
+        "exact whole-word definition must beat earlier substring definition"
+    );
+
+    let mut watched = code_context::watched::Watched::new(code_context::catalog::Spec {
+        root: directory.path().to_path_buf(),
+        scopes: vec!["src".into()],
+        globs: vec!["*.rs".into()],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    let first_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "let x = 10;", "radius": 8}),
+        )
+        .unwrap();
+    let first_lines: Vec<&str> = first_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        first_lines.first().copied(),
+        Some("    pub fn first_impl_method(&self) -> u32 {"),
+        "first method inside impl must clamp cleanly without leaking outer impl header: {first_lines:?}"
+    );
+    assert_eq!(
+        first_lines.last().copied(),
+        Some("    }"),
+        "first method inside impl must stop at its closing brace before adjacent method: {first_lines:?}"
+    );
+
+    let last_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "let y = 20;", "radius": 8}),
+        )
+        .unwrap();
+    let last_lines: Vec<&str> = last_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        last_lines.first().copied(),
+        Some("    pub fn last_impl_method(&self) -> u32 {")
+    );
+    assert_eq!(
+        last_lines.last().copied(),
+        Some("    }"),
+        "last method inside impl must clamp at its own closing brace before outer impl `}}`: {last_lines:?}"
+    );
+}

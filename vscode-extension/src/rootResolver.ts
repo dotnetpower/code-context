@@ -982,7 +982,7 @@ export function buildReadArguments(
   } else {
     rawRanges = [];
   }
-  const defaultSpan = rawRanges.length > 1 ? 79 : 119;
+  const defaultSpan = rawRanges.length >= 3 ? 49 : rawRanges.length > 1 ? 79 : 119;
   const splitRanges = input.split_ranges ?? input.splitRanges ?? true;
   const normalized = rawRanges.map((range) => {
     const rawPath =

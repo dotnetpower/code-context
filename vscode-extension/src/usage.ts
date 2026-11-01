@@ -40,10 +40,20 @@ export class UsageSummary {
   public readonly recentRoots: string[] = [];
   public totalMsSum = 0;
   public timedCalls = 0;
+  public estimatedTokensSaved = 0;
 
   public record(event: UsageEvent, at = Date.now()): void {
     const outcome = classifyOutcome(event.error);
     this.counts[outcome] += 1;
+    if (outcome === 'success') {
+      if (event.operation === 'code_context') {
+        this.estimatedTokensSaved += 450;
+      } else if (event.operation === 'code_grep' || event.operation === 'code_files') {
+        this.estimatedTokensSaved += 180;
+      } else if (event.operation === 'code_read') {
+        this.estimatedTokensSaved += 120;
+      }
+    }
     if (typeof event.totalMs === 'number' && Number.isFinite(event.totalMs) && event.totalMs >= 0) {
       this.totalMsSum += event.totalMs;
       this.timedCalls += 1;
@@ -82,6 +92,7 @@ export class UsageSummary {
     return [
       'Native calls in this extension host (including metadata), not all sessions.',
       `Success ${c.success}; cache not ready ${c.cache_not_ready}; policy denied ${c.policy_denied}; invalid input ${c.invalid_request}; system errors ${c.system_error}.`,
+      `Estimated lookup tokens saved: ~${this.estimatedTokensSaved} tokens.`,
       this.last ? `Last: ${new Date(this.last.at).toISOString()} ${this.last.operation} ${this.last.outcome}` : 'No calls observed yet.',
       multiRoots,
       'Click for daemon status, adaptive memory and aggregate native/MCP outcomes.',

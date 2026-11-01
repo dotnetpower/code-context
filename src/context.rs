@@ -845,7 +845,7 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                         || trimmed == "esac"))
         };
         let mut matched_header_indent: Option<usize> = None;
-        for idx in (1..=min_idx).rev() {
+        for idx in (0..=min_idx).rev() {
             if is_sfc && is_sfc_section_open(&snippet.lines[idx]) {
                 new_start_idx = idx;
                 break;
@@ -860,16 +860,20 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
             if is_block_definition_header(&snippet.lines[idx]) {
                 let header_start = rewind_leading_docs_and_attrs(&snippet.lines, idx);
-                if header_start == 0
+                let def_indent = leading_indent_cols(&snippet.lines[idx]);
+                let valid_boundary = header_start == 0
                     || snippet.lines[header_start - 1].trim().is_empty()
                     || (is_sfc && is_sfc_section_open(&snippet.lines[header_start - 1]))
-                {
+                    || is_block_close(&snippet.lines[header_start - 1])
+                    || (snippet.lines[header_start - 1].trim_end().ends_with('{')
+                        && leading_indent_cols(&snippet.lines[header_start - 1]) < def_indent);
+                if valid_boundary {
                     new_start_idx = header_start;
-                    matched_header_indent = Some(leading_indent_cols(&snippet.lines[idx]));
+                    matched_header_indent = Some(def_indent);
                     break;
                 }
             }
-            if idx < min_idx && is_block_close(&snippet.lines[idx]) {
+            if idx > 0 && idx < min_idx && is_block_close(&snippet.lines[idx]) {
                 let mut candidate = idx + 1;
                 while candidate < min_idx && snippet.lines[candidate].trim().is_empty() {
                     candidate += 1;
@@ -911,10 +915,14 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 new_end_idx = end_idx;
                 break;
             }
+            let close_indent = leading_indent_cols(&snippet.lines[idx]);
             if is_block_close(&snippet.lines[idx])
-                && matched_header_indent.is_none_or(|h_ind| leading_indent_cols(&snippet.lines[idx]) <= h_ind)
+                && matched_header_indent.is_none_or(|h_ind| close_indent <= h_ind)
                 && (snippet.lines[idx + 1].trim().is_empty()
-                    || (is_sfc && is_sfc_section_close(&snippet.lines[idx + 1])))
+                    || (is_sfc && is_sfc_section_close(&snippet.lines[idx + 1]))
+                    || (is_block_close(&snippet.lines[idx + 1])
+                        && leading_indent_cols(&snippet.lines[idx + 1]) < close_indent)
+                    || is_block_definition_header(&snippet.lines[idx + 1]))
             {
                 new_end_idx = idx;
                 break;

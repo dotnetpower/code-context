@@ -3198,6 +3198,10 @@ pub fn extract_ipynb(bytes: &[u8]) -> Result<String> {
                             out.push_str(line);
                             out.push('\n');
                         }
+                    } else if output.pointer("/data/image/png").is_some() {
+                        out.push_str("### [Cell Visual Output: image/png]\n");
+                    } else if output.pointer("/data/image/svg+xml").is_some() {
+                        out.push_str("### [Cell Visual Output: image/svg+xml]\n");
                     }
                     if let (Some(ename), Some(evalue)) = (
                         output.get("ename").and_then(serde_json::Value::as_str),

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.21.0
+
+- Boost exact whole-word identifier matches (`has_whole_word_match`) above
+  substring definition matches under `max_matches_per_file` and demote
+  `@generated` / `DO NOT EDIT` files so symbol lookups resolve directly to
+  human-authored definitions.
+- Fix block clamping for the first, adjacent, and last methods inside `impl`,
+  `trait`, `class`, `interface`, and `mod` blocks where no blank line separates
+  the method from `{` or `}`, and fix index-0 definition header indentation
+  tracking.
+- Reclaim heap memory in `PostingList::remove_sorted` when lists shrink to
+  `<= 5` entries, surface `[Cell Visual Output: image/png]` markers in Jupyter
+  notebooks, bound 3+ range default read spans to prevent `>8 KiB` host
+  offloading, and report estimated lookup tokens saved in the VS Code status bar
+  tooltip.
+
 ## 0.20.0
 
 - Expand `PostingList::Inline` capacity to 5 document IDs without increasing
