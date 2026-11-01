@@ -366,6 +366,12 @@ export function normalizeGlobPattern(glob: string): string {
   if (/^\*\*\/\*\.([a-zA-Z0-9_.+-]+|\{[a-zA-Z0-9_.,+-]+\})$/u.test(cleaned)) {
     return cleaned.slice(3);
   }
+  if (/^\*\*\.([a-zA-Z0-9_.+-]+)$/u.test(cleaned)) {
+    return cleaned.slice(1);
+  }
+  if (/^\.([a-zA-Z0-9_+-]+)$/u.test(cleaned)) {
+    return `*${cleaned}`;
+  }
   return cleaned;
 }
 
@@ -738,11 +744,26 @@ function splitPathWithEmbeddedGlob(
   if (rawPaths === undefined || rawPaths === null) {
     return { paths: undefined, extractedGlob: undefined };
   }
-  const items = Array.isArray(rawPaths)
+  const rawItems = Array.isArray(rawPaths)
     ? rawPaths
     : typeof rawPaths === 'string' && rawPaths.trim().length > 0
       ? [rawPaths]
       : [];
+  const items: string[] = [];
+  for (const rawItem of rawItems) {
+    if (typeof rawItem !== 'string' || rawItem.trim().length === 0) {
+      continue;
+    }
+    if (rawItem.includes(',') && !rawItem.includes('{')) {
+      for (const part of rawItem.split(',')) {
+        if (part.trim().length > 0) {
+          items.push(part.trim());
+        }
+      }
+    } else {
+      items.push(rawItem);
+    }
+  }
   const normalized: string[] = [];
   let extractedGlob: string | undefined;
   for (const item of items) {

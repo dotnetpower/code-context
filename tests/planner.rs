@@ -680,3 +680,142 @@ fn polyglot_definitions_block_clamping_comment_demotion_and_utf8_ci_planner_work
         "Dockerfile stage should not bleed into next FROM stage: {df_lines:?}"
     );
 }
+
+#[test]
+fn first_try_exact_edit_clamping_preserves_multiline_signatures_structs_overloads_and_regex_hints() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    // 1. Multi-line #[derive] + doc comment + struct with 8 fields + multi-line fn signature with inner if block
+    std::fs::write(
+        directory.path().join("src/service.rs"),
+        concat!(
+            "#[derive(\n",
+            "    Clone,\n",
+            "    Debug,\n",
+            ")]\n",
+            "/// Configuration for edit-safe service\n",
+            "pub struct EditSafeServiceConfig {\n",
+            "    pub host: String,\n",
+            "    pub port: u16,\n",
+            "    pub max_retries: usize,\n",
+            "    pub timeout_ms: u64,\n",
+            "    pub tls_enabled: bool,\n",
+            "    pub region: String,\n",
+            "}\n",
+            "\n",
+            "#[tokio::test]\n",
+            "async fn verify_multiline_sig(\n",
+            "    first_arg: usize,\n",
+            "    second_arg: &str,\n",
+            ") -> Result<usize, String> {\n",
+            "    if first_arg == 0 {\n",
+            "        return Err(\"zero\".into());\n",
+            "    }\n",
+            "    Ok(first_arg + second_arg.len())\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    // 2. TypeScript overload signatures followed by implementation
+    std::fs::write(
+        directory.path().join("src/overloads.ts"),
+        concat!(
+            "export function parseTokenPayload(raw: string): object;\n",
+            "export function parseTokenPayload(raw: Uint8Array): object;\n",
+            "export function parseTokenPayload(raw: string | Uint8Array): object {\n",
+            "  return typeof raw === 'string' ? JSON.parse(raw) : {};\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let mut watched = code_context::watched::Watched::new(code_context::catalog::Spec {
+        root: directory.path().to_path_buf(),
+        scopes: vec!["src".into()],
+        globs: vec!["*.rs".into(), "*.ts".into()],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    // Struct definition lookup preserves multi-line #[derive], doc comment, and all 6 fields through closing `}`
+    let struct_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "EditSafeServiceConfig", "radius": 10}),
+        )
+        .unwrap();
+    let struct_lines: Vec<&str> = struct_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(struct_lines.first().copied(), Some("#[derive("));
+    assert_eq!(struct_lines.last().copied(), Some("}"));
+    assert!(struct_lines.iter().any(|l| l.contains("pub region: String,")));
+
+    // Multi-line function signature hit extends through closing `) -> Result<usize, String> {` and body without inner `}` truncation
+    let fn_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "verify_multiline_sig", "radius": 10}),
+        )
+        .unwrap();
+    let fn_lines: Vec<&str> = fn_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(fn_lines.first().copied(), Some("#[tokio::test]"));
+    assert!(
+        fn_lines.iter().any(|l| l.contains(") -> Result<usize, String> {")),
+        "multi-line signature return type preserved: {fn_lines:?}"
+    );
+    assert!(
+        fn_lines.iter().any(|l| l.contains("Ok(first_arg + second_arg.len())")),
+        "inner if-block closing brace must not truncate outer function: {fn_lines:?}"
+    );
+
+    // TypeScript overload signature hit does not prematurely stop before implementation
+    let ts_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "parseTokenPayload", "radius": 8}),
+        )
+        .unwrap();
+    let ts_lines: Vec<&str> = ts_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        ts_lines.iter().any(|l| l.contains("JSON.parse(raw)")),
+        "TS overload + implementation body preserved together: {ts_lines:?}"
+    );
+
+    // Unintended literal regex search (0 matches with regex=false) emits helpful regex=true hint
+    let zero_regex = watched
+        .call(
+            "code_grep",
+            serde_json::json!({"pattern": "pub\\s+struct\\s+EditSafeServiceConfig", "regex": false}),
+        )
+        .unwrap();
+    assert_eq!(zero_regex["total_matches"], 0);
+    assert!(
+        zero_regex["freshness"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("regex=true"),
+        "expected regex=true hint in notice: {:?}",
+        zero_regex["freshness"]
+    );
+}

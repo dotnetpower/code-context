@@ -358,4 +358,26 @@ fn frontend_globs_support_compound_extensions_brace_globs_dynamic_routes_and_vit
     assert_eq!(diag_read[1]["path"], "src/components/Button.tsx");
     assert_eq!(diag_read[2]["path"], "src/components/Button.tsx");
     assert_eq!(diag_read[3]["path"], "src/assets/icon.svg");
+
+    // Shorthand globs (`**.svg`, `.wgsl`), comma-separated `paths`, and Windows backslash paths
+    let double_star_no_slash = watched
+        .call("code_files", json!({"glob": "**.svg"}))
+        .unwrap();
+    assert_eq!(double_star_no_slash["paths"], json!(["src/assets/icon.svg"]));
+
+    let dot_ext_only = watched
+        .call("code_files", json!({"glob": ".wgsl"}))
+        .unwrap();
+    assert_eq!(dot_ext_only["paths"], json!(["src/shaders/wave.wgsl"]));
+
+    let comma_paths = watched
+        .call(
+            "code_files",
+            json!({"glob": "*", "paths": ["src\\assets, src\\shaders"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        comma_paths["paths"],
+        json!(["src/assets/icon.svg", "src/shaders/wave.wgsl"])
+    );
 }

@@ -61,6 +61,11 @@ the whole corpus or editor buffers.
 For known changed files prefer Read/Context or explicit file paths rather than
 a full-root code_sync. Full sync is for exhaustive corpus absence/freshness
 barriers, not routine status checking or every edit.
+Before editing a file, use `#cctxNativeContext` (with `radius >= 8` for full
+function/struct/type signatures and closing delimiters) or `#cctxNativeRead`
+(`around_line` + `radius` or `start`..`end`) so your first edit includes exact
+indentation, complete signatures, and 3+ unique surrounding context lines
+without "No match found" or "Multiple matches found" retries.
 
 Use MCP `code_files`, `code_context`, `code_grep`, or `code_read` when the native tools are
 not callable in the current session, even if their names appear in a tool list.

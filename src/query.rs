@@ -1461,6 +1461,9 @@ fn is_low_signal_usage_line(line: &str) -> bool {
         || trimmed.starts_with("tracing::trace!(")
         || trimmed.starts_with("log::debug!(")
         || trimmed.starts_with("log::trace!(")
+        || trimmed.starts_with("println!(")
+        || trimmed.starts_with("eprintln!(")
+        || trimmed.starts_with("dbg!(")
         || trimmed == "debugger;"
         || trimmed == "debugger"
         || trimmed.starts_with("todo!(")
@@ -1537,12 +1540,22 @@ fn record_document(
             .copied()
             .filter_map(|line| {
                 let text = document.line(line);
-                let prio = if is_doc_file {
+                let mut prio = if is_doc_file {
                     crate::document::document_definition_priority(text)
                         .max(definition_priority(text))
                 } else {
                     definition_priority(text)
                 };
+                if prio == 0 && !is_doc_file && line > 0 {
+                    let prev_trim = trim_line_start(document.line(line - 1));
+                    if (prev_trim.starts_with("#[test")
+                        || prev_trim.starts_with("#[tokio::test")
+                        || prev_trim.starts_with("#[rstest"))
+                        && trim_line_start(text).contains("fn ")
+                    {
+                        prio = 3;
+                    }
+                }
                 (prio > 0).then_some((prio, line))
             })
             .collect();
@@ -1742,11 +1755,23 @@ pub(crate) fn simple_extension_suffix(glob: &str) -> Option<&str> {
             return Some(suffix);
         }
     }
+    if let Some(ext) = glob.strip_prefix("**.") {
+        let suffix = &glob[2..];
+        if is_valid_compound_ext(ext) {
+            return Some(suffix);
+        }
+    }
     if let Some(ext) = glob.strip_prefix("*.") {
         let suffix = &glob[1..];
         if is_valid_compound_ext(ext) {
             return Some(suffix);
         }
+    }
+    if let Some(ext) = glob.strip_prefix('.')
+        && !ext.contains(['/', '\\', '*', '?', '[', ']', '{', '}'])
+        && is_valid_compound_ext(ext)
+    {
+        return Some(glob);
     }
     None
 }

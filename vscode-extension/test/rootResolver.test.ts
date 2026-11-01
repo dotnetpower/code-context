@@ -311,4 +311,16 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
     normalizeRelativeTargetPath('#components/Button.tsx'),
     'src/components/Button.tsx',
   );
+  assert.equal(normalizeGlobPattern('**.rs'), '*.rs');
+  assert.equal(normalizeGlobPattern('.tsx'), '*.tsx');
+  assert.deepEqual(
+    buildFilesArguments({
+      glob: '.ts',
+      paths: 'src/a, src/b',
+    }),
+    {
+      glob: '*.ts',
+      paths: ['src/a', 'src/b'],
+    },
+  );
 });

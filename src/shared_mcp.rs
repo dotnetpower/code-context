@@ -358,20 +358,24 @@ fn normalize_single_range_map(
         return;
     }
     start = start.or(line_alias).or(center_alias);
-    let s = start
-        .and_then(|v| v.as_i64())
-        .filter(|&n| n > 0)
-        .map(|n| n as u64)
-        .or(extracted_start)
-        .unwrap_or(1);
-    let e = end
-        .and_then(|v| v.as_i64())
-        .filter(|&n| n > 0)
-        .map(|n| n as u64)
-        .or_else(|| count_span.map(|c| s + c - 1))
-        .or(extracted_end)
-        .unwrap_or(s + default_span)
-        .max(s);
+    let raw_s = start.as_ref().and_then(Value::as_i64);
+    let raw_e = end.as_ref().and_then(Value::as_i64);
+    let mut s = match raw_s {
+        Some(n) if n > 0 => n as u64,
+        Some(0) => 1,
+        _ => extracted_start.unwrap_or(1),
+    };
+    let mut e = match raw_e {
+        Some(-1) => s + 499,
+        Some(n) if n > 0 => n as u64,
+        _ => count_span
+            .map(|c| s + c - 1)
+            .or(extracted_end)
+            .unwrap_or(s + default_span),
+    };
+    if s > e && e >= 1 {
+        std::mem::swap(&mut s, &mut e);
+    }
     map.insert("start".into(), json!(s));
     map.insert("end".into(), json!(e));
 }
@@ -572,6 +576,10 @@ pub(crate) fn normalize_mcp_argument_aliases(
                     }
                     if extracted_glob.is_none() {
                         extracted_glob = Some(trimmed.to_owned());
+                    }
+                } else if trimmed.contains(',') && !trimmed.contains('{') {
+                    for part in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        cleaned_paths.push(Value::String(part.to_owned()));
                     }
                 } else {
                     cleaned_paths.push(Value::String(trimmed.to_owned()));

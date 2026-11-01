@@ -1010,6 +1010,10 @@ impl Watched {
                 self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
                 let result = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
                 self.check_search_paths(result.matches.iter().map(|hit| hit.path.as_str()))?;
+                let mut freshness = self.search_freshness("metadata");
+                if result.total_matches == 0 && looks_like_unintended_literal_regex(&query.pattern, query.regex) {
+                    append_regex_hint(&mut freshness);
+                }
                 if compact {
                     #[derive(serde::Serialize)]
                     struct CompactGrepHit<'a> {
@@ -1045,11 +1049,11 @@ impl Watched {
                         matches,
                         total_matches: result.total_matches,
                         truncated: result.truncated,
-                        freshness: self.search_freshness("metadata"),
+                        freshness,
                     })?);
                 }
                 let mut value = serde_json::to_value(&*result)?;
-                value["freshness"] = self.search_freshness("metadata");
+                value["freshness"] = freshness;
                 Ok(value)
             }
             "code_profile" => {
@@ -1090,11 +1094,17 @@ impl Watched {
                     return Err(invalid("radius 0..100, context limit 1..64 required; use code_read for larger ranges").into());
                 }
                 self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
+                let regex_hint_needed = !query.regex
+                    && looks_like_unintended_literal_regex(&query.pattern, query.regex);
                 if let Some(result) =
                     self.query_cache
                         .get_context(self.resident.stats.generation, &query, radius)
                 {
-                    return self.verified_context(&result, compact);
+                    let mut val = self.verified_context(&result, compact)?;
+                    if result.search.total_matches == 0 && regex_hint_needed {
+                        append_regex_hint(&mut val["freshness"]);
+                    }
+                    return Ok(val);
                 }
                 let search_arc = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
                 let search_owned =
@@ -1108,7 +1118,11 @@ impl Watched {
                     radius,
                     result.clone(),
                 );
-                self.verified_context(&result, compact)
+                let mut val = self.verified_context(&result, compact)?;
+                if result.search.total_matches == 0 && regex_hint_needed {
+                    append_regex_hint(&mut val["freshness"]);
+                }
+                Ok(val)
             }
             "code_read" => {
                 let request: ReadRequest = serde_json::from_value(arguments)?;
@@ -1187,6 +1201,9 @@ impl Watched {
             }
             if raw.contains("%20") {
                 *raw = raw.replace("%20", " ");
+            }
+            if !raw.starts_with('/') && !raw.starts_with("\\\\") && raw.contains('\\') {
+                *raw = raw.replace('\\', "/");
             }
             if raw == root_str {
                 *raw = ".".into();
@@ -1302,15 +1319,25 @@ impl Watched {
             }
         };
         if let Some(paths) = arguments.get_mut("paths").and_then(Value::as_array_mut) {
-            for item in paths {
+            let mut expanded = Vec::with_capacity(paths.len());
+            for item in paths.drain(..) {
                 if let Some(text) = item.as_str() {
-                    let mut owned = text.to_owned();
-                    strip_one(&mut owned);
-                    if owned != text {
-                        *item = Value::String(owned);
+                    if text.contains(',') && !text.contains('{') {
+                        for part in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                            let mut owned = part.to_owned();
+                            strip_one(&mut owned);
+                            expanded.push(Value::String(owned));
+                        }
+                    } else {
+                        let mut owned = text.to_owned();
+                        strip_one(&mut owned);
+                        expanded.push(Value::String(owned));
                     }
+                } else {
+                    expanded.push(item);
                 }
             }
+            *paths = expanded;
         }
         if let Some(ranges) = arguments.get_mut("ranges").and_then(Value::as_array_mut) {
             for range in ranges {
@@ -2081,5 +2108,31 @@ impl Watched {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+fn looks_like_unintended_literal_regex(pattern: &str, regex: bool) -> bool {
+    if regex || pattern.len() < 3 {
+        return false;
+    }
+    pattern.contains("\\s")
+        || pattern.contains("\\b")
+        || pattern.contains("\\w")
+        || pattern.contains("\\d")
+        || pattern.contains(".*")
+        || pattern.contains(".+")
+        || pattern.contains("(?:")
+        || (pattern.contains('|')
+            && !pattern.contains("||")
+            && !pattern.contains("| ")
+            && !pattern.contains(" |"))
+}
+
+fn append_regex_hint(freshness: &mut Value) {
+    if let Some(notice) = freshness.get("notice").and_then(Value::as_str) {
+        let updated = format!(
+            "{notice} (Pattern contains regex syntax with regex=false; set regex=true if a regular expression was intended.)"
+        );
+        freshness["notice"] = Value::String(updated);
     }
 }

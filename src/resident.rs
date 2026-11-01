@@ -205,10 +205,11 @@ struct SnapshotRangeError {
 
 impl Display for SnapshotRangeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let tail_start = self.lines.saturating_sub(79).max(1);
         write!(
             formatter,
-            "READ_RANGE_OUT_OF_BOUNDS path={} requested={}..{} indexed_lines={}: start exceeds snapshot EOF; locate the actual lines with code_context, then request a range within this file. Do not repeat the same invalid range.",
-            self.path, self.start, self.end, self.lines
+            "READ_RANGE_OUT_OF_BOUNDS path={} requested={}..{} indexed_lines={} valid_tail={}..{}: start exceeds snapshot EOF; locate the actual lines with code_context, then request a range within this file. Do not repeat the same invalid range.",
+            self.path, self.start, self.end, self.lines, tail_start, self.lines.max(1)
         )
     }
 }

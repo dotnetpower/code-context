@@ -71,9 +71,10 @@ pub fn read_many(workspace: &Workspace, ranges: &[ReadRange]) -> Result<Vec<Snip
         }
         let (hash, lines) = &loaded[&range.path];
         if range.start > lines.len() {
+            let tail_start = lines.len().saturating_sub(79).max(1);
             return Err(invalid(format!(
-                "READ_RANGE_OUT_OF_BOUNDS root={} path={} requested={}..{} lines={}: start exceeds EOF; locate current lines with code_context instead of repeating this range",
-                workspace.root.display(), range.path, range.start, range.end, lines.len()
+                "READ_RANGE_OUT_OF_BOUNDS root={} path={} requested={}..{} lines={} valid_tail={}..{}: start exceeds EOF; locate current lines with code_context instead of repeating this range",
+                workspace.root.display(), range.path, range.start, range.end, lines.len(), tail_start, lines.len().max(1)
             )).into());
         }
         let end = range.end.min(lines.len());
@@ -360,6 +361,7 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
     }
     let trimmed = crate::query::trim_line_start(line);
     trimmed.starts_with("#[")
+        || trimmed.starts_with("#![")
         || trimmed.starts_with("# ")
         || trimmed.starts_with("//")
         || trimmed.starts_with("-- ")
@@ -373,6 +375,110 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
         || trimmed.starts_with("'use client'")
         || trimmed.starts_with("\"use server\"")
         || trimmed.starts_with("'use server'")
+}
+
+fn rewind_leading_docs_and_attrs(lines: &[String], mut idx: usize) -> usize {
+    while idx > 0 {
+        let prev = &lines[idx - 1];
+        if is_leading_doc_or_attr(prev) {
+            idx -= 1;
+            continue;
+        }
+        let prev_trim = prev.trim();
+        if prev_trim.ends_with("*/") {
+            idx -= 1;
+            while idx > 0 && !lines[idx].contains("/*") {
+                idx -= 1;
+            }
+            continue;
+        }
+        if (prev_trim.ends_with(")]") || prev_trim.ends_with(')'))
+            && idx >= 2
+            && lines[..idx].iter().rev().take(6).any(|l| {
+                let t = crate::query::trim_line_start(l);
+                leading_indent_cols(l) <= 4
+                    && (t.starts_with("#[") || t.starts_with("#![") || t.starts_with('@'))
+            })
+        {
+            idx -= 1;
+            while idx > 0 {
+                let t = crate::query::trim_line_start(&lines[idx]);
+                if leading_indent_cols(&lines[idx]) <= 4
+                    && (t.starts_with("#[") || t.starts_with("#![") || t.starts_with('@'))
+                {
+                    break;
+                }
+                idx -= 1;
+            }
+            continue;
+        }
+        break;
+    }
+    idx
+}
+
+fn is_type_or_schema_definition(line: &str) -> bool {
+    let mut trimmed = crate::query::trim_line_start(line);
+    for prefix in [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "export ",
+        "default ",
+        "declare ",
+        "public ",
+        "private ",
+        "protected ",
+        "internal ",
+        "abstract ",
+        "sealed ",
+        "final ",
+        "data ",
+        "value ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            trimmed = rest.trim_start();
+        }
+    }
+    [
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "type ",
+        "class ",
+        "message ",
+        "service ",
+        "model ",
+        "table ",
+        "schema ",
+        "input ",
+        "CREATE TABLE ",
+        "create table ",
+    ]
+    .iter()
+    .any(|kw| trimmed.starts_with(kw))
+}
+
+fn is_multiline_signature_open(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if !trimmed.contains('(') {
+        return false;
+    }
+    let open_parens = trimmed.bytes().filter(|&b| b == b'(').count();
+    let close_parens = trimmed.bytes().filter(|&b| b == b')').count();
+    open_parens > close_parens
+        || (trimmed.ends_with(')') && !trimmed.contains('{') && !trimmed.ends_with(';'))
+}
+
+fn is_overload_or_stub_signature(line: &str) -> bool {
+    let trimmed = crate::query::trim_line_start(line).trim_end();
+    (trimmed.starts_with("export function ")
+        || trimmed.starts_with("function ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn "))
+        && trimmed.ends_with(';')
+        && !trimmed.contains('{')
 }
 
 fn is_sfc_section_open(line: &str) -> bool {
@@ -599,20 +705,25 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 || trimmed == "};"
                 || trimmed == "});"
                 || trimmed == "})"
+                || trimmed == "})?"
+                || trimmed == "})?;"
                 || trimmed == "]);"
                 || trimmed == "])"
                 || trimmed == "));"
                 || trimmed == "))"
+                || trimmed == ");"
                 || trimmed.starts_with("} satisfies ")
                 || trimmed.starts_with("} as ")
                 || trimmed.starts_with("}; //")
                 || trimmed.starts_with("}); //")
+                || trimmed.starts_with("}).")
                 || (is_end_lang
                     && (trimmed == "end"
                         || trimmed == "fi"
                         || trimmed == "done"
                         || trimmed == "esac"))
         };
+        let mut matched_header_indent: Option<usize> = None;
         for idx in (1..=min_idx).rev() {
             if is_sfc && is_sfc_section_open(&snippet.lines[idx]) {
                 new_start_idx = idx;
@@ -627,15 +738,13 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 break;
             }
             if is_block_definition_header(&snippet.lines[idx]) {
-                let mut header_start = idx;
-                while header_start > 0 && is_leading_doc_or_attr(&snippet.lines[header_start - 1]) {
-                    header_start -= 1;
-                }
-                if header_start > 0
-                    && (snippet.lines[header_start - 1].trim().is_empty()
-                        || (is_sfc && is_sfc_section_open(&snippet.lines[header_start - 1])))
+                let header_start = rewind_leading_docs_and_attrs(&snippet.lines, idx);
+                if header_start == 0
+                    || snippet.lines[header_start - 1].trim().is_empty()
+                    || (is_sfc && is_sfc_section_open(&snippet.lines[header_start - 1]))
                 {
                     new_start_idx = header_start;
+                    matched_header_indent = Some(leading_indent_cols(&snippet.lines[idx]));
                     break;
                 }
             }
@@ -655,32 +764,47 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
             new_start_idx = candidate;
         }
-        for idx in max_idx..snippet.lines.len().saturating_sub(1) {
-            if is_sfc && idx > max_idx && is_sfc_section_close(&snippet.lines[idx]) {
+        let mut effective_max_idx = max_idx;
+        if is_multiline_signature_open(&snippet.lines[effective_max_idx]) {
+            for idx in (effective_max_idx + 1)..snippet.lines.len().min(effective_max_idx + 8) {
+                effective_max_idx = idx;
+                let t = snippet.lines[idx].trim();
+                if t.ends_with('{') || t.ends_with(';') || t.ends_with("=>") {
+                    if t.ends_with('{') && idx + 1 < snippet.lines.len() {
+                        effective_max_idx = idx + 1;
+                    }
+                    break;
+                }
+            }
+        }
+        for idx in effective_max_idx..snippet.lines.len().saturating_sub(1) {
+            if is_sfc && idx > effective_max_idx && is_sfc_section_close(&snippet.lines[idx]) {
                 new_end_idx = idx;
                 break;
             }
-            if is_sfc && idx > max_idx && is_sfc_section_open(&snippet.lines[idx]) {
+            if is_sfc && idx > effective_max_idx && is_sfc_section_open(&snippet.lines[idx]) {
                 let mut end_idx = idx - 1;
-                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                while end_idx > effective_max_idx && snippet.lines[end_idx].trim().is_empty() {
                     end_idx -= 1;
                 }
                 new_end_idx = end_idx;
                 break;
             }
             if is_block_close(&snippet.lines[idx])
+                && matched_header_indent.is_none_or(|h_ind| leading_indent_cols(&snippet.lines[idx]) <= h_ind)
                 && (snippet.lines[idx + 1].trim().is_empty()
                     || (is_sfc && is_sfc_section_close(&snippet.lines[idx + 1])))
             {
                 new_end_idx = idx;
                 break;
             }
-            if idx > max_idx
+            if idx > effective_max_idx
                 && is_block_definition_header(&snippet.lines[idx])
+                && !is_overload_or_stub_signature(&snippet.lines[idx - 1])
                 && snippet.lines[idx - 1].trim().is_empty()
             {
                 let mut end_idx = idx - 1;
-                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                while end_idx > effective_max_idx && snippet.lines[end_idx].trim().is_empty() {
                     end_idx -= 1;
                 }
                 new_end_idx = end_idx;
@@ -745,15 +869,25 @@ fn assemble_inner(
             if is_def {
                 if is_doc {
                     (1usize, radius.min(10), 24usize)
+                } else if is_type_or_schema_definition(&hit.text) {
+                    (radius.min(5), radius.min(10), 24usize)
                 } else if is_frontend_component_path(&hit.path) {
-                    (1usize, radius.min(7), 20usize)
+                    (2usize, radius.min(7), 20usize)
+                } else if is_multiline_signature_open(&hit.text) {
+                    (radius.min(4), radius.min(8), 20usize)
                 } else {
                     (1usize, radius.min(5), 16usize)
                 }
             } else if is_doc {
                 (radius.min(3), radius.min(5), 16usize)
             } else if result.matches.len() <= 8 && is_multiline_jsx_or_call_open(&hit.text) {
-                (0usize, 2usize, 4usize)
+                (1usize, 2usize, 5usize)
+            } else if result.matches.len() <= 6
+                && hit.text.trim().len() < 24
+            {
+                // Short/non-unique line (e.g. `return Ok(());` or `break;`): include 1 line of context
+                // so VS Code `edit` does not fail with "Multiple matches found".
+                (1usize, 1usize, 4usize)
             } else {
                 (0usize, 0usize, 2usize)
             }

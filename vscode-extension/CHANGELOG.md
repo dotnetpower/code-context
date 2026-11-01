@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.18.0
+
+- Prevent VS Code agent edit retries (`No match found` / `Multiple matches found`)
+  and compile-fix rewrite loops by preserving multi-line function signatures,
+  `where` clauses, return types, multi-line `#[derive(...)]` / `/** ... */`
+  attributes, full `struct` / `interface` / `enum` / `type` field blocks, and
+  TypeScript/Rust overload + implementation pairs in `code_context`.
+- Track outer definition indentation during block clamping so inner `if`/`match`
+  closing braces (`}`) never truncate enclosing functions, and recognize chained
+  error-propagation closures (`})?`, `})?;`, `}).`).
+- Guarantee surrounding context lines for short/non-unique call-site hits, add
+  test-attribute (`#[test]`, `#[tokio::test]`, `#[rstest]`) definition boosting,
+  and demote debug print macros (`println!`, `eprintln!`, `dbg!`) under
+  `max_matches_per_file`.
+- Eliminate tool-invocation retries by auto-normalizing `**.ext` and `.ext`
+  shorthand globs, splitting comma-separated `paths`, converting Windows
+  backslash relative paths, handling `start=0` / reversed `start > end` /
+  `view_range: [start, -1]` in MCP and Native reads, reporting `valid_tail`
+  bounds on `READ_RANGE_OUT_OF_BOUNDS`, and surfacing a `regex=true` hint when
+  a literal search with regex syntax returns zero matches.
+
 ## 0.17.0
 
 - Expand polyglot symbol-definition ranking and smart block-clamped context

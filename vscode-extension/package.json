@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context by dotnetpower",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
