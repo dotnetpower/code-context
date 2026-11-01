@@ -300,6 +300,33 @@ class AdoptionAuditTests(unittest.TestCase):
         ):
             self.assertEqual(MODULE.classify(builtin), "builtin_search_read", builtin)
 
+    def test_request_eligibility_supports_multi_agent_aliases_and_anchor_suffixes(self):
+        coverage = {
+            "generated_at_unix": 1000.0,
+            "roots": [
+                {
+                    "registration": {"root": "/repo", "scopes": ["."], "globs": ["*.md", "*.rs"]},
+                    "files": ["docs/guide.md", "src/query.rs"],
+                }
+            ],
+        }
+        res_anchor = MODULE.request_eligibility(
+            "cctxNativeRead",
+            {"workspace_root": "/repo", "file_path": "docs/guide.md#install-setup"},
+            None,
+            coverage,
+            1005.0,
+        )
+        self.assertEqual(res_anchor["classification"], "eligible")
+        res_line = MODULE.request_eligibility(
+            "read_file",
+            {"projectRoot": "/repo", "filepath": "src/query.rs:120:5"},
+            None,
+            coverage,
+            1005.0,
+        )
+        self.assertEqual(res_line["classification"], "eligible")
+
 
 if __name__ == "__main__":
     unittest.main()

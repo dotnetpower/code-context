@@ -13,6 +13,7 @@ import {
   extractLineRangeFromPath,
   normalizeGlobPattern,
   normalizeRelativeTargetPath,
+  normalizeUriOrPath,
   resolveRegisteredRoot,
   resolveRegisteredRootAfterRefresh,
   listedWorktreeRoot,
@@ -282,4 +283,32 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
   assert.deepEqual(splitBuilt.ranges[0], { path: 'src/large.ts', start: 1, end: 500 });
   assert.deepEqual(splitBuilt.ranges[1], { path: 'src/large.ts', start: 501, end: 1000 });
   assert.deepEqual(splitBuilt.ranges[2], { path: 'src/large.ts', start: 1001, end: 1200 });
+
+  const aroundBuilt = buildReadArguments({
+    file_path: 'src/query.rs',
+    around_line: 100,
+    radius: 15,
+  });
+  assert.deepEqual(aroundBuilt.ranges, [{ path: 'src/query.rs', start: 85, end: 115 }]);
+
+  assert.deepEqual(
+    extractLineRangeFromPath('File "src/app.py", line 42'),
+    { path: 'src/app.py', start: 42, end: 82 },
+  );
+  assert.deepEqual(
+    extractLineRangeFromPath('--> src/main.rs:25:9'),
+    { path: 'src/main.rs', start: 25, end: 65 },
+  );
+  assert.equal(
+    normalizeUriOrPath('cursor://file/home/user/repo/src/index.ts'),
+    '/home/user/repo/src/index.ts',
+  );
+  assert.equal(
+    normalizeUriOrPath('/c/Users/dev/project/src/main.rs'),
+    'C:/Users/dev/project/src/main.rs',
+  );
+  assert.equal(
+    normalizeRelativeTargetPath('#components/Button.tsx'),
+    'src/components/Button.tsx',
+  );
 });

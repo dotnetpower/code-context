@@ -1159,12 +1159,27 @@ impl Watched {
                 }
                 *raw = target.to_owned();
             }
+            if let Some(rest) = raw.strip_prefix("-->") {
+                *raw = rest.trim().to_owned();
+            }
+            if let Some(rest) = raw.strip_prefix("File \"")
+                && let Some((file_part, _)) = rest.split_once('"')
+            {
+                *raw = file_part.to_owned();
+            }
             if let Some(rest) = raw.strip_prefix("file://") {
                 *raw = rest.to_owned();
             } else if let Some(scheme_end) = raw.find("://")
                 && matches!(
                     &raw[..scheme_end],
-                    "vscode-remote" | "vscode-file" | "vscode-userdata"
+                    "vscode-remote"
+                        | "vscode-file"
+                        | "vscode-userdata"
+                        | "vscode-insiders"
+                        | "cursor"
+                        | "windsurf"
+                        | "vscodium"
+                        | "git"
                 )
                 && let Some(slash) = raw[scheme_end + 3..].find('/')
             {
@@ -1228,11 +1243,13 @@ impl Watched {
             }
             if !self.stamps.contains_key(raw.as_str()) {
                 if let Some((base, suffix)) = raw.rsplit_once('#')
+                    && !base.is_empty()
                     && !suffix.is_empty()
                     && candidate_exists(base)
                 {
                     *raw = base.to_owned();
                 } else if let Some((base, suffix)) = raw.split_once(':')
+                    && !base.is_empty()
                     && !suffix.is_empty()
                     && suffix
                         .bytes()
@@ -1241,6 +1258,7 @@ impl Watched {
                 {
                     *raw = base.to_owned();
                 } else if let Some(open) = raw.rfind('(')
+                    && open > 0
                     && raw.ends_with(')')
                     && raw[open + 1..raw.len() - 1]
                         .bytes()
@@ -1264,6 +1282,7 @@ impl Watched {
                 } else if let Some(rest) = raw
                     .strip_prefix("@/")
                     .or_else(|| raw.strip_prefix("~/"))
+                    .or_else(|| raw.strip_prefix('#'))
                     && !rest.is_empty()
                 {
                     let candidate = format!("src/{rest}");
@@ -1300,9 +1319,11 @@ impl Watched {
                     && let Some(text) = path_val.as_str()
                 {
                     let mut owned = text.to_owned();
-                    if let Some((_, frag)) = owned.rsplit_once('#') {
+                    if let Some((base, frag)) = owned.rsplit_once('#') {
                         let frag = frag.trim_end_matches(')').trim_end_matches('>');
-                        if !frag.is_empty()
+                        if !base.is_empty()
+                            && !frag.is_empty()
+                            && !frag.contains('/')
                             && !frag
                                 .bytes()
                                 .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'L' | b'C'))

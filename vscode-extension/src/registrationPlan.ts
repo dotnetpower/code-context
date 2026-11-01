@@ -29,7 +29,6 @@ const SOURCE_EXTENSION_LIST = [
   'cc',
   'cjs',
   'clj',
-  'cljc',
   'cljs',
   'cmake',
   'cpp',
@@ -42,6 +41,7 @@ const SOURCE_EXTENSION_LIST = [
   'ex',
   'exs',
   'fs',
+  'gleam',
   'glsl',
   'go',
   'gql',
@@ -55,7 +55,6 @@ const SOURCE_EXTENSION_LIST = [
   'hpp',
   'hs',
   'hrl',
-  'hxx',
   'java',
   'jl',
   'js',
@@ -77,7 +76,6 @@ const SOURCE_EXTENSION_LIST = [
   'prisma',
   'proto',
   'ps1',
-  'psd1',
   'psm1',
   'py',
   'pyi',
@@ -107,6 +105,7 @@ const SOURCE_EXTENSION_LIST = [
   'txt',
   'json',
   'jsonc',
+  'jsonl',
   'yaml',
   'yml',
   'toml',
@@ -131,14 +130,16 @@ const SOURCE_EXTENSION_LIST = [
   'pdf',
   'pptx',
   'rtf',
+  'srt',
   'tex',
   'tsv',
   'typ',
   'vtt',
+  'xliff',
   'xlsx',
 ] as const;
 const SOURCE_EXTENSIONS = new Set<string>(SOURCE_EXTENSION_LIST);
-const SOURCE_GLOB_CASE_ALIASES = ['*.C', '*.H', '*.R'] as const;
+const SOURCE_GLOB_CASE_ALIASES = ['*.C', '*.R'] as const;
 const DEVELOPMENT_FILENAMES = [
   'Makefile',
   'GNUmakefile',

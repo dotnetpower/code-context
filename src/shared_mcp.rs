@@ -190,40 +190,186 @@ fn take_first_alias(
     chosen
 }
 
+fn parse_diagnostic_or_inline_range(raw: &str) -> (String, Option<u64>, Option<u64>) {
+    let mut trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("-->") {
+        trimmed = rest.trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("File \"")
+        && let Some((file_part, after_quote)) = rest.split_once('"')
+    {
+        let mut parsed_line = None;
+        if let Some((_, line_part)) = after_quote.split_once("line ") {
+            let digits: String = line_part
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u64>()
+                && n > 0
+            {
+                parsed_line = Some(n);
+            }
+        }
+        return (
+            file_part.to_owned(),
+            parsed_line,
+            parsed_line.map(|n| n + 40),
+        );
+    }
+    if let Some((base, frag)) = trimmed.rsplit_once('#')
+        && !base.is_empty()
+        && let Some(line_spec) = frag.strip_prefix('L').or_else(|| {
+            frag.as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_digit)
+                .then_some(frag)
+        })
+    {
+        let (start_part, end_part) = line_spec.split_once('-').unwrap_or((line_spec, ""));
+        let start_digits: String = start_part
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(s) = start_digits.parse::<u64>()
+            && s > 0
+        {
+            let end_clean = end_part.strip_prefix('L').unwrap_or(end_part);
+            let end_digits: String = end_clean
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let e = end_digits.parse::<u64>().ok().filter(|&n| n >= s).unwrap_or(s + 40);
+            return (base.to_owned(), Some(s), Some(e));
+        }
+    }
+    if let Some((base, suffix)) = trimmed.split_once(':')
+        && base.len() > 1
+        && !base.contains("://")
+        && suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        let (first_seg, rest_dash) = suffix.split_once('-').unwrap_or((suffix, ""));
+        let start_str = first_seg.split(':').next().unwrap_or("");
+        if let Ok(s) = start_str.parse::<u64>()
+            && s > 0
+        {
+            let end_str = rest_dash.split(':').next().unwrap_or("");
+            let e = end_str.parse::<u64>().ok().filter(|&n| n >= s).unwrap_or(s + 40);
+            return (base.to_owned(), Some(s), Some(e));
+        }
+    }
+    (trimmed.to_owned(), None, None)
+}
+
 fn normalize_single_range_map(
     map: &mut serde_json::Map<String, Value>,
     default_span: u64,
 ) {
     if !map.contains_key("path")
-        && let Some(path) = take_first_alias(map, &["filePath", "uri", "file", "target"])
+        && let Some(path) = take_first_alias(
+            map,
+            &[
+                "filePath",
+                "file_path",
+                "filepath",
+                "relative_path",
+                "relativePath",
+                "target_file",
+                "targetFile",
+                "uri",
+                "file",
+                "target",
+            ],
+        )
     {
         map.insert("path".into(), path);
     }
-    let mut start = map
-        .remove("start")
-        .or_else(|| take_first_alias(map, &["start_line", "startLine", "offset", "line"]));
-    let mut end = map
-        .remove("end")
-        .or_else(|| take_first_alias(map, &["end_line", "endLine"]));
+    let mut extracted_start = None;
+    let mut extracted_end = None;
+    if let Some(raw_path) = map.get("path").and_then(Value::as_str) {
+        let (clean_path, es, ee) = parse_diagnostic_or_inline_range(raw_path);
+        extracted_start = es;
+        extracted_end = ee;
+        if es.is_some() && clean_path != raw_path {
+            map.insert("path".into(), Value::String(clean_path));
+        }
+    }
+    let explicit_start = map.remove("start").or_else(|| {
+        take_first_alias(
+            map,
+            &[
+                "start_line",
+                "startLine",
+                "start_line_number",
+                "startLineNumber",
+                "from_line",
+                "fromLine",
+                "offset",
+            ],
+        )
+    });
+    let line_alias = take_first_alias(map, &["line", "line_number", "lineNumber"]);
+    let center_alias = take_first_alias(
+        map,
+        &["around_line", "aroundLine", "center_line", "centerLine"],
+    );
+    let radius_alias = take_first_alias(
+        map,
+        &["radius", "context_lines", "contextLines", "context"],
+    )
+    .and_then(|v| v.as_u64());
+    let mut end = map.remove("end").or_else(|| {
+        take_first_alias(
+            map,
+            &[
+                "end_line",
+                "endLine",
+                "end_line_number",
+                "endLineNumber",
+                "to_line",
+                "toLine",
+            ],
+        )
+    });
     let count_span = take_first_alias(map, &["numLines", "lineCount", "limit"])
         .and_then(|v| v.as_u64())
         .filter(|&n| n > 0);
+    let mut start = explicit_start;
     if let Some(Value::Array(vr)) = map.remove("view_range")
         && vr.len() == 2
     {
         start = start.or_else(|| vr.first().cloned());
         end = end.or_else(|| vr.get(1).cloned());
     }
+    if start.is_none()
+        && end.is_none()
+        && let Some(center) = center_alias
+            .as_ref()
+            .or(line_alias.as_ref())
+            .and_then(Value::as_i64)
+            .filter(|&n| n > 0)
+            .map(|n| n as u64)
+        && (center_alias.is_some() || radius_alias.is_some())
+    {
+        let r = radius_alias.unwrap_or(20);
+        let s = center.saturating_sub(r).max(1);
+        let e = center.saturating_add(r);
+        map.insert("start".into(), json!(s));
+        map.insert("end".into(), json!(e));
+        return;
+    }
+    start = start.or(line_alias).or(center_alias);
     let s = start
         .and_then(|v| v.as_i64())
         .filter(|&n| n > 0)
         .map(|n| n as u64)
+        .or(extracted_start)
         .unwrap_or(1);
     let e = end
         .and_then(|v| v.as_i64())
         .filter(|&n| n > 0)
         .map(|n| n as u64)
         .or_else(|| count_span.map(|c| s + c - 1))
+        .or(extracted_end)
         .unwrap_or(s + default_span)
         .max(s);
     map.insert("start".into(), json!(s));
@@ -258,20 +404,48 @@ pub(crate) fn normalize_mcp_argument_aliases(
     if !arguments.contains_key("root")
         && let Some(root_alias) = take_first_alias(
             arguments,
-            &["workspaceRoot", "workspace_root", "cwd", "projectRoot"],
+            &[
+                "workspaceRoot",
+                "workspace_root",
+                "cwd",
+                "projectRoot",
+                "project_root",
+                "repoRoot",
+                "repo_root",
+            ],
         )
         && root_alias.as_str().is_some_and(|s| !s.trim().is_empty())
     {
         arguments.insert("root".into(), root_alias);
     } else {
-        for k in ["workspaceRoot", "workspace_root", "cwd", "projectRoot"] {
+        for k in [
+            "workspaceRoot",
+            "workspace_root",
+            "cwd",
+            "projectRoot",
+            "project_root",
+            "repoRoot",
+            "repo_root",
+        ] {
             arguments.remove(k);
         }
     }
     if matches!(name, "code_grep" | "code_context") {
         let alias_val = take_first_alias(
             arguments,
-            &["query", "symbol", "search", "text", "needle"],
+            &[
+                "query",
+                "symbol",
+                "symbol_name",
+                "symbolName",
+                "search",
+                "search_query",
+                "searchQuery",
+                "regex_pattern",
+                "regexPattern",
+                "text",
+                "needle",
+            ],
         );
         if !arguments.contains_key("pattern")
             && let Some(val) = alias_val
@@ -320,7 +494,20 @@ pub(crate) fn normalize_mcp_argument_aliases(
         }
         let glob_alias = take_first_alias(
             arguments,
-            &["includePattern", "filePattern", "include", "filter"],
+            &[
+                "includePattern",
+                "include_pattern",
+                "filePattern",
+                "file_pattern",
+                "glob_pattern",
+                "globPattern",
+                "file_glob",
+                "fileGlob",
+                "include_glob",
+                "includeGlob",
+                "include",
+                "filter",
+            ],
         );
         if !arguments.contains_key("glob")
             && let Some(val) = glob_alias
@@ -335,14 +522,31 @@ pub(crate) fn normalize_mcp_argument_aliases(
     {
         arguments.insert("glob".into(), pattern);
     }
-    if matches!(name, "code_files" | "code_grep" | "code_context")
-        && !arguments.contains_key("paths")
-        && let Some(single_path) = arguments.remove("path")
-    {
-        if single_path.is_string() {
-            arguments.insert("paths".into(), Value::Array(vec![single_path]));
-        } else if single_path.is_array() {
-            arguments.insert("paths".into(), single_path);
+    if matches!(name, "code_files" | "code_grep" | "code_context") {
+        let single_path = take_first_alias(
+            arguments,
+            &[
+                "path",
+                "file_path",
+                "filePath",
+                "filepath",
+                "relative_path",
+                "relativePath",
+                "target_file",
+                "targetFile",
+                "dir",
+                "directory",
+                "folder",
+            ],
+        );
+        if !arguments.contains_key("paths")
+            && let Some(single_path) = single_path
+        {
+            if single_path.is_string() {
+                arguments.insert("paths".into(), Value::Array(vec![single_path]));
+            } else if single_path.is_array() {
+                arguments.insert("paths".into(), single_path);
+            }
         }
     }
     if matches!(name, "code_files" | "code_grep" | "code_context")
@@ -407,7 +611,25 @@ pub(crate) fn normalize_mcp_argument_aliases(
                 "end_line",
                 "startLine",
                 "endLine",
+                "start_line_number",
+                "end_line_number",
+                "startLineNumber",
+                "endLineNumber",
+                "from_line",
+                "to_line",
+                "fromLine",
+                "toLine",
                 "line",
+                "line_number",
+                "lineNumber",
+                "around_line",
+                "aroundLine",
+                "center_line",
+                "centerLine",
+                "radius",
+                "context_lines",
+                "contextLines",
+                "context",
                 "offset",
                 "numLines",
                 "lineCount",
@@ -432,7 +654,19 @@ pub(crate) fn normalize_mcp_argument_aliases(
             arguments.insert("ranges".into(), Value::Array(built));
         } else if let Some(path) = take_first_alias(
             arguments,
-            &["path", "filePath", "uri", "file", "target"],
+            &[
+                "path",
+                "filePath",
+                "file_path",
+                "filepath",
+                "relative_path",
+                "relativePath",
+                "target_file",
+                "targetFile",
+                "uri",
+                "file",
+                "target",
+            ],
         ) && path.is_string()
         {
             let mut single = serde_json::Map::new();
@@ -444,7 +678,25 @@ pub(crate) fn normalize_mcp_argument_aliases(
                 "end_line",
                 "startLine",
                 "endLine",
+                "start_line_number",
+                "end_line_number",
+                "startLineNumber",
+                "endLineNumber",
+                "from_line",
+                "to_line",
+                "fromLine",
+                "toLine",
                 "line",
+                "line_number",
+                "lineNumber",
+                "around_line",
+                "aroundLine",
+                "center_line",
+                "centerLine",
+                "radius",
+                "context_lines",
+                "contextLines",
+                "context",
                 "offset",
                 "numLines",
                 "lineCount",

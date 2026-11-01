@@ -213,9 +213,97 @@ pub(crate) fn validate_context(request: &ContextRequest) -> Result<()> {
 }
 
 fn is_python_top_header(line: &str) -> bool {
-    ["def ", "async def ", "class ", "@", "if __name__"]
+    [
+        "def ",
+        "async def ",
+        "class ",
+        "type ",
+        "@",
+        "if __name__",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn is_end_keyword_language_path(path: &str) -> bool {
+    [".rb", ".ex", ".exs", ".lua", ".sh", ".bash", ".zsh", ".jl", ".cr"]
         .iter()
-        .any(|prefix| line.starts_with(prefix))
+        .any(|ext| path.ends_with(ext))
+}
+
+fn is_makefile_or_justfile_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        file_name,
+        "Makefile" | "makefile" | "GNUmakefile" | "Justfile" | "justfile"
+    ) || path.ends_with(".mk")
+        || path.ends_with(".just")
+}
+
+fn is_dockerfile_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    file_name == "Dockerfile"
+        || file_name == "Containerfile"
+        || file_name.starts_with("Dockerfile.")
+        || file_name.starts_with("Containerfile.")
+        || path.ends_with(".dockerfile")
+}
+
+fn is_makefile_target_header(line: &str) -> bool {
+    if leading_indent_cols(line) > 0 {
+        return false;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('@')
+        || trimmed.starts_with("ifeq")
+        || trimmed.starts_with("ifneq")
+        || trimmed.starts_with("ifdef")
+        || trimmed.starts_with("ifndef")
+        || trimmed.starts_with("else")
+        || trimmed.starts_with("endif")
+        || trimmed.starts_with("include ")
+        || trimmed.starts_with("-include ")
+    {
+        return false;
+    }
+    if let Some((before_colon, after_colon)) = trimmed.split_once(':') {
+        !before_colon.is_empty()
+            && !before_colon.contains(['=', ' ', '\t'])
+            && !after_colon.starts_with('=')
+    } else {
+        false
+    }
+}
+
+fn is_sql_statement_start(line: &str) -> bool {
+    if leading_indent_cols(line) > 2 {
+        return false;
+    }
+    let trimmed = crate::query::trim_line_start(line);
+    let upper = trimmed.get(..36).unwrap_or(trimmed).to_ascii_uppercase();
+    [
+        "CREATE ",
+        "ALTER ",
+        "DROP ",
+        "INSERT INTO ",
+        "UPDATE ",
+        "DELETE FROM ",
+        "SELECT ",
+        "WITH ",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
+}
+
+fn is_sql_statement_end(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.ends_with(';')
+        || trimmed.eq_ignore_ascii_case("GO")
+        || trimmed.ends_with("$$;")
+        || trimmed.ends_with("END;")
+        || trimmed.ends_with("end;")
 }
 
 fn leading_indent_cols(line: &str) -> usize {
@@ -272,7 +360,9 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
     }
     let trimmed = crate::query::trim_line_start(line);
     trimmed.starts_with("#[")
+        || trimmed.starts_with("# ")
         || trimmed.starts_with("//")
+        || trimmed.starts_with("-- ")
         || trimmed.starts_with("/**")
         || trimmed.starts_with("/*")
         || trimmed == "*"
@@ -288,14 +378,17 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
 fn is_sfc_section_open(line: &str) -> bool {
     let trimmed = crate::query::trim_line_start(line);
     leading_indent_cols(line) == 0
-        && (trimmed.starts_with("<script")
-            || trimmed.starts_with("<template")
-            || trimmed.starts_with("<style")
+        && (trimmed == "<script>"
+            || trimmed.starts_with("<script ")
+            || trimmed == "<template>"
+            || trimmed.starts_with("<template ")
+            || trimmed == "<style>"
+            || trimmed.starts_with("<style ")
             || trimmed == "---")
 }
 
 fn is_sfc_section_close(line: &str) -> bool {
-    let trimmed = crate::query::trim_line_start(line);
+    let trimmed = crate::query::trim_line_start(line).trim_end();
     leading_indent_cols(line) == 0
         && (trimmed.starts_with("</script>")
             || trimmed.starts_with("</template>")
@@ -363,11 +456,22 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
         for idx in (1..=min_idx).rev() {
             if is_py_header(&snippet.lines[idx]) {
                 let mut header_start = idx;
-                while header_start > 0
-                    && leading_indent_cols(&snippet.lines[header_start - 1]) <= 4
-                    && snippet.lines[header_start - 1].trim_start().starts_with('@')
-                {
-                    header_start -= 1;
+                while header_start > 0 {
+                    let prev = &snippet.lines[header_start - 1];
+                    let prev_trimmed = prev.trim_start();
+                    if (leading_indent_cols(prev) <= 4 && prev_trimmed.starts_with('@'))
+                        || (header_start >= 2
+                            && (prev_trimmed.starts_with(')') || leading_indent_cols(prev) > 0)
+                            && snippet.lines[..header_start]
+                                .iter()
+                                .rev()
+                                .take(6)
+                                .any(|l| leading_indent_cols(l) <= 4 && l.trim_start().starts_with('@')))
+                    {
+                        header_start -= 1;
+                    } else {
+                        break;
+                    }
                 }
                 if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
                     new_start_idx = header_start;
@@ -387,10 +491,105 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 break;
             }
         }
+    } else if snippet.path.ends_with(".sql") {
+        for idx in (1..=min_idx).rev() {
+            if is_sql_statement_start(&snippet.lines[idx])
+                && (snippet.lines[idx - 1].trim().is_empty()
+                    || is_sql_statement_end(&snippet.lines[idx - 1])
+                    || snippet.lines[idx - 1].trim_start().starts_with("--"))
+            {
+                let mut header_start = idx;
+                while header_start > 0
+                    && snippet.lines[header_start - 1].trim_start().starts_with("--")
+                {
+                    header_start -= 1;
+                }
+                new_start_idx = header_start;
+                break;
+            }
+        }
+        for idx in max_idx..snippet.lines.len() {
+            if is_sql_statement_end(&snippet.lines[idx]) {
+                new_end_idx = idx;
+                break;
+            }
+            if idx > max_idx
+                && is_sql_statement_start(&snippet.lines[idx])
+                && snippet.lines[idx - 1].trim().is_empty()
+            {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+        }
+    } else if is_makefile_or_justfile_path(&snippet.path) {
+        for idx in (1..=min_idx).rev() {
+            if is_makefile_target_header(&snippet.lines[idx]) {
+                let mut header_start = idx;
+                while header_start > 0
+                    && snippet.lines[header_start - 1].trim_start().starts_with('#')
+                {
+                    header_start -= 1;
+                }
+                if header_start == 0 || snippet.lines[header_start - 1].trim().is_empty() {
+                    new_start_idx = header_start;
+                    break;
+                }
+            }
+        }
+        for idx in (max_idx + 1)..snippet.lines.len() {
+            if is_makefile_target_header(&snippet.lines[idx])
+                && snippet.lines[idx - 1].trim().is_empty()
+            {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+        }
+    } else if is_dockerfile_path(&snippet.path) {
+        let is_from_line = |line: &str| {
+            leading_indent_cols(line) == 0
+                && line
+                    .trim_start()
+                    .get(..5)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("FROM "))
+        };
+        for idx in (1..=min_idx).rev() {
+            if is_from_line(&snippet.lines[idx]) {
+                let mut header_start = idx;
+                while header_start > 0
+                    && snippet.lines[header_start - 1].trim_start().starts_with('#')
+                {
+                    header_start -= 1;
+                }
+                new_start_idx = header_start;
+                break;
+            }
+        }
+        for idx in (max_idx + 1)..snippet.lines.len() {
+            if is_from_line(&snippet.lines[idx]) {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx
+                    && (snippet.lines[end_idx].trim().is_empty()
+                        || snippet.lines[end_idx].trim_start().starts_with('#'))
+                {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+        }
     } else {
         let is_sfc = snippet.path.ends_with(".vue")
             || snippet.path.ends_with(".svelte")
             || snippet.path.ends_with(".astro");
+        let is_end_lang = is_end_keyword_language_path(&snippet.path);
         let is_block_close = |line: &str| {
             if leading_indent_cols(line) > 4 {
                 return false;
@@ -400,10 +599,19 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 || trimmed == "};"
                 || trimmed == "});"
                 || trimmed == "})"
+                || trimmed == "]);"
+                || trimmed == "])"
                 || trimmed == "));"
                 || trimmed == "))"
                 || trimmed.starts_with("} satisfies ")
-                || trimmed.starts_with("} as const")
+                || trimmed.starts_with("} as ")
+                || trimmed.starts_with("}; //")
+                || trimmed.starts_with("}); //")
+                || (is_end_lang
+                    && (trimmed == "end"
+                        || trimmed == "fi"
+                        || trimmed == "done"
+                        || trimmed == "esac"))
         };
         for idx in (1..=min_idx).rev() {
             if is_sfc && is_sfc_section_open(&snippet.lines[idx]) {
@@ -576,6 +784,7 @@ fn assemble_inner(
     for snippet in &mut snippets {
         clamp_snippet_to_block(snippet, &result.matches, radius);
     }
+    coalesce_adjacent_snippets(&mut snippets);
     if verify_lines {
         for hit in &result.matches {
             let current = snippets
@@ -600,4 +809,31 @@ fn assemble_inner(
     };
     check_context_size(&output)?;
     Ok(output)
+}
+
+fn coalesce_adjacent_snippets(snippets: &mut Vec<Snippet>) {
+    if snippets.len() <= 1 {
+        return;
+    }
+    let mut merged: Vec<Snippet> = Vec::with_capacity(snippets.len());
+    for current in snippets.drain(..) {
+        if let Some(prev) = merged.last_mut()
+            && prev.path == current.path
+            && prev.sha256 == current.sha256
+            && current.start >= prev.start
+            && current.start <= prev.end.saturating_add(1)
+            && current.end.max(prev.end) - prev.start < 500
+        {
+            if current.end > prev.end {
+                let skip = (prev.end + 1).saturating_sub(current.start);
+                if skip < current.lines.len() {
+                    prev.lines.extend_from_slice(&current.lines[skip..]);
+                    prev.end = current.end;
+                }
+            }
+        } else {
+            merged.push(current);
+        }
+    }
+    *snippets = merged;
 }

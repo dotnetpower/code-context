@@ -192,18 +192,54 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
     # Do not parse, execute, or rewrite arbitrary shell commands.
     if tool in {"bash", "run_in_terminal"}:
         return {"classification": "unknown", "reason": "shell_command_not_interpreted"}
-    target_root = arguments.get("root") or cwd
+    target_root = (
+        arguments.get("root")
+        or arguments.get("workspaceRoot")
+        or arguments.get("workspace_root")
+        or arguments.get("projectRoot")
+        or arguments.get("project_root")
+        or arguments.get("cwd")
+        or cwd
+    )
     paths = []
     is_read = tool in {"view", "read_file"} or tool.endswith(("NativeRead", "codeRead", "code_read"))
     if is_read:
         if tool in {"view", "read_file"}:
-            value = arguments.get("path", arguments.get("filePath"))
+            value = (
+                arguments.get("path")
+                or arguments.get("filePath")
+                or arguments.get("file_path")
+                or arguments.get("filepath")
+            )
             paths = [value] if isinstance(value, str) else []
         else:
             ranges = arguments.get("ranges", [])
-            paths = [item["path"] for item in ranges if isinstance(item, dict) and isinstance(item.get("path"), str)]
+            if isinstance(ranges, list) and ranges:
+                paths = [
+                    item.get("path") or item.get("filePath") or item.get("file_path")
+                    for item in ranges
+                    if isinstance(item, dict)
+                    and isinstance(item.get("path") or item.get("filePath") or item.get("file_path"), str)
+                ]
+            elif isinstance(arguments.get("paths"), list):
+                paths = [p for p in arguments["paths"] if isinstance(p, str)]
+            else:
+                single = (
+                    arguments.get("path")
+                    or arguments.get("filePath")
+                    or arguments.get("file_path")
+                    or arguments.get("file")
+                )
+                paths = [single] if isinstance(single, str) else []
     else:
-        values = arguments.get("paths", arguments.get("path"))
+        values = (
+            arguments.get("paths")
+            or arguments.get("path")
+            or arguments.get("file_path")
+            or arguments.get("filePath")
+            or arguments.get("dir")
+            or arguments.get("directory")
+        )
         if isinstance(values, str):
             paths = [values]
         elif isinstance(values, list):
@@ -253,7 +289,10 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
             continue
         admitted = entry["files"]
         if is_read:
-            if relative in admitted:
+            clean_rel = relative.split("#", 1)[0]
+            if ":" in clean_rel and clean_rel.rsplit(":", 1)[1].replace("-", "").replace(":", "").isdigit():
+                clean_rel = clean_rel.split(":", 1)[0]
+            if relative in admitted or clean_rel in admitted:
                 verdicts.append(("eligible", "admitted_file"))
             else:
                 verdicts.append(("legitimate_fallback", "not_in_permitted_inventory"))

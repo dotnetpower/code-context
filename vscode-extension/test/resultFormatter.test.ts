@@ -113,17 +113,20 @@ void test('context results include numbered source without JSON processing', () 
 
   const multiHit = formatToolResult('code_context', {
     search: {
-      total_matches: 3,
+      total_matches: 5,
       truncated: false,
       matches: [
         { path: 'src/main.rs', line: 7 },
         { path: 'src/main.rs', line: 12 },
+        { path: 'src/main.rs', line: 20 },
+        { path: 'src/main.rs', line: 21 },
+        { path: 'src/main.rs', line: 22 },
         { path: 'src/lib.rs', line: 4 },
       ],
     },
     snippets: [],
   });
-  assert.match(multiHit, /src\/main\.rs:7,12\nsrc\/lib\.rs:4/);
+  assert.match(multiHit, /src\/main\.rs:7,12,20-22\nsrc\/lib\.rs:4/);
 });
 
 void test('read ranges retain path, hash, and line numbers', () => {

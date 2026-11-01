@@ -883,24 +883,61 @@ pub(crate) fn trim_line_start(line: &str) -> &str {
 fn strip_modifier(trimmed: &str) -> Option<&str> {
     let bytes = trimmed.as_bytes();
     match bytes.first()? {
-        b'p' => [
-            "pub(crate) ",
-            "pub(super) ",
-            "pub ",
-            "protected ",
-            "private ",
-            "public ",
-            "partial ",
-        ]
-        .iter()
-        .find_map(|prefix| trimmed.strip_prefix(prefix)),
-        b'e' => trimmed.strip_prefix("export "),
-        b'd' => ["default ", "declare "]
+        b'p' => {
+            if let Some(rest) = trimmed.strip_prefix("pub(")
+                && let Some((_, after_paren)) = rest.split_once(')')
+            {
+                let after_paren = after_paren.trim_start();
+                if !after_paren.is_empty() {
+                    return Some(after_paren);
+                }
+            }
+            [
+                "pub ",
+                "protected ",
+                "private ",
+                "public ",
+                "partial ",
+            ]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        }
+        b'e' => {
+            if let Some(rest) = trimmed.strip_prefix("export ") {
+                return Some(rest);
+            }
+            if let Some(rest) = trimmed.strip_prefix("external ") {
+                return Some(rest);
+            }
+            if let Some(rest) = trimmed.strip_prefix("extern ") {
+                let rest = rest.trim_start();
+                if let Some(after_quote) = rest.strip_prefix('"')
+                    && let Some((_, after_abi)) = after_quote.split_once('"')
+                {
+                    let after_abi = after_abi.trim_start();
+                    if !after_abi.is_empty() {
+                        return Some(after_abi);
+                    }
+                } else if rest.starts_with("fn ")
+                    || rest.starts_with("type ")
+                    || rest.starts_with("static ")
+                {
+                    return Some(rest);
+                }
+            }
+            None
+        }
+        b'd' => ["default ", "declare ", "data "]
             .iter()
             .find_map(|prefix| trimmed.strip_prefix(prefix)),
-        b'i' => trimmed.strip_prefix("internal "),
+        b'i' => ["internal ", "inline ", "infix "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
         b's' => {
-            if let Some(rest) = trimmed.strip_prefix("sealed ") {
+            if let Some(rest) = trimmed
+                .strip_prefix("sealed ")
+                .or_else(|| trimmed.strip_prefix("suspend "))
+            {
                 return Some(rest);
             }
             if let Some(rest) = trimmed.strip_prefix("static ") {
@@ -910,6 +947,8 @@ fn strip_modifier(trimmed: &str) -> Option<&str> {
                     || next.starts_with("class ")
                     || next.starts_with("function")
                     || next.starts_with("readonly ")
+                    || next.starts_with("fun ")
+                    || next.starts_with("func ")
                 {
                     return Some(rest);
                 }
@@ -921,10 +960,17 @@ fn strip_modifier(trimmed: &str) -> Option<&str> {
             .find_map(|prefix| trimmed.strip_prefix(prefix)),
         b'u' => trimmed.strip_prefix("unsafe "),
         b'c' => {
+            if let Some(rest) = trimmed.strip_prefix("companion ") {
+                return Some(rest);
+            }
+            if let Some(rest) = trimmed.strip_prefix("convenience ") {
+                return Some(rest);
+            }
             if let Some(rest) = trimmed.strip_prefix("const ") {
                 let next = rest.trim_start();
                 if next.starts_with("fn ")
                     || next.starts_with("unsafe ")
+                    || next.starts_with("extern ")
                     || next.starts_with("enum ")
                 {
                     return Some(rest);
@@ -932,9 +978,24 @@ fn strip_modifier(trimmed: &str) -> Option<&str> {
             }
             None
         }
-        b'v' => trimmed.strip_prefix("virtual "),
-        b'o' => trimmed.strip_prefix("override "),
-        b'r' => trimmed.strip_prefix("readonly "),
+        b'v' => ["virtual ", "value "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'o' => ["override ", "open ", "operator "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'r' => ["readonly ", "reified ", "required "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'f' => ["final ", "fileprivate "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'l' => ["local ", "lateinit "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'm' => trimmed.strip_prefix("mutating "),
+        b'n' => trimmed.strip_prefix("nonmutating "),
+        b't' => trimmed.strip_prefix("tailrec "),
         _ => None,
     }
 }
@@ -1010,9 +1071,39 @@ fn is_vite_plugin_hook_line(trimmed: &str) -> bool {
         "handleHotUpdate(",
         "resolveId(",
         "transform(",
+        "load(",
+        "buildStart(",
+        "buildEnd(",
+        "generateBundle(",
+        "writeBundle(",
     ]
     .iter()
     .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn is_sql_ddl_definition_line(trimmed: &str) -> bool {
+    let upper = trimmed.get(..36).unwrap_or(trimmed).to_ascii_uppercase();
+    [
+        "CREATE TABLE ",
+        "CREATE TEMP TABLE ",
+        "CREATE TEMPORARY TABLE ",
+        "CREATE VIEW ",
+        "CREATE OR REPLACE VIEW ",
+        "CREATE MATERIALIZED VIEW ",
+        "CREATE INDEX ",
+        "CREATE UNIQUE INDEX ",
+        "CREATE FUNCTION ",
+        "CREATE OR REPLACE FUNCTION ",
+        "CREATE PROCEDURE ",
+        "CREATE OR REPLACE PROCEDURE ",
+        "CREATE TRIGGER ",
+        "CREATE TYPE ",
+        "CREATE DOMAIN ",
+        "CREATE SCHEMA ",
+        "ALTER TABLE ",
+    ]
+    .iter()
+    .any(|prefix| upper.starts_with(prefix))
 }
 
 pub(crate) fn is_definition_line(line: &str) -> bool {
@@ -1033,6 +1124,7 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
             || trimmed.starts_with("declare ")
             || trimmed.starts_with("pub ")
             || trimmed.starts_with("pub(")
+            || trimmed.starts_with("public ")
         {
             had_export_or_declare = true;
         }
@@ -1042,11 +1134,12 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
         return 0;
     };
     if matches!(first, b'c' | b'l' | b'v') {
-        let is_const = trimmed.starts_with("const ");
+        let is_const = trimmed.starts_with("const ") || trimmed.starts_with("val ");
         if let Some(after_kw) = trimmed
             .strip_prefix("const ")
             .or_else(|| trimmed.strip_prefix("let "))
             .or_else(|| trimmed.strip_prefix("var "))
+            .or_else(|| trimmed.strip_prefix("val "))
         {
             let after_trimmed = after_kw.trim_start();
             if after_trimmed.starts_with("_ ") || after_trimmed.starts_with("_=") {
@@ -1060,11 +1153,39 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
                 || after_trimmed.contains("lazy(")
                 || after_trimmed.contains("defineConfig(")
                 || after_trimmed.contains("createSlice(")
-                || after_trimmed.contains("createStore(");
+                || after_trimmed.contains("createStore(")
+                || after_trimmed.contains("defineStore(")
+                || after_trimmed.contains("createServerFn(")
+                || after_trimmed.contains("createFileRoute(")
+                || after_trimmed.contains("createRootRoute(")
+                || after_trimmed.contains("createRoute(")
+                || after_trimmed.contains("createLazyFileRoute(")
+                || after_trimmed.contains("defineProps")
+                || after_trimmed.contains("defineEmits")
+                || after_trimmed.contains("defineModel")
+                || after_trimmed.contains("$state(")
+                || after_trimmed.contains("$state.raw(")
+                || after_trimmed.contains("$derived(")
+                || after_trimmed.contains("$derived.by(")
+                || after_trimmed.contains("$props(")
+                || after_trimmed.contains("createSignal(")
+                || after_trimmed.contains("createResource(")
+                || after_trimmed.contains("createMemo(")
+                || after_trimmed.contains("useActionState(")
+                || after_trimmed.contains("useOptimistic(")
+                || after_trimmed.contains("queryOptions(")
+                || after_trimmed.contains("infiniteQueryOptions(")
+                || after_trimmed.contains("atom(")
+                || after_trimmed.contains("pgTable(")
+                || after_trimmed.contains("mysqlTable(")
+                || after_trimmed.contains("sqliteTable(")
+                || after_trimmed.contains("z.object(")
+                || after_trimmed.contains("z.enum(")
+                || after_trimmed.contains("v.object(");
             if had_export_or_declare {
                 return if indent == 0 { 4 } else { 3 };
             }
-            if indent == 0 && is_component_or_fn {
+            if indent <= 2 && is_component_or_fn {
                 return 3;
             }
             if is_const && indent == 0 {
@@ -1076,10 +1197,15 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
     if indent <= 4 && is_vite_plugin_hook_line(trimmed) {
         return 2;
     }
+    if indent <= 2 && is_sql_ddl_definition_line(trimmed) {
+        return 3;
+    }
     let keywords: &[&str] = match first {
         b'f' => &[
             "fn ",
+            "fun ",
             "func ",
+            "func(",
             "function ",
             "function*",
             "function(",
@@ -1087,28 +1213,158 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
             "forwardRef<",
             "fragment ",
         ],
-        b's' => &["struct ", "static ", "scalar ", "subscription "],
-        b'e' => &["enum ", "extend type ", "extend interface ", "extend input "],
-        b't' => &["trait ", "type "],
-        b'i' => &["impl ", "impl<", "interface ", "input "],
-        b'm' => &["mod ", "macro_rules!", "module ", "memo(", "memo<", "model ", "mutation "],
+        b's' => &[
+            "struct ",
+            "static ",
+            "scalar ",
+            "subscription ",
+            "service ",
+            "schema ",
+            "schema{",
+            "scope :",
+            "sub ",
+            "subscript(",
+        ],
+        b'e' => &[
+            "enum ",
+            "extension ",
+            "extend type ",
+            "extend interface ",
+            "extend input ",
+            "event ",
+        ],
+        b't' => &[
+            "trait ",
+            "type ",
+            "table ",
+            "terraform ",
+            "terraform{",
+            "targetScope ",
+        ],
+        b'i' => &[
+            "impl ",
+            "impl<",
+            "interface ",
+            "input ",
+            "init(",
+            "init?(",
+        ],
+        b'm' => &[
+            "mod ",
+            "macro_rules!",
+            "macro ",
+            "module ",
+            "mixin ",
+            "memo(",
+            "memo<",
+            "model ",
+            "mutation ",
+            "message ",
+        ],
         b'c' => &[
             "class ",
             "createContext(",
             "createContext<",
             "createSlice(",
             "createStore(",
+            "createServerFn(",
+            "createServerFn<",
+            "createFileRoute(",
+            "createRootRoute(",
+            "createRoute(",
+            "createLazyFileRoute(",
+            "createSignal(",
+            "createEffect(",
+            "createResource(",
+            "createMemo(",
+            "cmake_minimum_required(",
         ],
         b'd' => &[
             "def ",
+            "defp ",
+            "defmodule ",
+            "defmacro ",
+            "defmacrop ",
+            "defguard ",
+            "defguardp ",
+            "defprotocol ",
+            "defimpl ",
+            "defstruct",
+            "defexception ",
+            "defdelegate ",
             "defineConfig(",
             "defineVitestConfig(",
+            "defineNuxtConfig(",
+            "definePageMeta(",
+            "defineEventHandler(",
+            "defineNitroPlugin(",
+            "defineAppConfig(",
+            "defineStore(",
+            "defineProps",
+            "defineEmits",
+            "defineModel",
+            "defineExpose",
+            "defineOptions",
+            "defineSlots",
             "datasource ",
+            "directive @",
+            "data \"",
         ],
         b'n' => &["namespace "],
-        b'l' => &["lazy(", "lazy<"],
-        b'g' => &["global ", "global{", "generator "],
-        b'q' => &["query "],
+        b'l' => &[
+            "lazy(",
+            "lazy<",
+            "loader(",
+            "clientLoader(",
+            "locals ",
+            "locals{",
+        ],
+        b'g' => &[
+            "global ",
+            "global{",
+            "generator ",
+            "generateMetadata(",
+            "generateStaticParams(",
+            "generateViewport(",
+        ],
+        b'q' => &["query ", "queryOptions(", "infiniteQueryOptions("],
+        b'a' => &[
+            "actor ",
+            "associatedtype ",
+            "action(",
+            "clientAction(",
+            "attr_reader ",
+            "attr_writer ",
+            "attr_accessor ",
+            "add_executable(",
+            "add_library(",
+        ],
+        b'p' => &[
+            "package ",
+            "protocol ",
+            "proc ",
+            "property ",
+            "param ",
+            "provider \"",
+            "project(",
+        ],
+        b'o' => &[
+            "object ",
+            "oneof ",
+            "output \"",
+            "output ",
+        ],
+        b'r' => &[
+            "resource \"",
+            "resource ",
+            "rpc ",
+            "root_type ",
+        ],
+        b'u' => &["union ", "useActionState(", "useOptimistic(", "useFormStatus("],
+        b'v' => &["variable \""],
+        b'F' => &["FROM "],
+        b'E' => &["ENTRYPOINT "],
+        b'C' => &["CMD "],
         b'R' => &[
             "React.memo(",
             "React.memo<",
@@ -1128,8 +1384,16 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
             "@theme ",
             "@theme{",
             "@custom-media ",
+            "@Component(",
+            "@Injectable(",
+            "@Directive(",
+            "@Pipe(",
+            "@NgModule(",
+            "@Controller(",
+            "@Module(",
         ],
         b':' => &[":root ", ":root{"],
+        b'$' => &["$effect(", "$effect.pre("],
         _ => &[],
     };
     if keywords.iter().any(|keyword| trimmed.starts_with(keyword)) {
@@ -1147,13 +1411,60 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
     0
 }
 
+pub(crate) fn is_comment_only_line(line: &str, is_doc_file: bool) -> bool {
+    let trimmed = trim_line_start(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("*/")
+        || trimmed == "*"
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("-- ")
+    {
+        return true;
+    }
+    if !is_doc_file
+        && trimmed.starts_with('#')
+        && !trimmed.starts_with("#[")
+        && !trimmed.starts_with("#![")
+        && !trimmed.starts_with("#include")
+        && !trimmed.starts_with("#define")
+        && !trimmed.starts_with("#ifdef")
+        && !trimmed.starts_with("#ifndef")
+        && !trimmed.starts_with("#endif")
+        && !trimmed.starts_with("#pragma")
+        && !trimmed.starts_with("#region")
+        && !trimmed.starts_with("#endregion")
+        && !trimmed.starts_with("#error")
+        && !trimmed.starts_with("#warning")
+        && !trimmed.starts_with("#!")
+    {
+        return true;
+    }
+    false
+}
+
 fn is_low_signal_usage_line(line: &str) -> bool {
     let trimmed = trim_line_start(line).trim_end();
     (trimmed.starts_with("</") && trimmed.ends_with('>'))
         || trimmed.starts_with("console.log(")
         || trimmed.starts_with("console.debug(")
+        || trimmed.starts_with("console.info(")
+        || trimmed.starts_with("console.warn(")
+        || trimmed.starts_with("console.error(")
+        || trimmed.starts_with("console.trace(")
+        || trimmed.starts_with("logger.debug(")
+        || trimmed.starts_with("logger.trace(")
+        || trimmed.starts_with("tracing::debug!(")
+        || trimmed.starts_with("tracing::trace!(")
+        || trimmed.starts_with("log::debug!(")
+        || trimmed.starts_with("log::trace!(")
         || trimmed == "debugger;"
         || trimmed == "debugger"
+        || trimmed.starts_with("todo!(")
+        || trimmed.starts_with("unimplemented!(")
 }
 
 pub(crate) fn is_import_line(line: &str) -> bool {
@@ -1161,12 +1472,28 @@ pub(crate) fn is_import_line(line: &str) -> bool {
     trimmed.starts_with("use ")
         || trimmed.starts_with("import ")
         || trimmed.starts_with("import(")
+        || trimmed.starts_with("import (")
         || trimmed.starts_with("import\"")
+        || trimmed.starts_with("import \"")
         || trimmed.starts_with("import'")
+        || trimmed.starts_with("import '")
         || trimmed.starts_with("import{")
         || trimmed.starts_with("import*")
         || trimmed.starts_with("from ")
         || trimmed.starts_with("#include")
+        || trimmed.starts_with("using ")
+        || trimmed.starts_with("extern crate ")
+        || trimmed.starts_with("require ")
+        || trimmed.starts_with("require_relative ")
+        || trimmed.starts_with("require_once ")
+        || trimmed.starts_with("require_once(")
+        || trimmed.starts_with("include_once ")
+        || trimmed.starts_with("include_once(")
+        || trimmed.starts_with("alias ")
+        || trimmed.starts_with("export '")
+        || trimmed.starts_with("part '")
+        || trimmed.starts_with("part of ")
+        || trimmed.starts_with("inherit ")
         || trimmed.starts_with("} from ")
         || trimmed.starts_with("}from ")
         || trimmed.starts_with("@import ")
@@ -1237,6 +1564,7 @@ fn record_document(
                 .filter(|&line| {
                     let text = document.line(line);
                     !(is_low_signal_usage_line(text)
+                        || is_comment_only_line(text, is_doc_file)
                         || is_doc_file && crate::document::is_document_boilerplate_line(text))
                 })
                 .collect();
@@ -1320,6 +1648,37 @@ fn validate(query: &Query) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn strip_path_line_or_anchor_suffix(raw: &str) -> &str {
+    let mut s = raw.trim();
+    while let Some(rest) = s.strip_prefix("./") {
+        if rest.is_empty() {
+            break;
+        }
+        s = rest;
+    }
+    if s.len() > 1 {
+        s = s.trim_end_matches('/');
+    }
+    if let Some((before_hash, after_hash)) = s.rsplit_once('#')
+        && !before_hash.is_empty()
+        && !after_hash.is_empty()
+        && before_hash.contains('.')
+    {
+        s = before_hash;
+    }
+    if let Some((before_colon, after_colon)) = s.split_once(':')
+        && before_colon.len() > 1
+        && !after_colon.is_empty()
+        && after_colon.as_bytes()[0].is_ascii_digit()
+        && after_colon
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'-'))
+    {
+        s = before_colon;
+    }
+    s
+}
+
 pub(crate) fn paths(prefixes: &[String]) -> Result<Vec<std::path::PathBuf>> {
     if prefixes.len() > 64
         || prefixes.iter().any(|path| path.len() > 4096)
@@ -1332,8 +1691,14 @@ pub(crate) fn paths(prefixes: &[String]) -> Result<Vec<std::path::PathBuf>> {
     prefixes
         .iter()
         .map(|path| {
-            safe_relative(Path::new(path))?;
-            Ok(normalize(Path::new(path)))
+            let cleaned = strip_path_line_or_anchor_suffix(path);
+            let target = if cleaned.is_empty() {
+                path.as_str()
+            } else {
+                cleaned
+            };
+            safe_relative(Path::new(target))?;
+            Ok(normalize(Path::new(target)))
         })
         .collect()
 }

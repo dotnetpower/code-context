@@ -46,6 +46,31 @@ export function validateDaemonStatus(value: JsonValue): void {
   }
 }
 
+export function compressLineNumbers(nums: readonly number[]): string {
+  if (nums.length <= 2) {
+    return nums.join(',');
+  }
+  const parts: string[] = [];
+  let i = 0;
+  while (i < nums.length) {
+    const start = nums[i]!;
+    let end = start;
+    let j = i + 1;
+    while (j < nums.length && nums[j] === end + 1) {
+      end = nums[j]!;
+      j += 1;
+    }
+    if (j - i >= 3) {
+      parts.push(`${start}-${end}`);
+      i = j;
+    } else {
+      parts.push(String(start));
+      i += 1;
+    }
+  }
+  return parts.join(',');
+}
+
 function formatSearch(value: JsonValue, includeFreshness = true): string {
   const search = recordValue(value, 'search result');
   const matches = arrayValue(search.matches, 'search matches');
@@ -57,7 +82,7 @@ function formatSearch(value: JsonValue, includeFreshness = true): string {
   let pendingLines: number[] = [];
   const flushPending = (): void => {
     if (previousPath !== undefined && pendingLines.length > 0) {
-      lines.push(`${previousPath}:${pendingLines.join(',')}`);
+      lines.push(`${previousPath}:${compressLineNumbers(pendingLines)}`);
       pendingLines = [];
     }
   };

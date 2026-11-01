@@ -252,6 +252,20 @@ fn class_ascii_small(class: &Class) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+fn class_unicode_single_utf8(class: &Class) -> Option<Vec<u8>> {
+    if let Class::Unicode(unicode) = class {
+        let ranges = unicode.ranges();
+        if ranges.len() == 1 && ranges[0].start() == ranges[0].end() {
+            let ch = ranges[0].start();
+            if !ch.is_ascii() {
+                let mut buf = [0_u8; 4];
+                return Some(ch.encode_utf8(&mut buf).as_bytes().to_vec());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 enum RunSlot {
     Pair([u8; 2]),
@@ -279,12 +293,11 @@ fn flush_run(run: &mut Vec<RunSlot>, conditions: &mut Vec<CandidateExpr>) {
             } else {
                 conditions.push(CandidateExpr::ByteClasses(pairs));
             }
-        } else if small_count == 1
-            && run.iter().all(|slot| match slot {
+        } else if small_count == 1 {
+            let all_exact = run.iter().all(|slot| match slot {
                 RunSlot::Pair(pair) => pair[0] == pair[1],
                 RunSlot::Small(_) => true,
-            })
-        {
+            });
             let mut branches = Vec::new();
             let small_idx = run
                 .iter()
@@ -295,15 +308,27 @@ fn flush_run(run: &mut Vec<RunSlot>, conditions: &mut Vec<CandidateExpr>) {
                 RunSlot::Pair(_) => &[],
             };
             for &choice in choices {
-                let mut literal = Vec::with_capacity(run.len());
-                for (idx, slot) in run.iter().enumerate() {
-                    if idx == small_idx {
-                        literal.push(choice);
-                    } else if let RunSlot::Pair([b, _]) = slot {
-                        literal.push(*b);
+                if all_exact {
+                    let mut literal = Vec::with_capacity(run.len());
+                    for (idx, slot) in run.iter().enumerate() {
+                        if idx == small_idx {
+                            literal.push(choice);
+                        } else if let RunSlot::Pair([b, _]) = slot {
+                            literal.push(*b);
+                        }
                     }
+                    branches.push(CandidateExpr::Literal(literal));
+                } else {
+                    let mut pairs = Vec::with_capacity(run.len());
+                    for (idx, slot) in run.iter().enumerate() {
+                        if idx == small_idx {
+                            pairs.push([choice, choice]);
+                        } else if let RunSlot::Pair(pair) = slot {
+                            pairs.push(*pair);
+                        }
+                    }
+                    branches.push(CandidateExpr::ByteClasses(pairs));
                 }
-                branches.push(CandidateExpr::Literal(literal));
             }
             if !branches.is_empty() {
                 conditions.push(CandidateExpr::Or(branches).simplify());
@@ -311,6 +336,56 @@ fn flush_run(run: &mut Vec<RunSlot>, conditions: &mut Vec<CandidateExpr>) {
         }
     }
     run.clear();
+}
+
+fn push_concat_item(
+    child: &Hir,
+    depth: usize,
+    run: &mut Vec<RunSlot>,
+    conditions: &mut Vec<CandidateExpr>,
+) {
+    if depth > 64 {
+        flush_run(run, conditions);
+        return;
+    }
+    match child.kind() {
+        HirKind::Empty | HirKind::Look(_) => {}
+        HirKind::Literal(literal) => {
+            for &byte in &literal.0 {
+                run.push(RunSlot::Pair([byte, byte]));
+            }
+        }
+        HirKind::Capture(capture) => {
+            push_concat_item(&capture.sub, depth + 1, run, conditions);
+        }
+        HirKind::Concat(nested) => {
+            for sub in nested {
+                push_concat_item(sub, depth + 1, run, conditions);
+            }
+        }
+        HirKind::Class(class) => {
+            if let Some(pair) = class_ascii_pair(class) {
+                run.push(RunSlot::Pair(pair));
+            } else if let Some(utf8_bytes) = class_unicode_single_utf8(class) {
+                for byte in utf8_bytes {
+                    run.push(RunSlot::Pair([byte, byte]));
+                }
+            } else if let Some(small) = class_ascii_small(class) {
+                if run.iter().any(|slot| matches!(slot, RunSlot::Small(_))) {
+                    flush_run(run, conditions);
+                }
+                run.push(RunSlot::Small(small));
+            } else {
+                flush_run(run, conditions);
+            }
+        }
+        _ => {
+            flush_run(run, conditions);
+            if let Some(cond) = mandatory(child, depth + 1) {
+                conditions.push(cond);
+            }
+        }
+    }
 }
 
 fn mandatory(hir: &Hir, depth: usize) -> Option<CandidateExpr> {
@@ -325,31 +400,7 @@ fn mandatory(hir: &Hir, depth: usize) -> Option<CandidateExpr> {
             let mut conditions = Vec::new();
             let mut run: Vec<RunSlot> = Vec::new();
             for child in children {
-                match child.kind() {
-                    HirKind::Literal(literal) => {
-                        for &byte in &literal.0 {
-                            run.push(RunSlot::Pair([byte, byte]));
-                        }
-                    }
-                    HirKind::Class(class) => {
-                        if let Some(pair) = class_ascii_pair(class) {
-                            run.push(RunSlot::Pair(pair));
-                        } else if let Some(small) = class_ascii_small(class) {
-                            if run.iter().any(|slot| matches!(slot, RunSlot::Small(_))) {
-                                flush_run(&mut run, &mut conditions);
-                            }
-                            run.push(RunSlot::Small(small));
-                        } else {
-                            flush_run(&mut run, &mut conditions);
-                        }
-                    }
-                    _ => {
-                        flush_run(&mut run, &mut conditions);
-                        if let Some(cond) = mandatory(child, depth + 1) {
-                            conditions.push(cond);
-                        }
-                    }
-                }
+                push_concat_item(child, depth, &mut run, &mut conditions);
             }
             flush_run(&mut run, &mut conditions);
             match conditions.len() {

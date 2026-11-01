@@ -1240,9 +1240,16 @@ pub fn format_markdown_table(rows: &[Vec<String>]) -> Vec<String> {
     }
     let mut lines = Vec::with_capacity(rows.len() + 1);
     for (idx, row) in rows.iter().enumerate() {
-        let mut padded: Vec<&str> = row.iter().map(String::as_str).collect();
+        let mut padded: Vec<String> = row
+            .iter()
+            .map(|cell| {
+                cell.replace("\r\n", " ")
+                    .replace(['\r', '\n'], " ")
+                    .replace('|', "\\|")
+            })
+            .collect();
         while padded.len() < col_count {
-            padded.push("");
+            padded.push(String::new());
         }
         lines.push(format!("| {} |", padded.join(" | ")));
         if idx == 0 {
@@ -2871,9 +2878,11 @@ pub fn extract_pdf(bytes: &[u8]) -> Result<String> {
     let raw_str = String::from_utf8_lossy(bytes);
     let meta = DocumentMetadata {
         title: extract_pdf_info_field(&raw_str, "/Title"),
-        creator: extract_pdf_info_field(&raw_str, "/Author"),
+        creator: extract_pdf_info_field(&raw_str, "/Author")
+            .or_else(|| extract_pdf_info_field(&raw_str, "/Creator")),
         subject: extract_pdf_info_field(&raw_str, "/Subject"),
         keywords: extract_pdf_info_field(&raw_str, "/Keywords"),
+        application: extract_pdf_info_field(&raw_str, "/Producer"),
         ..Default::default()
     };
 
@@ -3147,8 +3156,18 @@ pub fn extract_ipynb(bytes: &[u8]) -> Result<String> {
             out.push_str(&format!("## [Notebook Cell {cell_num}: markdown]\n"));
             out.push_str(source.trim_end());
             out.push_str("\n\n");
+        } else if cell_type == "raw" {
+            out.push_str(&format!("## [Notebook Cell {cell_num}: raw]\n"));
+            out.push_str(source.trim_end());
+            out.push_str("\n\n");
         } else {
-            out.push_str(&format!("## [Notebook Cell {cell_num}: code ({lang})]\n"));
+            if let Some(exec_count) = cell.get("execution_count").and_then(serde_json::Value::as_u64) {
+                out.push_str(&format!(
+                    "## [Notebook Cell {cell_num}: code ({lang}) In[{exec_count}]]\n"
+                ));
+            } else {
+                out.push_str(&format!("## [Notebook Cell {cell_num}: code ({lang})]\n"));
+            }
             out.push_str(source.trim_end());
             out.push('\n');
             if let Some(outputs) = cell.get("outputs").and_then(serde_json::Value::as_array) {
@@ -3157,6 +3176,8 @@ pub fn extract_ipynb(bytes: &[u8]) -> Result<String> {
                         .get("text")
                         .map(json_lines)
                         .or_else(|| output.pointer("/data/text/plain").map(json_lines))
+                        .or_else(|| output.pointer("/data/text/markdown").map(json_lines))
+                        .or_else(|| output.pointer("/data/text/latex").map(json_lines))
                         .unwrap_or_default();
                     if !text_out.trim().is_empty() {
                         out.push_str("### [Cell Output]\n");
@@ -3170,6 +3191,18 @@ pub fn extract_ipynb(bytes: &[u8]) -> Result<String> {
                         output.get("evalue").and_then(serde_json::Value::as_str),
                     ) {
                         out.push_str(&format!("### [Cell Error] {ename}: {evalue}\n"));
+                        if let Some(tb) = output.get("traceback").and_then(serde_json::Value::as_array) {
+                            for tb_line in tb.iter().filter_map(serde_json::Value::as_str).take(12) {
+                                let clean = strip_ansi_escapes(tb_line);
+                                for sub in clean.lines() {
+                                    let trimmed_sub = sub.trim_end();
+                                    if !trimmed_sub.is_empty() {
+                                        out.push_str(trimmed_sub);
+                                        out.push('\n');
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3179,11 +3212,153 @@ pub fn extract_ipynb(bytes: &[u8]) -> Result<String> {
     Ok(out)
 }
 
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn extract_jsonl(text: &str) -> String {
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut key_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(obj) = val.as_object() {
+                for k in obj.keys() {
+                    if key_set.len() < 16 {
+                        key_set.insert(k.clone());
+                    }
+                }
+            }
+            records.push(val);
+        }
+    }
+    if records.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::from("# [Document Metadata]\n");
+    out.push_str(&format!("Count: {} records\n", records.len()));
+    if !key_set.is_empty() {
+        let keys: Vec<&str> = key_set.iter().map(String::as_str).collect();
+        out.push_str(&format!("Keys: {}\n", keys.join(", ")));
+    }
+    out.push('\n');
+    for (idx, val) in records.iter().enumerate() {
+        let rec_num = idx + 1;
+        out.push_str(&format!("## [Record {rec_num}]\n"));
+        if let Some(obj) = val.as_object() {
+            for (k, v) in obj {
+                match v {
+                    serde_json::Value::String(s) => out.push_str(&format!("{k}: {s}\n")),
+                    _ => out.push_str(&format!("{k}: {v}\n")),
+                }
+            }
+        } else {
+            out.push_str(&format!("{val}\n"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub fn extract_vtt_or_srt(text: &str) -> String {
+    let normalized = normalize_line_endings(text);
+    let mut out = String::new();
+    let mut cue_idx = 0usize;
+    let blocks: Vec<&str> = normalized.split("\n\n").collect();
+    for block in blocks {
+        let trimmed = block.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("WEBVTT")
+            || trimmed.starts_with("STYLE")
+            || trimmed.starts_with("REGION")
+        {
+            continue;
+        }
+        if let Some(note_rest) = trimmed.strip_prefix("NOTE") {
+            let note_body = note_rest.trim();
+            if !note_body.is_empty() {
+                out.push_str(&format!("### [Note] {note_body}\n\n"));
+            }
+            continue;
+        }
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let Some(arrow_pos) = lines.iter().position(|l| l.contains("-->")) else {
+            continue;
+        };
+        cue_idx += 1;
+        let cue_id = if arrow_pos > 0 && !lines[0].trim().is_empty() {
+            lines[0].trim().to_owned()
+        } else {
+            cue_idx.to_string()
+        };
+        let timing = lines[arrow_pos].trim();
+        out.push_str(&format!("### [Cue {cue_id}: {timing}]\n"));
+        for &payload_line in &lines[arrow_pos + 1..] {
+            let clean = strip_vtt_tags(payload_line.trim());
+            if !clean.is_empty() {
+                out.push_str(&clean);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn strip_vtt_tags(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after_lt = &rest[lt + 1..];
+        if let Some(gt) = after_lt.find('>') {
+            let tag = after_lt[..gt].trim();
+            if let Some(speaker) = tag.strip_prefix("v ") {
+                let speaker = speaker.trim();
+                if !speaker.is_empty() {
+                    out.push_str(&format!("[{speaker}]: "));
+                }
+            }
+            rest = &after_lt[gt + 1..];
+        } else {
+            out.push('<');
+            rest = after_lt;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn extract_xliff_or_tmx(xml: &str) -> String {
     let mut out = String::new();
     let mut cursor = 0usize;
-    while let Some(pos) = find_word_tag(xml, cursor, "trans-unit")
-        .or_else(|| find_word_tag(xml, cursor, "tu"))
+    while let Some(pos) = [
+        find_word_tag(xml, cursor, "trans-unit"),
+        find_word_tag(xml, cursor, "tu"),
+        find_word_tag(xml, cursor, "unit"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
     {
         let Some(gt) = xml[pos..].find('>') else {
             break;
@@ -3208,9 +3383,11 @@ pub fn extract_xliff_or_tmx(xml: &str) -> String {
 
         let id = extract_xml_attr(open_tag, "id")
             .or_else(|| extract_xml_attr(open_tag, "tuid"))
+            .or_else(|| extract_xml_attr(open_tag, "resname"))
             .unwrap_or_else(|| "unit".into());
         let source = extract_xml_tag_text(body, "source");
         let target = extract_xml_tag_text(body, "target");
+        let notes = extract_all_local_tag_texts(body, &["note"]);
         let segs = extract_all_local_tag_texts(body, &["seg"]);
         out.push_str(&format!("### [Translation Unit: {id}]\n"));
         if let Some(src) = source {
@@ -3221,6 +3398,9 @@ pub fn extract_xliff_or_tmx(xml: &str) -> String {
         }
         for seg in segs {
             out.push_str(&format!("Segment: {seg}\n"));
+        }
+        for note in notes {
+            out.push_str(&format!("Note: {note}\n"));
         }
         out.push('\n');
     }
@@ -3411,6 +3591,9 @@ pub fn is_document_path(path: &str) -> bool {
             | "bib"
             | "csv"
             | "tsv"
+            | "jsonl"
+            | "ndjson"
+            | "jsonlines"
             | "svg"
             | "xliff"
             | "xlf"
@@ -3553,7 +3736,12 @@ pub fn document_definition_priority(line: &str) -> u8 {
         {
             return 4;
         }
-        if trimmed.starts_with("#let ") || trimmed.starts_with("#show ") {
+        if trimmed.starts_with("#let ")
+            || trimmed.starts_with("#show ")
+            || trimmed.starts_with("#figure(")
+            || trimmed.starts_with("#table(")
+            || trimmed.starts_with("#outline(")
+        {
             return 3;
         }
     }
@@ -3603,12 +3791,23 @@ pub fn document_definition_priority(line: &str) -> u8 {
             "\\subsection*{",
             "\\subsubsection{",
             "\\subsubsection*{",
+            "\\paragraph{",
+            "\\paragraph*{",
+            "\\subparagraph{",
+            "\\subparagraph*{",
             "\\newcommand{",
             "\\renewcommand{",
             "\\DeclareRobustCommand{",
             "\\newtheorem{",
+            "\\caption{",
             "\\label{",
             "\\def\\",
+            "\\begin{theorem}",
+            "\\begin{lemma}",
+            "\\begin{proposition}",
+            "\\begin{corollary}",
+            "\\begin{definition}",
+            "\\begin{algorithm}",
         ] {
             if trimmed.starts_with(prefix) {
                 return 3;
@@ -3821,6 +4020,7 @@ fn is_extracted_unit_boundary(line: &str) -> bool {
         || trimmed.starts_with("## [Page ")
         || trimmed.starts_with("## [Notebook Cell ")
         || trimmed.starts_with("## [Chapter ")
+        || trimmed.starts_with("## [Record ")
         || trimmed.starts_with("# [Document Metadata]")
         || trimmed.starts_with("## [Footnotes]")
         || trimmed.starts_with("## [Endnotes]")
@@ -3829,6 +4029,7 @@ fn is_extracted_unit_boundary(line: &str) -> bool {
         || trimmed.starts_with("## [Charts]")
         || trimmed.starts_with("## [Sheet Comments]")
         || trimmed.starts_with("### [Translation Unit: ")
+        || trimmed.starts_with("### [Cue ")
 }
 
 fn parse_fence_marker(line: &str) -> Option<(u8, usize, bool)> {
@@ -4138,7 +4339,21 @@ pub fn clamp_document_snippet(
         }
 
         // 2e. Multi-line footnote definition ([^id]: ... followed by indented continuation lines)
+        let mut fn_start = None;
         if is_markdown_footnote_definition(lines[min_idx].trim_start()) {
+            fn_start = Some(min_idx);
+        } else if lines[min_idx].starts_with("  ") || lines[min_idx].starts_with('\t') {
+            for idx in (0..min_idx).rev() {
+                if is_markdown_footnote_definition(lines[idx].trim_start()) {
+                    fn_start = Some(idx);
+                    break;
+                }
+                if !(lines[idx].starts_with("  ") || lines[idx].starts_with('\t')) {
+                    break;
+                }
+            }
+        }
+        if let Some(start_idx) = fn_start {
             let mut fn_end = max_idx;
             while fn_end + 1 < lines.len() {
                 let next = &lines[fn_end + 1];
@@ -4148,16 +4363,27 @@ pub fn clamp_document_snippet(
                     break;
                 }
             }
-            return Some((min_idx, fn_end));
+            return Some((start_idx, fn_end));
         }
     }
 
-    // 3. LaTeX environment (\begin{...} .. \end{...}) or BibTeX entry (@article{...} .. })
+    // 3. LaTeX environment (\begin{...} .. \end{...}), BibTeX entry (@article{...} .. }), or VTT/SRT cue
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if (ext == "vtt" || ext == "srt") && !lines.iter().any(|l| is_extracted_unit_boundary(l)) {
+        let mut start = min_idx;
+        while start > 0 && !lines[start - 1].trim().is_empty() {
+            start -= 1;
+        }
+        let mut end = max_idx;
+        while end + 1 < lines.len() && !lines[end + 1].trim().is_empty() {
+            end += 1;
+        }
+        return Some((start, end));
+    }
     if ext == "bib" {
         let mut start = 0usize;
         for idx in (0..=min_idx).rev() {
@@ -4306,7 +4532,31 @@ fn strip_inline_markdown_for_slug(raw: &str) -> (String, Option<String>) {
         rest = after_open;
     }
     out.push_str(rest);
-    (out, explicit_id)
+    // Strip inline HTML tags (e.g. <code>, </code>, <em>, <strong>) and formatting markers
+    let mut clean_inline = String::with_capacity(out.len());
+    let mut scan = out.as_str();
+    while let Some(lt) = scan.find('<') {
+        clean_inline.push_str(&scan[..lt]);
+        let after_lt = &scan[lt + 1..];
+        if let Some(gt) = after_lt.find('>') {
+            let tag = &after_lt[..gt];
+            if !tag.is_empty()
+                && !tag.contains(' ')
+                && tag
+                    .trim_start_matches('/')
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric())
+            {
+                scan = &after_lt[gt + 1..];
+                continue;
+            }
+        }
+        clean_inline.push('<');
+        scan = after_lt;
+    }
+    clean_inline.push_str(scan);
+    let clean_inline = clean_inline.replace(['`', '*', '~'], "");
+    (clean_inline, explicit_id)
 }
 
 pub fn github_heading_slug(heading_line: &str) -> String {
@@ -4426,7 +4676,52 @@ pub fn inspect_structure(path: &str, text: &str) -> Vec<String> {
     }
     let masks = compute_markdown_block_masks(&lines);
     let is_md = is_markdown_path(path);
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let mut out = Vec::new();
+    if matches!(ext.as_str(), "jsonl" | "ndjson" | "jsonlines")
+        && !lines.iter().any(|l| is_extracted_unit_boundary(l))
+    {
+        let mut rec_num = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                rec_num += 1;
+                let summary = val
+                    .get("id")
+                    .or_else(|| val.get("name"))
+                    .or_else(|| val.get("type"))
+                    .or_else(|| val.get("event"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("object");
+                out.push(format!("L{}: [Record {rec_num}] {summary}", idx + 1));
+            }
+        }
+        return out;
+    }
+    if ext == "svg" {
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if let Some(title) = extract_xml_tag_text(trimmed, "title") {
+                out.push(format!("L{}: [svg:title] {title}", idx + 1));
+            } else if let Some(desc) = extract_xml_tag_text(trimmed, "desc") {
+                out.push(format!("L{}: [svg:desc] {desc}", idx + 1));
+            } else if (trimmed.starts_with("<g ") || trimmed.starts_with("<symbol "))
+                && let Some(id) = extract_xml_attr(trimmed, "id")
+            {
+                out.push(format!("L{}: [svg:id] #{id}", idx + 1));
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
     if let Some(fm_end) = masks.frontmatter_end {
         for (idx, line) in lines.iter().enumerate().take(fm_end).skip(1) {
             let trimmed = line.trim();

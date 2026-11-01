@@ -4,9 +4,10 @@
 
 ## Key Facts & Measured Impact
 
-- **Retrieval Speedup**: **6.83× faster** on the AKS Store Demo mixed retrieval suite (`3.809 ms → 0.557 ms`, 95% CI `6.65–7.06×`), **11.60× faster** on literal search, and **10.65× faster** on a 506-file Python suite (including **12.88×** on `ignore_case: true` queries via ASCII case-folded trigram indexing).
-- **Lookup Token Reduction**: Replacing multi-step `rg` + `view` calls with a single block-clamped `code_context` call cuts tool result payload tokens by **47.5% to 66.2% on Rust** (`29,396 → 9,929` tokens) and **49.5% to 71.1% on Python** (`24,126 → 6,971` tokens), or **84.6% to 91.5%** versus full-file reads.
+- **Retrieval Speedup**: **15.01× faster** on the AKS Store Demo mixed retrieval suite (`3.899 ms → 0.260 ms`, 95% CI `14.69–15.30×`), **20.50× faster** on literal search, and **18.54× faster** on search + context (including ASCII/UTF-8 case-folded trigram indexing).
+- **Lookup Token Reduction**: Replacing multi-step `rg` + `view` calls with a single block-clamped `code_context` call cuts tool result payload tokens by **73.2% to 84.0% on Rust** (`15,028–25,133 → 4,031` tokens) and **84.7% to 91.3% on Python** (`13,997–24,609 → 2,141` tokens).
 - **Coding Agent Acceleration (Copilot A/B Trials)**: Reduces tool calls by **61.9%** (`7.00 → 2.67`), LLM round-trip turns by **26.7%** (`5.00 → 3.67`), net session AIU billing cost by **25.4%**, and end-to-end task completion wall time by **24.7%** (`20.31s → 15.30s`) at 100% answer accuracy.
+- **Polyglot AST/Block Clamping & Rich Documents**: Prioritizes symbol definitions and clamps context blocks across Rust, Python, TypeScript/React 19/Vue/Svelte, Go, Kotlin, Swift, Elixir, Ruby, SQL, Protobuf, Terraform, Makefile, Dockerfile, Markdown (`#slug` anchor reads), and zero-dependency Office/ODF/EPUB/PDF/RTF/Jupyter/JSONL/SRT/WebVTT/XLIFF documents.
 - **Nonblocking Root Cache**: Cold lookups return `CACHE_MISS` immediately and schedule bounded background loading so agents never stall on startup or index warmup.
 
 ## Seven Native & MCP Tools

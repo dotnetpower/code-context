@@ -24,7 +24,7 @@ export function classifyOutcome(error?: string): Outcome {
   }
   if (
     error.startsWith('READ_RANGE_OUT_OF_BOUNDS ') ||
-    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root|No registered Code Context workspace|root must be an absolute path/u.test(error)
+    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.(64|1000)|provide 1\.\.64 ranges|include\/exclude globs|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root|No registered Code Context workspace|root must be an absolute path/u.test(error)
   ) {
     return 'invalid_request';
   }

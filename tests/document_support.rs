@@ -1044,6 +1044,120 @@ fn round_11_markdown_frontmatter_fences_setext_alerts_admonitions_tables_and_slu
     assert_eq!(anchor_read[1]["lines"][0], "## Performance Table");
 }
 
+#[test]
+fn round_12_jsonl_vtt_srt_xliff2_ipynb_errors_svg_and_inline_slug_stripping() {
+    use code_context::document::{
+        clamp_document_snippet, extract_ipynb, extract_jsonl, extract_vtt_or_srt,
+        extract_xliff_or_tmx, format_markdown_table, github_heading_slug, inspect_structure,
+    };
+
+    // 1. JSON Lines (.jsonl) extraction & structure inspection
+    let raw_jsonl = concat!(
+        "{\"id\":\"evt-1\",\"type\":\"tool_call\",\"tool\":\"cctxNativeContext\"}\n",
+        "{\"id\":\"evt-2\",\"type\":\"tool_result\",\"status\":\"ok\"}\n"
+    );
+    let extracted_jsonl = extract_jsonl(raw_jsonl);
+    assert!(extracted_jsonl.contains("Count: 2 records"));
+    assert!(extracted_jsonl.contains("## [Record 1]"));
+    assert!(extracted_jsonl.contains("tool: cctxNativeContext"));
+    let jsonl_outline = inspect_structure("logs/events.jsonl", raw_jsonl);
+    assert_eq!(
+        jsonl_outline,
+        vec![
+            "L1: [Record 1] evt-1".to_string(),
+            "L2: [Record 2] evt-2".to_string()
+        ]
+    );
+
+    // 2. WebVTT & SRT extraction + raw SRT cue clamping
+    let raw_vtt = concat!(
+        "WEBVTT\n\n",
+        "NOTE Intro segment\n\n",
+        "cue-1\n",
+        "00:00:01.000 --> 00:00:04.000\n",
+        "<v Alice>Welcome to Code Context!</v>\n\n",
+        "2\n",
+        "00:00:05.000 --> 00:00:08.000\n",
+        "Sub-millisecond trigram search.\n"
+    );
+    let vtt_out = extract_vtt_or_srt(raw_vtt);
+    assert!(vtt_out.contains("### [Note] Intro segment"));
+    assert!(vtt_out.contains("### [Cue cue-1: 00:00:01.000 --> 00:00:04.000]"));
+    assert!(vtt_out.contains("[Alice]: Welcome to Code Context!"));
+
+    let srt_lines: Vec<String> = vec![
+        "1",
+        "00:00:01,000 --> 00:00:03,000",
+        "First subtitle line",
+        "",
+        "2",
+        "00:00:04,000 --> 00:00:06,000",
+        "Matched second subtitle line",
+        "Second cue continuation",
+        "",
+        "3",
+        "00:00:07,000 --> 00:00:09,000",
+        "Third subtitle",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        clamp_document_snippet("captions.srt", &srt_lines, 6, 6),
+        Some((4, 7))
+    );
+
+    // 3. XLIFF 2.0 <unit> with <note> and <segment>
+    let xliff2 = r#"<xliff version="2.0"><file id="f1"><unit id="greeting_btn">
+      <notes><note>Button label on home screen</note></notes>
+      <segment><source>Start Now</source><target>지금 시작</target></segment>
+    </unit></file></xliff>"#;
+    let xliff2_out = extract_xliff_or_tmx(xliff2);
+    assert!(xliff2_out.contains("### [Translation Unit: greeting_btn]"));
+    assert!(xliff2_out.contains("Target: 지금 시작"));
+    assert!(xliff2_out.contains("Note: Button label on home screen"));
+
+    // 4. Jupyter Notebook (.ipynb) with execution_count & ANSI-colored error traceback
+    let ipynb_err = r#"{
+      "metadata": {"kernelspec": {"language": "python"}},
+      "cells": [{
+        "cell_type": "code",
+        "execution_count": 7,
+        "source": ["1 / 0\n"],
+        "outputs": [{
+          "output_type": "error",
+          "ename": "ZeroDivisionError",
+          "evalue": "division by zero",
+          "traceback": ["\u001b[0;31mZeroDivisionError\u001b[0m: division by zero at line 1"]
+        }]
+      }]
+    }"#;
+    let ipynb_out = extract_ipynb(ipynb_err.as_bytes()).unwrap();
+    assert!(ipynb_out.contains("## [Notebook Cell 1: code (python) In[7]]"));
+    assert!(ipynb_out.contains("### [Cell Error] ZeroDivisionError: division by zero"));
+    assert!(ipynb_out.contains("ZeroDivisionError: division by zero at line 1"));
+    assert!(!ipynb_out.contains("\u{1b}"));
+
+    // 5. Markdown heading slug with inline code backticks, bold, and HTML tags
+    assert_eq!(
+        github_heading_slug("## Using `code_context` in **VS Code** <code>v0.17</code>"),
+        "using-code_context-in-vs-code-v017"
+    );
+
+    // 6. Table cell pipe & newline escaping
+    let tbl = format_markdown_table(&[
+        vec!["Header".into(), "Expression".into()],
+        vec!["Union".into(), "a | b\nc".into()],
+    ]);
+    assert_eq!(tbl[2], "| Union | a \\| b c |");
+
+    // 7. SVG structure inspection
+    let svg_src = "<svg>\n  <title>Architecture Diagram</title>\n  <g id=\"cache-layer\">\n    <text>Trigram Index</text>\n  </g>\n</svg>";
+    let svg_outline = inspect_structure("diagram.svg", svg_src);
+    assert!(svg_outline.iter().any(|s| s.contains("[svg:title] Architecture Diagram")));
+    assert!(svg_outline.iter().any(|s| s.contains("[svg:id] #cache-layer")));
+}
+
 
 
 

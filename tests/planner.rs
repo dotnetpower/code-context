@@ -446,3 +446,237 @@ fn react_vite_definitions_barrels_jsx_tags_bom_and_quote_alias_planner_work() {
         "Vue script snippet should not bleed into <template>: {vue_lines:?}"
     );
 }
+
+#[test]
+fn polyglot_definitions_block_clamping_comment_demotion_and_utf8_ci_planner_work() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    // 1. Rust file with comment-only mention, usage, and pub(in ...) extern "C" fn definition
+    std::fs::write(
+        directory.path().join("src/ffi.rs"),
+        concat!(
+            "// ffi_bridge_symbol is mentioned in this top comment\n",
+            "fn caller() {\n",
+            "    ffi_bridge_symbol();\n",
+            "}\n",
+            "\n",
+            "/// FFI entrypoint doc\n",
+            "pub(in crate::ffi) unsafe extern \"C\" fn ffi_bridge_symbol() -> i32 {\n",
+            "    let 보리_kernel_flag = 42;\n",
+            "    보리_kernel_flag\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    // 2. SQL file with multiple statements
+    std::fs::write(
+        directory.path().join("src/schema.sql"),
+        concat!(
+            "CREATE TABLE accounts (\n",
+            "    id BIGINT PRIMARY KEY\n",
+            ");\n",
+            "\n",
+            "-- Audit table\n",
+            "CREATE TABLE audit_events (\n",
+            "    event_id BIGINT PRIMARY KEY,\n",
+            "    audit_payload TEXT NOT NULL\n",
+            ");\n",
+            "\n",
+            "CREATE INDEX idx_audit ON audit_events(event_id);\n",
+        ),
+    )
+    .unwrap();
+
+    // 3. Ruby / Elixir style `end` block file
+    std::fs::write(
+        directory.path().join("src/worker.rb"),
+        concat!(
+            "class LegacyWorker\n",
+            "  def noop\n",
+            "  end\n",
+            "end\n",
+            "\n",
+            "def process_invoice_batch(items)\n",
+            "  invoice_marker = items.count\n",
+            "  invoice_marker\n",
+            "end\n",
+            "\n",
+            "def after_batch\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+
+    // 4. Makefile & Dockerfile
+    std::fs::write(
+        directory.path().join("src/Makefile"),
+        concat!(
+            "clean:\n",
+            "\trm -rf target\n",
+            "\n",
+            "# Build release binary\n",
+            "release-bundle:\n",
+            "\tcargo build --release --bin cctx_special\n",
+            "\tstrip target/release/cctx_special\n",
+            "\n",
+            "test:\n",
+            "\tcargo test\n",
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("src/Dockerfile"),
+        concat!(
+            "FROM rust:1.85-alpine AS builder\n",
+            "WORKDIR /app\n",
+            "RUN cargo build --release --bin docker_stage_target\n",
+            "\n",
+            "FROM alpine:3.21 AS runtime\n",
+            "COPY --from=builder /app/target/release/cctx /usr/local/bin/cctx\n",
+        ),
+    )
+    .unwrap();
+
+    for index in 0..25 {
+        std::fs::write(
+            directory.path().join(format!("src/pad_{index}.rs")),
+            format!("pub fn pad_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(
+        directory.path(),
+        vec!["src".into()],
+        vec![
+            "*.rs".into(),
+            "*.sql".into(),
+            "*.rb".into(),
+            "Makefile".into(),
+            "Dockerfile".into(),
+        ],
+    )
+    .unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+
+    // Verify UTF-8 + ASCII case-insensitive regex uses trigram index
+    let utf8_ci = query(r"보리_KERNEL_flag", true, true);
+    let utf8_profiled = search_profiled(&resident, &utf8_ci, &mut cache).unwrap();
+    assert!(
+        utf8_profiled.profile.used_index,
+        "UTF-8 + ASCII ignore_case regex should use trigram index: {:?}",
+        utf8_profiled.profile
+    );
+    assert_eq!(utf8_profiled.result.total_matches, 2);
+
+    // Verify non-capturing group + word boundary + small class uses trigram index
+    let grouped_q = query(r"\b(?:ffi)[-_]bridge_symbol\b", true, true);
+    let grouped_prof = search_profiled(&resident, &grouped_q, &mut cache).unwrap();
+    assert!(
+        grouped_prof.profile.used_index,
+        "grouped small-class ignore_case regex should use trigram index: {:?}",
+        grouped_prof.profile
+    );
+
+    // Verify max_matches_per_file=1 selects `pub(in crate::ffi) unsafe extern "C" fn` over top comment
+    let mut ffi_q = query("ffi_bridge_symbol", false, false);
+    ffi_q.paths = vec!["src/ffi.rs:1-10".into()];
+    ffi_q.max_matches_per_file = Some(1);
+    let ffi_res = search_fast(&resident, &ffi_q, &mut cache).unwrap();
+    assert_eq!(ffi_res.matches.len(), 1);
+    assert!(
+        ffi_res.matches[0].text.contains("extern \"C\" fn ffi_bridge_symbol"),
+        "expected FFI definition line, got: {:?}",
+        ffi_res.matches[0]
+    );
+
+    // Verify SQL, Ruby `end`, Makefile target, and Dockerfile stage block clamping
+    let mut watched = code_context::watched::Watched::new(code_context::catalog::Spec {
+        root: directory.path().to_path_buf(),
+        scopes: vec!["src".into()],
+        globs: vec![
+            "*.rs".into(),
+            "*.sql".into(),
+            "*.rb".into(),
+            "Makefile".into(),
+            "Dockerfile".into(),
+        ],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    let sql_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "audit_payload", "radius": 10}),
+        )
+        .unwrap();
+    let sql_lines: Vec<&str> = sql_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(sql_lines.first().copied(), Some("-- Audit table"));
+    assert_eq!(sql_lines.last().copied(), Some(");"));
+
+    let rb_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "invoice_marker = items.count", "radius": 10}),
+        )
+        .unwrap();
+    let rb_lines: Vec<&str> = rb_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(rb_lines.first().copied(), Some("def process_invoice_batch(items)"));
+    assert_eq!(rb_lines.last().copied(), Some("end"));
+
+    let mk_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "cctx_special", "radius": 10}),
+        )
+        .unwrap();
+    let mk_lines: Vec<&str> = mk_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(mk_lines.first().copied(), Some("# Build release binary"));
+    assert_eq!(mk_lines.last().copied(), Some("\tstrip target/release/cctx_special"));
+
+    let df_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "docker_stage_target", "radius": 10}),
+        )
+        .unwrap();
+    let df_lines: Vec<&str> = df_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        df_lines.first().copied(),
+        Some("FROM rust:1.85-alpine AS builder")
+    );
+    assert!(
+        !df_lines.iter().any(|l| l.contains("FROM alpine")),
+        "Dockerfile stage should not bleed into next FROM stage: {df_lines:?}"
+    );
+}

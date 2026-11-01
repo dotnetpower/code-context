@@ -101,6 +101,10 @@ pub fn find<'a>(
         && !normalized_glob.contains(['*', '?', '[', ']', '{', '}', '/', '\\', '.'])
     {
         let stem_lower = normalized_glob.to_ascii_lowercase();
+        let stem_alnum: String = stem_lower
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
         matches = candidates
             .into_iter()
             .filter(|candidate| {
@@ -110,7 +114,20 @@ pub fn find<'a>(
                 Path::new(candidate)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|name| name.to_ascii_lowercase().contains(&stem_lower))
+                    .is_some_and(|name| {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.contains(&stem_lower) {
+                            return true;
+                        }
+                        if stem_alnum.len() >= 3 {
+                            let name_alnum: String = lower
+                                .chars()
+                                .filter(|c| c.is_ascii_alphanumeric())
+                                .collect();
+                            return name_alnum.contains(&stem_alnum);
+                        }
+                        false
+                    })
             })
             .collect();
     }

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.17.0
+
+- Expand polyglot symbol-definition ranking and smart block-clamped context
+  assembly across Go, Kotlin, Scala, Swift, Elixir, Ruby, PHP, Lua, Dart, SQL
+  DDL, Protobuf/gRPC, GraphQL, Terraform/HCL/Bicep, Makefile/Justfile recipes,
+  Dockerfile multi-stage builds, Python 3.12+ `type` aliases and multi-line
+  decorators, React 19 / TanStack / Next.js / Svelte 5 Runes / Vue 3.5+ /
+  Angular Signals, and comment-only hit demotion with post-clamping snippet
+  coalescing.
+- Accelerate UTF-8 / CJK / Korean + ASCII `ignore_case` regex queries and
+  grouped small character classes (`\b(?:prefix)[-_]suffix\b`) in the trigram
+  query planner, and add cross-convention (`camelCase` / `snake_case` /
+  `kebab-case`) filename stem fallback in `code_files`.
+- Add JSON Lines (`.jsonl`, `.ndjson`, `.jsonlines`) record extraction and
+  structure inspection, XLIFF 2.0 `<unit>`/`<note>` support, WebVTT/SRT cue
+  extraction and clamping, Jupyter `In[N]` execution counts and ANSI-cleaned
+  error tracebacks, SVG structure inspection, inline code/HTML stripping in
+  Markdown `#slug` anchors, and 2026 polyglot source/exclusion profiles.
+- Support `around_line` / `center_line` + `radius` centered reads, Python
+  traceback (`File "path", line N`) and Rust/Go compiler diagnostic (`-->
+  path:line:col`) target parsing, `#subpath` package aliases, `cursor://` /
+  `windsurf://` / `vscode-insiders://` URIs, MSYS paths, and consecutive line-run
+  compression (`20-22`) in search output.
+
 ## 0.16.0
 
 - Add native zero-dependency document indexing and smart section/slide/sheet/table

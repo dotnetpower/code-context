@@ -329,4 +329,33 @@ fn frontend_globs_support_compound_extensions_brace_globs_dynamic_routes_and_vit
         .unwrap();
     assert_eq!(read_markdown[0]["path"], "src/components/Button.tsx");
     assert_eq!(read_markdown[1]["path"], "src/assets/icon.svg");
+
+    // Cross-convention stem fallback (snake_case query matching camelCase/PascalCase file)
+    let snake_stem = watched
+        .call("code_files", json!({"glob": "button_stories"}))
+        .unwrap();
+    assert_eq!(
+        snake_stem["paths"],
+        json!(["src/components/Button.stories.tsx"])
+    );
+
+    // Compiler diagnostic (`--> path:line:col`), Python traceback (`File "path", line N`), and `#subpath` alias
+    let cursor_uri = format!("cursor://file{}/src/assets/icon.svg", dir.path().display());
+    let diag_read = watched
+        .call(
+            "code_read",
+            json!({
+                "ranges": [
+                    {"path": "--> src/components/Button.tsx:1:5", "start": 1, "end": 1},
+                    {"path": "File \"src/components/Button.tsx\", line 1", "start": 1, "end": 1},
+                    {"path": "#components/Button.tsx", "start": 1, "end": 1},
+                    {"path": cursor_uri, "start": 1, "end": 1}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(diag_read[0]["path"], "src/components/Button.tsx");
+    assert_eq!(diag_read[1]["path"], "src/components/Button.tsx");
+    assert_eq!(diag_read[2]["path"], "src/components/Button.tsx");
+    assert_eq!(diag_read[3]["path"], "src/assets/icon.svg");
 }

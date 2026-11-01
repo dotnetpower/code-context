@@ -85,7 +85,9 @@ export function disambiguateRootByRelativePaths(
     const candidateRelatives =
       cleaned.startsWith('@/') || cleaned.startsWith('~/')
         ? [cleaned, `src/${cleaned.slice(2)}`]
-        : [cleaned];
+        : cleaned.startsWith('#') && cleaned.length > 1
+          ? [cleaned, `src/${cleaned.slice(1)}`]
+          : [cleaned];
     for (const candidateRel of candidateRelatives) {
       const firstSegment = candidateRel.split('/')[0];
       if (firstSegment && candidateRel.includes('/')) {
@@ -389,13 +391,22 @@ export function normalizeUriOrPath(raw: string): string {
       return trimmed;
     }
   }
-  const remoteMatch = /^(?:vscode-remote|vscode-file|vscode-userdata):\/\/[^/]+(\/.*)$/iu.exec(trimmed);
+  const remoteMatch =
+    /^(?:vscode-remote|vscode-file|vscode-userdata|vscode-insiders|cursor|windsurf|vscodium|git):\/\/[^/]+(\/.*)$/iu.exec(
+      trimmed,
+    );
   if (remoteMatch?.[1]) {
     try {
       return decodeURIComponent(remoteMatch[1]);
     } catch {
       return remoteMatch[1];
     }
+  }
+  const msysMatch = /^\/([a-zA-Z])\/(Users|Program Files|Windows|projects|work|dev|repos)\/(.*)$/u.exec(
+    trimmed,
+  );
+  if (msysMatch?.[1] && msysMatch[2] && msysMatch[3] !== undefined) {
+    return `${msysMatch[1].toUpperCase()}:/${msysMatch[2]}/${msysMatch[3]}`;
   }
   return trimmed;
 }
@@ -406,7 +417,20 @@ export function extractLineRangeFromPath(rawPath: string): {
   end?: number;
   anchor?: string;
 } {
-  const normalized = stripViteQuerySuffix(normalizeUriOrPath(rawPath));
+  let cleanedInput = unwrapMarkdownLinkAndQuotes(rawPath);
+  if (cleanedInput.startsWith('-->')) {
+    cleanedInput = cleanedInput.slice(3).trim();
+  }
+  const pyTraceMatch = /^File\s+"([^"]+)"(?:,\s*line\s+(\d+))?/u.exec(cleanedInput);
+  if (pyTraceMatch?.[1]) {
+    const cleanFile = stripViteQuerySuffix(normalizeUriOrPath(pyTraceMatch[1]));
+    if (pyTraceMatch[2]) {
+      const start = Number.parseInt(pyTraceMatch[2], 10);
+      return { path: cleanFile, start, end: start + 40 };
+    }
+    return { path: cleanFile };
+  }
+  const normalized = stripViteQuerySuffix(normalizeUriOrPath(cleanedInput));
   const hashMatch =
     /^(.+?\.[^#/:]+)#L?(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$/u.exec(normalized);
   if (hashMatch?.[1] && hashMatch[2]) {
@@ -474,6 +498,11 @@ export function normalizeRelativeTargetPath(rawPath: string, root?: string | nul
     if (!root || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
       normalized = aliasedSubpath;
     }
+  } else if (normalized.startsWith('#') && normalized.length > 1 && normalized.includes('/')) {
+    const aliasedSubpath = `src/${normalized.slice(1)}`;
+    if (!root || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
+      normalized = aliasedSubpath;
+    }
   }
   if (normalized.length > 1 && normalized.endsWith('/')) {
     normalized = normalized.replace(/\/+$/u, '');
@@ -530,17 +559,38 @@ export interface CopilotRootInput {
   workspace_root?: string | null;
   cwd?: string | null;
   projectRoot?: string | null;
+  project_root?: string | null;
+  repoRoot?: string | null;
+  repo_root?: string | null;
 }
 
 export interface CopilotFilesInput extends CopilotRootInput {
   glob?: string | null;
   pattern?: string | null;
   includePattern?: string | null;
+  include_pattern?: string | null;
   filePattern?: string | null;
+  file_pattern?: string | null;
+  glob_pattern?: string | null;
+  globPattern?: string | null;
+  file_glob?: string | null;
+  fileGlob?: string | null;
+  include_glob?: string | null;
+  includeGlob?: string | null;
   include?: string | null;
   filter?: string | null;
   paths?: string[] | string | null;
   path?: string | null;
+  file_path?: string | null;
+  filePath?: string | null;
+  filepath?: string | null;
+  relative_path?: string | null;
+  relativePath?: string | null;
+  target_file?: string | null;
+  targetFile?: string | null;
+  dir?: string | null;
+  directory?: string | null;
+  folder?: string | null;
   limit?: number | null;
   maxResults?: number | null;
   max_results?: number | null;
@@ -551,7 +601,13 @@ export interface CopilotSearchInput extends CopilotRootInput {
   pattern?: string | null;
   query?: string | null;
   symbol?: string | null;
+  symbol_name?: string | null;
+  symbolName?: string | null;
   search?: string | null;
+  search_query?: string | null;
+  searchQuery?: string | null;
+  regex_pattern?: string | null;
+  regexPattern?: string | null;
   text?: string | null;
   needle?: string | null;
   regex?: boolean | null;
@@ -570,9 +626,27 @@ export interface CopilotSearchInput extends CopilotRootInput {
   maxMatchesPerFile?: number | null;
   paths?: string[] | string | null;
   path?: string | null;
+  file_path?: string | null;
+  filePath?: string | null;
+  filepath?: string | null;
+  relative_path?: string | null;
+  relativePath?: string | null;
+  target_file?: string | null;
+  targetFile?: string | null;
+  dir?: string | null;
+  directory?: string | null;
+  folder?: string | null;
   glob?: string | null;
   includePattern?: string | null;
+  include_pattern?: string | null;
   filePattern?: string | null;
+  file_pattern?: string | null;
+  glob_pattern?: string | null;
+  globPattern?: string | null;
+  file_glob?: string | null;
+  fileGlob?: string | null;
+  include_glob?: string | null;
+  includeGlob?: string | null;
   include?: string | null;
   filter?: string | null;
 }
@@ -587,6 +661,12 @@ export interface CopilotContextInput extends CopilotSearchInput {
 export interface CopilotReadRangeInput {
   path?: string | null;
   filePath?: string | null;
+  file_path?: string | null;
+  filepath?: string | null;
+  relative_path?: string | null;
+  relativePath?: string | null;
+  target_file?: string | null;
+  targetFile?: string | null;
   uri?: string | null;
   file?: string | null;
   target?: string | null;
@@ -596,7 +676,25 @@ export interface CopilotReadRangeInput {
   end_line?: number | null;
   startLine?: number | null;
   endLine?: number | null;
+  start_line_number?: number | null;
+  end_line_number?: number | null;
+  startLineNumber?: number | null;
+  endLineNumber?: number | null;
+  from_line?: number | null;
+  to_line?: number | null;
+  fromLine?: number | null;
+  toLine?: number | null;
   line?: number | null;
+  line_number?: number | null;
+  lineNumber?: number | null;
+  around_line?: number | null;
+  aroundLine?: number | null;
+  center_line?: number | null;
+  centerLine?: number | null;
+  radius?: number | null;
+  context_lines?: number | null;
+  contextLines?: number | null;
+  context?: number | null;
   offset?: number | null;
   limit?: number | null;
   numLines?: number | null;
@@ -622,6 +720,9 @@ export function extractRawRootInput(input: CopilotRootInput | undefined): string
     input.workspace_root,
     input.cwd,
     input.projectRoot,
+    input.project_root,
+    input.repoRoot,
+    input.repo_root,
   ]) {
     if (typeof candidate === 'string' && candidate.trim().length > 0) {
       return candidate.trim();
@@ -679,14 +780,32 @@ export function buildFilesArguments(
   input: CopilotFilesInput,
   root?: string | null,
 ): Record<string, string | number | boolean | string[]> {
-  const { paths: normalizedPaths, extractedGlob } = splitPathWithEmbeddedGlob(
-    input.paths ?? input.path,
-    root,
-  );
+  const rawPathInput =
+    input.paths ??
+    input.path ??
+    input.file_path ??
+    input.filePath ??
+    input.filepath ??
+    input.relative_path ??
+    input.relativePath ??
+    input.target_file ??
+    input.targetFile ??
+    input.dir ??
+    input.directory ??
+    input.folder;
+  const { paths: normalizedPaths, extractedGlob } = splitPathWithEmbeddedGlob(rawPathInput, root);
   const rawGlob =
     nonEmptyString(input.glob) ??
     nonEmptyString(input.includePattern) ??
+    nonEmptyString(input.include_pattern) ??
     nonEmptyString(input.filePattern) ??
+    nonEmptyString(input.file_pattern) ??
+    nonEmptyString(input.glob_pattern) ??
+    nonEmptyString(input.globPattern) ??
+    nonEmptyString(input.file_glob) ??
+    nonEmptyString(input.fileGlob) ??
+    nonEmptyString(input.include_glob) ??
+    nonEmptyString(input.includeGlob) ??
     nonEmptyString(input.include) ??
     nonEmptyString(input.filter) ??
     nonEmptyString(input.pattern) ??
@@ -712,7 +831,13 @@ export function buildSearchArguments(
     nonEmptyString(input.pattern) ??
     nonEmptyString(input.query) ??
     nonEmptyString(input.symbol) ??
+    nonEmptyString(input.symbol_name) ??
+    nonEmptyString(input.symbolName) ??
     nonEmptyString(input.search) ??
+    nonEmptyString(input.search_query) ??
+    nonEmptyString(input.searchQuery) ??
+    nonEmptyString(input.regex_pattern) ??
+    nonEmptyString(input.regexPattern) ??
     nonEmptyString(input.text) ??
     nonEmptyString(input.needle) ??
     '';
@@ -737,17 +862,35 @@ export function buildSearchArguments(
   if (typeof rawMaxPerFile === 'number' && Number.isFinite(rawMaxPerFile)) {
     args.max_matches_per_file = Math.min(64, Math.max(1, Math.trunc(rawMaxPerFile)));
   }
-  const { paths: normalizedPaths, extractedGlob } = splitPathWithEmbeddedGlob(
-    input.paths ?? input.path,
-    root,
-  );
+  const rawPathInput =
+    input.paths ??
+    input.path ??
+    input.file_path ??
+    input.filePath ??
+    input.filepath ??
+    input.relative_path ??
+    input.relativePath ??
+    input.target_file ??
+    input.targetFile ??
+    input.dir ??
+    input.directory ??
+    input.folder;
+  const { paths: normalizedPaths, extractedGlob } = splitPathWithEmbeddedGlob(rawPathInput, root);
   if (normalizedPaths !== undefined) {
     args.paths = normalizedPaths;
   }
   const rawGlob =
     nonEmptyString(input.glob) ??
     nonEmptyString(input.includePattern) ??
+    nonEmptyString(input.include_pattern) ??
     nonEmptyString(input.filePattern) ??
+    nonEmptyString(input.file_pattern) ??
+    nonEmptyString(input.glob_pattern) ??
+    nonEmptyString(input.globPattern) ??
+    nonEmptyString(input.file_glob) ??
+    nonEmptyString(input.fileGlob) ??
+    nonEmptyString(input.include_glob) ??
+    nonEmptyString(input.includeGlob) ??
     nonEmptyString(input.include) ??
     nonEmptyString(input.filter) ??
     extractedGlob;
@@ -788,7 +931,19 @@ export function buildReadArguments(
         path,
       }));
   } else if (
-    typeof (input.path ?? input.filePath ?? input.uri ?? input.file ?? input.target) === 'string'
+    typeof (
+      input.path ??
+      input.filePath ??
+      input.file_path ??
+      input.filepath ??
+      input.relative_path ??
+      input.relativePath ??
+      input.target_file ??
+      input.targetFile ??
+      input.uri ??
+      input.file ??
+      input.target
+    ) === 'string'
   ) {
     rawRanges = [input];
   } else {
@@ -800,6 +955,12 @@ export function buildReadArguments(
     const rawPath =
       nonEmptyString(range.path) ??
       nonEmptyString(range.filePath) ??
+      nonEmptyString(range.file_path) ??
+      nonEmptyString(range.filepath) ??
+      nonEmptyString(range.relative_path) ??
+      nonEmptyString(range.relativePath) ??
+      nonEmptyString(range.target_file) ??
+      nonEmptyString(range.targetFile) ??
       nonEmptyString(range.uri) ??
       nonEmptyString(range.file) ??
       nonEmptyString(range.target) ??
@@ -807,38 +968,65 @@ export function buildReadArguments(
     const extracted = extractLineRangeFromPath(rawPath);
     const tupleStart = Array.isArray(range.view_range) ? range.view_range[0] : undefined;
     const tupleEnd = Array.isArray(range.view_range) ? range.view_range[1] : undefined;
-    const rawStart =
+    const explicitStart =
       positiveNumber(range.start) ??
       positiveNumber(range.start_line) ??
       positiveNumber(range.startLine) ??
+      positiveNumber(range.start_line_number) ??
+      positiveNumber(range.startLineNumber) ??
+      positiveNumber(range.from_line) ??
+      positiveNumber(range.fromLine) ??
       positiveNumber(range.offset) ??
+      positiveNumber(tupleStart);
+    const explicitEnd =
+      positiveNumber(range.end) ??
+      positiveNumber(range.end_line) ??
+      positiveNumber(range.endLine) ??
+      positiveNumber(range.end_line_number) ??
+      positiveNumber(range.endLineNumber) ??
+      positiveNumber(range.to_line) ??
+      positiveNumber(range.toLine) ??
+      positiveNumber(tupleEnd);
+    const lineCandidate =
       positiveNumber(range.line) ??
-      positiveNumber(tupleStart) ??
-      extracted.start ??
-      1;
+      positiveNumber(range.line_number) ??
+      positiveNumber(range.lineNumber);
+    const centerCandidate =
+      positiveNumber(range.around_line) ??
+      positiveNumber(range.aroundLine) ??
+      positiveNumber(range.center_line) ??
+      positiveNumber(range.centerLine);
+    const radiusCandidate =
+      positiveNumber(range.radius) ??
+      positiveNumber(range.context_lines) ??
+      positiveNumber(range.contextLines) ??
+      positiveNumber(range.context);
+    const baseTargetPath = normalizeRelativeTargetPath(extracted.path, root);
+    if (
+      explicitStart === undefined &&
+      explicitEnd === undefined &&
+      (centerCandidate !== undefined || (lineCandidate !== undefined && radiusCandidate !== undefined))
+    ) {
+      const center = Math.trunc(centerCandidate ?? lineCandidate ?? 1);
+      const rad = Math.trunc(radiusCandidate ?? 20);
+      const s = Math.max(1, center - rad);
+      const e = Math.max(s, center + rad);
+      return { path: baseTargetPath, start: s, end: e };
+    }
+    const rawStart = explicitStart ?? lineCandidate ?? extracted.start ?? 1;
     const clampedStart = Math.max(1, Math.trunc(rawStart));
     const countSpan =
       positiveNumber(range.numLines) ??
       positiveNumber(range.lineCount) ??
       positiveNumber(range.limit);
     const rawEndCandidate =
-      positiveNumber(range.end) ??
-      positiveNumber(range.end_line) ??
-      positiveNumber(range.endLine) ??
-      positiveNumber(tupleEnd) ??
+      explicitEnd ??
       (countSpan !== undefined ? clampedStart + Math.trunc(countSpan) - 1 : undefined) ??
       extracted.end ??
       Math.max(clampedStart, clampedStart + defaultSpan);
     const clampedEnd = Math.max(1, Math.trunc(rawEndCandidate));
-    const baseTargetPath = normalizeRelativeTargetPath(extracted.path, root);
     const hasExplicitStart =
-      positiveNumber(range.start) !== undefined ||
-      positiveNumber(range.start_line) !== undefined ||
-      positiveNumber(range.startLine) !== undefined ||
-      positiveNumber(range.offset) !== undefined ||
-      positiveNumber(range.line) !== undefined ||
-      positiveNumber(tupleStart) !== undefined ||
-      extracted.start !== undefined;
+      explicitStart !== undefined || lineCandidate !== undefined || extracted.start !== undefined;
     const finalPath =
       extracted.anchor && !hasExplicitStart
         ? `${baseTargetPath}#${extracted.anchor}`
