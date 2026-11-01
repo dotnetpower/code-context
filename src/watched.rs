@@ -77,7 +77,7 @@ mod io_tests {
                 break;
             }
             assert!(started.elapsed() < Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(watched.io_profile.full_inventory_scans, before + 1);
         assert_eq!(watched.io_profile.full_source_verifications, 0);
@@ -315,7 +315,7 @@ mod io_tests {
 }
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-const READ_RECOVERY_DELAY: Duration = Duration::from_millis(25);
+const READ_RECOVERY_DELAY: Duration = Duration::from_millis(8);
 pub(crate) const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
 const ROOT_RUNTIME_HEADROOM: usize = 160 * 1024 * 1024;
 type MaintenanceResult = (u64, Result<BTreeMap<String, Stamp>>);

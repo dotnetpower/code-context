@@ -731,6 +731,21 @@ fn scan(
             file_lines.clear();
             let bytes = document.text.as_bytes();
             let mut search_pos = 0usize;
+            if matches.len() >= query.limit {
+                while search_pos < bytes.len() {
+                    let Some(rel) = finder.find(&bytes[search_pos..]) else {
+                        break;
+                    };
+                    let position = search_pos + rel;
+                    *total += 1;
+                    if let Some(nl) = memchr::memchr(b'\n', &bytes[position..]) {
+                        search_pos = position + nl + 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
             let mut line_cursor = 0usize;
             while search_pos < bytes.len() {
                 let Some(rel) = finder.find(&bytes[search_pos..]) else {
@@ -1199,6 +1214,9 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
     }
     if indent <= 2 && is_sql_ddl_definition_line(trimmed) {
         return 3;
+    }
+    if indent == 0 && (trimmed.starts_with("func (") || trimmed.starts_with("func(")) {
+        return 4;
     }
     let keywords: &[&str] = match first {
         b'f' => &[

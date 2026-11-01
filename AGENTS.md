@@ -18,10 +18,13 @@
 
 ## Build, Test, and Verification Commands
 
-Run the smallest relevant check during iteration, and run the full verification suite before packaging or releasing:
+Run the smallest relevant check during iteration (prefer `#tctxNativeRun` with modified files or `cargo test --test <target> --locked`), and run the full verification suite before packaging or releasing:
 
 ```sh
-# Rust backend unit & integration tests and clippy lint
+# Fast targeted Rust test during iteration (e.g. planner, file_discovery, document_support)
+cargo test --test planner --locked
+
+# Full Rust backend unit & integration tests and clippy lint
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 

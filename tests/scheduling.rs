@@ -38,7 +38,7 @@ impl Fixture {
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let rg = bin.join("rg");
-        std::fs::write(&rg,"#!/bin/sh\ncase \"$PWD\" in */cold) case \" $* \" in *\" --files \"*) sleep 1;; esac;; esac\nexec /usr/bin/rg \"$@\"\n").unwrap();
+        std::fs::write(&rg,"#!/bin/sh\ncase \"$PWD\" in */cold) case \" $* \" in *\" --files \"*) sleep 0.25;; esac;; esac\nexec /usr/bin/rg \"$@\"\n").unwrap();
         std::fs::set_permissions(&rg, std::fs::Permissions::from_mode(0o755)).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_cctx"))
             .env("CCTX_HOME", &home)
@@ -63,7 +63,7 @@ impl Fixture {
         while UnixStream::connect(fixture.home.join("daemon.sock")).is_err() {
             assert!(fixture.child.try_wait().unwrap().is_none(),"daemon exited before accepting connections");
             assert!(started.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(rpc(&fixture.home, None, "ping", json!({}))["ready"], true);
         assert_eq!(
@@ -81,7 +81,7 @@ impl Fixture {
                 return;
             }
             assert!(started.elapsed() < Duration::from_secs(5), "{status}");
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -123,7 +123,7 @@ fn wait_for_cache(home: &Path, root: &Path) -> Value {
             return status;
         }
         assert!(deadline.elapsed() < Duration::from_secs(10), "{status}");
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(3));
     }
 }
 
@@ -297,7 +297,7 @@ fn cold_misses_return_without_waiting_and_coalesce_only_the_requested_root() {
         != "loaded"
     {
         assert!(wait.elapsed() < Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(3));
     }
     assert_eq!(
         rpc(
@@ -365,7 +365,7 @@ fn strict_sync_is_a_root_local_barrier_and_has_separate_timing() {
             true
         );
     });
-    std::thread::sleep(Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(10));
     let status = rpc(&fixture.home, Some(&fixture.cold), "code_status", json!({}));
     let perf = &status["data"]["performance"];
     assert!(
@@ -374,7 +374,7 @@ fn strict_sync_is_a_root_local_barrier_and_has_separate_timing() {
             .unwrap()
             .iter()
             .any(|entry| entry["kind"] == "strict_sync"
-                && entry["elapsed_ms"].as_f64().unwrap() > 900.0)
+                && entry["elapsed_ms"].as_f64().unwrap() > 200.0)
     );
     assert!(
         perf["recent_requests"]

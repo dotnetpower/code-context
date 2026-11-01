@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.0
+
+- Accelerate coding, build, and test cycles by configuring `line-tables-only`
+  debug symbols and `opt-level = 2` dependency compilation in `dev`/`test`
+  profiles, cutting `cargo test` wall-clock runtime by >65%.
+- Reduce daemon active background polling latency (`25 ms → 5 ms`) and watcher
+  atomic-save read recovery delay (`25 ms → 8 ms`), and skip post-limit line
+  galloping with a `memchr` newline jump fast path in resident and query scans.
+- Extend signature-complete clamping to Rust `where` clauses, Python class
+  methods immediately following `class` headers, C++ `template<...>` prefixes,
+  C# `[Attribute]` annotations, and Go receiver method definitions (`func (s
+  *Server)`), and enable incremental TypeScript builds (`incremental: true`).
+
 ## 0.18.0
 
 - Prevent VS Code agent edit retries (`No match found` / `Multiple matches found`)

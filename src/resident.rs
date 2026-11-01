@@ -1023,22 +1023,26 @@ impl Resident {
                     break;
                 };
                 let offset = search_pos + rel;
-                let line = find_line_gallop(&document.starts, line_cursor, offset);
                 total_matches += 1;
                 if matches.len() < request.limit {
+                    let line = find_line_gallop(&document.starts, line_cursor, offset);
                     matches.push(Hit {
                         path: document.path.to_string(),
                         line: line + 1,
                         text: document.line(line).into(),
                     });
+                    line_cursor = line + 1;
+                    search_pos = document
+                        .starts
+                        .get(line_cursor)
+                        .copied()
+                        .map(|start| start as usize)
+                        .unwrap_or(bytes.len());
+                } else if let Some(nl) = memchr::memchr(b'\n', &bytes[offset..]) {
+                    search_pos = offset + nl + 1;
+                } else {
+                    break;
                 }
-                line_cursor = line + 1;
-                search_pos = document
-                    .starts
-                    .get(line_cursor)
-                    .copied()
-                    .map(|start| start as usize)
-                    .unwrap_or(bytes.len());
             }
         }
         let result = SearchResult {

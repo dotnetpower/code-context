@@ -111,19 +111,16 @@ pub(crate) fn is_response_budget(error: &(dyn std::error::Error + 'static)) -> b
 }
 
 pub(crate) fn string_bound(value: &str) -> usize {
-    2 + value.len()
-        + value
-            .bytes()
-            .map(|byte| {
-                if byte < 0x20 {
-                    5
-                } else if matches!(byte, b'"' | b'\\') {
-                    1
-                } else {
-                    0
-                }
-            })
-            .sum::<usize>()
+    let bytes = value.as_bytes();
+    let mut extra = 0usize;
+    for &byte in bytes {
+        if byte < 0x20 {
+            extra += 5;
+        } else if byte == b'"' || byte == b'\\' {
+            extra += 1;
+        }
+    }
+    2 + bytes.len() + extra
 }
 
 pub(crate) fn check_search_size(result: &SearchResult) -> Result<()> {
@@ -371,6 +368,12 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
         || trimmed.starts_with("* ")
         || trimmed.starts_with("*/")
         || trimmed.starts_with('@')
+        || trimmed.starts_with("template<")
+        || trimmed.starts_with("template <")
+        || (trimmed.starts_with('[')
+            && trimmed.ends_with(']')
+            && !trimmed.starts_with("[[")
+            && trimmed.len() >= 3)
         || trimmed.starts_with("\"use client\"")
         || trimmed.starts_with("'use client'")
         || trimmed.starts_with("\"use server\"")
@@ -462,13 +465,16 @@ fn is_type_or_schema_definition(line: &str) -> bool {
 
 fn is_multiline_signature_open(line: &str) -> bool {
     let trimmed = line.trim_end();
-    if !trimmed.contains('(') {
-        return false;
+    if trimmed.contains('(') {
+        let open_parens = trimmed.bytes().filter(|&b| b == b'(').count();
+        let close_parens = trimmed.bytes().filter(|&b| b == b')').count();
+        if open_parens > close_parens
+            || (!trimmed.contains('{') && !trimmed.ends_with(';') && !trimmed.ends_with(':'))
+        {
+            return true;
+        }
     }
-    let open_parens = trimmed.bytes().filter(|&b| b == b'(').count();
-    let close_parens = trimmed.bytes().filter(|&b| b == b')').count();
-    open_parens > close_parens
-        || (trimmed.ends_with(')') && !trimmed.contains('{') && !trimmed.ends_with(';'))
+    false
 }
 
 fn is_overload_or_stub_signature(line: &str) -> bool {
@@ -579,7 +585,12 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                         break;
                     }
                 }
-                if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
+                if header_start > 0
+                    && (snippet.lines[header_start - 1].trim().is_empty()
+                        || snippet.lines[header_start - 1]
+                            .trim_start()
+                            .starts_with("class "))
+                {
                     new_start_idx = header_start;
                     break;
                 }

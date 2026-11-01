@@ -14,6 +14,8 @@
     "forceConsistentCasingInFileNames": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./out/.tsbuildinfo",
     "types": [
       "node",
       "vscode"

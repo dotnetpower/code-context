@@ -61,7 +61,7 @@ impl Fixture {
         let start = Instant::now();
         while fixture.rpc("ping", None, json!({})).is_err() {
             assert!(start.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
         fixture
     }
@@ -756,10 +756,10 @@ fn legacy_prewarm_stays_unloaded_until_actual_source_demand() {
     let started = Instant::now();
     while rpc(&home, "ping", None, json!({})).is_err() {
         assert!(started.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(25));
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
             rpc(&home, "ping", None, json!({})).unwrap()["loaded_roots"],
             0
@@ -777,7 +777,7 @@ fn legacy_prewarm_stays_unloaded_until_actual_source_demand() {
         != "loaded"
     {
         assert!(start.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(
         rpc(&home, "code_grep", Some(&root), json!({"pattern":"ready"})).unwrap()["data"]["total_matches"],

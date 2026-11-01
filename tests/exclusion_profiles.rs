@@ -320,7 +320,7 @@ fn wait_for_count(watched: &mut Watched, expected: u64) {
             return;
         }
         assert!(started.elapsed() < Duration::from_secs(4));
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

@@ -22,21 +22,39 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 mod candidate_policy_tests {
     use super::*;
 
-    fn reference(workspace:&Workspace,name:&str)->Result<bool> {
-        let path=Path::new(name);
+    fn reference_with_compiled(
+        workspace: &Workspace,
+        include_matchers: &[globset::GlobMatcher],
+        exclude_matchers: &[globset::GlobMatcher],
+        name: &str,
+    ) -> Result<bool> {
+        let path = Path::new(name);
         safe_relative(path)?;
-        let path=normalize(path);
-        if !workspace.scopes.iter().any(|scope|scope=="."||path.starts_with(scope)) {return Ok(false);}
-        let included=workspace.globs.iter().map(|pattern|Glob::new(pattern))
-            .collect::<std::result::Result<Vec<_>,_>>()?.iter().any(|glob|{
-                let matcher=glob.compile_matcher();
-                matcher.is_match(&path)||path.file_name().is_some_and(|name|matcher.is_match(name))
-            });
-        if !included {return Ok(false);}
-        for pattern in workspace.effective_excludes() {
-            let matcher=Glob::new(&pattern)?.compile_matcher();
-            if path.ancestors().filter(|p|!p.as_os_str().is_empty()).any(|ancestor|
-                matcher.is_match(ancestor)||ancestor.file_name().is_some_and(|name|matcher.is_match(name))) {
+        let path = normalize(path);
+        if !workspace
+            .scopes
+            .iter()
+            .any(|scope| scope == "." || path.starts_with(scope))
+        {
+            return Ok(false);
+        }
+        let included = include_matchers.iter().any(|matcher| {
+            matcher.is_match(&path) || path.file_name().is_some_and(|name| matcher.is_match(name))
+        });
+        if !included {
+            return Ok(false);
+        }
+        for matcher in exclude_matchers {
+            if path
+                .ancestors()
+                .filter(|p| !p.as_os_str().is_empty())
+                .any(|ancestor| {
+                    matcher.is_match(ancestor)
+                        || ancestor
+                            .file_name()
+                            .is_some_and(|name| matcher.is_match(name))
+                })
+            {
                 return Ok(false);
             }
         }
@@ -45,19 +63,64 @@ mod candidate_policy_tests {
 
     #[test]
     fn compiled_policy_matches_existing_scope_glob_exclusion_and_hidden_rules() {
-        let root=tempfile::tempdir().unwrap();
-        let workspace=Workspace::new_with_excludes(root.path(),vec![".".into()],
-            vec!["*.rs".into(),"*.ts".into(),"docs/**/*.md".into(),"Makefile".into()],
-            vec!["**/private/**".into(),"**/manual.rs".into()],true).unwrap();
-        let policy=CandidatePolicy::compile(workspace.candidate_policy_key()).unwrap();
-        for directory in ["","src/","src/private/","target/","src/target/","node_modules/","docs/a/"] {
-            for file in ["lib.rs","app.ts","manual.rs","a.md","Makefile","readme.txt"] {
-                let name=format!("{directory}{file}");
-                assert_eq!(policy.candidate_path(&name).unwrap(),reference(&workspace,&name).unwrap(),"{name}");
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_excludes(
+            root.path(),
+            vec![".".into()],
+            vec![
+                "*.rs".into(),
+                "*.ts".into(),
+                "docs/**/*.md".into(),
+                "Makefile".into(),
+            ],
+            vec!["**/private/**".into(), "**/manual.rs".into()],
+            true,
+        )
+        .unwrap();
+        let include_matchers: Vec<_> = workspace
+            .globs
+            .iter()
+            .map(|p| Glob::new(p).unwrap().compile_matcher())
+            .collect();
+        let exclude_matchers: Vec<_> = workspace
+            .effective_excludes()
+            .into_iter()
+            .map(|p| Glob::new(&p).unwrap().compile_matcher())
+            .collect();
+        let policy = CandidatePolicy::compile(workspace.candidate_policy_key()).unwrap();
+        for directory in [
+            "",
+            "src/",
+            "src/private/",
+            "target/",
+            "src/target/",
+            "node_modules/",
+            "docs/a/",
+        ] {
+            for file in [
+                "lib.rs",
+                "app.ts",
+                "manual.rs",
+                "a.md",
+                "Makefile",
+                "readme.txt",
+            ] {
+                let name = format!("{directory}{file}");
+                assert_eq!(
+                    policy.candidate_path(&name).unwrap(),
+                    reference_with_compiled(
+                        &workspace,
+                        &include_matchers,
+                        &exclude_matchers,
+                        &name
+                    )
+                    .unwrap(),
+                    "{name}"
+                );
             }
         }
-        for name in [".hidden.rs",".github/a.rs","../escape.rs","/absolute.rs"] {
-            assert!(policy.candidate_path(name).is_err(),"{name}");
+        for name in [".hidden.rs", ".github/a.rs", "../escape.rs", "/absolute.rs"] {
+            assert!(policy.candidate_path(name).is_err(), "{name}");
         }
     }
 }

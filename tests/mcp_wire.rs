@@ -73,7 +73,7 @@ fn shared_stdio_enforces_frame_budget_and_json_only_output() {
         if ping.status.success() { break; }
         assert!(daemon.0.try_wait().unwrap().is_none(), "{}", std::fs::read_to_string(&log).unwrap());
         assert!(started.elapsed() < Duration::from_secs(5), "private daemon did not become ready");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     let run = |input: &[u8]| {
         let mut child = Command::new(binary).env("CCTX_HOME", &home)

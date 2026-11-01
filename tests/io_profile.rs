@@ -72,7 +72,7 @@ fn wait(watched: &mut Watched, marker: &str, count: usize) {
             Ok(value) => value,
             Err(error) if error.to_string().contains("STALE_INDEX") => {
                 assert!(started.elapsed() < Duration::from_secs(4), "{error}");
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(error) => panic!("{error}"),
@@ -84,7 +84,7 @@ fn wait(watched: &mut Watched, marker: &str, count: usize) {
             started.elapsed() < Duration::from_secs(4),
             "watcher did not converge: {value}"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

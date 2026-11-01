@@ -41,7 +41,7 @@ fn wait_for(watched: &mut Watched, pattern: &str, count: u64) {
             Ok(found) => found,
             Err(error) if error.to_string().contains("STALE_INDEX") => {
                 assert!(start.elapsed() < Duration::from_secs(4), "{error}");
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(error) => panic!("{error}"),
@@ -53,7 +53,7 @@ fn wait_for(watched: &mut Watched, pattern: &str, count: u64) {
             start.elapsed() < Duration::from_secs(4),
             "watcher did not converge: wanted {count}, got {found}"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -353,11 +353,10 @@ fn incremental_index_agrees_with_live_rg_after_repeated_updates() {
 #[test]
 fn stale_background_reconciliation_cannot_overwrite_newer_generation() {
     let (dir, mut watched) = fixture();
-    std::thread::sleep(Duration::from_millis(2100));
     watched.schedule_maintenance();
     std::fs::write(dir.path().join("src/a.rs"), "new_epoch_marker\n").unwrap();
     watched.call("code_sync", json!({})).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(10));
     assert_eq!(query(&mut watched, "new_epoch_marker")["total_matches"], 1);
 }
 

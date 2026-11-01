@@ -65,10 +65,8 @@ pub fn find<'a>(
         None
     };
     let candidates: Vec<&'a str> = candidates.into_iter().collect();
-    let mut matches: Vec<&'a str> = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| {
+    let mut matches: Vec<&'a str> = Vec::with_capacity(candidates.len().min(request.limit));
+    matches.extend(candidates.iter().copied().filter(|candidate| {
             if !crate::query::path_matches_str(candidate, &prefixes) {
                 return false;
             }
@@ -94,8 +92,7 @@ pub fn find<'a>(
                 let glob = glob.as_ref().expect("compiled glob");
                 glob.is_match(path) || path.file_name().is_some_and(|name| glob.is_match(name))
             }
-        })
-        .collect();
+        }));
     if matches.is_empty()
         && normalized_glob.len() >= 2
         && !normalized_glob.contains(['*', '?', '[', ']', '{', '}', '/', '\\', '.'])

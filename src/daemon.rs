@@ -32,7 +32,7 @@ const MAX_COLD_LOAD_RETRIES: u8 = 6;
 const MIN_COLD_RETRY_RESERVE: usize = 128 * 1024 * 1024;
 const CACHE_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const IDLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
-const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SERVICE_READ_BPS: u64 = 32_000_000;
 const SERVICE_WRITE_BPS: u64 = 1_000_000;
 type WireResult = std::result::Result<Value, String>;
@@ -2833,9 +2833,9 @@ mod tests {
     fn idle_loop_sleeps_without_delaying_active_work() {
         let mut server=Server::default();
         assert_eq!(server.poll_interval(false),Duration::from_secs(1));
-        assert_eq!(server.poll_interval(true),Duration::from_millis(25));
+        assert_eq!(server.poll_interval(true),Duration::from_millis(5));
         server.pending_roots.push_back(PendingRoot {requested:PathBuf::from("/test/root"),retry:0});
-        assert_eq!(server.poll_interval(false),Duration::from_millis(25));
+        assert_eq!(server.poll_interval(false),Duration::from_millis(5));
     }
 
     #[test]

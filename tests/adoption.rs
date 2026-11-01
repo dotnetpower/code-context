@@ -110,6 +110,10 @@ impl Fixture {
                 .unwrap(),
         );
         let start = Instant::now();
+        while std::os::unix::net::UnixStream::connect(self.home.join("daemon.sock")).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
         while !self
             .command()
             .arg("ping")
@@ -119,7 +123,7 @@ impl Fixture {
             .success()
         {
             assert!(start.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -196,7 +200,7 @@ fn mcp_cold_miss_is_explicit_and_not_retried_or_reported_as_zero_matches() {
             break;
         }
         assert!(deadline.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(3));
     }
     let hit = f.mcp_once(&f.repo, "code_files", json!({"glob":"*.rs"}));
     assert_eq!(hit["isError"], false);
@@ -241,7 +245,7 @@ fn requested_worktree_loads_without_listing_or_preparing_siblings() {
     let started = Instant::now();
     while !f.home.join("daemon.sock").exists() {
         assert!(started.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     let miss = f.mcp_once(&f.linked, "code_files", json!({"glob":"*.rs"}));
     assert!(
@@ -258,7 +262,7 @@ fn requested_worktree_loads_without_listing_or_preparing_siblings() {
             break;
         }
         assert!(started.elapsed() < Duration::from_secs(10), "{status}");
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(3));
     }
     let hit = f.mcp_once(
         &f.linked,
@@ -296,7 +300,7 @@ fn slow_worktree_preparation_for_explicit_sync_does_not_block_a_ready_root() {
     let bin = directory.join("slow-git");
     std::fs::create_dir(&bin).unwrap();
     let git = bin.join("git");
-    std::fs::write(&git,"#!/bin/sh\ncase \" $* \" in *\" rev-parse \"*) printf active > \"$CCTX_TEST_GIT_MARKER\"; sleep 0.3;; *\" worktree list \"*) exit 71;; esac\nexec /usr/bin/git \"$@\"\n").unwrap();
+    std::fs::write(&git,"#!/bin/sh\ncase \" $* \" in *\" rev-parse \"*) printf active > \"$CCTX_TEST_GIT_MARKER\"; sleep 0.12;; *\" worktree list \"*) exit 71;; esac\nexec /usr/bin/git \"$@\"\n").unwrap();
     std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let marker = directory.join("git-active");
     f.daemon = Some(
@@ -315,7 +319,7 @@ fn slow_worktree_preparation_for_explicit_sync_does_not_block_a_ready_root() {
     let started = Instant::now();
     while !f.home.join("daemon.sock").exists() {
         assert!(started.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     f.cli(&f.repo, &["ping"]);
     f.cli(&f.repo, &["sync"]);
@@ -325,7 +329,7 @@ fn slow_worktree_preparation_for_explicit_sync_does_not_block_a_ready_root() {
         let started = Instant::now();
         while !marker.exists() {
             assert!(started.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
         let started = Instant::now();
         let hit = f.mcp_once(&f.repo, "code_grep", json!({"pattern":"main"}));
@@ -671,7 +675,7 @@ fn hardening_unrelated_registration_preserves_failure_cooldown() {
     assert!(first["content"][0]["text"].as_str().unwrap().contains("CACHE_MISS"));
     let started = Instant::now();
     loop {
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(3));
         let result = f.mcp_once(&unregistered, "code_context", arguments.clone());
         if result["content"][0]["text"].as_str().unwrap().contains("CACHE_LOAD_FAILED") {
             break;
@@ -692,7 +696,7 @@ fn hardening_parent_authorization_change_releases_cached_failure() {
     assert!(first["content"][0]["text"].as_str().unwrap().contains("CACHE_MISS"));
     let started = Instant::now();
     loop {
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(3));
         let result = f.mcp_once(&f.linked, "code_context", arguments.clone());
         if result["content"][0]["text"].as_str().unwrap().contains("CACHE_LOAD_FAILED") {
             break;

@@ -714,6 +714,13 @@ fn first_try_exact_edit_clamping_preserves_multiline_signatures_structs_overload
             "    }\n",
             "    Ok(first_arg + second_arg.len())\n",
             "}\n",
+            "\n",
+            "pub fn execute_with_where_clause<T>(item: T) -> usize\n",
+            "where\n",
+            "    T: AsRef<str> + Send,\n",
+            "{\n",
+            "    item.as_ref().len()\n",
+            "}\n",
         ),
     )
     .unwrap();
@@ -782,6 +789,28 @@ fn first_try_exact_edit_clamping_preserves_multiline_signatures_structs_overload
     assert!(
         fn_lines.iter().any(|l| l.contains("Ok(first_arg + second_arg.len())")),
         "inner if-block closing brace must not truncate outer function: {fn_lines:?}"
+    );
+
+    // Rust `where` clause following single-line parameter list extends through `{` and body
+    let where_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "execute_with_where_clause", "radius": 8}),
+        )
+        .unwrap();
+    let where_lines: Vec<&str> = where_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        where_lines.iter().any(|l| l.contains("T: AsRef<str> + Send,")),
+        "where clause preserved: {where_lines:?}"
+    );
+    assert!(
+        where_lines.iter().any(|l| l.contains("item.as_ref().len()")),
+        "where-clause function body preserved: {where_lines:?}"
     );
 
     // TypeScript overload signature hit does not prematurely stop before implementation
