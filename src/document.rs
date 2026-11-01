@@ -4003,11 +4003,11 @@ pub fn is_document_boilerplate_line(line: &str) -> bool {
 }
 
 pub fn matches_extension_case_insensitive(candidate: &str, suffix: &str) -> bool {
-    if candidate.len() < suffix.len() || !is_document_path(candidate) {
+    if candidate.len() < suffix.len() {
         return false;
     }
     let tail = &candidate.as_bytes()[candidate.len() - suffix.len()..];
-    tail.eq_ignore_ascii_case(suffix.as_bytes())
+    tail.eq_ignore_ascii_case(suffix.as_bytes()) && is_document_path(candidate)
 }
 
 fn heading_level_of_line(line: &str) -> Option<usize> {

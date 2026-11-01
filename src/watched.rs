@@ -1143,6 +1143,27 @@ impl Watched {
     }
 
     fn normalize_root_prefixed_arguments(&self, arguments: &mut Value) {
+        let has_paths = arguments.get("paths").is_some_and(|v| {
+            v.as_array().is_some_and(|arr| {
+                !arr.is_empty()
+                    && !arr
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(|s| self.stamps.contains_key(s)))
+            })
+        });
+        let has_ranges = arguments.get("ranges").is_some_and(|v| {
+            v.as_array().is_some_and(|arr| {
+                !arr.is_empty()
+                    && !arr.iter().all(|item| {
+                        item.get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| self.stamps.contains_key(s))
+                    })
+            })
+        });
+        if !has_paths && !has_ranges {
+            return;
+        }
         let Some(root_str) = self.spec.root.to_str() else {
             return;
         };

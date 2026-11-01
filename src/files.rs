@@ -64,6 +64,48 @@ pub fn find<'a>(
     } else {
         None
     };
+    if let Some(suffix) = ext_suffix {
+        let mut matches: Vec<&'a str> = Vec::with_capacity(request.limit.min(256));
+        for candidate in candidates {
+            if !crate::query::path_matches_str(candidate, &prefixes) {
+                continue;
+            }
+            if candidate.ends_with(suffix)
+                || crate::document::matches_extension_case_insensitive(candidate, suffix)
+            {
+                matches.push(candidate);
+            }
+        }
+        if !matches.windows(2).all(|w| w[0] < w[1]) {
+            matches.sort_unstable();
+            matches.dedup();
+        }
+        let total_matches = matches.len();
+        let paths: Vec<String> = matches
+            .into_iter()
+            .take(request.limit)
+            .map(String::from)
+            .collect();
+        let bound = 64
+            + paths
+                .iter()
+                .map(|p| 2 + crate::context::string_bound(p))
+                .sum::<usize>();
+        let result = FileResult {
+            paths,
+            total_matches,
+            truncated: total_matches > request.limit,
+        };
+        if bound > MAX_RESPONSE.saturating_sub(64)
+            && serde_json::to_vec(&result)?.len() > MAX_RESPONSE
+        {
+            return Err(invalid(
+                "file result exceeds response limit; narrow glob/paths or lower limit",
+            )
+            .into());
+        }
+        return Ok(result);
+    }
     let candidates: Vec<&'a str> = candidates.into_iter().collect();
     let mut matches: Vec<&'a str> = Vec::with_capacity(candidates.len().min(request.limit));
     matches.extend(candidates.iter().copied().filter(|candidate| {
