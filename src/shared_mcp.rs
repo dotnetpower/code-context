@@ -92,34 +92,242 @@ fn flush_pending_traces(
     }
 }
 
-fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Option<PathBuf> {
-    let mut candidate_path: Option<&str> = None;
-    if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
-        candidate_path = paths.iter().find_map(Value::as_str).filter(|p| p.starts_with('/'));
-    }
-    if candidate_path.is_none()
-        && let Some(ranges) = arguments.get("ranges").and_then(Value::as_array)
+fn clean_target_candidate(raw: &str) -> &str {
+    let mut s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('`') && s.ends_with('`'))
+            || (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\'')))
     {
-        candidate_path = ranges
-            .iter()
-            .filter_map(|r| r.get("path").and_then(Value::as_str))
-            .find(|p| p.starts_with('/'));
+        s = s[1..s.len() - 1].trim();
     }
-    let target = std::path::Path::new(candidate_path?);
-    let specs = crate::catalog::load().ok()?;
-    specs
-        .into_iter()
-        .filter(|spec| target.starts_with(&spec.root))
-        .max_by_key(|spec| spec.root.components().count())
-        .map(|spec| spec.root)
+    if s.starts_with('[')
+        && let Some((_, rest)) = s.split_once("](")
+        && let Some(target) = rest.strip_suffix(')')
+    {
+        s = target.trim();
+        if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+            s = s[1..s.len() - 1].trim();
+        }
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        s = rest;
+    }
+    if let Some((base, _)) = s.rsplit_once('#') {
+        s = base;
+    } else if let Some((base, suffix)) = s.split_once(':')
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b':')
+    {
+        s = base;
+    }
+    s
 }
 
-fn normalize_mcp_argument_aliases(name: &str, arguments: &mut serde_json::Map<String, Value>) {
-    if matches!(name, "code_grep" | "code_context")
-        && !arguments.contains_key("pattern")
-        && let Some(query) = arguments.remove("query")
+fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Option<PathBuf> {
+    let mut raw_candidates: Vec<&str> = Vec::new();
+    if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+        raw_candidates.extend(paths.iter().filter_map(Value::as_str));
+    }
+    if let Some(ranges) = arguments.get("ranges").and_then(Value::as_array) {
+        raw_candidates.extend(
+            ranges
+                .iter()
+                .filter_map(|r| r.get("path").and_then(Value::as_str)),
+        );
+    }
+    if raw_candidates.is_empty() {
+        return None;
+    }
+    let specs = crate::catalog::load().ok()?;
+    for raw in &raw_candidates {
+        let cleaned = clean_target_candidate(raw);
+        if cleaned.starts_with('/') {
+            let target = std::path::Path::new(cleaned);
+            if let Some(root) = specs
+                .iter()
+                .filter(|spec| target.starts_with(&spec.root))
+                .max_by_key(|spec| spec.root.components().count())
+                .map(|spec| spec.root.clone())
+            {
+                return Some(root);
+            }
+        }
+    }
+    if specs.len() > 1 {
+        for raw in &raw_candidates {
+            let cleaned = clean_target_candidate(raw).trim_start_matches("./");
+            if cleaned.is_empty() || cleaned.starts_with('/') || cleaned.starts_with("..") {
+                continue;
+            }
+            let matching: Vec<_> = specs
+                .iter()
+                .filter(|spec| spec.root.join(cleaned).exists())
+                .collect();
+            if matching.len() == 1 {
+                return Some(matching[0].root.clone());
+            }
+        }
+    }
+    None
+}
+
+fn take_first_alias(
+    arguments: &mut serde_json::Map<String, Value>,
+    aliases: &[&str],
+) -> Option<Value> {
+    let mut chosen = None;
+    for &alias in aliases {
+        if let Some(val) = arguments.remove(alias)
+            && chosen.is_none()
+            && !val.is_null()
+        {
+            chosen = Some(val);
+        }
+    }
+    chosen
+}
+
+fn normalize_single_range_map(
+    map: &mut serde_json::Map<String, Value>,
+    default_span: u64,
+) {
+    if !map.contains_key("path")
+        && let Some(path) = take_first_alias(map, &["filePath", "uri", "file", "target"])
     {
-        arguments.insert("pattern".into(), query);
+        map.insert("path".into(), path);
+    }
+    let mut start = map
+        .remove("start")
+        .or_else(|| take_first_alias(map, &["start_line", "startLine", "offset", "line"]));
+    let mut end = map
+        .remove("end")
+        .or_else(|| take_first_alias(map, &["end_line", "endLine"]));
+    let count_span = take_first_alias(map, &["numLines", "lineCount", "limit"])
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0);
+    if let Some(Value::Array(vr)) = map.remove("view_range")
+        && vr.len() == 2
+    {
+        start = start.or_else(|| vr.first().cloned());
+        end = end.or_else(|| vr.get(1).cloned());
+    }
+    let s = start
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+        .map(|n| n as u64)
+        .unwrap_or(1);
+    let e = end
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+        .map(|n| n as u64)
+        .or_else(|| count_span.map(|c| s + c - 1))
+        .unwrap_or(s + default_span)
+        .max(s);
+    map.insert("start".into(), json!(s));
+    map.insert("end".into(), json!(e));
+}
+
+pub(crate) fn normalize_mcp_argument_aliases(
+    name: &str,
+    arguments: &mut serde_json::Map<String, Value>,
+) {
+    // Strip null or empty-string optional parameters commonly emitted by LLMs
+    for optional_key in [
+        "root",
+        "glob",
+        "paths",
+        "max_matches_per_file",
+        "regex",
+        "ignore_case",
+        "limit",
+        "radius",
+        "page",
+        "split_ranges",
+    ] {
+        if let Some(val) = arguments.get(optional_key)
+            && (val.is_null()
+                || (matches!(optional_key, "root" | "glob")
+                    && val.as_str().is_some_and(|s| s.trim().is_empty())))
+        {
+            arguments.remove(optional_key);
+        }
+    }
+    if !arguments.contains_key("root")
+        && let Some(root_alias) = take_first_alias(
+            arguments,
+            &["workspaceRoot", "workspace_root", "cwd", "projectRoot"],
+        )
+        && root_alias.as_str().is_some_and(|s| !s.trim().is_empty())
+    {
+        arguments.insert("root".into(), root_alias);
+    } else {
+        for k in ["workspaceRoot", "workspace_root", "cwd", "projectRoot"] {
+            arguments.remove(k);
+        }
+    }
+    if matches!(name, "code_grep" | "code_context") {
+        let alias_val = take_first_alias(
+            arguments,
+            &["query", "symbol", "search", "text", "needle"],
+        );
+        if !arguments.contains_key("pattern")
+            && let Some(val) = alias_val
+        {
+            arguments.insert("pattern".into(), val);
+        }
+        let regex_alias = take_first_alias(arguments, &["isRegexp", "is_regex", "useRegex"]);
+        if !arguments.contains_key("regex")
+            && let Some(val) = regex_alias
+        {
+            arguments.insert("regex".into(), val);
+        }
+        let ci_alias = take_first_alias(arguments, &["caseInsensitive", "case_insensitive"]);
+        let cs_alias = arguments.remove("isCaseSensitive");
+        if !arguments.contains_key("ignore_case") {
+            if let Some(val) = ci_alias {
+                arguments.insert("ignore_case".into(), val);
+            } else if let Some(Value::Bool(cs)) = cs_alias {
+                arguments.insert("ignore_case".into(), Value::Bool(!cs));
+            }
+        }
+        let max_per_file = arguments.remove("maxMatchesPerFile");
+        if !arguments.contains_key("max_matches_per_file")
+            && let Some(val) = max_per_file
+            && !val.is_null()
+        {
+            arguments.insert("max_matches_per_file".into(), val);
+        }
+    }
+    if name == "code_context" {
+        let radius_alias =
+            take_first_alias(arguments, &["contextLines", "context_lines", "context"]);
+        if !arguments.contains_key("radius")
+            && let Some(val) = radius_alias
+        {
+            arguments.insert("radius".into(), val);
+        }
+    }
+    if matches!(name, "code_files" | "code_grep" | "code_context") {
+        let limit_alias =
+            take_first_alias(arguments, &["maxResults", "max_results", "head_limit"]);
+        if !arguments.contains_key("limit")
+            && let Some(val) = limit_alias
+        {
+            arguments.insert("limit".into(), val);
+        }
+        let glob_alias = take_first_alias(
+            arguments,
+            &["includePattern", "filePattern", "include", "filter"],
+        );
+        if !arguments.contains_key("glob")
+            && let Some(val) = glob_alias
+            && val.as_str().is_some_and(|s| !s.trim().is_empty())
+        {
+            arguments.insert("glob".into(), val);
+        }
     }
     if name == "code_files"
         && !arguments.contains_key("glob")
@@ -137,36 +345,119 @@ fn normalize_mcp_argument_aliases(name: &str, arguments: &mut serde_json::Map<St
             arguments.insert("paths".into(), single_path);
         }
     }
-    if name == "code_read"
-        && !arguments.contains_key("ranges")
-        && let Some(path) = arguments
-            .remove("path")
-            .or_else(|| arguments.remove("filePath"))
-        && path.is_string()
+    if matches!(name, "code_files" | "code_grep" | "code_context")
+        && let Some(Value::Array(paths_arr)) = arguments.get_mut("paths")
     {
-        let mut start = arguments
-            .remove("start")
-            .or_else(|| arguments.remove("start_line"))
-            .or_else(|| arguments.remove("startLine"));
-        let mut end = arguments
-            .remove("end")
-            .or_else(|| arguments.remove("end_line"))
-            .or_else(|| arguments.remove("endLine"));
-        if let Some(Value::Array(vr)) = arguments.remove("view_range")
-            && vr.len() == 2
-        {
-            start = start.or_else(|| vr.first().cloned());
-            end = end.or_else(|| vr.get(1).cloned());
+        let mut cleaned_paths = Vec::with_capacity(paths_arr.len());
+        let mut extracted_glob: Option<String> = None;
+        for item in paths_arr.drain(..) {
+            if let Some(raw_str) = item.as_str() {
+                let trimmed = raw_str.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.contains(['*', '?', '[', '{']) {
+                    if let Some(wild_pos) = trimmed.find(['*', '?', '[', '{'])
+                        && let Some(slash) = trimmed[..wild_pos].rfind('/')
+                        && slash > 0
+                    {
+                        let prefix = &trimmed[..slash];
+                        if prefix != "." {
+                            cleaned_paths.push(Value::String(prefix.to_owned()));
+                        }
+                    }
+                    if extracted_glob.is_none() {
+                        extracted_glob = Some(trimmed.to_owned());
+                    }
+                } else {
+                    cleaned_paths.push(Value::String(trimmed.to_owned()));
+                }
+            } else {
+                cleaned_paths.push(item);
+            }
         }
-        let s = start.and_then(|v| v.as_u64()).unwrap_or(1).max(1);
-        let e = end
-            .and_then(|v| v.as_u64())
-            .unwrap_or(s + 119)
-            .max(s);
-        arguments.insert(
-            "ranges".into(),
-            json!([{"path": path, "start": s, "end": e}]),
-        );
+        *paths_arr = cleaned_paths;
+        if !arguments.contains_key("glob")
+            && let Some(g) = extracted_glob
+        {
+            arguments.insert("glob".into(), Value::String(g));
+        }
+    }
+    if name == "code_read" {
+        if let Some(split_alias) = arguments.remove("splitRanges")
+            && !arguments.contains_key("split_ranges")
+            && !split_alias.is_null()
+        {
+            arguments.insert("split_ranges".into(), split_alias);
+        }
+        if let Some(Value::Array(ranges)) = arguments.get_mut("ranges") {
+            let default_span = if ranges.len() > 1 { 79 } else { 119 };
+            for range in ranges.iter_mut() {
+                if let Some(map) = range.as_object_mut() {
+                    normalize_single_range_map(map, default_span);
+                }
+            }
+        } else if let Some(Value::Array(paths)) = arguments.remove("paths") {
+            let default_span = if paths.len() > 1 { 79 } else { 119 };
+            let mut template = serde_json::Map::new();
+            for key in [
+                "start",
+                "end",
+                "start_line",
+                "end_line",
+                "startLine",
+                "endLine",
+                "line",
+                "offset",
+                "numLines",
+                "lineCount",
+                "limit",
+                "view_range",
+            ] {
+                if let Some(v) = arguments.remove(key) {
+                    template.insert(key.into(), v);
+                }
+            }
+            let built: Vec<Value> = paths
+                .into_iter()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .filter(|p| !p.trim().is_empty())
+                .map(|path| {
+                    let mut m = template.clone();
+                    m.insert("path".into(), Value::String(path));
+                    normalize_single_range_map(&mut m, default_span);
+                    Value::Object(m)
+                })
+                .collect();
+            arguments.insert("ranges".into(), Value::Array(built));
+        } else if let Some(path) = take_first_alias(
+            arguments,
+            &["path", "filePath", "uri", "file", "target"],
+        ) && path.is_string()
+        {
+            let mut single = serde_json::Map::new();
+            single.insert("path".into(), path);
+            for key in [
+                "start",
+                "end",
+                "start_line",
+                "end_line",
+                "startLine",
+                "endLine",
+                "line",
+                "offset",
+                "numLines",
+                "lineCount",
+                "limit",
+                "view_range",
+            ] {
+                if let Some(v) = arguments.remove(key) {
+                    single.insert(key.into(), v);
+                }
+            }
+            normalize_single_range_map(&mut single, 119);
+            arguments.insert("ranges".into(), Value::Array(vec![Value::Object(single)]));
+        }
     }
 }
 

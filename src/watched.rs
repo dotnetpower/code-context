@@ -1141,8 +1141,37 @@ impl Watched {
             .filter(|n| !n.is_empty())
             .map(|n| format!("{n}/"));
         let strip_one = |raw: &mut String| {
+            let trimmed = raw.trim();
+            if trimmed.len() >= 2
+                && ((trimmed.starts_with('`') && trimmed.ends_with('`'))
+                    || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+            {
+                *raw = trimmed[1..trimmed.len() - 1].trim().to_owned();
+            }
+            if raw.starts_with('[')
+                && let Some((_, rest)) = raw.split_once("](")
+                && let Some(target) = rest.strip_suffix(')')
+            {
+                let mut target = target.trim();
+                if target.starts_with('<') && target.ends_with('>') && target.len() >= 2 {
+                    target = target[1..target.len() - 1].trim();
+                }
+                *raw = target.to_owned();
+            }
             if let Some(rest) = raw.strip_prefix("file://") {
                 *raw = rest.to_owned();
+            } else if let Some(scheme_end) = raw.find("://")
+                && matches!(
+                    &raw[..scheme_end],
+                    "vscode-remote" | "vscode-file" | "vscode-userdata"
+                )
+                && let Some(slash) = raw[scheme_end + 3..].find('/')
+            {
+                *raw = raw[scheme_end + 3 + slash..].to_owned();
+            }
+            if raw.contains("%20") {
+                *raw = raw.replace("%20", " ");
             }
             if raw == root_str {
                 *raw = ".".into();
@@ -1160,19 +1189,67 @@ impl Watched {
                     break;
                 }
             }
+            let candidate_exists = |path_candidate: &str| -> bool {
+                if self.stamps.contains_key(path_candidate)
+                    || self.spec.root.join(path_candidate).exists()
+                {
+                    return true;
+                }
+                if let Some(rest) = path_candidate
+                    .strip_prefix("@/")
+                    .or_else(|| path_candidate.strip_prefix("~/"))
+                    && !rest.is_empty()
+                {
+                    let aliased = format!("src/{rest}");
+                    return self.stamps.contains_key(aliased.as_str())
+                        || self.spec.root.join(&aliased).exists();
+                }
+                false
+            };
+            if !self.stamps.contains_key(raw.as_str())
+                && let Some((base, query)) = raw.split_once('?')
+                && !base.is_empty()
+                && [
+                    "raw",
+                    "url",
+                    "worker",
+                    "sharedworker",
+                    "inline",
+                    "inline-css",
+                    "no-inline",
+                    "react",
+                    "component",
+                    "used",
+                ]
+                .iter()
+                .any(|tag| query == *tag || query.starts_with(&format!("{tag}&")))
+            {
+                *raw = base.to_owned();
+            }
             if !self.stamps.contains_key(raw.as_str()) {
                 if let Some((base, suffix)) = raw.rsplit_once('#')
-                    && suffix.starts_with('L')
-                    && suffix[1..].bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'L')
-                    && (self.stamps.contains_key(base) || self.spec.root.join(base).exists())
-                {
-                    *raw = base.to_owned();
-                } else if let Some((base, suffix)) = raw.rsplit_once(':')
                     && !suffix.is_empty()
-                    && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-                    && (self.stamps.contains_key(base) || self.spec.root.join(base).exists())
+                    && candidate_exists(base)
                 {
                     *raw = base.to_owned();
+                } else if let Some((base, suffix)) = raw.split_once(':')
+                    && !suffix.is_empty()
+                    && suffix
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b == b'-' || b == b':')
+                    && candidate_exists(base)
+                {
+                    *raw = base.to_owned();
+                } else if let Some(open) = raw.rfind('(')
+                    && raw.ends_with(')')
+                    && raw[open + 1..raw.len() - 1]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b == b',' || b == b' ')
+                {
+                    let base = &raw[..open];
+                    if candidate_exists(base) {
+                        *raw = base.to_owned();
+                    }
                 }
             }
             if !self.stamps.contains_key(raw.as_str())
@@ -1184,6 +1261,17 @@ impl Watched {
                     && (self.stamps.contains_key(rest) || self.spec.root.join(rest).exists())
                 {
                     *raw = rest.to_owned();
+                } else if let Some(rest) = raw
+                    .strip_prefix("@/")
+                    .or_else(|| raw.strip_prefix("~/"))
+                    && !rest.is_empty()
+                {
+                    let candidate = format!("src/{rest}");
+                    if self.stamps.contains_key(candidate.as_str())
+                        || self.spec.root.join(&candidate).exists()
+                    {
+                        *raw = candidate;
+                    }
                 } else if let Some(rest) = raw
                     .strip_prefix("a/")
                     .or_else(|| raw.strip_prefix("b/"))
@@ -1207,14 +1295,40 @@ impl Watched {
         }
         if let Some(ranges) = arguments.get_mut("ranges").and_then(Value::as_array_mut) {
             for range in ranges {
+                let mut md_anchor: Option<String> = None;
                 if let Some(path_val) = range.get_mut("path")
                     && let Some(text) = path_val.as_str()
                 {
                     let mut owned = text.to_owned();
+                    if let Some((_, frag)) = owned.rsplit_once('#') {
+                        let frag = frag.trim_end_matches(')').trim_end_matches('>');
+                        if !frag.is_empty()
+                            && !frag
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'L' | b'C'))
+                        {
+                            md_anchor = Some(frag.to_owned());
+                        }
+                    }
                     strip_one(&mut owned);
                     if owned != text {
                         *path_val = Value::String(owned);
                     }
+                }
+                if let Some(anchor) = md_anchor
+                    && let Some(path_str) = range.get("path").and_then(Value::as_str)
+                    && crate::document::is_document_path(path_str)
+                    && range.get("start").and_then(Value::as_u64).unwrap_or(1) == 1
+                    && let Some(&doc_id) = self.resident.paths.get(path_str)
+                    && let Some((sec_start, sec_end)) =
+                        crate::document::resolve_markdown_anchor_range(
+                            &self.resident.documents[doc_id].text,
+                            &anchor,
+                        )
+                    && let Some(obj) = range.as_object_mut()
+                {
+                    obj.insert("start".into(), json!(sec_start));
+                    obj.insert("end".into(), json!(sec_end));
                 }
             }
         }
@@ -1703,7 +1817,16 @@ impl Watched {
                 .map(|&id| &resident.documents[id])
                 .filter(|doc| doc.sha256_hex.as_ref() == snippet.sha256);
             if let Some(doc) = known_doc {
-                if meta.len() as usize != doc.text.len() {
+                if stamps
+                    .get(&snippet.path)
+                    .is_some_and(|s| s.length != meta.len())
+                {
+                    return Ok(true);
+                }
+                if !crate::document::is_container_or_rich_document(rel_path)
+                    && meta.len() as usize != doc.text.len()
+                    && !matches!(meta.len() % 2, 0)
+                {
                     return Ok(true);
                 }
                 if meta.len() > 4096
@@ -1726,7 +1849,7 @@ impl Watched {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
                 Err(error) => return Err(error.into()),
             }
-            if buf.len() > max_file_bytes || memchr::memchr(0, buf).is_some() {
+            if buf.len() > max_file_bytes {
                 return Err(invalid(format!(
                     "binary file or file larger than configured limit is unsupported: {}",
                     rel_path.display()
@@ -1734,7 +1857,19 @@ impl Watched {
                 .into());
             }
             use sha2::{Digest, Sha256};
-            let digest: [u8; 32] = Sha256::digest(&*buf).into();
+            let digest: [u8; 32] =
+                if let Some(extracted) = crate::document::extract_document_bytes(rel_path, buf)? {
+                    Sha256::digest(extracted.as_bytes()).into()
+                } else {
+                    if memchr::memchr(0, buf).is_some() {
+                        return Err(invalid(format!(
+                            "binary file or file larger than configured limit is unsupported: {}",
+                            rel_path.display()
+                        ))
+                        .into());
+                    }
+                    Sha256::digest(&*buf).into()
+                };
             if let Some(doc) = known_doc {
                 return Ok(digest != doc.sha256);
             }

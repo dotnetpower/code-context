@@ -81,6 +81,48 @@ pub fn search(workspace: &Workspace, request: &Search) -> Result<SearchResult> {
             text: text.strip_suffix('\n').unwrap_or(text).to_owned(),
         });
     }
+    if workspace.globs.iter().any(|g| {
+        g == "*"
+            || g.contains('*')
+                && crate::document::is_container_or_rich_document(Path::new(
+                    g.trim_start_matches('*'),
+                ))
+            || crate::document::is_container_or_rich_document(Path::new(g))
+    }) {
+        let allowed = workspace.files()?;
+        let rich_paths: Vec<_> = allowed
+            .iter()
+            .filter(|p| crate::document::is_container_or_rich_document(p))
+            .collect();
+        if !rich_paths.is_empty() {
+            let matcher = grep_regex::RegexMatcherBuilder::new()
+                .fixed_strings(!request.regex)
+                .case_insensitive(request.ignore_case)
+                .multi_line(true)
+                .line_terminator(Some(b'\n'))
+                .build(&request.pattern)?;
+            use grep_matcher::Matcher;
+            for doc_path in rich_paths {
+                let rel_str = doc_path.to_string_lossy().into_owned();
+                matches.retain(|hit| hit.path != rel_str);
+                let Ok(bytes) = workspace.read_allowed(&rel_str, &allowed) else {
+                    continue;
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                for (idx, line_text) in text.split_terminator('\n').enumerate() {
+                    if matcher.is_match(line_text.as_bytes())? {
+                        matches.push(Hit {
+                            path: rel_str.clone(),
+                            line: idx + 1,
+                            text: line_text.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+    }
     matches.sort();
     matches.dedup();
     let total_matches = matches.len();

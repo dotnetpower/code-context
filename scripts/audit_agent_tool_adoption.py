@@ -33,10 +33,31 @@ def classify(name: str) -> str:
         return "other"
     if name.startswith(("cctxNative", "code-context-native")):
         return "native"
-    if name.startswith("code-context-"):
+    if name.startswith("code-context-") or name in {
+        "code_files",
+        "code_grep",
+        "code_context",
+        "code_read",
+        "code_status",
+        "code_sync",
+        "code_workspaces",
+    }:
         return "mcp"
     lowered = name.lower()
-    if name in {"rg", "view", "glob", "usages"} or any(
+    if name in {
+        "rg",
+        "view",
+        "glob",
+        "usages",
+        "read_file",
+        "grep_search",
+        "file_search",
+        "find_by_name",
+        "list_dir",
+        "copilot_findFiles",
+        "copilot_findTextInFiles",
+        "copilot_readFile",
+    } or any(
         part in lowered for part in ("search", "grep", "readfile")
     ):
         return "builtin_search_read"

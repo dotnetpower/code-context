@@ -1,7 +1,10 @@
-use crate::query::paths;
+use crate::query::{
+    brace_extension_suffixes, escape_dynamic_route_brackets, paths, scoped_extension_glob,
+    simple_extension_suffix, trim_leading_dot_slash,
+};
 use crate::workspace::MAX_RESPONSE;
 use crate::{Result, invalid};
-use globset::Glob;
+use globset::{Glob, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -26,20 +29,6 @@ pub struct FileResult {
     pub truncated: bool,
 }
 
-fn simple_extension_suffix(glob: &str) -> Option<&str> {
-    let ext = glob.strip_prefix("*.")?;
-    let suffix = &glob[1..];
-    if !ext.is_empty()
-        && ext
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        Some(suffix)
-    } else {
-        None
-    }
-}
-
 pub fn find<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     request: &FileQuery,
@@ -51,27 +40,55 @@ pub fn find<'a>(
         );
     }
     let prefixes = paths(&request.paths)?;
-    let ext_suffix = simple_extension_suffix(&request.glob);
+    let normalized_glob = trim_leading_dot_slash(&request.glob);
+    let ext_suffix = simple_extension_suffix(normalized_glob);
     let brace_suffixes = if ext_suffix.is_none() {
-        crate::query::brace_extension_suffixes(&request.glob)
+        brace_extension_suffixes(normalized_glob)
     } else {
         None
     };
-    let glob = if ext_suffix.is_none() && brace_suffixes.is_none() {
-        Some(Glob::new(&request.glob)?.compile_matcher())
+    let scoped_ext = if ext_suffix.is_none() && brace_suffixes.is_none() {
+        scoped_extension_glob(normalized_glob)
     } else {
         None
     };
+    let glob = if ext_suffix.is_none() && brace_suffixes.is_none() && scoped_ext.is_none() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new(normalized_glob)?);
+        if let Some(escaped) = escape_dynamic_route_brackets(normalized_glob)
+            && let Ok(route_glob) = Glob::new(&escaped)
+        {
+            builder.add(route_glob);
+        }
+        Some(builder.build()?)
+    } else {
+        None
+    };
+    let candidates: Vec<&'a str> = candidates.into_iter().collect();
     let mut matches: Vec<&'a str> = candidates
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|candidate| {
             if !crate::query::path_matches_str(candidate, &prefixes) {
                 return false;
             }
             if let Some(suffix) = ext_suffix {
                 candidate.ends_with(suffix)
+                    || crate::document::matches_extension_case_insensitive(candidate, suffix)
             } else if let Some(suffixes) = &brace_suffixes {
-                suffixes.iter().any(|s| candidate.ends_with(s.as_str()))
+                suffixes.iter().any(|s| {
+                    candidate.ends_with(s.as_str())
+                        || crate::document::matches_extension_case_insensitive(
+                            candidate,
+                            s.as_str(),
+                        )
+                })
+            } else if let Some((dir_prefix, suffixes)) = &scoped_ext {
+                candidate.starts_with(*dir_prefix)
+                    && candidate.as_bytes().get(dir_prefix.len()) == Some(&b'/')
+                    && suffixes
+                        .iter()
+                        .any(|s| candidate[dir_prefix.len() + 1..].ends_with(s.as_str()))
             } else {
                 let path = Path::new(candidate);
                 let glob = glob.as_ref().expect("compiled glob");
@@ -79,6 +96,24 @@ pub fn find<'a>(
             }
         })
         .collect();
+    if matches.is_empty()
+        && normalized_glob.len() >= 2
+        && !normalized_glob.contains(['*', '?', '[', ']', '{', '}', '/', '\\', '.'])
+    {
+        let stem_lower = normalized_glob.to_ascii_lowercase();
+        matches = candidates
+            .into_iter()
+            .filter(|candidate| {
+                if !crate::query::path_matches_str(candidate, &prefixes) {
+                    return false;
+                }
+                Path::new(candidate)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().contains(&stem_lower))
+            })
+            .collect();
+    }
     if !matches.windows(2).all(|w| w[0] < w[1]) {
         matches.sort_unstable();
         matches.dedup();

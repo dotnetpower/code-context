@@ -219,6 +219,7 @@ fn is_python_top_header(line: &str) -> bool {
 }
 
 fn leading_indent_cols(line: &str) -> usize {
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
     let mut cols = 0usize;
     for b in line.bytes() {
         match b {
@@ -230,29 +231,104 @@ fn leading_indent_cols(line: &str) -> usize {
     cols
 }
 
+fn is_frontend_block_header(trimmed: &str) -> bool {
+    [
+        "useEffect(",
+        "useLayoutEffect(",
+        "useMemo(",
+        "useCallback(",
+        "React.useEffect(",
+        "React.useLayoutEffect(",
+        "describe(",
+        "describe.each(",
+        "test(",
+        "test.each(",
+        "test.describe(",
+        "it(",
+        "it.each(",
+        "beforeEach(",
+        "afterEach(",
+        "configResolved(",
+        "configureServer(",
+        "transform(",
+        "resolveId(",
+        "handleHotUpdate(",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
 fn is_block_definition_header(line: &str) -> bool {
-    if line.trim().is_empty() || leading_indent_cols(line) > 4 {
+    let trimmed = crate::query::trim_line_start(line);
+    if trimmed.is_empty() || leading_indent_cols(line) > 4 {
         return false;
     }
-    crate::query::is_definition_line(line)
+    crate::query::is_definition_line(line) || is_frontend_block_header(trimmed)
 }
 
 fn is_leading_doc_or_attr(line: &str) -> bool {
     if leading_indent_cols(line) > 4 {
         return false;
     }
-    let trimmed = line.trim_start();
+    let trimmed = crate::query::trim_line_start(line);
     trimmed.starts_with("#[")
-        || trimmed.starts_with("///")
+        || trimmed.starts_with("//")
         || trimmed.starts_with("/**")
+        || trimmed.starts_with("/*")
         || trimmed == "*"
         || trimmed.starts_with("* ")
         || trimmed.starts_with("*/")
         || trimmed.starts_with('@')
+        || trimmed.starts_with("\"use client\"")
+        || trimmed.starts_with("'use client'")
+        || trimmed.starts_with("\"use server\"")
+        || trimmed.starts_with("'use server'")
+}
+
+fn is_sfc_section_open(line: &str) -> bool {
+    let trimmed = crate::query::trim_line_start(line);
+    leading_indent_cols(line) == 0
+        && (trimmed.starts_with("<script")
+            || trimmed.starts_with("<template")
+            || trimmed.starts_with("<style")
+            || trimmed == "---")
+}
+
+fn is_sfc_section_close(line: &str) -> bool {
+    let trimmed = crate::query::trim_line_start(line);
+    leading_indent_cols(line) == 0
+        && (trimmed.starts_with("</script>")
+            || trimmed.starts_with("</template>")
+            || trimmed.starts_with("</style>")
+            || trimmed == "---")
+}
+
+fn is_frontend_component_path(path: &str) -> bool {
+    path.ends_with(".tsx")
+        || path.ends_with(".jsx")
+        || path.ends_with(".vue")
+        || path.ends_with(".svelte")
+        || path.ends_with(".astro")
+}
+
+fn is_multiline_jsx_or_call_open(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if trimmed.ends_with(['(', ',', '{', '<', '='])
+        || trimmed.ends_with("=>")
+        || trimmed.ends_with("=> (")
+    {
+        return true;
+    }
+    let start = crate::query::trim_line_start(trimmed);
+    start.starts_with('<')
+        && !start.starts_with("</")
+        && !start.starts_with("<!--")
+        && !trimmed.ends_with('>')
 }
 
 fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
-    if radius < 6 || snippet.lines.len() <= 2 {
+    let is_doc = crate::document::is_document_path(&snippet.path);
+    if (!is_doc && radius < 6) || (is_doc && radius == 0) || snippet.lines.len() <= 2 {
         return;
     }
     let mut min_hit = usize::MAX;
@@ -270,7 +346,17 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
     let max_idx = max_hit - snippet.start;
     let mut new_start_idx = 0usize;
     let mut new_end_idx = snippet.lines.len() - 1;
-    if snippet.path.ends_with(".py") || snippet.path.ends_with(".pyi") {
+    if crate::document::is_document_path(&snippet.path)
+        && let Some((doc_start, doc_end)) = crate::document::clamp_document_snippet(
+            &snippet.path,
+            &snippet.lines,
+            min_idx,
+            max_idx,
+        )
+    {
+        new_start_idx = doc_start;
+        new_end_idx = doc_end;
+    } else if snippet.path.ends_with(".py") || snippet.path.ends_with(".pyi") {
         let is_py_header = |line: &str| {
             leading_indent_cols(line) <= 4 && is_python_top_header(line.trim_start())
         };
@@ -302,20 +388,45 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             }
         }
     } else {
+        let is_sfc = snippet.path.ends_with(".vue")
+            || snippet.path.ends_with(".svelte")
+            || snippet.path.ends_with(".astro");
         let is_block_close = |line: &str| {
             if leading_indent_cols(line) > 4 {
                 return false;
             }
             let trimmed = line.trim();
-            trimmed == "}" || trimmed == "};"
+            trimmed == "}"
+                || trimmed == "};"
+                || trimmed == "});"
+                || trimmed == "})"
+                || trimmed == "));"
+                || trimmed == "))"
+                || trimmed.starts_with("} satisfies ")
+                || trimmed.starts_with("} as const")
         };
         for idx in (1..=min_idx).rev() {
+            if is_sfc && is_sfc_section_open(&snippet.lines[idx]) {
+                new_start_idx = idx;
+                break;
+            }
+            if is_sfc && idx < min_idx && is_sfc_section_close(&snippet.lines[idx]) {
+                let mut candidate = idx + 1;
+                while candidate < min_idx && snippet.lines[candidate].trim().is_empty() {
+                    candidate += 1;
+                }
+                new_start_idx = candidate;
+                break;
+            }
             if is_block_definition_header(&snippet.lines[idx]) {
                 let mut header_start = idx;
                 while header_start > 0 && is_leading_doc_or_attr(&snippet.lines[header_start - 1]) {
                     header_start -= 1;
                 }
-                if header_start > 0 && snippet.lines[header_start - 1].trim().is_empty() {
+                if header_start > 0
+                    && (snippet.lines[header_start - 1].trim().is_empty()
+                        || (is_sfc && is_sfc_section_open(&snippet.lines[header_start - 1])))
+                {
                     new_start_idx = header_start;
                     break;
                 }
@@ -337,7 +448,22 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
             new_start_idx = candidate;
         }
         for idx in max_idx..snippet.lines.len().saturating_sub(1) {
-            if is_block_close(&snippet.lines[idx]) && snippet.lines[idx + 1].trim().is_empty() {
+            if is_sfc && idx > max_idx && is_sfc_section_close(&snippet.lines[idx]) {
+                new_end_idx = idx;
+                break;
+            }
+            if is_sfc && idx > max_idx && is_sfc_section_open(&snippet.lines[idx]) {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+            if is_block_close(&snippet.lines[idx])
+                && (snippet.lines[idx + 1].trim().is_empty()
+                    || (is_sfc && is_sfc_section_close(&snippet.lines[idx + 1])))
+            {
                 new_end_idx = idx;
                 break;
             }
@@ -397,17 +523,28 @@ fn assemble_inner(
 ) -> Result<ContextResult> {
     let has_definition_hit = radius >= 6
         && result.matches.iter().any(|hit| {
-            crate::query::is_definition_line(&hit.text)
-                || is_python_top_header(hit.text.trim_start())
+            !crate::document::is_document_path(&hit.path)
+                && (crate::query::is_definition_line(&hit.text)
+                    || is_python_top_header(hit.text.trim_start()))
         });
     let mut ranges: Vec<ReadRange> = Vec::with_capacity(result.matches.len());
     for hit in &result.matches {
         let (above, below, max_span) = if has_definition_hit {
+            let is_doc = crate::document::is_document_path(&hit.path);
             let is_def = crate::query::is_definition_line(&hit.text)
-                || is_python_top_header(hit.text.trim_start());
+                || is_python_top_header(hit.text.trim_start())
+                || (is_doc && crate::document::is_document_definition_line(&hit.text));
             if is_def {
-                (1usize, radius.min(5), 16usize)
-            } else if result.matches.len() <= 8 && hit.text.trim_end().ends_with(['(', ',', '{']) {
+                if is_doc {
+                    (1usize, radius.min(10), 24usize)
+                } else if is_frontend_component_path(&hit.path) {
+                    (1usize, radius.min(7), 20usize)
+                } else {
+                    (1usize, radius.min(5), 16usize)
+                }
+            } else if is_doc {
+                (radius.min(3), radius.min(5), 16usize)
+            } else if result.matches.len() <= 8 && is_multiline_jsx_or_call_open(&hit.text) {
                 (0usize, 2usize, 4usize)
             } else {
                 (0usize, 0usize, 2usize)

@@ -75,7 +75,9 @@ function formatSearch(value: JsonValue, includeFreshness = true): string {
       }
     } else {
       flushPending();
-      const text = ` ${stringValue(item.text, `search match ${index} text`)}`;
+      const rawText = stringValue(item.text, `search match ${index} text`);
+      const preview = rawText.length > 512 ? `${rawText.slice(0, 512)}...` : rawText;
+      const text = ` ${preview}`;
       if (previousPath === path) {
         lines.push(`:${line}${text}`);
       } else {

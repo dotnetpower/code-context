@@ -6,10 +6,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  buildContextArguments,
+  buildFilesArguments,
+  buildReadArguments,
+  buildSearchArguments,
+  extractLineRangeFromPath,
+  normalizeGlobPattern,
+  normalizeRelativeTargetPath,
   resolveRegisteredRoot,
   resolveRegisteredRootAfterRefresh,
   listedWorktreeRoot,
   parseGitIdentity,
+  wslCandidateToLinuxPath,
 } from '../src/rootResolver.js';
 import type { WorkspaceSpec } from '../src/types.js';
 
@@ -177,4 +185,101 @@ void test('real Git worktree output authorizes siblings but not unrelated reposi
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compound globs normalize cleanly', () => {
+  assert.deepEqual(extractLineRangeFromPath('src/assets/icon.svg?react'), {
+    path: 'src/assets/icon.svg',
+  });
+  assert.deepEqual(extractLineRangeFromPath('src/App.tsx:42:15'), {
+    path: 'src/App.tsx',
+    start: 42,
+    end: 82,
+  });
+  assert.deepEqual(extractLineRangeFromPath('src/App.tsx(18,5)'), {
+    path: 'src/App.tsx',
+    start: 18,
+    end: 58,
+  });
+  assert.equal(normalizeGlobPattern('./**/*.{ts,tsx}'), '*.{ts,tsx}');
+  assert.equal(normalizeGlobPattern('**/*.module.css'), '*.module.css');
+  assert.equal(normalizeGlobPattern('**/*.test.tsx'), '*.test.tsx');
+  assert.equal(normalizeRelativeTargetPath('@/components/Button.tsx?react'), 'src/components/Button.tsx');
+  assert.equal(normalizeRelativeTargetPath('~/hooks/useAuth.ts'), 'src/hooks/useAuth.ts');
+  assert.equal(normalizeRelativeTargetPath('b/src/main.rs'), 'src/main.rs');
+  assert.deepEqual(extractLineRangeFromPath('[App.tsx](/repo/src/App.tsx#L10C5-L20C2)'), {
+    path: '/repo/src/App.tsx',
+    start: 10,
+    end: 20,
+  });
+  assert.deepEqual(extractLineRangeFromPath('[Setup](docs/SETUP.md#windows-agent-sessions)'), {
+    path: 'docs/SETUP.md',
+    anchor: 'windows-agent-sessions',
+  });
+  const mdAnchorRead = buildReadArguments({
+    path: '[Setup](docs/SETUP.md#windows-agent-sessions)',
+  });
+  assert.deepEqual(mdAnchorRead.ranges, [
+    { path: 'docs/SETUP.md#windows-agent-sessions', start: 1, end: 120 },
+  ]);
+  assert.equal(normalizeGlobPattern('*.ts, *.tsx'), '*.{ts,tsx}');
+  assert.equal(normalizeGlobPattern('*.{ts, tsx, js}'), '*.{ts,tsx,js}');
+  assert.equal(wslCandidateToLinuxPath('file://wsl.localhost/Ubuntu/home/user/repo'), '/home/user/repo');
+
+  assert.deepEqual(
+    buildFilesArguments({
+      includePattern: null,
+      paths: ['src/**/*.tsx'],
+      maxResults: 50,
+    }),
+    {
+      glob: 'src/**/*.tsx',
+      paths: ['src'],
+      limit: 50,
+    },
+  );
+  assert.deepEqual(
+    buildSearchArguments({
+      symbol: 'useAuth',
+      isRegexp: true,
+      isCaseSensitive: false,
+      maxResults: 25,
+      maxMatchesPerFile: 3,
+      glob: '',
+    }),
+    {
+      pattern: 'useAuth',
+      regex: true,
+      ignore_case: true,
+      limit: 25,
+      max_matches_per_file: 3,
+    },
+  );
+  assert.deepEqual(
+    buildContextArguments({
+      needle: 'Button',
+      contextLines: 8,
+    }),
+    {
+      pattern: 'Button',
+      radius: 8,
+    },
+  );
+  const readBuilt = buildReadArguments({
+    paths: ['[a.ts](src/a.ts)', '`src/b.ts`'],
+    view_range: [10, -1],
+  });
+  assert.deepEqual(readBuilt.ranges, [
+    { path: 'src/a.ts', start: 10, end: 89 },
+    { path: 'src/b.ts', start: 10, end: 89 },
+  ]);
+  const splitBuilt = buildReadArguments({
+    path: 'src/large.ts',
+    start: 1,
+    end: 1200,
+  });
+  assert.equal(splitBuilt.ranges.length, 3);
+  assert.deepEqual(splitBuilt.ranges[0], { path: 'src/large.ts', start: 1, end: 500 });
+  assert.deepEqual(splitBuilt.ranges[1], { path: 'src/large.ts', start: 501, end: 1000 });
+  assert.deepEqual(splitBuilt.ranges[2], { path: 'src/large.ts', start: 1001, end: 1200 });
 });

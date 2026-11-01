@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod context;
 pub mod daemon;
 pub mod diagnostics;
+pub mod document;
 pub mod engine;
 pub mod exclusion_policy;
 pub mod experiment;

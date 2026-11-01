@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context by dotnetpower",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -161,8 +161,11 @@
           "files",
           "glob",
           "find",
+          "find_by_name",
+          "file_search",
           "search",
           "paths",
+          "workspace",
           "native",
           "cctx",
           "code-context"
@@ -181,7 +184,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 1024,
-              "description": "Filename or relative-path glob, e.g. *Tools.ts, *.json or src/**/*.rs."
+              "description": "Filename or relative-path glob, e.g. *Tools.ts, *.{ts,tsx}, **/*.test.tsx, src/**/*.rs, or bare stem."
             },
             "paths": {
               "type": "array",
@@ -209,6 +212,8 @@
           "files",
           "search",
           "grep",
+          "grep_search",
+          "code_search",
           "rg",
           "ripgrep",
           "saved-source",
@@ -360,6 +365,7 @@
         "tags": [
           "files",
           "read",
+          "read_file",
           "view",
           "cat",
           "lines",
@@ -405,7 +411,7 @@
                   "path": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Non-hidden workspace-relative file path (do not pass .github/.vscode dotfiles)."
+                    "description": "Non-hidden workspace-relative file path (supports path:line:col, path#Lstart-Lend, and @/ aliases; do not pass .github/.vscode dotfiles)."
                   },
                   "start": {
                     "type": "integer",

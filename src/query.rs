@@ -23,6 +23,7 @@ const RESULT_CACHE_ENTRIES: usize = 32;
 const RESULT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CONTEXT_CACHE_ENTRIES: usize = 16;
 const CONTEXT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const ELIGIBLE_CACHE_ENTRIES: usize = 4;
 const INDEX_OPERATION_BYTE_EQUIVALENT: usize = 64;
 // Tuning queries showed no reliable win once candidate bytes exceeded 75% of
 // the eligible corpus. Holdout queries are not used to choose this threshold.
@@ -125,7 +126,7 @@ pub struct QueryCache {
     result_bytes: usize,
     contexts: VecDeque<ContextEntry>,
     context_bytes: usize,
-    last_eligible: Option<EligibleEntry>,
+    eligible_cache: VecDeque<EligibleEntry>,
 }
 
 impl QueryCache {
@@ -198,13 +199,8 @@ impl QueryCache {
         self.result_bytes = self.results.iter().map(|entry| entry.owned_bytes).sum();
         self.contexts.retain(|entry| entry.generation == generation);
         self.context_bytes = self.contexts.iter().map(|entry| entry.owned_bytes).sum();
-        if self
-            .last_eligible
-            .as_ref()
-            .is_some_and(|e| e.generation != generation)
-        {
-            self.last_eligible = None;
-        }
+        self.eligible_cache
+            .retain(|entry| entry.generation == generation);
     }
 
     pub fn clear_memory(&mut self) {
@@ -214,7 +210,7 @@ impl QueryCache {
         self.result_bytes = 0;
         self.contexts.clear();
         self.context_bytes = 0;
-        self.last_eligible = None;
+        self.eligible_cache.clear();
     }
 
     fn get_result(&mut self, generation: u64, query: &Query) -> Option<std::sync::Arc<SearchResult>> {
@@ -488,12 +484,18 @@ fn search_internal(
         }
     }
     let (eligible, eligible_bytes) = if scoped {
-        if let Some(entry) = cache.last_eligible.as_ref()
-            && entry.generation == resident.stats.generation
-            && entry.paths == query.paths
-            && entry.glob == query.glob
-        {
-            (entry.ids.clone(), entry.bytes)
+        if let Some(pos) = cache.eligible_cache.iter().position(|entry| {
+            entry.generation == resident.stats.generation
+                && entry.paths == query.paths
+                && entry.glob == query.glob
+        }) {
+            let entry = cache
+                .eligible_cache
+                .remove(pos)
+                .expect("eligible cache hit");
+            let out = (entry.ids.clone(), entry.bytes);
+            cache.eligible_cache.push_back(entry);
+            out
         } else {
             let mut ids: Vec<_> = resident
                 .paths
@@ -504,7 +506,10 @@ fn search_internal(
             ids.sort_unstable();
             let bytes = resident.candidate_bytes(&ids);
             if query.paths.len() <= 8 {
-                cache.last_eligible = Some(EligibleEntry {
+                if cache.eligible_cache.len() >= ELIGIBLE_CACHE_ENTRIES {
+                    cache.eligible_cache.pop_front();
+                }
+                cache.eligible_cache.push_back(EligibleEntry {
                     generation: resident.stats.generation,
                     paths: query.paths.clone(),
                     glob: query.glob.clone(),
@@ -871,10 +876,14 @@ fn scan_document(
     Ok(())
 }
 
+pub(crate) fn trim_line_start(line: &str) -> &str {
+    line.strip_prefix('\u{feff}').unwrap_or(line).trim_start()
+}
+
 fn strip_modifier(trimmed: &str) -> Option<&str> {
     let bytes = trimmed.as_bytes();
-    let prefixes: &[&str] = match bytes.first()? {
-        b'p' => &[
+    match bytes.first()? {
+        b'p' => [
             "pub(crate) ",
             "pub(super) ",
             "pub ",
@@ -882,52 +891,294 @@ fn strip_modifier(trimmed: &str) -> Option<&str> {
             "private ",
             "public ",
             "partial ",
-        ],
-        b'e' => &["export "],
-        b'd' => &["default "],
-        b'i' => &["internal "],
-        b's' => &["static ", "sealed "],
-        b'a' => &["async ", "abstract "],
-        b'u' => &["unsafe "],
-        b'c' => &["const "],
-        b'v' => &["virtual "],
-        b'o' => &["override "],
-        _ => return None,
-    };
-    prefixes
+        ]
         .iter()
-        .find_map(|prefix| trimmed.strip_prefix(prefix))
+        .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'e' => trimmed.strip_prefix("export "),
+        b'd' => ["default ", "declare "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'i' => trimmed.strip_prefix("internal "),
+        b's' => {
+            if let Some(rest) = trimmed.strip_prefix("sealed ") {
+                return Some(rest);
+            }
+            if let Some(rest) = trimmed.strip_prefix("static ") {
+                let next = rest.trim_start();
+                if next.starts_with("fn ")
+                    || next.starts_with("async ")
+                    || next.starts_with("class ")
+                    || next.starts_with("function")
+                    || next.starts_with("readonly ")
+                {
+                    return Some(rest);
+                }
+            }
+            None
+        }
+        b'a' => ["async ", "abstract "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix)),
+        b'u' => trimmed.strip_prefix("unsafe "),
+        b'c' => {
+            if let Some(rest) = trimmed.strip_prefix("const ") {
+                let next = rest.trim_start();
+                if next.starts_with("fn ")
+                    || next.starts_with("unsafe ")
+                    || next.starts_with("enum ")
+                {
+                    return Some(rest);
+                }
+            }
+            None
+        }
+        b'v' => trimmed.strip_prefix("virtual "),
+        b'o' => trimmed.strip_prefix("override "),
+        b'r' => trimmed.strip_prefix("readonly "),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_reexport_from_line(trimmed: &str) -> bool {
+    let trimmed = trim_line_start(trimmed);
+    let Some(rest) = trimmed.strip_prefix("export ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("type ").map(str::trim_start).unwrap_or(rest);
+    if !(rest.starts_with('*') || rest.starts_with('{')) {
+        return false;
+    }
+    rest.contains(" from '")
+        || rest.contains(" from \"")
+        || rest.contains("}from '")
+        || rest.contains("}from \"")
+}
+
+fn is_cjs_require_import(trimmed: &str) -> bool {
+    if trimmed.starts_with("require(") {
+        return true;
+    }
+    if !(trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var "))
+    {
+        return false;
+    }
+    if let Some((_, rhs)) = trimmed.split_once('=') {
+        let rhs = rhs.trim_start();
+        rhs.starts_with("require(")
+    } else {
+        false
+    }
+}
+
+fn leading_indent_cols(line: &str) -> usize {
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+    let mut cols = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => cols += 1,
+            b'\t' => cols += 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
+fn is_react_component_or_hook_binding(after_keyword: &str) -> bool {
+    let ident: &str = after_keyword
+        .trim_start()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .next()
+        .unwrap_or("");
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = ident.as_bytes();
+    let is_pascal = bytes[0].is_ascii_uppercase()
+        && bytes.iter().any(|b| b.is_ascii_lowercase());
+    let is_hook = ident.starts_with("use")
+        && bytes.get(3).is_some_and(u8::is_ascii_uppercase);
+    is_pascal || is_hook
+}
+
+fn is_vite_plugin_hook_line(trimmed: &str) -> bool {
+    [
+        "configResolved(",
+        "configureServer(",
+        "configurePreviewServer(",
+        "transformIndexHtml(",
+        "handleHotUpdate(",
+        "resolveId(",
+        "transform(",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
 }
 
 pub(crate) fn is_definition_line(line: &str) -> bool {
-    let mut trimmed = line.trim_start();
+    definition_priority(line) > 0
+}
+
+pub(crate) fn definition_priority(line: &str) -> u8 {
+    let raw = trim_line_start(line);
+    if raw.is_empty() || is_reexport_from_line(raw) || is_cjs_require_import(raw) {
+        return 0;
+    }
+    let indent = leading_indent_cols(line);
+    let mut trimmed = raw;
+    let mut had_export_or_declare = false;
     while let Some(rest) = strip_modifier(trimmed) {
+        if trimmed.starts_with("export ")
+            || trimmed.starts_with("default ")
+            || trimmed.starts_with("declare ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("pub(")
+        {
+            had_export_or_declare = true;
+        }
         trimmed = rest.trim_start();
     }
     let Some(&first) = trimmed.as_bytes().first() else {
-        return false;
+        return 0;
     };
+    if matches!(first, b'c' | b'l' | b'v') {
+        let is_const = trimmed.starts_with("const ");
+        if let Some(after_kw) = trimmed
+            .strip_prefix("const ")
+            .or_else(|| trimmed.strip_prefix("let "))
+            .or_else(|| trimmed.strip_prefix("var "))
+        {
+            let after_trimmed = after_kw.trim_start();
+            if after_trimmed.starts_with("_ ") || after_trimmed.starts_with("_=") {
+                return 0;
+            }
+            let is_component_or_fn = is_react_component_or_hook_binding(after_trimmed)
+                || after_trimmed.contains("=>")
+                || after_trimmed.contains("memo(")
+                || after_trimmed.contains("forwardRef(")
+                || after_trimmed.contains("createContext(")
+                || after_trimmed.contains("lazy(")
+                || after_trimmed.contains("defineConfig(")
+                || after_trimmed.contains("createSlice(")
+                || after_trimmed.contains("createStore(");
+            if had_export_or_declare {
+                return if indent == 0 { 4 } else { 3 };
+            }
+            if indent == 0 && is_component_or_fn {
+                return 3;
+            }
+            if is_const && indent == 0 {
+                return 2;
+            }
+            return 0;
+        }
+    }
+    if indent <= 4 && is_vite_plugin_hook_line(trimmed) {
+        return 2;
+    }
     let keywords: &[&str] = match first {
-        b'f' => &["fn ", "func ", "function "],
-        b's' => &["struct ", "static "],
-        b'e' => &["enum "],
+        b'f' => &[
+            "fn ",
+            "func ",
+            "function ",
+            "function*",
+            "function(",
+            "forwardRef(",
+            "forwardRef<",
+            "fragment ",
+        ],
+        b's' => &["struct ", "static ", "scalar ", "subscription "],
+        b'e' => &["enum ", "extend type ", "extend interface ", "extend input "],
         b't' => &["trait ", "type "],
-        b'i' => &["impl ", "impl<", "interface "],
-        b'm' => &["mod ", "macro_rules!"],
-        b'c' => &["const ", "class "],
-        b'd' => &["def "],
+        b'i' => &["impl ", "impl<", "interface ", "input "],
+        b'm' => &["mod ", "macro_rules!", "module ", "memo(", "memo<", "model ", "mutation "],
+        b'c' => &[
+            "class ",
+            "createContext(",
+            "createContext<",
+            "createSlice(",
+            "createStore(",
+        ],
+        b'd' => &[
+            "def ",
+            "defineConfig(",
+            "defineVitestConfig(",
+            "datasource ",
+        ],
         b'n' => &["namespace "],
-        _ => return false,
+        b'l' => &["lazy(", "lazy<"],
+        b'g' => &["global ", "global{", "generator "],
+        b'q' => &["query "],
+        b'R' => &[
+            "React.memo(",
+            "React.memo<",
+            "React.forwardRef(",
+            "React.forwardRef<",
+            "React.lazy(",
+            "React.lazy<",
+            "React.createContext(",
+            "React.createContext<",
+        ],
+        b'@' => &[
+            "@keyframes ",
+            "@layer ",
+            "@mixin ",
+            "@function ",
+            "@utility ",
+            "@theme ",
+            "@theme{",
+            "@custom-media ",
+        ],
+        b':' => &[":root ", ":root{"],
+        _ => &[],
     };
-    keywords.iter().any(|keyword| trimmed.starts_with(keyword))
+    if keywords.iter().any(|keyword| trimmed.starts_with(keyword)) {
+        return if had_export_or_declare || indent <= 2 { 3 } else { 2 };
+    }
+    if had_export_or_declare
+        && (trimmed.starts_with("create(")
+            || trimmed.starts_with("create<")
+            || trimmed.starts_with("styled(")
+            || trimmed.starts_with("styled.")
+            || trimmed.starts_with("cva("))
+    {
+        return 3;
+    }
+    0
 }
 
-fn is_import_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
+fn is_low_signal_usage_line(line: &str) -> bool {
+    let trimmed = trim_line_start(line).trim_end();
+    (trimmed.starts_with("</") && trimmed.ends_with('>'))
+        || trimmed.starts_with("console.log(")
+        || trimmed.starts_with("console.debug(")
+        || trimmed == "debugger;"
+        || trimmed == "debugger"
+}
+
+pub(crate) fn is_import_line(line: &str) -> bool {
+    let trimmed = trim_line_start(line);
     trimmed.starts_with("use ")
         || trimmed.starts_with("import ")
+        || trimmed.starts_with("import(")
+        || trimmed.starts_with("import\"")
+        || trimmed.starts_with("import'")
+        || trimmed.starts_with("import{")
+        || trimmed.starts_with("import*")
         || trimmed.starts_with("from ")
         || trimmed.starts_with("#include")
+        || trimmed.starts_with("} from ")
+        || trimmed.starts_with("}from ")
+        || trimmed.starts_with("@import ")
+        || trimmed.starts_with("@import\"")
+        || trimmed.starts_with("@import'")
+        || trimmed.starts_with("@use ")
+        || trimmed.starts_with("@forward ")
+        || trimmed.starts_with("/// <reference ")
+        || trimmed.starts_with("///<reference ")
+        || trimmed.starts_with("/// <amd-")
+        || is_reexport_from_line(trimmed)
+        || is_cjs_require_import(trimmed)
 }
 
 fn record_document(
@@ -953,11 +1204,26 @@ fn record_document(
         return;
     }
     if max_per_file.is_some() {
-        let mut selected: Vec<usize> = file_lines
+        let is_doc_file = crate::document::is_document_path(&document.path);
+        let mut def_candidates: Vec<(u8, usize)> = file_lines
             .iter()
             .copied()
-            .filter(|&line| is_definition_line(document.line(line)))
+            .filter_map(|line| {
+                let text = document.line(line);
+                let prio = if is_doc_file {
+                    crate::document::document_definition_priority(text)
+                        .max(definition_priority(text))
+                } else {
+                    definition_priority(text)
+                };
+                (prio > 0).then_some((prio, line))
+            })
+            .collect();
+        def_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut selected: Vec<usize> = def_candidates
+            .into_iter()
             .take(cap)
+            .map(|(_, line)| line)
             .collect();
         if selected.len() < cap {
             let non_imports: Vec<usize> = file_lines
@@ -965,10 +1231,21 @@ fn record_document(
                 .copied()
                 .filter(|&line| !is_import_line(document.line(line)))
                 .collect();
-            let pool: &[usize] = if non_imports.is_empty() {
-                file_lines
-            } else {
+            let high_signal: Vec<usize> = non_imports
+                .iter()
+                .copied()
+                .filter(|&line| {
+                    let text = document.line(line);
+                    !(is_low_signal_usage_line(text)
+                        || is_doc_file && crate::document::is_document_boilerplate_line(text))
+                })
+                .collect();
+            let pool: &[usize] = if !high_signal.is_empty() {
+                &high_signal
+            } else if !non_imports.is_empty() {
                 &non_imports
+            } else {
+                file_lines
             };
             // Anchor-aware selection (first + last + evenly strided middle),
             // preventing top-of-file imports from starving bottom-of-file call sites.
@@ -996,7 +1273,7 @@ fn record_document(
                 }
             }
             if selected.len() < cap {
-                for &line in pool.iter().chain(file_lines.iter()) {
+                for &line in pool.iter().chain(non_imports.iter()).chain(file_lines.iter()) {
                     if !selected.contains(&line) {
                         selected.push(line);
                         if selected.len() == cap {
@@ -1005,8 +1282,8 @@ fn record_document(
                     }
                 }
             }
-            selected.sort_unstable();
         }
+        selected.sort_unstable();
         for line in selected {
             matches.push(Hit {
                 path: document.path.to_string(),
@@ -1065,50 +1342,185 @@ enum GlobFilter<'a> {
     None,
     Extension(&'a str),
     BraceExtensions(Vec<String>),
+    ScopedExtensions {
+        dir_prefix: &'a str,
+        suffixes: Vec<String>,
+    },
     Compiled(GlobSet),
 }
 
+pub(crate) fn trim_leading_dot_slash(mut glob: &str) -> &str {
+    while let Some(rest) = glob.strip_prefix("./") {
+        if rest.is_empty() {
+            break;
+        }
+        glob = rest;
+    }
+    glob
+}
+
+pub(crate) fn is_valid_compound_ext(ext: &str) -> bool {
+    !ext.is_empty()
+        && !ext.starts_with('.')
+        && !ext.ends_with('.')
+        && !ext.contains("..")
+        && ext
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+pub(crate) fn simple_extension_suffix(glob: &str) -> Option<&str> {
+    let glob = trim_leading_dot_slash(glob);
+    if let Some(ext) = glob.strip_prefix("**/*.") {
+        let suffix = &glob[4..];
+        if is_valid_compound_ext(ext) {
+            return Some(suffix);
+        }
+    }
+    if let Some(ext) = glob.strip_prefix("*.") {
+        let suffix = &glob[1..];
+        if is_valid_compound_ext(ext) {
+            return Some(suffix);
+        }
+    }
+    None
+}
+
 pub(crate) fn brace_extension_suffixes(glob: &str) -> Option<Vec<String>> {
-    let inner = glob.strip_prefix("*.{")?.strip_suffix('}')?;
+    let glob = trim_leading_dot_slash(glob.trim());
+    if !glob.contains('{') && glob.contains(',') {
+        let mut suffixes = Vec::with_capacity(4);
+        for raw_part in glob.split(',') {
+            let part = trim_leading_dot_slash(raw_part.trim());
+            let ext = part
+                .strip_prefix("**/*.")
+                .or_else(|| part.strip_prefix("*."))?;
+            if !is_valid_compound_ext(ext) {
+                return None;
+            }
+            suffixes.push(format!(".{ext}"));
+        }
+        return (2..=16).contains(&suffixes.len()).then_some(suffixes);
+    }
+    let inner = glob
+        .strip_prefix("**/*.{")
+        .or_else(|| glob.strip_prefix("*.{"))?
+        .strip_suffix('}')?;
     if inner.is_empty() {
         return None;
     }
     let mut suffixes = Vec::with_capacity(4);
-    for part in inner.split(',') {
-        if part.is_empty()
-            || !part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
+    for raw_part in inner.split(',') {
+        let part = raw_part.trim();
+        if !is_valid_compound_ext(part) {
             return None;
         }
         suffixes.push(format!(".{part}"));
     }
-    (suffixes.len() >= 2 && suffixes.len() <= 8).then_some(suffixes)
+    (2..=16).contains(&suffixes.len()).then_some(suffixes)
+}
+
+pub(crate) fn scoped_extension_glob(glob: &str) -> Option<(&str, Vec<String>)> {
+    let glob = trim_leading_dot_slash(glob);
+    let (dir_prefix, tail) = glob.split_once("/**/")?;
+    if dir_prefix.is_empty()
+        || dir_prefix.starts_with('/')
+        || dir_prefix.ends_with('/')
+        || dir_prefix.contains("//")
+        || dir_prefix.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || !dir_prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+    {
+        return None;
+    }
+    if let Some(ext) = tail.strip_prefix("*.")
+        && is_valid_compound_ext(ext)
+    {
+        return Some((dir_prefix, vec![format!(".{ext}")]));
+    }
+    if let Some(inner) = tail.strip_prefix("*.{").and_then(|s| s.strip_suffix('}')) {
+        let mut suffixes = Vec::with_capacity(4);
+        for raw_part in inner.split(',') {
+            let part = raw_part.trim();
+            if !is_valid_compound_ext(part) {
+                return None;
+            }
+            suffixes.push(format!(".{part}"));
+        }
+        if (2..=16).contains(&suffixes.len()) {
+            return Some((dir_prefix, suffixes));
+        }
+    }
+    None
+}
+
+pub(crate) fn escape_dynamic_route_brackets(glob: &str) -> Option<String> {
+    if !glob.contains('[') || !glob.contains(']') {
+        return None;
+    }
+    let mut out = String::with_capacity(glob.len() + 8);
+    let mut rest = glob;
+    let mut escaped_any = false;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        if let Some(close) = after_open.find(']') {
+            let inner = &after_open[..close];
+            let is_route_param = inner.starts_with("...")
+                || inner.starts_with('[')
+                || (inner.len() >= 2
+                    && inner
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+            if is_route_param {
+                out.push_str("\\[");
+                out.push_str(inner);
+                out.push_str("\\]");
+                escaped_any = true;
+            } else {
+                out.push('[');
+                out.push_str(inner);
+                out.push(']');
+            }
+            rest = &after_open[close + 1..];
+        } else {
+            out.push_str(&rest[open..]);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    escaped_any.then_some(out)
 }
 
 fn glob(query: &Query) -> Result<GlobFilter<'_>> {
-    let Some(glob) = query.glob.as_deref() else {
+    let Some(raw_glob) = query.glob.as_deref() else {
         return Ok(GlobFilter::None);
     };
-    if glob.len() > 1024 {
+    if raw_glob.len() > 1024 {
         return Err(invalid("glob exceeds 1024 bytes").into());
     }
-    if let Some(ext) = glob.strip_prefix("*.") {
-        let suffix = &glob[1..];
-        if !ext.is_empty()
-            && ext
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
-            return Ok(GlobFilter::Extension(suffix));
-        }
+    let glob = trim_leading_dot_slash(raw_glob);
+    if let Some(suffix) = simple_extension_suffix(glob) {
+        return Ok(GlobFilter::Extension(suffix));
     }
     if let Some(suffixes) = brace_extension_suffixes(glob) {
         return Ok(GlobFilter::BraceExtensions(suffixes));
     }
+    if let Some((dir_prefix, suffixes)) = scoped_extension_glob(glob) {
+        return Ok(GlobFilter::ScopedExtensions {
+            dir_prefix,
+            suffixes,
+        });
+    }
     let mut builder = GlobSetBuilder::new();
     builder.add(Glob::new(glob)?);
+    if let Some(escaped) = escape_dynamic_route_brackets(glob)
+        && let Ok(route_glob) = Glob::new(&escaped)
+    {
+        builder.add(route_glob);
+    }
     Ok(GlobFilter::Compiled(builder.build()?))
 }
 
@@ -1127,6 +1539,16 @@ fn path_allowed(
         GlobFilter::Extension(suffix) => raw_path.ends_with(suffix),
         GlobFilter::BraceExtensions(suffixes) => {
             suffixes.iter().any(|suffix| raw_path.ends_with(suffix.as_str()))
+        }
+        GlobFilter::ScopedExtensions {
+            dir_prefix,
+            suffixes,
+        } => {
+            raw_path.starts_with(*dir_prefix)
+                && raw_path.as_bytes().get(dir_prefix.len()) == Some(&b'/')
+                && suffixes
+                    .iter()
+                    .any(|suffix| raw_path[dir_prefix.len() + 1..].ends_with(suffix.as_str()))
         }
         GlobFilter::Compiled(set) => {
             let path = Path::new(raw_path);

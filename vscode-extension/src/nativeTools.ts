@@ -1,5 +1,4 @@
-import { existsSync } from 'node:fs';
-import { basename, join, posix, resolve } from 'node:path';
+import { posix, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import * as vscode from 'vscode';
@@ -8,6 +7,20 @@ import { TracedRequestError, type ClientTrace, type DaemonClient } from './daemo
 import { formatToolResult } from './resultFormatter.js';
 import { formatTrace, outcomeLevel, singleLine } from './logFormatter.js';
 import {
+  buildContextArguments,
+  buildFilesArguments,
+  buildReadArguments,
+  buildSearchArguments,
+  type CopilotContextInput as ContextInput,
+  type CopilotFilesInput as FilesInput,
+  type CopilotReadInput as ReadInput,
+  type CopilotRootInput as RootInput,
+  type CopilotSearchInput as SearchInput,
+  extractLineRangeFromPath,
+  extractRawRootInput,
+  normalizeGlobPattern,
+  normalizeRelativeTargetPath,
+  normalizeUriOrPath,
   resolveRegisteredRootAfterRefresh,
   resolveWslRoot,
   wslCandidateToLinuxPath,
@@ -27,60 +40,11 @@ export const NATIVE_TOOL_NAMES = [
   'code-context-native_codeWorkspaces',
 ] as const;
 
-interface RootInput {
-  root?: string;
-}
-
-interface FilesInput extends RootInput {
-  glob?: string;
-  pattern?: string;
-  paths?: string[] | string;
-  path?: string;
-  limit?: number;
-}
-
-interface SearchInput extends RootInput {
-  pattern?: string;
-  query?: string;
-  regex?: boolean;
-  ignore_case?: boolean;
-  limit?: number;
-  max_matches_per_file?: number;
-  paths?: string[] | string;
-  path?: string;
-  glob?: string;
-}
-
-interface ContextInput extends SearchInput {
-  radius?: number;
-}
-
-interface ReadRangeInput {
-  path?: string;
-  filePath?: string;
-  start?: number;
-  end?: number;
-  start_line?: number;
-  end_line?: number;
-  startLine?: number;
-  endLine?: number;
-  view_range?: readonly [number, number];
-}
-
-interface ReadInput extends RootInput {
-  split_ranges?: boolean;
-  page?: boolean;
-  ranges?: ReadRangeInput[];
-  path?: string;
-  filePath?: string;
-  start?: number;
-  end?: number;
-  start_line?: number;
-  end_line?: number;
-  startLine?: number;
-  endLine?: number;
-  view_range?: readonly [number, number];
-}
+export {
+  extractLineRangeFromPath,
+  normalizeGlobPattern,
+  normalizeRelativeTargetPath,
+};
 
 type EmptyInput = Record<string, never>;
 
@@ -192,7 +156,10 @@ export class NativeToolBridge implements vscode.Disposable {
     const traceId = randomUUID();
     let root: string | null = null;
     try {
-      const explicit = normalizeExplicitRootInput((input as RootInput).root, this.client.usesWslBridge);
+      const explicit = normalizeExplicitRootInput(
+        extractRawRootInput(input as RootInput),
+        this.client.usesWslBridge,
+      );
       root = definition.needsRoot
         ? await this.resolveRoot(
             explicit,
@@ -222,18 +189,27 @@ export class NativeToolBridge implements vscode.Disposable {
       result.trace.started_unix_ms = startedUnixMs;
       result.trace.completed_unix_ms = Date.now();
       result.trace.outcome = 'success';
-      this.onUsage?.({ operation: definition.operation, root });
+      this.onUsage?.({
+        operation: definition.operation,
+        root,
+        totalMs: result.trace.total_ms,
+      });
       if (definition.operation === 'code_sync') {
         this.registry.invalidate();
       }
       return result;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      this.onUsage?.({ operation: definition.operation, root, error: message });
       const elapsed = performance.now() - started;
+      this.onUsage?.({
+        operation: definition.operation,
+        root,
+        error: message,
+        totalMs: elapsed,
+      });
       const trace: ClientTrace = error instanceof TracedRequestError ? error.trace : {
         trace_id: traceId, origin: 'native', operation: definition.operation,
-        root: root ?? (definition.needsRoot ? (input as RootInput).root ?? null : null),
+        root: root ?? (definition.needsRoot ? extractRawRootInput(input as RootInput) ?? null : null),
         queue_ms: 0, prepare_ms: elapsed, ipc_ms: 0, serialize_ms: 0, write_ms: 0,
         total_ms: elapsed, success: false, available: false, daemon: null,
         started_unix_ms: startedUnixMs, completed_unix_ms: Date.now(),
@@ -360,8 +336,8 @@ const searchDefinition: ToolDefinition<SearchInput> = {
   operation: 'code_grep',
   needsRoot: true,
   invocationMessage: (input) =>
-    `Searching indexed source${input.regex ? ' (regex)' : ''} for "${input.pattern ?? input.query ?? ''}"${rootSuffix(input.root)}`,
-  arguments: (input, root) => searchArguments(input, root, 1000),
+    `Searching indexed source${input.regex ?? input.isRegexp ? ' (regex)' : ''} for "${input.pattern ?? input.query ?? input.symbol ?? ''}"${rootSuffix(extractRawRootInput(input))}`,
+  arguments: (input, root) => buildSearchArguments(input, root, 1000),
 };
 
 const filesDefinition: ToolDefinition<FilesInput> = {
@@ -369,22 +345,8 @@ const filesDefinition: ToolDefinition<FilesInput> = {
   operation: 'code_files',
   needsRoot: true,
   invocationMessage: (input) =>
-    `Finding indexed files matching "${input.glob ?? input.pattern ?? '*'}"${rootSuffix(input.root)}`,
-  arguments: (input, root) => {
-    const rawGlob = input.glob ?? input.pattern;
-    const glob = normalizeGlobPattern(
-      typeof rawGlob === 'string' && rawGlob.trim().length > 0 ? rawGlob.trim() : '*',
-    );
-    const args: Record<string, JsonValue> = { glob };
-    const normalizedPaths = normalizeInputPaths(input.paths ?? input.path, root);
-    if (normalizedPaths !== undefined) {
-      args.paths = normalizedPaths;
-    }
-    if (typeof input.limit === 'number' && Number.isFinite(input.limit)) {
-      args.limit = Math.min(1000, Math.max(1, Math.trunc(input.limit)));
-    }
-    return args;
-  },
+    `Finding indexed files matching "${input.glob ?? input.includePattern ?? input.filePattern ?? input.pattern ?? '*'}"${rootSuffix(extractRawRootInput(input))}`,
+  arguments: (input, root) => buildFilesArguments(input, root),
 };
 
 const contextDefinition: ToolDefinition<ContextInput> = {
@@ -392,14 +354,8 @@ const contextDefinition: ToolDefinition<ContextInput> = {
   operation: 'code_context',
   needsRoot: true,
   invocationMessage: (input) =>
-    `Searching indexed source with context${input.regex ? ' (regex)' : ''} for "${input.pattern ?? input.query ?? ''}"${rootSuffix(input.root)}`,
-  arguments: (input, root) => {
-    const args = searchArguments(input, root, 64);
-    if (typeof input.radius === 'number' && Number.isFinite(input.radius)) {
-      args.radius = Math.min(100, Math.max(0, Math.trunc(input.radius)));
-    }
-    return args;
-  },
+    `Searching indexed source with context${input.regex ?? input.isRegexp ? ' (regex)' : ''} for "${input.pattern ?? input.query ?? input.symbol ?? ''}"${rootSuffix(extractRawRootInput(input))}`,
+  arguments: (input, root) => buildContextArguments(input, root),
 };
 
 const readDefinition: ToolDefinition<ReadInput> = {
@@ -407,44 +363,14 @@ const readDefinition: ToolDefinition<ReadInput> = {
   operation: 'code_read',
   needsRoot: true,
   invocationMessage: (input) => {
-    const count = Array.isArray(input.ranges) ? input.ranges.length : 1;
-    return `Reading ${count} indexed source range(s)${rootSuffix(input.root)}`;
+    const count = Array.isArray(input.ranges)
+      ? input.ranges.length
+      : Array.isArray(input.paths)
+        ? input.paths.length
+        : 1;
+    return `Reading ${count} indexed source range(s)${rootSuffix(extractRawRootInput(input))}`;
   },
-  arguments: (input, root) => {
-    const rawRanges: ReadRangeInput[] =
-      Array.isArray(input.ranges) && input.ranges.length > 0
-        ? input.ranges
-        : typeof (input.path ?? input.filePath) === 'string'
-          ? [input]
-          : [];
-    const normalized = rawRanges.map((range) => {
-      const rawPath = range.path ?? range.filePath ?? '';
-      const extracted = extractLineRangeFromPath(rawPath);
-      const tupleStart = Array.isArray(range.view_range) ? range.view_range[0] : undefined;
-      const tupleEnd = Array.isArray(range.view_range) ? range.view_range[1] : undefined;
-      const rawStart =
-        range.start ?? range.start_line ?? range.startLine ?? tupleStart ?? extracted.start ?? 1;
-      const rawEndCandidate =
-        range.end ??
-        range.end_line ??
-        range.endLine ??
-        (tupleEnd !== undefined && tupleEnd >= 0 ? tupleEnd : undefined) ??
-        extracted.end ??
-        Math.max(rawStart, rawStart + 119);
-      const clampedStart = Math.max(1, Math.trunc(rawStart));
-      const clampedEnd = Math.max(1, Math.trunc(rawEndCandidate));
-      return {
-        path: normalizeRelativeTargetPath(extracted.path, root),
-        start: Math.min(clampedStart, clampedEnd),
-        end: Math.max(clampedStart, clampedEnd),
-      };
-    });
-    return {
-      split_ranges: input.split_ranges ?? true,
-      page: input.page ?? false,
-      ranges: deduplicateAndMergeRanges(normalized),
-    };
-  },
+  arguments: (input, root) => buildReadArguments(input, root),
 };
 
 const statusDefinition: ToolDefinition<RootInput> = {
@@ -480,71 +406,11 @@ function rootSuffix(root: string | undefined): string {
   return name ? ` in ${name}` : '';
 }
 
-function normalizeGlobPattern(glob: string): string {
-  if (/^\*\*\/\*\.([a-zA-Z0-9_+-]+)$/u.test(glob)) {
-    return glob.slice(3);
-  }
-  return glob;
-}
-
-function searchArguments(
-  input: SearchInput,
-  root?: string | null,
-  maxLimit = 1000,
-): Record<string, JsonValue> {
-  const args: Record<string, JsonValue> = { pattern: input.pattern ?? input.query ?? '' };
-  if (input.regex !== undefined) {
-    args.regex = input.regex;
-  }
-  if (input.ignore_case !== undefined) {
-    args.ignore_case = input.ignore_case;
-  }
-  if (typeof input.limit === 'number' && Number.isFinite(input.limit)) {
-    args.limit = Math.min(maxLimit, Math.max(1, Math.trunc(input.limit)));
-  }
-  if (typeof input.max_matches_per_file === 'number' && Number.isFinite(input.max_matches_per_file)) {
-    args.max_matches_per_file = Math.min(64, Math.max(1, Math.trunc(input.max_matches_per_file)));
-  }
-  const normalizedPaths = normalizeInputPaths(input.paths ?? input.path, root);
-  if (normalizedPaths !== undefined) {
-    args.paths = normalizedPaths;
-  }
-  if (input.glob !== undefined) {
-    args.glob = normalizeGlobPattern(input.glob);
-  }
-  return args;
-}
-
-function normalizeUriOrPath(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('file://')) {
-    try {
-      const parsed = new URL(trimmed);
-      let decoded = decodeURIComponent(parsed.pathname);
-      if (/^\/[a-zA-Z]:\//u.test(decoded)) {
-        decoded = decoded.slice(1);
-      }
-      return decoded;
-    } catch {
-      return trimmed;
-    }
-  }
-  const remoteMatch = /^vscode-remote:\/\/[^/]+(\/.*)$/iu.exec(trimmed);
-  if (remoteMatch?.[1]) {
-    try {
-      return decodeURIComponent(remoteMatch[1]);
-    } catch {
-      return remoteMatch[1];
-    }
-  }
-  return trimmed;
-}
-
 function normalizeExplicitRootInput(
   rawRoot: string | undefined,
   usesWslBridge: boolean,
 ): string | undefined {
-  if (rawRoot === undefined) {
+  if (rawRoot === undefined || rawRoot.trim().length === 0) {
     return undefined;
   }
   const normalized = normalizeUriOrPath(rawRoot);
@@ -554,118 +420,22 @@ function normalizeExplicitRootInput(
   return normalized;
 }
 
-function extractLineRangeFromPath(rawPath: string): {
-  path: string;
-  start?: number;
-  end?: number;
-} {
-  const normalized = normalizeUriOrPath(rawPath);
-  const hashMatch = /^(.+?\.[^#/:]+)#L(\d+)(?:-L?(\d+))?$/u.exec(normalized);
-  if (hashMatch?.[1] && hashMatch[2]) {
-    const start = Number.parseInt(hashMatch[2], 10);
-    const end = hashMatch[3] ? Number.parseInt(hashMatch[3], 10) : start + 40;
-    return { path: hashMatch[1], start, end };
-  }
-  const colonMatch = /^(.+?\.[^/:]+):(\d+)(?:-(\d+))?$/u.exec(normalized);
-  if (colonMatch?.[1] && colonMatch[2]) {
-    const start = Number.parseInt(colonMatch[2], 10);
-    const end = colonMatch[3] ? Number.parseInt(colonMatch[3], 10) : start + 40;
-    return { path: colonMatch[1], start, end };
-  }
-  return { path: normalized };
-}
-
-function deduplicateAndMergeRanges(
-  ranges: Array<{ path: string; start: number; end: number }>,
-): Array<{ path: string; start: number; end: number }> {
-  if (ranges.length <= 1) {
-    return ranges;
-  }
-  const merged: Array<{ path: string; start: number; end: number }> = [];
-  for (const current of ranges) {
-    const previous = merged.at(-1);
-    if (
-      previous &&
-      previous.path === current.path &&
-      current.start >= previous.start &&
-      current.start <= previous.end + 1 &&
-      Math.max(previous.end, current.end) - previous.start < 500
-    ) {
-      previous.end = Math.max(previous.end, current.end);
-    } else if (
-      !merged.some(
-        (item) =>
-          item.path === current.path && item.start <= current.start && item.end >= current.end,
-      )
-    ) {
-      merged.push({ ...current });
-    }
-  }
-  return merged;
-}
-
-function normalizeRelativeTargetPath(rawPath: string, root?: string | null): string {
-  let normalized = extractLineRangeFromPath(rawPath).path;
-  if (!normalized.startsWith('\\\\') && !/^[a-zA-Z]:\\/u.test(normalized)) {
-    normalized = normalized.replaceAll('\\', '/');
-  }
-  if (root) {
-    const cleanRoot = root.replaceAll('\\', '/').replace(/\/+$/u, '');
-    if (normalized === cleanRoot) {
-      return '.';
-    }
-    if (normalized.startsWith(`${cleanRoot}/`)) {
-      normalized = normalized.slice(cleanRoot.length + 1);
-    } else {
-      const rootName = posix.basename(cleanRoot) || basename(cleanRoot);
-      if (rootName && normalized.startsWith(`${rootName}/`)) {
-        const stripped = normalized.slice(rootName.length + 1);
-        if (stripped && !existsSync(join(root, normalized)) && existsSync(join(root, stripped))) {
-          normalized = stripped;
-        }
-      }
-    }
-  }
-  while (normalized.startsWith('./') && normalized.length > 2) {
-    normalized = normalized.slice(2);
-  }
-  if (normalized.length > 1 && normalized.endsWith('/')) {
-    normalized = normalized.replace(/\/+$/u, '');
-  }
-  return normalized;
-}
-
-function normalizeInputPaths(
-  rawPaths: string[] | string | undefined,
-  root?: string | null,
-): string[] | undefined {
-  if (rawPaths === undefined) {
-    return undefined;
-  }
-  const items = Array.isArray(rawPaths)
-    ? rawPaths
-    : typeof rawPaths === 'string' && rawPaths.trim().length > 0
-      ? [rawPaths]
-      : [];
-  return items.map((item) => normalizeRelativeTargetPath(item, root));
-}
-
 function collectRawInputPaths(input: unknown): string[] {
   if (!isRecord(input)) {
     return [];
   }
   const raw: string[] = [];
-  if (typeof input.path === 'string') {
-    raw.push(extractLineRangeFromPath(input.path).path);
+  for (const key of ['path', 'filePath', 'uri', 'file', 'target'] as const) {
+    const val = input[key];
+    if (typeof val === 'string' && val.trim().length > 0) {
+      raw.push(extractLineRangeFromPath(val).path);
+    }
   }
-  if (typeof input.filePath === 'string') {
-    raw.push(extractLineRangeFromPath(input.filePath).path);
-  }
-  if (typeof input.paths === 'string') {
+  if (typeof input.paths === 'string' && input.paths.trim().length > 0) {
     raw.push(extractLineRangeFromPath(input.paths).path);
   } else if (Array.isArray(input.paths)) {
     for (const item of input.paths) {
-      if (typeof item === 'string') {
+      if (typeof item === 'string' && item.trim().length > 0) {
         raw.push(extractLineRangeFromPath(item).path);
       }
     }
@@ -673,9 +443,12 @@ function collectRawInputPaths(input: unknown): string[] {
   if (Array.isArray(input.ranges)) {
     for (const range of input.ranges) {
       if (isRecord(range)) {
-        const rangePath = typeof range.path === 'string' ? range.path : typeof range.filePath === 'string' ? range.filePath : undefined;
-        if (rangePath) {
-          raw.push(extractLineRangeFromPath(rangePath).path);
+        for (const key of ['path', 'filePath', 'uri', 'file', 'target'] as const) {
+          const rangePath = range[key];
+          if (typeof rangePath === 'string' && rangePath.trim().length > 0) {
+            raw.push(extractLineRangeFromPath(rangePath).path);
+            break;
+          }
         }
       }
     }

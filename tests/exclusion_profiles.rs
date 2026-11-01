@@ -336,9 +336,89 @@ fn profile_marker_recognizes_extensions_and_nested_markers() {
         "main.tf",
         "package.nimble",
         "ProjectSettings/ProjectVersion.txt",
+        "vite.config.ts",
+        "vitest.config.ts",
+        "next.config.ts",
+        "svelte.config.js",
+        "astro.config.mjs",
     ] {
         assert!(code_context::exclusion_policy::is_profile_marker(
             Path::new(path)
         ));
     }
+}
+
+#[test]
+fn frontend_and_vite_profiles_exclude_lockfiles_bundles_sourcemaps_and_generated_outputs() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src/components")).unwrap();
+    std::fs::create_dir_all(root.path().join("src/__generated__")).unwrap();
+    std::fs::create_dir_all(root.path().join("storybook-static")).unwrap();
+    std::fs::create_dir_all(root.path().join("playwright-report")).unwrap();
+    std::fs::create_dir_all(root.path().join("test-results")).unwrap();
+    std::fs::create_dir_all(root.path().join("dist-ssr")).unwrap();
+    std::fs::create_dir_all(root.path().join("dev-dist")).unwrap();
+
+    std::fs::write(root.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();
+    std::fs::write(root.path().join("vite.config.ts"), "export default {}\n").unwrap();
+    std::fs::write(
+        root.path().join("src/components/Button.tsx"),
+        "export const Button = () => <button />;\n",
+    )
+    .unwrap();
+
+    // Lockfiles, minified bundles, sourcemaps, and generated Vite/Relay/TanStack outputs
+    for noisy in [
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "vite.config.ts.timestamp-1730000000000-abc123.mjs",
+        "src/routeTree.gen.ts",
+        "src/__generated__/graphql.ts",
+        "src/vendor.min.js",
+        "src/vendor.min.mjs",
+        "src/styles.min.css",
+        "src/app.bundle.js",
+        "src/app.chunk.js",
+        "src/App.tsx.map",
+        "src/styles.css.map",
+        "src/types.d.ts.map",
+        "storybook-static/iframe.js",
+        "playwright-report/index.html",
+        "test-results/report.json",
+        "dist-ssr/entry-server.js",
+        "dev-dist/sw.js",
+    ] {
+        std::fs::write(root.path().join(noisy), "noisy_artifact\n").unwrap();
+    }
+
+    let workspace = Workspace::new(
+        root.path(),
+        vec![".".into()],
+        vec![
+            "*.json".into(),
+            "*.yaml".into(),
+            "*.ts".into(),
+            "*.tsx".into(),
+            "*.js".into(),
+            "*.mjs".into(),
+            "*.css".into(),
+            "*.html".into(),
+        ],
+    )
+    .unwrap();
+
+    let profiles = workspace.detected_profiles();
+    assert!(profiles.contains(&"node"), "{profiles:?}");
+    assert!(profiles.contains(&"vite"), "{profiles:?}");
+    assert_eq!(
+        files(&workspace),
+        [
+            "package.json",
+            "src/components/Button.tsx",
+            "vite.config.ts"
+        ]
+    );
 }

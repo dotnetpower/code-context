@@ -4,6 +4,7 @@ export interface UsageEvent {
   operation: string;
   root: string | null;
   error?: string;
+  totalMs?: number;
 }
 
 export function classifyOutcome(error?: string): Outcome {
@@ -23,7 +24,7 @@ export function classifyOutcome(error?: string): Outcome {
   }
   if (
     error.startsWith('READ_RANGE_OUT_OF_BOUNDS ') ||
-    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root/u.test(error)
+    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.64|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root|No registered Code Context workspace|root must be an absolute path/u.test(error)
   ) {
     return 'invalid_request';
   }
@@ -37,10 +38,16 @@ export class UsageSummary {
   public last: (UsageEvent & { outcome: Outcome; at: number }) | undefined;
   public lastRoot: string | undefined;
   public readonly recentRoots: string[] = [];
+  public totalMsSum = 0;
+  public timedCalls = 0;
 
   public record(event: UsageEvent, at = Date.now()): void {
     const outcome = classifyOutcome(event.error);
     this.counts[outcome] += 1;
+    if (typeof event.totalMs === 'number' && Number.isFinite(event.totalMs) && event.totalMs >= 0) {
+      this.totalMsSum += event.totalMs;
+      this.timedCalls += 1;
+    }
     this.last = { ...event, outcome, at };
     if (event.root) {
       this.lastRoot = event.root;
@@ -53,6 +60,10 @@ export class UsageSummary {
         this.recentRoots.shift();
       }
     }
+  }
+
+  public get avgLatencyMs(): number | undefined {
+    return this.timedCalls > 0 ? this.totalMsSum / this.timedCalls : undefined;
   }
 
   public text(): string {

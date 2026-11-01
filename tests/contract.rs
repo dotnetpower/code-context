@@ -267,6 +267,45 @@ fn mcp_initialize_list_call_and_errors() {
     let unknown = handle(&workspace, json!({"id":5,"method":"unknown"})).unwrap();
     assert_eq!(unknown["error"]["code"], -32601);
     assert!(handle(&workspace, json!({"method":"notifications/initialized"})).is_none());
+
+    // Copilot parameter aliases and null/empty optional sanitization
+    let aliased_grep = handle(
+        &workspace,
+        json!({
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "code_grep",
+                "arguments": {
+                    "symbol": "NEED.*",
+                    "isRegexp": true,
+                    "caseInsensitive": true,
+                    "maxResults": 10,
+                    "glob": null,
+                    "root": ""
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(aliased_grep["result"]["isError"], false, "{aliased_grep}");
+
+    let aliased_read = handle(
+        &workspace,
+        json!({
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "code_read",
+                "arguments": {
+                    "filePath": "a.rs",
+                    "view_range": [2, -1]
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(aliased_read["result"]["isError"], false, "{aliased_read}");
 }
 
 #[test]

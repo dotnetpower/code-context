@@ -285,6 +285,21 @@ class AdoptionAuditTests(unittest.TestCase):
             MODULE.atomic_write(output, '{"schema": 2}')
             self.assertEqual(output.read_text(), '{"schema": 2}')
 
+    def test_classifies_vscode_copilot_native_mcp_and_builtin_tools(self):
+        self.assertEqual(MODULE.classify("cctxNativeContext"), "native")
+        self.assertEqual(MODULE.classify("code-context-native_codeRead"), "native")
+        self.assertEqual(MODULE.classify("code-context-code_grep"), "mcp")
+        self.assertEqual(MODULE.classify("code_context"), "mcp")
+        for builtin in (
+            "copilot_findFiles",
+            "copilot_findTextInFiles",
+            "copilot_readFile",
+            "read_file",
+            "grep_search",
+            "find_by_name",
+        ):
+            self.assertEqual(MODULE.classify(builtin), "builtin_search_read", builtin)
+
 
 if __name__ == "__main__":
     unittest.main()

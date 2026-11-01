@@ -25,8 +25,28 @@ pub const UNIVERSAL_EXCLUDED_DIRS: &[&str] = &[
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".ipynb_checkpoints",
+    ".quarto",
+    ".vitepress",
+    "_site",
+    "_book",
     ".next",
     ".nuxt",
+    ".vite",
+    ".turbo",
+    ".parcel-cache",
+    ".svelte-kit",
+    ".astro",
+    ".output",
+    ".vercel",
+    ".netlify",
+    ".wrangler",
+    ".docusaurus",
+    "storybook-static",
+    "playwright-report",
+    "test-results",
+    "dist-ssr",
+    "dev-dist",
     ".gradle",
     ".dart_tool",
     "CMakeFiles",
@@ -70,9 +90,56 @@ const UNIVERSAL_GLOBS: &[&str] = &[
     "**/bazel-*/**",
     "**/mutants.out*",
     "**/mutants.out*/**",
+    "**/*.min.js",
+    "**/*.min.mjs",
+    "**/*.min.cjs",
+    "**/*.min.css",
+    "**/*.bundle.js",
+    "**/*.chunk.js",
+    "**/*.map",
+    "**/*.js.map",
+    "**/*.css.map",
+    "**/*.d.ts.map",
+    "**/~$*",
+    "**/.~lock.*#",
+    "**/*.aux",
+    "**/*.bbl",
+    "**/*.blg",
+    "**/*.fdb_latexmk",
+    "**/*.fls",
+    "**/*.lof",
+    "**/*.lot",
+    "**/*.nav",
+    "**/*.snm",
+    "**/*.synctex.gz",
+    "**/*.toc",
+    "**/*.xdv",
 ];
 
-const NODE: &[&str] = &["**/logs", "**/logs/**", "**/pids", "**/pids/**"];
+const NODE: &[&str] = &[
+    "**/logs",
+    "**/logs/**",
+    "**/pids",
+    "**/pids/**",
+    "**/package-lock.json",
+    "**/npm-shrinkwrap.json",
+    "**/pnpm-lock.yaml",
+    "**/yarn.lock",
+    "**/bun.lock",
+    "**/vite.config.*.timestamp-*",
+    "**/__generated__/**",
+    "**/routeTree.gen.ts",
+];
+const VITE: &[&str] = &[
+    "**/dist-ssr/**",
+    "**/dev-dist/**",
+    "**/storybook-static/**",
+    "**/playwright-report/**",
+    "**/test-results/**",
+    "**/vite.config.*.timestamp-*",
+    "**/__generated__/**",
+    "**/routeTree.gen.ts",
+];
 const PYTHON: &[&str] = &[
     "**/downloads/**",
     "**/eggs/**",
@@ -170,6 +237,9 @@ const ROS: &[&str] = &[
 ];
 const OCAML: &[&str] = &["**/_opam/**"];
 const CLOJURE: &[&str] = &["**/classes/**", "**/checkouts/**", "**/lib/**"];
+const MDBOOK: &[&str] = &["**/book/**"];
+const MKDOCS: &[&str] = &["**/site/**"];
+const QUARTO: &[&str] = &["**/_site/**", "**/_freeze/**", "**/*_files/**"];
 
 struct ProfileRule {
     name: &'static str,
@@ -184,6 +254,26 @@ const PROFILE_RULES: &[ProfileRule] = &[
         files: &["package.json"],
         extensions: &[],
         patterns: NODE,
+    },
+    ProfileRule {
+        name: "vite",
+        files: &[
+            "vite.config.ts",
+            "vite.config.js",
+            "vite.config.mts",
+            "vite.config.mjs",
+            "vitest.config.ts",
+            "vitest.config.js",
+            "vitest.config.mts",
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.ts",
+            "svelte.config.js",
+            "astro.config.mjs",
+            "astro.config.ts",
+        ],
+        extensions: &[],
+        patterns: VITE,
     },
     ProfileRule {
         name: "python",
@@ -340,6 +430,24 @@ const PROFILE_RULES: &[ProfileRule] = &[
         extensions: &["nimble"],
         patterns: &[],
     },
+    ProfileRule {
+        name: "mdbook",
+        files: &["book.toml"],
+        extensions: &[],
+        patterns: MDBOOK,
+    },
+    ProfileRule {
+        name: "mkdocs",
+        files: &["mkdocs.yml", "mkdocs.yaml"],
+        extensions: &[],
+        patterns: MKDOCS,
+    },
+    ProfileRule {
+        name: "quarto",
+        files: &["_quarto.yml", "_quarto.yaml"],
+        extensions: &[],
+        patterns: QUARTO,
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -489,6 +597,19 @@ pub fn is_profile_marker(path: &Path) -> bool {
     if matches!(
         name,
         "package.json"
+            | "vite.config.ts"
+            | "vite.config.js"
+            | "vite.config.mts"
+            | "vite.config.mjs"
+            | "vitest.config.ts"
+            | "vitest.config.js"
+            | "vitest.config.mts"
+            | "next.config.js"
+            | "next.config.mjs"
+            | "next.config.ts"
+            | "svelte.config.js"
+            | "astro.config.mjs"
+            | "astro.config.ts"
             | "pyproject.toml"
             | "setup.py"
             | "setup.cfg"
@@ -523,6 +644,11 @@ pub fn is_profile_marker(path: &Path) -> bool {
             | "DESCRIPTION"
             | "NAMESPACE"
             | "repositories.config"
+            | "book.toml"
+            | "mkdocs.yml"
+            | "mkdocs.yaml"
+            | "_quarto.yml"
+            | "_quarto.yaml"
     ) {
         return true;
     }

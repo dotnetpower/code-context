@@ -261,3 +261,188 @@ fn leading_repetition_case_insensitive_regex_prefilters_and_matches_oracle() {
         compare(&workspace, &resident, &query(pattern, true, true));
     }
 }
+
+#[test]
+fn react_vite_definitions_barrels_jsx_tags_bom_and_quote_alias_planner_work() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src/components")).unwrap();
+    std::fs::create_dir_all(directory.path().join("src/styles")).unwrap();
+
+    // 1. Component file with UTF-8 BOM, multi-line imports, barrel re-export, local const,
+    //    exported React.memo/forwardRef component, custom hook, JSX opening/closing tags, and console.log
+    let component_source = concat!(
+        "\u{feff}/// <reference types=\"vite/client\" />\n",
+        "import {\n",
+        "  useState,\n",
+        "  useEffect,\n",
+        "} from 'react';\n",
+        "import { helper } from '@/utils/ButtonHelper';\n",
+        "export { ButtonGroup } from './ButtonGroup';\n",
+        "function internalSetup() {\n",
+        "  const Button = helper();\n",
+        "  console.log(Button);\n",
+        "  return Button;\n",
+        "}\n",
+        "\n",
+        "// Primary UI button component\n",
+        "export const Button = React.memo(forwardRef<HTMLButtonElement, ButtonProps>((props, ref) => {\n",
+        "  const [active, setActive] = useState(false);\n",
+        "  return (\n",
+        "    <ButtonWrapper variant={props.variant}>\n",
+        "      <button ref={ref}>{props.label}</button>\n",
+        "    </ButtonWrapper>\n",
+        "  );\n",
+        "}));\n",
+        "\n",
+        "export function useButtonState() {\n",
+        "  return true;\n",
+        "}\n"
+    );
+    std::fs::write(
+        directory.path().join("src/components/Button.tsx"),
+        component_source,
+    )
+    .unwrap();
+
+    // 2. Vue SFC file to verify <script setup> / <template> / <style> section boundary clamping
+    let vue_source = concat!(
+        "<script setup lang=\"ts\">\n",
+        "import { ref } from 'vue';\n",
+        "const count = ref(0);\n",
+        "export function incrementCounter() {\n",
+        "  count.value += 1;\n",
+        "}\n",
+        "</script>\n",
+        "<template>\n",
+        "  <button @click=\"incrementCounter\">{{ count }}</button>\n",
+        "</template>\n",
+        "<style scoped>\n",
+        ".btn { color: blue; }\n",
+        "</style>\n"
+    );
+    std::fs::write(
+        directory.path().join("src/components/Counter.vue"),
+        vue_source,
+    )
+    .unwrap();
+
+    // 3. CSS file with @keyframes and @layer
+    std::fs::write(
+        directory.path().join("src/styles/app.css"),
+        "@import \"tailwindcss\";\n@layer components {\n  .btn { display: inline-flex; }\n}\n@keyframes pulseSpin {\n  from { opacity: 0; }\n  to { opacity: 1; }\n}\n",
+    )
+    .unwrap();
+
+    for index in 0..30 {
+        std::fs::write(
+            directory.path().join(format!("src/noise_{index}.ts")),
+            format!("export const noise_{index} = {index};\n"),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(
+        directory.path(),
+        vec!["src".into()],
+        vec!["*.tsx".into(), "*.ts".into(), "*.vue".into(), "*.css".into()],
+    )
+    .unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+
+    // Verify 3-way quote + @/ alias regex uses the trigram index
+    let alias_query = query(r#"from\s+['"`]@/"#, true, false);
+    let alias_profiled = search_profiled(&resident, &alias_query, &mut cache).unwrap();
+    assert!(alias_profiled.profile.used_index, "{:?}", alias_profiled.profile);
+    assert_eq!(alias_profiled.result.total_matches, 1);
+
+    // Verify max_matches_per_file=1 on Button.tsx picks the top-level exported component
+    // (line 15) rather than the barrel re-export (line 7) or indented local const (line 9)
+    let mut btn_query = query("Button", false, false);
+    btn_query.paths = vec!["src/components/Button.tsx".into()];
+    btn_query.max_matches_per_file = Some(1);
+    let btn_result = search_fast(&resident, &btn_query, &mut cache).unwrap();
+    assert_eq!(btn_result.matches.len(), 1);
+    assert!(
+        btn_result.matches[0]
+            .text
+            .starts_with("export const Button = React.memo"),
+        "expected exported component definition first, got: {:?}",
+        btn_result.matches[0]
+    );
+
+    // Verify max_matches_per_file=1 on ButtonWrapper picks opening JSX tag with props over closing tag
+    let mut jsx_query = query("ButtonWrapper", false, false);
+    jsx_query.paths = vec!["src/components/Button.tsx".into()];
+    jsx_query.max_matches_per_file = Some(1);
+    let jsx_result = search_fast(&resident, &jsx_query, &mut cache).unwrap();
+    assert_eq!(jsx_result.matches.len(), 1);
+    assert!(
+        jsx_result.matches[0].text.contains("<ButtonWrapper variant="),
+        "expected opening JSX tag, got: {:?}",
+        jsx_result.matches[0]
+    );
+
+    // Verify multi-entry eligible cache handles alternating .tsx / .ts / .css globs
+    for glob_pat in ["*.tsx", "*.ts", "*.css", "*.tsx", "*.ts"] {
+        let mut q = query("export", false, false);
+        q.glob = Some(glob_pat.into());
+        let _ = search_profiled(&resident, &q, &mut cache).unwrap();
+    }
+
+    // Verify context clamping on React component (`}));` closure + leading `//` comment)
+    // and Vue SFC (`<script setup>` / `</script>` boundary)
+    let mut watched = code_context::watched::Watched::new(code_context::catalog::Spec {
+        root: directory.path().to_path_buf(),
+        scopes: vec!["src".into()],
+        globs: vec!["*.tsx".into(), "*.ts".into(), "*.vue".into(), "*.css".into()],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    let ctx_react = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "setActive", "radius": 10}),
+        )
+        .unwrap();
+    let react_lines: Vec<&str> = ctx_react["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        react_lines
+            .iter()
+            .any(|l| l.contains("// Primary UI button component")),
+        "leading // comment preserved: {react_lines:?}"
+    );
+    assert_eq!(
+        react_lines.last().copied(),
+        Some("}));"),
+        "clamped at }})); closure: {react_lines:?}"
+    );
+
+    let ctx_vue = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "count.value += 1", "radius": 12}),
+        )
+        .unwrap();
+    let vue_lines: Vec<&str> = ctx_vue["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !vue_lines.iter().any(|l| l.contains("<template>")),
+        "Vue script snippet should not bleed into <template>: {vue_lines:?}"
+    );
+}

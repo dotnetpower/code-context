@@ -79,15 +79,37 @@ class BenchmarkTests(unittest.TestCase):
             self.assertIn("not", text)
 
     def test_relative_document_links_and_images_exist(self):
+        def md_slug(heading: str) -> str:
+            text = re.sub(r"^[#=]+\s*|\s*#+$", "", heading.strip())
+            text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+            slug = "".join(
+                ch.lower() if ch.isalnum() else ("-" if ch in " \t-" else ("_" if ch == "_" else ""))
+                for ch in text
+            )
+            return slug.strip("-")
+
         documents = list(ROOT.glob("*.md")) + list((ROOT / "docs").rglob("*.md"))
         documents += [ROOT / "vscode-extension/README.md"]
         documents += list((ROOT / "vscode-extension/docs").rglob("*.md"))
         for path in documents:
-            for target in re.findall(r"\]\(([^)\s]+)\)", path.read_text()):
-                if "://" in target or target.startswith("#"):
+            for raw_target in re.findall(r"\]\(([^)\s]+)\)", path.read_text()):
+                if "://" in raw_target or raw_target.startswith("#"):
                     continue
-                target = target.split("#")[0]
-                self.assertTrue((path.parent / target).exists(), f"{path.relative_to(ROOT)} -> {target}")
+                parts = raw_target.split("#", 1)
+                target_path = (path.parent / parts[0]).resolve()
+                self.assertTrue(target_path.exists(), f"{path.relative_to(ROOT)} -> {raw_target}")
+                if len(parts) == 2 and parts[1] and target_path.suffix.lower() == ".md":
+                    anchor = parts[1].lower()
+                    headings = [
+                        md_slug(line)
+                        for line in target_path.read_text().splitlines()
+                        if re.match(r"^\s{0,3}#{1,6}\s+", line)
+                    ]
+                    collapsed = [re.sub(r"-+", "-", h) for h in headings]
+                    self.assertTrue(
+                        anchor in headings or re.sub(r"-+", "-", anchor) in collapsed,
+                        f"{path.relative_to(ROOT)} -> {raw_target} missing heading anchor #{anchor}",
+                    )
 
     def test_installer_blocks_legacy_publisher_before_dependency_install(self):
         with tempfile.TemporaryDirectory() as directory:

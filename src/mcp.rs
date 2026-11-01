@@ -56,7 +56,12 @@ pub fn call(workspace: &Workspace, name: &str, arguments: Value) -> Result<Value
     call_engine(&mut Engine::from(workspace.clone()), name, arguments)
 }
 
-pub fn call_engine(engine: &mut Engine, name: &str, arguments: Value) -> Result<Value> {
+pub fn call_engine(engine: &mut Engine, name: &str, mut arguments: Value) -> Result<Value> {
+    if matches!(name, "code_files" | "code_grep" | "code_read" | "code_context")
+        && let Some(map) = arguments.as_object_mut()
+    {
+        crate::shared_mcp::normalize_mcp_argument_aliases(name, map);
+    }
     match name {
         "code_files" => Ok(serde_json::to_value(engine.files(
             &serde_json::from_value::<crate::files::FileQuery>(arguments)?,

@@ -37,16 +37,19 @@ const SOURCE_EXTENSION_LIST = [
   'cts',
   'cxx',
   'dart',
+  'ejs',
   'erl',
   'ex',
   'exs',
   'fs',
+  'glsl',
   'go',
   'gql',
   'gradle',
   'graphql',
   'groovy',
   'h',
+  'hbs',
   'hcl',
   'hh',
   'hpp',
@@ -68,7 +71,9 @@ const SOURCE_EXTENSION_LIST = [
   'mts',
   'nim',
   'nix',
+  'pcss',
   'php',
+  'postcss',
   'prisma',
   'proto',
   'ps1',
@@ -83,16 +88,21 @@ const SOURCE_EXTENSION_LIST = [
   'scala',
   'sh',
   'sql',
+  'styl',
+  'svg',
   'swift',
   'tf',
   'tftpl',
   'ts',
   'tsx',
   'vb',
+  'wgsl',
   'zig',
   'zsh',
+  'markdown',
   'md',
   'mdx',
+  'qmd',
   'rst',
   'txt',
   'json',
@@ -108,6 +118,24 @@ const SOURCE_EXTENSION_LIST = [
   'scss',
   'vue',
   'svelte',
+  'adoc',
+  'bib',
+  'csv',
+  'docx',
+  'epub',
+  'ipynb',
+  'odp',
+  'ods',
+  'odt',
+  'org',
+  'pdf',
+  'pptx',
+  'rtf',
+  'tex',
+  'tsv',
+  'typ',
+  'vtt',
+  'xlsx',
 ] as const;
 const SOURCE_EXTENSIONS = new Set<string>(SOURCE_EXTENSION_LIST);
 const SOURCE_GLOB_CASE_ALIASES = ['*.C', '*.H', '*.R'] as const;
@@ -144,8 +172,10 @@ export function inferGlobs(paths: readonly string[]): string[] {
       devNames.push(base);
     }
     const extension = extname(path).slice(1);
-    if (SOURCE_EXTENSIONS.has(extension.toLowerCase())) {
-      extensions.add(extension);
+    const lower = extension.toLowerCase();
+    if (SOURCE_EXTENSIONS.has(lower)) {
+      const caseAlias = (SOURCE_GLOB_CASE_ALIASES as readonly string[]).includes(`*.${extension}`);
+      extensions.add(caseAlias ? extension : lower);
     }
   }
   return [...new Set([

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.16.0
+
+- Add native zero-dependency document indexing and smart section/slide/sheet/table
+  clamping for Office (`docx`, `pptx`, `xlsx`), OpenDocument (`odt`, `odp`, `ods`),
+  `epub`, `pdf`, `rtf`, Jupyter `ipynb`, `csv`/`tsv`, LaTeX/BibTeX, Typst, AsciiDoc,
+  Org, XLIFF/gettext, and WebVTT/SRT.
+- Enhance Markdown (`.md`, `.mdx`, `.markdown`, `.qmd`, `.rmd`, and agent
+  instructions) with fence-aware ATX/Setext heading detection, GFM alerts,
+  `:::` admonitions, `<details>`, pipeless GFM tables, `$$` math blocks, and
+  `path.md#heading-slug` section range reads.
+- Improve React, Vite, TypeScript/TSX, Vue/Svelte/Astro SFC, and CSS/Tailwind
+  definition ranking, barrel re-export filtering, dynamic-route globs
+  (`[id].tsx`), compound extension fast paths (`*.test.tsx`, `*.module.css`),
+  Vite `?raw`/`?react` query stripping, `@/` alias resolution, and lockfile/bundle
+  exclusions.
+- Expand VS Code GitHub Copilot compatibility with built-in tool parameter
+  aliases (`includePattern`, `symbol`, `isRegexp`, `caseInsensitive`,
+  `maxResults`, `contextLines`, `filePath`, `view_range`), Markdown link and
+  backtick path unwrapping, and automatic `>500`-line read chunking.
+
 ## 0.15.0
 
 - Eliminate multi-project VS Code startup contention with registry seeding,

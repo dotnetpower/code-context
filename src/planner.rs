@@ -222,12 +222,92 @@ fn class_ascii_pair(class: &Class) -> Option<[u8; 2]> {
     }
 }
 
-fn flush_run(run: &mut Vec<[u8; 2]>, conditions: &mut Vec<CandidateExpr>) {
+fn class_ascii_small(class: &Class) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(4);
+    match class {
+        Class::Unicode(unicode) => {
+            for range in unicode.iter() {
+                if !range.start().is_ascii() || !range.end().is_ascii() {
+                    return None;
+                }
+                for ch in range.start()..=range.end() {
+                    if bytes.len() >= 4 {
+                        return None;
+                    }
+                    bytes.push(ch as u8);
+                }
+            }
+        }
+        Class::Bytes(byte_class) => {
+            for range in byte_class.iter() {
+                for b in range.start()..=range.end() {
+                    if bytes.len() >= 4 {
+                        return None;
+                    }
+                    bytes.push(b);
+                }
+            }
+        }
+    }
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+#[derive(Clone)]
+enum RunSlot {
+    Pair([u8; 2]),
+    Small(Vec<u8>),
+}
+
+fn flush_run(run: &mut Vec<RunSlot>, conditions: &mut Vec<CandidateExpr>) {
     if run.len() >= MIN_INDEXED_LITERAL_BYTES && run.len() <= MAX_LITERAL_BYTES {
-        if run.iter().all(|pair| pair[0] == pair[1]) {
-            conditions.push(CandidateExpr::Literal(run.iter().map(|pair| pair[0]).collect()));
-        } else {
-            conditions.push(CandidateExpr::ByteClasses(run.clone()));
+        let small_count = run
+            .iter()
+            .filter(|slot| matches!(slot, RunSlot::Small(_)))
+            .count();
+        if small_count == 0 {
+            let pairs: Vec<[u8; 2]> = run
+                .iter()
+                .map(|slot| match slot {
+                    RunSlot::Pair(pair) => *pair,
+                    RunSlot::Small(_) => unreachable!(),
+                })
+                .collect();
+            if pairs.iter().all(|pair| pair[0] == pair[1]) {
+                conditions.push(CandidateExpr::Literal(
+                    pairs.iter().map(|pair| pair[0]).collect(),
+                ));
+            } else {
+                conditions.push(CandidateExpr::ByteClasses(pairs));
+            }
+        } else if small_count == 1
+            && run.iter().all(|slot| match slot {
+                RunSlot::Pair(pair) => pair[0] == pair[1],
+                RunSlot::Small(_) => true,
+            })
+        {
+            let mut branches = Vec::new();
+            let small_idx = run
+                .iter()
+                .position(|slot| matches!(slot, RunSlot::Small(_)))
+                .expect("one small slot");
+            let choices = match &run[small_idx] {
+                RunSlot::Small(choices) => choices.as_slice(),
+                RunSlot::Pair(_) => &[],
+            };
+            for &choice in choices {
+                let mut literal = Vec::with_capacity(run.len());
+                for (idx, slot) in run.iter().enumerate() {
+                    if idx == small_idx {
+                        literal.push(choice);
+                    } else if let RunSlot::Pair([b, _]) = slot {
+                        literal.push(*b);
+                    }
+                }
+                branches.push(CandidateExpr::Literal(literal));
+            }
+            if !branches.is_empty() {
+                conditions.push(CandidateExpr::Or(branches).simplify());
+            }
         }
     }
     run.clear();
@@ -243,17 +323,22 @@ fn mandatory(hir: &Hir, depth: usize) -> Option<CandidateExpr> {
         HirKind::Repetition(repeat) if repeat.min > 0 => mandatory(&repeat.sub, depth + 1),
         HirKind::Concat(children) => {
             let mut conditions = Vec::new();
-            let mut run: Vec<[u8; 2]> = Vec::new();
+            let mut run: Vec<RunSlot> = Vec::new();
             for child in children {
                 match child.kind() {
                     HirKind::Literal(literal) => {
                         for &byte in &literal.0 {
-                            run.push([byte, byte]);
+                            run.push(RunSlot::Pair([byte, byte]));
                         }
                     }
                     HirKind::Class(class) => {
                         if let Some(pair) = class_ascii_pair(class) {
-                            run.push(pair);
+                            run.push(RunSlot::Pair(pair));
+                        } else if let Some(small) = class_ascii_small(class) {
+                            if run.iter().any(|slot| matches!(slot, RunSlot::Small(_))) {
+                                flush_run(&mut run, &mut conditions);
+                            }
+                            run.push(RunSlot::Small(small));
                         } else {
                             flush_run(&mut run, &mut conditions);
                         }

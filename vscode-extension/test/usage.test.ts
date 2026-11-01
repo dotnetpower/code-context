@@ -29,6 +29,7 @@ void test('status is event driven, bounded and identifies native-host rather tha
   assert.match(usage.tooltip(), /not all sessions/);
   assert.match(usage.tooltip(), /1970-01-01T00:00:03.000Z/);
   assert.equal(usage.lastRoot, '/project');
-  usage.record({ operation: 'code_workspaces', root: null }, 4000);
+  usage.record({ operation: 'code_workspaces', root: null, totalMs: 1.5 }, 4000);
   assert.equal(usage.lastRoot, '/project');
+  assert.equal(usage.avgLatencyMs, 1.5);
 });

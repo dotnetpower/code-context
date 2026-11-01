@@ -479,7 +479,17 @@ impl Workspace {
         std::fs::File::open(absolute)?
             .take(max_file_bytes as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > max_file_bytes || memchr::memchr(0, &bytes).is_some() {
+        if bytes.len() > max_file_bytes {
+            return Err(invalid(format!(
+                "binary file or file larger than configured limit is unsupported: {}",
+                path.display()
+            ))
+            .into());
+        }
+        if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)? {
+            return Ok(extracted.into_bytes());
+        }
+        if memchr::memchr(0, &bytes).is_some() {
             return Err(invalid(format!(
                 "binary file or file larger than configured limit is unsupported: {}",
                 path.display()

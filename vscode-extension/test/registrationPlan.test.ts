@@ -48,12 +48,14 @@ void test('source glob inference includes safe documentation and configuration',
     inferGlobs([
       '/workspace/src/main.ts',
       '/workspace/src/App.tsx',
+      '/workspace/src/Hero.TSX',
+      '/workspace/src/logo.SVG',
       '/workspace/src/again.ts',
       '/workspace/README.md',
       '/workspace/image.png',
       '/workspace/api/main.py',
     ]),
-    ['*.md', '*.py', '*.ts', '*.tsx'],
+    ['*.md', '*.py', '*.svg', '*.ts', '*.tsx'],
   );
 });
 
@@ -61,11 +63,20 @@ void test('automatic globs cover future supported source languages', () => {
   const globs = allSourceGlobs();
   assert.ok(globs.includes('*.rs'));
   assert.ok(globs.includes('*.ts'));
+  assert.ok(globs.includes('*.tsx'));
+  assert.ok(globs.includes('*.svg'));
+  assert.ok(globs.includes('*.pcss'));
+  assert.ok(globs.includes('*.postcss'));
+  assert.ok(globs.includes('*.styl'));
+  assert.ok(globs.includes('*.glsl'));
+  assert.ok(globs.includes('*.wgsl'));
+  assert.ok(globs.includes('*.hbs'));
+  assert.ok(globs.includes('*.ejs'));
   assert.ok(globs.includes('*.go'));
   assert.ok(globs.includes('*.java'));
   assert.ok(globs.includes('*.R'));
   assert.equal(new Set(globs).size, globs.length);
-  for (const extension of ['md', 'json', 'yaml', 'yml', 'toml', 'jsonc']) {
+  for (const extension of ['md', 'json', 'yaml', 'yml', 'toml', 'jsonc', 'docx', 'pptx', 'xlsx', 'pdf']) {
     assert.ok(globs.includes(`*.${extension}`));
   }
   assert.ok(globs.length <= 128);

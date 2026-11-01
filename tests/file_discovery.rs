@@ -189,3 +189,144 @@ fn simple_extension_glob_requires_dot_boundary_and_supports_single_char_extensio
     .unwrap();
     assert_eq!(c.paths, ["src/main.c"]);
 }
+
+#[test]
+fn frontend_globs_support_compound_extensions_brace_globs_dynamic_routes_and_vite_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    for subdir in [
+        "src/components",
+        "src/assets",
+        "src/styles",
+        "src/shaders",
+        "pages/users",
+        "app/[...slug]",
+    ] {
+        std::fs::create_dir_all(dir.path().join(subdir)).unwrap();
+    }
+    for (path, text) in [
+        ("src/components/Button.tsx", "export const Button = () => <button />;\n"),
+        ("src/components/Button.test.tsx", "test('Button', () => {});\n"),
+        ("src/components/Button.stories.tsx", "export default { title: 'Button' };\n"),
+        ("src/components/Button.module.css", ".btn { color: red; }\n"),
+        ("src/components/types.d.ts", "export interface ButtonProps {}\n"),
+        ("src/assets/icon.svg", "<svg viewBox=\"0 0 24 24\"></svg>\n"),
+        ("src/styles/theme.pcss", "@layer base { :root { --bg: #fff; } }\n"),
+        ("src/shaders/wave.wgsl", "@vertex fn main() {}\n"),
+        ("pages/users/[id].tsx", "export default function UserPage() { return null; }\n"),
+        ("app/[...slug]/page.tsx", "export default function CatchAll() { return null; }\n"),
+    ] {
+        std::fs::write(dir.path().join(path), text).unwrap();
+    }
+
+    let mut watched = Watched::new(Spec {
+        root: dir.path().to_path_buf(),
+        scopes: vec![".".into()],
+        globs: code_context::registration::DEFAULT_SOURCE_GLOBS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    // Compound & recursive brace globs
+    let tests_only = watched
+        .call("code_files", json!({"glob": "**/*.test.tsx"}))
+        .unwrap();
+    assert_eq!(tests_only["paths"], json!(["src/components/Button.test.tsx"]));
+
+    let css_modules = watched
+        .call("code_files", json!({"glob": "*.module.css"}))
+        .unwrap();
+    assert_eq!(css_modules["paths"], json!(["src/components/Button.module.css"]));
+
+    let dts = watched
+        .call("code_files", json!({"glob": "./**/*.d.ts"}))
+        .unwrap();
+    assert_eq!(dts["paths"], json!(["src/components/types.d.ts"]));
+
+    let scoped_brace = watched
+        .call("code_files", json!({"glob": "src/components/**/*.{ts,tsx}"}))
+        .unwrap();
+    assert_eq!(
+        scoped_brace["paths"],
+        json!([
+            "src/components/Button.stories.tsx",
+            "src/components/Button.test.tsx",
+            "src/components/Button.tsx",
+            "src/components/types.d.ts"
+        ])
+    );
+
+    // Next.js / Remix dynamic route bracket globs
+    let dynamic_id = watched
+        .call("code_files", json!({"glob": "pages/users/[id].tsx"}))
+        .unwrap();
+    assert_eq!(dynamic_id["paths"], json!(["pages/users/[id].tsx"]));
+
+    let catch_all = watched
+        .call("code_files", json!({"glob": "app/[...slug]/page.tsx"}))
+        .unwrap();
+    assert_eq!(catch_all["paths"], json!(["app/[...slug]/page.tsx"]));
+
+    // Vite ?react / ?raw query suffix, @/ path alias, and tsc/Vite line:col normalization
+    let read_aliased = watched
+        .call(
+            "code_read",
+            json!({
+                "ranges": [
+                    {"path": "@/components/Button.tsx:1:10", "start": 1, "end": 1},
+                    {"path": "@/assets/icon.svg?react", "start": 1, "end": 1},
+                    {"path": "src/shaders/wave.wgsl?raw", "start": 1, "end": 1},
+                    {"path": "src/styles/theme.pcss(1,5)", "start": 1, "end": 1}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(read_aliased[0]["path"], "src/components/Button.tsx");
+    assert_eq!(read_aliased[1]["path"], "src/assets/icon.svg");
+    assert_eq!(read_aliased[2]["path"], "src/shaders/wave.wgsl");
+    assert_eq!(read_aliased[3]["path"], "src/styles/theme.pcss");
+
+    // Comma-separated globs outside braces ("*.tsx, *.svg") and bare stem fallback ("Button")
+    let comma_glob = watched
+        .call("code_files", json!({"glob": "*.svg, *.wgsl"}))
+        .unwrap();
+    assert_eq!(
+        comma_glob["paths"],
+        json!(["src/assets/icon.svg", "src/shaders/wave.wgsl"])
+    );
+
+    let bare_stem = watched
+        .call("code_files", json!({"glob": "Button"}))
+        .unwrap();
+    assert_eq!(
+        bare_stem["paths"],
+        json!([
+            "src/components/Button.module.css",
+            "src/components/Button.stories.tsx",
+            "src/components/Button.test.tsx",
+            "src/components/Button.tsx"
+        ])
+    );
+
+    // Markdown links, backticks, and #L1C5 hash anchors in watched paths
+    let read_markdown = watched
+        .call(
+            "code_read",
+            json!({
+                "ranges": [
+                    {"path": "[Button.tsx](src/components/Button.tsx#L1C5)", "start": 1, "end": 1},
+                    {"path": "`src/assets/icon.svg`", "start": 1, "end": 1}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(read_markdown[0]["path"], "src/components/Button.tsx");
+    assert_eq!(read_markdown[1]["path"], "src/assets/icon.svg");
+}

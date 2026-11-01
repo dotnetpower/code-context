@@ -87,7 +87,7 @@ Tool discovery does not prove that a model selects the tools.
 | `#cctxNativeFiles` | Filename/path discovery with a glob |
 | `#cctxNativeGrep` | Exact or regex source search |
 | `#cctxNativeContext` | Search plus nearby source |
-| `#cctxNativeRead` | Batched ranges with whole-file hashes |
+| `#cctxNativeRead` | Batched ranges with whole-file hashes (supports `path:line:col`, `#Lstart-Lend`, and `path.md#heading-slug`) |
 | `#cctxNativeStatus` | Observational state, no source loading |
 | `#cctxNativeSync` | Explicit full-source freshness barrier |
 | `#cctxNativeWorkspaces` | Registered roots and coverage |
