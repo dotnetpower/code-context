@@ -590,11 +590,13 @@ fn start_windows_daemon() -> Result<()> {
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .spawn()?;
     let started = Instant::now();
+    let mut delay_ms = 2_u64;
     while started.elapsed() < Duration::from_secs(3) {
         if connect_rpc_stream().is_ok() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms * 2).min(20);
     }
     Ok(())
 }

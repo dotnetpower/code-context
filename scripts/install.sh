@@ -9,11 +9,11 @@ install -m 0644 deploy/code-context.service "$HOME/.config/systemd/user/code-con
 systemctl --user daemon-reload
 systemctl --user enable code-context.service
 systemctl --user restart code-context.service
-for attempt in $(seq 1 50); do
+for attempt in $(seq 1 500); do
     if "$HOME/.local/bin/cctx" ping; then
         exit 0
     fi
-    sleep 0.1
+    sleep 0.01
 done
 printf 'code-context daemon did not become ready\n' >&2
 exit 1

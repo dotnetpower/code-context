@@ -9,6 +9,7 @@ __pycache__/
 /vscode-extension/node_modules/
 /vscode-extension/out/
 /vscode-extension/dist/
+/vscode-extension/.eslintcache
 .env
 .env.*
 !.env.example

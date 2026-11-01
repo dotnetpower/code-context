@@ -848,3 +848,154 @@ fn first_try_exact_edit_clamping_preserves_multiline_signatures_structs_overload
         zero_regex["freshness"]
     );
 }
+
+#[test]
+fn two_small_classes_conflict_markers_toml_yaml_and_negated_globs_work() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    std::fs::write(
+        directory.path().join("src/conflict.rs"),
+        concat!(
+            "fn before_conflict() {}\n\n",
+            "<<<<<<< HEAD\n",
+            "pub fn conflict_target_fn() -> u32 {\n",
+            "    10\n",
+            "=======\n",
+            "pub fn conflict_target_fn() -> u32 {\n",
+            "    20\n",
+            ">>>>>>> feature-branch\n\n",
+            "fn after_conflict() {}\n",
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("src/config.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"demo\"\n\n",
+            "# Core dependencies\n",
+            "[dependencies]\n",
+            "serde = \"1.0\"\n",
+            "special_toml_dep = \"0.4\"\n\n",
+            "[dev-dependencies]\n",
+            "tempfile = \"3\"\n",
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("src/openapi.yaml"),
+        concat!(
+            "paths:\n",
+            "  /api/v1/users:\n",
+            "    get:\n",
+            "      operationId: listUsersEndpoint\n",
+            "  /api/v1/orders:\n",
+            "    post:\n",
+            "      operationId: createOrderEndpoint\n",
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("src/handlers.rs"),
+        "pub fn get_user_id() {}\npub fn set_item_id() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("src/handlers.test.rs"),
+        "pub fn get_user_id() {}\n",
+    )
+    .unwrap();
+
+    for i in 0..24 {
+        std::fs::write(
+            directory.path().join(format!("src/pad_{i}.rs")),
+            format!("pub fn pad_{i}() {{ /* {} */ }}\n", "x".repeat(256)),
+        )
+        .unwrap();
+    }
+
+    let workspace = Workspace::new(
+        directory.path(),
+        vec!["src".into()],
+        vec!["*.rs".into(), "*.toml".into(), "*.yaml".into()],
+    )
+    .unwrap();
+    let resident = Resident::load(&workspace, true, 1).unwrap();
+    let mut cache = QueryCache::default();
+
+    // 1. Two 3-choice small character classes in one concat run (`[gsd]et_user_[iIx]d`) uses trigram index
+    let two_small = query(r"[gsd]et_user_[iIx]d", true, false);
+    let prof = search_profiled(&resident, &two_small, &mut cache).unwrap();
+    assert!(prof.profile.used_index, "{:?}", prof.profile);
+    assert_eq!(prof.result.total_matches, 2);
+
+    // 2. Negated glob (`*.rs, !*.test.rs`) excludes test file
+    let mut neg_q = query("get_user_id", false, false);
+    neg_q.glob = Some("*.rs, !*.test.rs".into());
+    let neg_res = search_fast(&resident, &neg_q, &mut cache).unwrap();
+    assert_eq!(neg_res.matches.len(), 1);
+    assert_eq!(neg_res.matches[0].path, "src/handlers.rs");
+
+    // 3. Git conflict block, TOML section, and YAML endpoint clamping
+    let mut watched = code_context::watched::Watched::new(code_context::catalog::Spec {
+        root: directory.path().to_path_buf(),
+        scopes: vec!["src".into()],
+        globs: vec!["*.rs".into(), "*.toml".into(), "*.yaml".into()],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    let conflict_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "conflict_target_fn", "radius": 10}),
+        )
+        .unwrap();
+    let c_lines: Vec<&str> = conflict_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(c_lines.first().copied(), Some("<<<<<<< HEAD"));
+    assert_eq!(c_lines.last().copied(), Some(">>>>>>> feature-branch"));
+
+    let toml_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "special_toml_dep", "radius": 10}),
+        )
+        .unwrap();
+    let t_lines: Vec<&str> = toml_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(t_lines.first().copied(), Some("# Core dependencies"));
+    assert_eq!(t_lines.last().copied(), Some("special_toml_dep = \"0.4\""));
+
+    let yaml_ctx = watched
+        .call(
+            "code_context",
+            serde_json::json!({"pattern": "listUsersEndpoint", "radius": 10}),
+        )
+        .unwrap();
+    let y_lines: Vec<&str> = yaml_ctx["snippets"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(y_lines.first().copied(), Some("  /api/v1/users:"));
+    assert!(!y_lines.iter().any(|l| l.contains("/api/v1/orders:")));
+}

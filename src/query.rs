@@ -23,7 +23,7 @@ const RESULT_CACHE_ENTRIES: usize = 32;
 const RESULT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CONTEXT_CACHE_ENTRIES: usize = 16;
 const CONTEXT_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const ELIGIBLE_CACHE_ENTRIES: usize = 4;
+const ELIGIBLE_CACHE_ENTRIES: usize = 16;
 const INDEX_OPERATION_BYTE_EQUIVALENT: usize = 64;
 // Tuning queries showed no reliable win once candidate bytes exceeded 75% of
 // the eligible corpus. Holdout queries are not used to choose this threshold.
@@ -542,7 +542,7 @@ fn search_internal(
     let mut path_sorted = !scoped;
     let mut candidate_bytes = eligible_bytes;
     let mut line_prefilter = false;
-    if let Some(plan) = if allow_plan {
+    if let Some(plan) = if allow_plan && (!scoped || eligible.len() > 2 || collect_profile) {
         compiled.plan.as_ref()
     } else {
         None
@@ -775,6 +775,40 @@ fn scan(
     Ok(())
 }
 
+fn partition_ids_by_bytes<'a>(
+    resident: &Resident,
+    ids: &'a [usize],
+    workers: usize,
+) -> Vec<&'a [usize]> {
+    if workers <= 1 || ids.len() <= 1 {
+        return vec![ids];
+    }
+    let total_bytes: usize = ids
+        .iter()
+        .map(|&id| resident.documents[id].text.len().max(1))
+        .sum();
+    let target_per_worker = total_bytes.div_ceil(workers).max(1);
+    let mut slices = Vec::with_capacity(workers);
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (idx, &id) in ids.iter().enumerate() {
+        acc += resident.documents[id].text.len().max(1);
+        let remaining_items = ids.len() - (idx + 1);
+        let remaining_workers = workers.saturating_sub(slices.len() + 1);
+        if (acc >= target_per_worker && slices.len() + 1 < workers)
+            || (remaining_workers > 0 && remaining_items == remaining_workers)
+        {
+            slices.push(&ids[start..=idx]);
+            start = idx + 1;
+            acc = 0;
+        }
+    }
+    if start < ids.len() {
+        slices.push(&ids[start..]);
+    }
+    slices
+}
+
 fn scan_parallel(
     resident: &Resident,
     query: &Query,
@@ -782,10 +816,10 @@ fn scan_parallel(
     ids: &[usize],
     workers: usize,
 ) -> Result<(Vec<Hit>, usize)> {
-    let chunk_size = ids.len().div_ceil(workers);
+    let chunks = partition_ids_by_bytes(resident, ids, workers);
     let parts = std::thread::scope(|scope| {
-        let handles: Vec<_> = ids
-            .chunks(chunk_size)
+        let handles: Vec<_> = chunks
+            .into_iter()
             .map(|chunk| {
                 std::thread::Builder::new()
                     .name("cctx-regex".into())
@@ -1412,6 +1446,20 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
         ],
         b':' => &[":root ", ":root{"],
         b'$' => &["$effect(", "$effect.pre("],
+        b'-' => {
+            if indent <= 4
+                && trimmed.starts_with("--")
+                && let Some((prop, val)) = trimmed[2..].split_once(':')
+                && !prop.is_empty()
+                && !val.trim().is_empty()
+                && prop
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return 3;
+            }
+            &[]
+        }
         _ => &[],
     };
     if keywords.iter().any(|keyword| trimmed.starts_with(keyword)) {
@@ -1568,11 +1616,15 @@ fn record_document(
                     let prev_trim = trim_line_start(document.line(line - 1));
                     if (prev_trim.starts_with("#[test")
                         || prev_trim.starts_with("#[tokio::test")
-                        || prev_trim.starts_with("#[rstest"))
+                        || prev_trim.starts_with("#[rstest")
+                        || prev_trim.starts_with("#[proc_macro"))
                         && trim_line_start(text).contains("fn ")
                     {
                         prio = 3;
                     }
+                }
+                if prio > 0 && leading_indent_cols(text) == 0 && !document.path.starts_with("tests/") {
+                    prio = prio.saturating_add(1);
                 }
                 (prio > 0).then_some((prio, line))
             })
@@ -1743,6 +1795,10 @@ enum GlobFilter<'a> {
         suffixes: Vec<String>,
     },
     Compiled(GlobSet),
+    IncludeExclude {
+        include: Option<GlobSet>,
+        exclude: GlobSet,
+    },
 }
 
 pub(crate) fn trim_leading_dot_slash(mut glob: &str) -> &str {
@@ -1910,6 +1966,31 @@ fn glob(query: &Query) -> Result<GlobFilter<'_>> {
         return Err(invalid("glob exceeds 1024 bytes").into());
     }
     let glob = trim_leading_dot_slash(raw_glob);
+    if glob.starts_with('!') || (!glob.contains('{') && glob.contains(",!") || glob.contains(", !")) {
+        let mut inc_builder = GlobSetBuilder::new();
+        let mut exc_builder = GlobSetBuilder::new();
+        let mut has_inc = false;
+        for part in glob.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(neg) = part.strip_prefix('!') {
+                let neg = trim_leading_dot_slash(neg.trim());
+                if !neg.is_empty() {
+                    exc_builder.add(Glob::new(neg)?);
+                }
+            } else {
+                let pos = trim_leading_dot_slash(part);
+                inc_builder.add(Glob::new(pos)?);
+                has_inc = true;
+            }
+        }
+        return Ok(GlobFilter::IncludeExclude {
+            include: if has_inc {
+                Some(inc_builder.build()?)
+            } else {
+                None
+            },
+            exclude: exc_builder.build()?,
+        });
+    }
     if let Some(suffix) = simple_extension_suffix(glob) {
         return Ok(GlobFilter::Extension(suffix));
     }
@@ -1932,6 +2013,14 @@ fn glob(query: &Query) -> Result<GlobFilter<'_>> {
     Ok(GlobFilter::Compiled(builder.build()?))
 }
 
+#[inline]
+pub(crate) fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack.ends_with(suffix)
+        || (haystack.len() >= suffix.len()
+            && haystack.as_bytes()[haystack.len() - suffix.len()..]
+                .eq_ignore_ascii_case(suffix.as_bytes()))
+}
+
 fn path_allowed(
     resident: &Resident,
     id: usize,
@@ -1944,23 +2033,34 @@ fn path_allowed(
     }
     match glob {
         GlobFilter::None => true,
-        GlobFilter::Extension(suffix) => raw_path.ends_with(suffix),
-        GlobFilter::BraceExtensions(suffixes) => {
-            suffixes.iter().any(|suffix| raw_path.ends_with(suffix.as_str()))
-        }
+        GlobFilter::Extension(suffix) => ends_with_ignore_ascii_case(raw_path, suffix),
+        GlobFilter::BraceExtensions(suffixes) => suffixes
+            .iter()
+            .any(|suffix| ends_with_ignore_ascii_case(raw_path, suffix.as_str())),
         GlobFilter::ScopedExtensions {
             dir_prefix,
             suffixes,
         } => {
             raw_path.starts_with(*dir_prefix)
                 && raw_path.as_bytes().get(dir_prefix.len()) == Some(&b'/')
-                && suffixes
-                    .iter()
-                    .any(|suffix| raw_path[dir_prefix.len() + 1..].ends_with(suffix.as_str()))
+                && suffixes.iter().any(|suffix| {
+                    ends_with_ignore_ascii_case(&raw_path[dir_prefix.len() + 1..], suffix.as_str())
+                })
         }
         GlobFilter::Compiled(set) => {
             let path = Path::new(raw_path);
             set.is_match(path) || path.file_name().is_some_and(|name| set.is_match(name))
+        }
+        GlobFilter::IncludeExclude { include, exclude } => {
+            let path = Path::new(raw_path);
+            let file_name = path.file_name();
+            if exclude.is_match(path) || file_name.is_some_and(|n| exclude.is_match(n)) {
+                return false;
+            }
+            match include {
+                Some(inc) => inc.is_match(path) || file_name.is_some_and(|n| inc.is_match(n)),
+                None => true,
+            }
         }
     }
 }

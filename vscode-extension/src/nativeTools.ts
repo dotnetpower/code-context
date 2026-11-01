@@ -28,7 +28,7 @@ import {
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
 
-const REGISTRY_CACHE_MS = 5_000;
+const REGISTRY_CACHE_MS = 15_000;
 const STICKY_ROOT_TTL_MS = 300_000;
 export const NATIVE_TOOL_NAMES = [
   'code-context-native_codeFiles',

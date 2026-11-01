@@ -195,6 +195,13 @@ fn parse_diagnostic_or_inline_range(raw: &str) -> (String, Option<u64>, Option<u
     if let Some(rest) = trimmed.strip_prefix("-->") {
         trimmed = rest.trim();
     }
+    if (trimmed.starts_with("https://github.com/") || trimmed.starts_with("https://gitlab.com/"))
+        && let Some((_, after_blob)) = trimmed.split_once("/blob/")
+        && let Some((_, repo_rel)) = after_blob.split_once('/')
+        && !repo_rel.is_empty()
+    {
+        trimmed = repo_rel;
+    }
     if let Some(rest) = trimmed.strip_prefix("File \"")
         && let Some((file_part, after_quote)) = rest.split_once('"')
     {
@@ -247,7 +254,8 @@ fn parse_diagnostic_or_inline_range(raw: &str) -> (String, Option<u64>, Option<u
         && !base.contains("://")
         && suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
     {
-        let (first_seg, rest_dash) = suffix.split_once('-').unwrap_or((suffix, ""));
+        let numeric_prefix = suffix.split_whitespace().next().unwrap_or(suffix);
+        let (first_seg, rest_dash) = numeric_prefix.split_once('-').unwrap_or((numeric_prefix, ""));
         let start_str = first_seg.split(':').next().unwrap_or("");
         if let Ok(s) = start_str.parse::<u64>()
             && s > 0

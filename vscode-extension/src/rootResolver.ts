@@ -408,6 +408,17 @@ export function normalizeUriOrPath(raw: string): string {
       return remoteMatch[1];
     }
   }
+  const ghBlobMatch =
+    /^https?:\/\/(?:github\.com|gitlab\.com)\/[^/]+\/[^/]+\/(?:-\/)?blob\/[^/]+\/(.+)$/iu.exec(
+      trimmed,
+    );
+  if (ghBlobMatch?.[1]) {
+    try {
+      return decodeURIComponent(ghBlobMatch[1]);
+    } catch {
+      return ghBlobMatch[1];
+    }
+  }
   const msysMatch = /^\/([a-zA-Z])\/(Users|Program Files|Windows|projects|work|dev|repos)\/(.*)$/u.exec(
     trimmed,
   );
@@ -448,7 +459,8 @@ export function extractLineRangeFromPath(rawPath: string): {
   if (slugMatch?.[1] && slugMatch[2]) {
     return { path: stripViteQuerySuffix(slugMatch[1]), anchor: slugMatch[2] };
   }
-  const colonMatch = /^(.+?\.[^/:]+):(\d+)(?::\d+)?(?:-(\d+)(?::\d+)?)?$/u.exec(normalized);
+  const colonMatch =
+    /^(.+?\.[^/:]+):(\d+)(?::\d+)?(?:-(\d+)(?::\d+)?)?(?::\s+.*|\s+.*)?$/u.exec(normalized);
   if (colonMatch?.[1] && colonMatch[2]) {
     const start = Number.parseInt(colonMatch[2], 10);
     const end = colonMatch[3] ? Number.parseInt(colonMatch[3], 10) : start + 40;

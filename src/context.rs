@@ -381,7 +381,8 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
 }
 
 fn rewind_leading_docs_and_attrs(lines: &[String], mut idx: usize) -> usize {
-    while idx > 0 {
+    let min_allowed = idx.saturating_sub(12);
+    while idx > min_allowed {
         let prev = &lines[idx - 1];
         if is_leading_doc_or_attr(prev) {
             idx -= 1;
@@ -390,7 +391,7 @@ fn rewind_leading_docs_and_attrs(lines: &[String], mut idx: usize) -> usize {
         let prev_trim = prev.trim();
         if prev_trim.ends_with("*/") {
             idx -= 1;
-            while idx > 0 && !lines[idx].contains("/*") {
+            while idx > min_allowed && !lines[idx].contains("/*") {
                 idx -= 1;
             }
             continue;
@@ -404,7 +405,7 @@ fn rewind_leading_docs_and_attrs(lines: &[String], mut idx: usize) -> usize {
             })
         {
             idx -= 1;
-            while idx > 0 {
+            while idx > min_allowed {
                 let t = crate::query::trim_line_start(&lines[idx]);
                 if leading_indent_cols(&lines[idx]) <= 4
                     && (t.starts_with("#[") || t.starts_with("#![") || t.starts_with('@'))
@@ -473,6 +474,20 @@ fn is_multiline_signature_open(line: &str) -> bool {
         {
             return true;
         }
+    }
+    let start = crate::query::trim_line_start(trimmed);
+    if (start.starts_with("impl ")
+        || start.starts_with("impl<")
+        || start.starts_with("pub trait ")
+        || start.starts_with("trait ")
+        || start.starts_with("export class ")
+        || start.starts_with("class ")
+        || start.starts_with("export interface ")
+        || start.starts_with("interface "))
+        && !trimmed.ends_with('{')
+        && !trimmed.ends_with(';')
+    {
+        return true;
     }
     false
 }
@@ -551,6 +566,26 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
     let max_idx = max_hit - snippet.start;
     let mut new_start_idx = 0usize;
     let mut new_end_idx = snippet.lines.len() - 1;
+    // Git merge conflict block (`<<<<<<<` .. `=======` .. `>>>>>>>`) full preservation
+    if let Some(conflict_start) = (0..=min_idx)
+        .rev()
+        .find(|&i| snippet.lines[i].starts_with("<<<<<<<"))
+    {
+        let already_closed_before = ((conflict_start + 1)..min_idx)
+            .any(|i| snippet.lines[i].starts_with(">>>>>>>"));
+        if !already_closed_before
+            && let Some(conflict_end) = (max_idx..snippet.lines.len())
+                .find(|&i| snippet.lines[i].starts_with(">>>>>>>"))
+        {
+            snippet.lines.truncate(conflict_end + 1);
+            if conflict_start > 0 {
+                snippet.lines.drain(..conflict_start);
+            }
+            snippet.start += conflict_start;
+            snippet.end = snippet.start + snippet.lines.len() - 1;
+            return;
+        }
+    }
     if crate::document::is_document_path(&snippet.path)
         && let Some((doc_start, doc_end)) = crate::document::clamp_document_snippet(
             &snippet.path,
@@ -700,6 +735,81 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
                 }
                 new_end_idx = end_idx;
                 break;
+            }
+        }
+    } else if snippet.path.ends_with(".toml") {
+        let is_toml_section = |line: &str| {
+            let t = line.trim();
+            leading_indent_cols(line) == 0 && t.starts_with('[') && t.ends_with(']')
+        };
+        for idx in (0..=min_idx).rev() {
+            if is_toml_section(&snippet.lines[idx]) {
+                let mut header_start = idx;
+                while header_start > 0
+                    && snippet.lines[header_start - 1].trim_start().starts_with('#')
+                {
+                    header_start -= 1;
+                }
+                new_start_idx = header_start;
+                break;
+            }
+        }
+        for idx in (max_idx + 1)..snippet.lines.len() {
+            if is_toml_section(&snippet.lines[idx]) {
+                let mut end_idx = idx - 1;
+                while end_idx > max_idx
+                    && (snippet.lines[end_idx].trim().is_empty()
+                        || snippet.lines[end_idx].trim_start().starts_with('#'))
+                {
+                    end_idx -= 1;
+                }
+                new_end_idx = end_idx;
+                break;
+            }
+        }
+    } else if snippet.path.ends_with(".yaml") || snippet.path.ends_with(".yml") {
+        let is_yaml_block_header = |line: &str| {
+            let indent = leading_indent_cols(line);
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return false;
+            }
+            (indent == 0 && t.ends_with(':'))
+                || (indent <= 4
+                    && (t.starts_with('/') && t.ends_with(':')
+                        || t.starts_with("- name:")
+                        || t.starts_with("- id:")))
+        };
+        let mut start_indent = None;
+        for idx in (0..=min_idx).rev() {
+            if is_yaml_block_header(&snippet.lines[idx]) {
+                start_indent = Some(leading_indent_cols(&snippet.lines[idx]));
+                let mut header_start = idx;
+                while header_start > 0
+                    && snippet.lines[header_start - 1].trim_start().starts_with('#')
+                {
+                    header_start -= 1;
+                }
+                new_start_idx = header_start;
+                break;
+            }
+        }
+        if let Some(s_indent) = start_indent {
+            for idx in (max_idx + 1)..snippet.lines.len() {
+                let t = snippet.lines[idx].trim();
+                if !t.is_empty()
+                    && !t.starts_with('#')
+                    && leading_indent_cols(&snippet.lines[idx]) <= s_indent
+                    && (is_yaml_block_header(&snippet.lines[idx])
+                        || (s_indent == 0 && leading_indent_cols(&snippet.lines[idx]) == 0))
+                {
+                    let mut end_idx = idx - 1;
+                    while end_idx > max_idx && snippet.lines[end_idx].trim().is_empty() {
+                        end_idx -= 1;
+                    }
+                    new_end_idx = end_idx;
+                    break;
+                }
             }
         }
     } else {

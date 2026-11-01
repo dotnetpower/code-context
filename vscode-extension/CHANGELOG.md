@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.20.0
+
+- Expand `PostingList::Inline` capacity to 5 document IDs without increasing
+  bucket size (`24 B`), lower multi-threaded trigram indexing threshold to
+  `512 KiB`, add CJK UTF-8 syllable boundary selectivity scoring and 16-window
+  long-literal sampling, bypass trigram lookups when `<=2` files are scoped,
+  and partition parallel regex workers by byte size.
+- Add 2-class small character set planning (`[gs]et_user_[iI]d`) and redundant
+  subslice literal elimination in the HIR planner, negated glob filters
+  (`*.rs, !*.test.rs`), case-insensitive extension matching across all source
+  files, and multi-token subsequence filename fallback in `code_files`.
+- Add Git merge conflict (`<<<<<<<` .. `>>>>>>>`), TOML section (`[table]`),
+  and YAML OpenAPI/workflow block clamping, cap leading doc-comment rewind to
+  12 lines, extend multi-line `impl`/`trait`/`class`/`interface` headers, and
+  recognize CSS custom properties (`--var:`), `#[proc_macro*]`, Mermaid diagrams,
+  and PlantUML blocks.
+- Compact `#cctxNativeStatus` and `#cctxNativeWorkspaces` JSON payloads by >93%
+  so responses stay inline (`<3 KB`) instead of being offloaded to `/tmp`,
+  support `.ipynb#cell-N` / `#slide-N` / `#page-N` / `#record-N` anchors,
+  GitHub/GitLab blob URLs, and `rg` `path:line: text` inputs, and preserve
+  `.tsbuildinfo` and `.eslintcache` across extension builds.
+
 ## 0.19.0
 
 - Accelerate coding, build, and test cycles by configuring `line-tables-only`

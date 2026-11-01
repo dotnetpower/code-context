@@ -323,4 +323,14 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
       paths: ['src/a', 'src/b'],
     },
   );
+  assert.deepEqual(
+    extractLineRangeFromPath(
+      'https://github.com/dotnetpower/code-context/blob/main/src/query.rs#L10-L25',
+    ),
+    { path: 'src/query.rs', start: 10, end: 25 },
+  );
+  assert.deepEqual(
+    extractLineRangeFromPath('src/query.rs:42:10: pub fn search()'),
+    { path: 'src/query.rs', start: 42, end: 82 },
+  );
 });

@@ -452,7 +452,8 @@ fn result_cache_accounts_for_query_key_memory() {
 #[test]
 fn dense_trigram_builder_preserves_large_corpus_results() {
     let root = tempfile::tempdir().unwrap();
-    let bytes = "abc\n".repeat((17 * 1024 * 1024) / 4);
+    let line_count = (16 * 1024 * 1024) / 4 + 1;
+    let bytes = "abc\n".repeat(line_count);
     std::fs::write(root.path().join("large.rs"), bytes).unwrap();
     let workspace = Workspace::new(root.path(), vec![".".into()], vec!["*.rs".into()]).unwrap();
     let mut limited = policy();
@@ -470,7 +471,7 @@ fn dense_trigram_builder_preserves_large_corpus_results() {
             limit: 8,
         })
         .unwrap();
-    assert_eq!(found.total_matches, 17 * 1024 * 1024 / 4);
+    assert_eq!(found.total_matches, line_count);
     assert_eq!(resident.candidate_stats("abc").0, 1);
 }
 

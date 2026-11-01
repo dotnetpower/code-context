@@ -29,9 +29,58 @@ export function formatToolResult(operation: string, value: JsonValue): string {
           + `next_ranges=${JSON.stringify(arrayValue(result.next_ranges,'next ranges'))}`;
       }
       return formatSnippets(value);
+    case 'code_status':
+      return formatCompactStatusJson(value);
+    case 'code_workspaces':
+      return formatCompactWorkspacesJson(value);
     default:
       return JSON.stringify(value);
   }
+}
+
+function formatCompactStatusJson(value: JsonValue): string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+  const clone: Record<string, JsonValue> = { ...value };
+  if (typeof clone.coverage === 'object' && clone.coverage !== null && !Array.isArray(clone.coverage)) {
+    const cov = { ...clone.coverage };
+    if (Array.isArray(cov.globs) && cov.globs.length > 12) {
+      cov.globs_count = cov.globs.length;
+      cov.globs = cov.globs.slice(0, 8);
+    }
+    clone.coverage = cov;
+  }
+  if (typeof clone.performance === 'object' && clone.performance !== null && !Array.isArray(clone.performance)) {
+    const perf = { ...clone.performance };
+    for (const key of ['recent_requests', 'recent_clients', 'recent_background', 'evictions']) {
+      const arr = perf[key];
+      if (Array.isArray(arr) && arr.length > 3) {
+        perf[`${key}_total`] = arr.length;
+        perf[key] = arr.slice(-3);
+      }
+    }
+    clone.performance = perf;
+  }
+  return JSON.stringify(clone);
+}
+
+function formatCompactWorkspacesJson(value: JsonValue): string {
+  if (!Array.isArray(value) || value.length <= 2) {
+    return JSON.stringify(value);
+  }
+  const compacted = value.map((item) => {
+    if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+      const copy: Record<string, JsonValue> = { ...item };
+      if (Array.isArray(copy.globs) && copy.globs.length > 8) {
+        copy.globs_count = copy.globs.length;
+        copy.globs = copy.globs.slice(0, 6);
+      }
+      return copy;
+    }
+    return item;
+  });
+  return JSON.stringify(compacted);
 }
 
 export function validateDaemonStatus(value: JsonValue): void {
@@ -166,9 +215,10 @@ function formatSnippets(value: JsonValue): string {
       previousSha = sha;
     }
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-      output.push(
-        `${start + lineIndex}: ${stringValue(lines[lineIndex], `${label} line ${lineIndex}`)}`,
-      );
+      const rawLine = stringValue(lines[lineIndex], `${label} line ${lineIndex}`);
+      const boundedLine =
+        rawLine.length > 2048 ? `${rawLine.slice(0, 2048)}... [truncated]` : rawLine;
+      output.push(`${start + lineIndex}: ${boundedLine}`);
     }
   }
   return output.length > 0 ? output.join('\n') : 'snippets=0';

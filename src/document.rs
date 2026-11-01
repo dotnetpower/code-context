@@ -1922,6 +1922,10 @@ fn extract_xlsx_worksheet_rows(
                     .and_then(|idx| shared_strings.get(idx).cloned())
                     .unwrap_or_default(),
                 "inlineStr" => extract_all_local_tag_texts(c_body, &["t"]).join(""),
+                "str" => raw_v.unwrap_or_default(),
+                "e" => raw_v
+                    .map(|err| format!("[Error: {err}]"))
+                    .unwrap_or_default(),
                 "b" => match raw_v.as_deref() {
                     Some("1") | Some("true") => "TRUE".into(),
                     Some("0") | Some("false") => "FALSE".into(),
@@ -2926,7 +2930,16 @@ pub fn extract_pdf(bytes: &[u8]) -> Result<String> {
             continue;
         }
         let content_str = String::from_utf8_lossy(&decoded_bytes);
-        if content_str.contains("BT") || content_str.contains("Tj") || content_str.contains("TJ") {
+        if dict_slice.contains("/ObjStm")
+            && out.is_empty()
+            && let Some(obj_title) = extract_pdf_info_field(&content_str, "/Title")
+        {
+            out.push_str(&format!("# [Document Metadata]\nTitle: {obj_title}\n\n"));
+        }
+        if content_str.contains("BT")
+            || content_str.contains("Tj")
+            || content_str.contains("TJ")
+        {
             let page_lines = parse_pdf_content_stream(&content_str);
             if !page_lines.is_empty() {
                 page_num += 1;
@@ -3831,8 +3844,31 @@ pub fn document_definition_priority(line: &str) -> u8 {
             "@unpublished{",
             "@online{",
             "@software{",
+            "@startuml",
+            "@startmindmap",
+            "@startwbs",
         ] {
             if lower.starts_with(entry) {
+                return 4;
+            }
+        }
+    }
+    // Mermaid diagram headers
+    if !has_leading_tab && leading_spaces <= 2 {
+        for diagram in [
+            "flowchart ",
+            "graph ",
+            "sequenceDiagram",
+            "classDiagram",
+            "stateDiagram",
+            "erDiagram",
+            "gantt",
+            "mindmap",
+            "timeline",
+            "gitGraph",
+            "C4Context",
+        ] {
+            if trimmed.starts_with(diagram) {
                 return 4;
             }
         }
@@ -4561,7 +4597,7 @@ fn strip_inline_markdown_for_slug(raw: &str) -> (String, Option<String>) {
 
 pub fn github_heading_slug(heading_line: &str) -> String {
     let raw = heading_line.strip_prefix('\u{feff}').unwrap_or(heading_line).trim();
-    let stripped = raw.trim_start_matches(['#', '=']).trim_start();
+    let stripped = raw.trim_start_matches(['#', '=', '*']).trim_start();
     let (cleaned, explicit_id) = strip_inline_markdown_for_slug(stripped);
     if let Some(id) = explicit_id {
         return id;
@@ -4609,6 +4645,34 @@ pub fn resolve_markdown_anchor_range(text: &str, anchor: &str) -> Option<(usize,
         return None;
     }
     let masks = compute_markdown_block_masks(&lines);
+    let unit_prefix = if let Some(num) = target.strip_prefix("cell-") {
+        Some(format!("## [notebook cell {num}:"))
+    } else if let Some(num) = target.strip_prefix("slide-") {
+        Some(format!("## [slide {num}]"))
+    } else if let Some(num) = target.strip_prefix("page-") {
+        Some(format!("## [page {num}]"))
+    } else {
+        target
+            .strip_prefix("record-")
+            .map(|num| format!("## [record {num}]"))
+    };
+    if let Some(prefix) = unit_prefix {
+        for (idx, line) in lines.iter().enumerate() {
+            if !masks.in_fence[idx] && line.trim_start().to_lowercase().starts_with(&prefix) {
+                let mut end_idx = lines.len() - 1;
+                for (next_idx, next_line) in lines.iter().enumerate().skip(idx + 1) {
+                    if !masks.in_fence[next_idx] && is_extracted_unit_boundary(next_line) {
+                        end_idx = next_idx - 1;
+                        break;
+                    }
+                }
+                while end_idx > idx && lines[end_idx].trim().is_empty() {
+                    end_idx -= 1;
+                }
+                return Some((idx + 1, (end_idx + 1).min(idx + 120)));
+            }
+        }
+    }
     let mut slug_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 

@@ -380,4 +380,24 @@ fn frontend_globs_support_compound_extensions_brace_globs_dynamic_routes_and_vit
         comma_paths["paths"],
         json!(["src/assets/icon.svg", "src/shaders/wave.wgsl"])
     );
+
+    // Multi-token subsequence filename fallback ("btn stories" -> Button.stories.tsx) and GitHub blob URL / rg line output
+    let subseq = watched
+        .call("code_files", json!({"glob": "button stories"}))
+        .unwrap();
+    assert_eq!(subseq["paths"], json!(["src/components/Button.stories.tsx"]));
+
+    let gh_and_rg = watched
+        .call(
+            "code_read",
+            json!({
+                "ranges": [
+                    {"path": "https://github.com/dotnetpower/code-context/blob/main/src/components/Button.tsx#L1", "start": 1, "end": 1},
+                    {"path": "src/components/Button.tsx:1: export const Button", "start": 1, "end": 1}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(gh_and_rg[0]["path"], "src/components/Button.tsx");
+    assert_eq!(gh_and_rg[1]["path"], "src/components/Button.tsx");
 }

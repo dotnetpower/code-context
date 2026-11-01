@@ -55,7 +55,7 @@ pub(crate) type TrigramMap<V> = HashMap<u32, V, TrigramBuildHasher>;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PostingList {
-    Inline { len: u8, ids: [u32; 4] },
+    Inline { len: u8, ids: [u32; 5] },
     Heap(Vec<u32>),
 }
 
@@ -64,7 +64,7 @@ impl Default for PostingList {
     fn default() -> Self {
         Self::Inline {
             len: 0,
-            ids: [0; 4],
+            ids: [0; 5],
         }
     }
 }
@@ -74,7 +74,7 @@ impl PostingList {
     pub(crate) fn single(id: u32) -> Self {
         Self::Inline {
             len: 1,
-            ids: [id, 0, 0, 0],
+            ids: [id, 0, 0, 0, 0],
         }
     }
 
@@ -112,7 +112,7 @@ impl PostingList {
         match self {
             Self::Inline { len, ids } => {
                 let l = usize::from(*len);
-                if l < 4 {
+                if l < 5 {
                     ids[l] = id;
                     *len += 1;
                 } else {
@@ -132,7 +132,7 @@ impl PostingList {
             Self::Inline { len, ids } => {
                 let l = usize::from(*len);
                 let pos = ids[..l].binary_search(&id).unwrap_or_else(|i| i);
-                if l < 4 {
+                if l < 5 {
                     ids.copy_within(pos..l, pos + 1);
                     ids[pos] = id;
                     *len += 1;
@@ -140,7 +140,7 @@ impl PostingList {
                     let mut v = Vec::with_capacity(8);
                     v.extend_from_slice(&ids[..pos]);
                     v.push(id);
-                    v.extend_from_slice(&ids[pos..4]);
+                    v.extend_from_slice(&ids[pos..5]);
                     *self = Self::Heap(v);
                 }
             }
@@ -509,7 +509,7 @@ impl Resident {
         let mut dense_epoch = 1_u16;
         if dense_seen.is_none()
             && self.documents.len() >= 16
-            && self.stats.source_bytes >= 2 * 1024 * 1024
+            && self.stats.source_bytes >= 512 * 1024
             && base_owned.saturating_add(self.stats.source_bytes.saturating_mul(4))
                 <= self.max_owned_bytes
         {
@@ -821,14 +821,7 @@ impl Resident {
                 keyed_lists[i] = (k, slice);
             }
             let active = &mut keyed_lists[..key_len];
-            active.sort_unstable_by_key(|&(k, list)| {
-                let b0 = (k & 0xff) as u8;
-                let b1 = ((k >> 8) & 0xff) as u8;
-                let b2 = ((k >> 16) & 0xff) as u8;
-                let non_ascii =
-                    usize::from(b0 >= 0x80) + usize::from(b1 >= 0x80) + usize::from(b2 >= 0x80);
-                (list.len(), non_ascii)
-            });
+            active.sort_unstable_by_key(|&(k, list)| (list.len(), trigram_selectivity_penalty(k)));
             if key_len == 1 {
                 return active[0].1.iter().map(|&id| id as usize).collect();
             }
@@ -859,7 +852,21 @@ impl Resident {
             }
             return out;
         }
-        let mut keys: Vec<_> = pattern.windows(3).map(trigram).collect();
+        let mut keys: Vec<_> = if window_count <= 24 {
+            pattern.windows(3).map(trigram).collect()
+        } else {
+            let mut sampled = Vec::with_capacity(16);
+            sampled.push(trigram(&pattern[..3]));
+            sampled.push(trigram(&pattern[1..4]));
+            let span = window_count - 2;
+            for slot in 1..=12 {
+                let idx = 1 + (slot * span) / 13;
+                sampled.push(trigram(&pattern[idx..idx + 3]));
+            }
+            sampled.push(trigram(&pattern[window_count - 2..window_count + 1]));
+            sampled.push(trigram(&pattern[window_count - 1..window_count + 2]));
+            sampled
+        };
         keys.sort_unstable();
         keys.dedup();
         let Some(mut keyed_lists) = keys
@@ -872,15 +879,8 @@ impl Resident {
         if keyed_lists.iter().any(|(_, list)| list.is_empty()) {
             return Vec::new();
         }
-        // Prefer shortest posting lists first; break ties by preferring ASCII trigrams
-        // over UTF-8 continuation-heavy trigrams for higher selectivity.
-        keyed_lists.sort_unstable_by_key(|&(k, list)| {
-            let b0 = (k & 0xff) as u8;
-            let b1 = ((k >> 8) & 0xff) as u8;
-            let b2 = ((k >> 16) & 0xff) as u8;
-            let non_ascii = usize::from(b0 >= 0x80) + usize::from(b1 >= 0x80) + usize::from(b2 >= 0x80);
-            (list.len(), non_ascii)
-        });
+        keyed_lists
+            .sort_unstable_by_key(|&(k, list)| (list.len(), trigram_selectivity_penalty(k)));
         if keyed_lists.len() > MAX_QUERY_POSTING_INTERSECTIONS {
             keyed_lists.truncate(MAX_QUERY_POSTING_INTERSECTIONS);
         }
@@ -1108,6 +1108,21 @@ impl Resident {
         let ids = self.candidates(pattern);
         let bytes = ids.iter().map(|id| self.documents[*id].text.len()).sum();
         (ids.len(), bytes)
+    }
+}
+
+#[inline]
+fn trigram_selectivity_penalty(k: u32) -> usize {
+    let b0 = (k & 0xff) as u8;
+    let b1 = ((k >> 8) & 0xff) as u8;
+    let b2 = ((k >> 16) & 0xff) as u8;
+    if b0 < 0x80 && b1 < 0x80 && b2 < 0x80 {
+        0
+    } else if (b0 & 0xF0) == 0xE0 && (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
+        // Complete aligned 3-byte UTF-8 CJK/Hangul syllable
+        1
+    } else {
+        1 + usize::from(b0 >= 0x80) + usize::from(b1 >= 0x80) + usize::from(b2 >= 0x80)
     }
 }
 

@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context by dotnetpower",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -399,6 +399,31 @@
               "default": true,
               "description": "Split broad reads into <=500-line segments (max 64 segments, 256KiB)."
             },
+            "path": {
+              "type": "string",
+              "description": "Optional single workspace-relative path (supports path:line:col, path#Lstart-Lend, path.md#slug, and @/ aliases) when reading one range."
+            },
+            "start": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional 1-based inclusive start line for single-file reads."
+            },
+            "end": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional 1-based inclusive end line for single-file reads."
+            },
+            "around_line": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional 1-based center line for reading a symmetric window around a diagnostic or symbol."
+            },
+            "radius": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "description": "Optional line radius around around_line (default 20)."
+            },
             "ranges": {
               "type": "array",
               "minItems": 1,
@@ -562,7 +587,7 @@
     "clean": "node ./scripts/clean.mjs",
     "compile": "tsc -p ./",
     "check": "tsc -p ./ --noEmit",
-    "lint": "eslint .",
+    "lint": "eslint --cache --cache-location .eslintcache .",
     "test": "npm run compile && node --test out/test/**/*.test.js",
     "bench": "npm run compile && node scripts/bench-native.mjs",
     "package": "npm run clean && npm run lint && npm test && vsce package --baseContentUrl https://github.com/dotnetpower/code-context/blob/main/vscode-extension --baseImagesUrl https://raw.githubusercontent.com/dotnetpower/code-context/main/vscode-extension --out dist/code-context-native.vsix",

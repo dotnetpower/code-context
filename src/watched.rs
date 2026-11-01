@@ -1176,6 +1176,13 @@ impl Watched {
             if let Some(rest) = raw.strip_prefix("-->") {
                 *raw = rest.trim().to_owned();
             }
+            if (raw.starts_with("https://github.com/") || raw.starts_with("https://gitlab.com/"))
+                && let Some((_, after_blob)) = raw.split_once("/blob/")
+                && let Some((_, repo_rel)) = after_blob.split_once('/')
+                && !repo_rel.is_empty()
+            {
+                *raw = repo_rel.to_owned();
+            }
             if let Some(rest) = raw.strip_prefix("File \"")
                 && let Some((file_part, _)) = rest.split_once('"')
             {
@@ -1268,9 +1275,7 @@ impl Watched {
                 } else if let Some((base, suffix)) = raw.split_once(':')
                     && !base.is_empty()
                     && !suffix.is_empty()
-                    && suffix
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || b == b'-' || b == b':')
+                    && suffix.as_bytes()[0].is_ascii_digit()
                     && candidate_exists(base)
                 {
                     *raw = base.to_owned();
@@ -1877,7 +1882,7 @@ impl Watched {
                 {
                     return Ok(true);
                 }
-                if meta.len() > 4096
+                if (meta.len() > 4096 || crate::document::is_binary_container_document(rel_path))
                     && let Ok(current_stamp) = crate::incremental::stamp_from_metadata(&meta)
                     && stamps.get(&snippet.path) == Some(&current_stamp)
                 {

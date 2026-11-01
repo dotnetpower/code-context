@@ -87,6 +87,27 @@ void test('self-test cannot report old daemon capabilities as ready', () => {
   assert.doesNotThrow(() => validateDaemonStatus({ capabilities: {
     schema: 3, code_files: true, context_radius_max: 100, authorized_worktrees: true, read_pages:true, request_tracing:true, trace_clock:'unix_ms', source_cache:'nonblocking_root_cache',
   } }));
+  const bloatedStatus = {
+    capabilities: {
+      schema: 3, code_files: true, context_radius_max: 100, authorized_worktrees: true,
+      read_pages: true, request_tracing: true, trace_clock: 'unix_ms', source_cache: 'nonblocking_root_cache',
+    },
+    coverage: { root: '/repo', globs: Array.from({ length: 100 }, (_, i) => `*.ext${i}`) },
+    performance: {
+      recent_requests: Array.from({ length: 60 }, (_, i) => ({ id: i })),
+      recent_clients: Array.from({ length: 60 }, (_, i) => ({ id: i })),
+    },
+  };
+  const compactStatusText = formatToolResult('code_status', bloatedStatus);
+  const parsedStatus = JSON.parse(compactStatusText) as {
+    coverage: { globs: string[]; globs_count: number };
+    performance: { recent_requests: JsonValue[]; recent_requests_total: number };
+  };
+  assert.doesNotThrow(() => validateDaemonStatus(parsedStatus));
+  assert.equal(parsedStatus.coverage.globs.length, 8);
+  assert.equal(parsedStatus.coverage.globs_count, 100);
+  assert.equal(parsedStatus.performance.recent_requests.length, 3);
+  assert.equal(parsedStatus.performance.recent_requests_total, 60);
 });
 
 void test('context results include numbered source without JSON processing', () => {

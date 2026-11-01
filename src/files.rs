@@ -102,6 +102,10 @@ pub fn find<'a>(
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
             .collect();
+        let stem_tokens: Vec<&str> = stem_lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
         matches = candidates
             .into_iter()
             .filter(|candidate| {
@@ -121,7 +125,24 @@ pub fn find<'a>(
                                 .chars()
                                 .filter(|c| c.is_ascii_alphanumeric())
                                 .collect();
-                            return name_alnum.contains(&stem_alnum);
+                            if name_alnum.contains(&stem_alnum) {
+                                return true;
+                            }
+                            if stem_tokens.len() >= 2 {
+                                let mut cursor = name_alnum.as_str();
+                                let mut all_found = true;
+                                for &tok in &stem_tokens {
+                                    if let Some(pos) = cursor.find(tok) {
+                                        cursor = &cursor[pos + tok.len()..];
+                                    } else {
+                                        all_found = false;
+                                        break;
+                                    }
+                                }
+                                if all_found {
+                                    return true;
+                                }
+                            }
                         }
                         false
                     })

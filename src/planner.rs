@@ -173,7 +173,7 @@ pub(crate) fn build(hir: &Hir) -> Option<CandidateExpr> {
     }
     for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
         if let Some(boundary) = extracted(hir, kind)
-            && (conditions.is_empty() || boundary.atom_count() <= 4)
+            && (conditions.is_empty() || boundary.atom_count() == 1)
         {
             conditions.push(boundary);
         }
@@ -333,6 +333,60 @@ fn flush_run(run: &mut Vec<RunSlot>, conditions: &mut Vec<CandidateExpr>) {
             if !branches.is_empty() {
                 conditions.push(CandidateExpr::Or(branches).simplify());
             }
+        } else if small_count == 2 {
+            let all_exact = run.iter().all(|slot| match slot {
+                RunSlot::Pair(pair) => pair[0] == pair[1],
+                RunSlot::Small(_) => true,
+            });
+            let small_positions: Vec<usize> = run
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| matches!(slot, RunSlot::Small(_)).then_some(i))
+                .collect();
+            let (idx_a, idx_b) = (small_positions[0], small_positions[1]);
+            let choices_a = match &run[idx_a] {
+                RunSlot::Small(c) => c.as_slice(),
+                RunSlot::Pair(_) => &[],
+            };
+            let choices_b = match &run[idx_b] {
+                RunSlot::Small(c) => c.as_slice(),
+                RunSlot::Pair(_) => &[],
+            };
+            if choices_a.len() * choices_b.len() <= 16 {
+                let mut branches = Vec::with_capacity(choices_a.len() * choices_b.len());
+                for &ca in choices_a {
+                    for &cb in choices_b {
+                        if all_exact {
+                            let mut literal = Vec::with_capacity(run.len());
+                            for (idx, slot) in run.iter().enumerate() {
+                                if idx == idx_a {
+                                    literal.push(ca);
+                                } else if idx == idx_b {
+                                    literal.push(cb);
+                                } else if let RunSlot::Pair([b, _]) = slot {
+                                    literal.push(*b);
+                                }
+                            }
+                            branches.push(CandidateExpr::Literal(literal));
+                        } else {
+                            let mut pairs = Vec::with_capacity(run.len());
+                            for (idx, slot) in run.iter().enumerate() {
+                                if idx == idx_a {
+                                    pairs.push([ca, ca]);
+                                } else if idx == idx_b {
+                                    pairs.push([cb, cb]);
+                                } else if let RunSlot::Pair(pair) = slot {
+                                    pairs.push(*pair);
+                                }
+                            }
+                            branches.push(CandidateExpr::ByteClasses(pairs));
+                        }
+                    }
+                }
+                if !branches.is_empty() {
+                    conditions.push(CandidateExpr::Or(branches).simplify());
+                }
+            }
         }
     }
     run.clear();
@@ -371,7 +425,11 @@ fn push_concat_item(
                     run.push(RunSlot::Pair([byte, byte]));
                 }
             } else if let Some(small) = class_ascii_small(class) {
-                if run.iter().any(|slot| matches!(slot, RunSlot::Small(_))) {
+                let existing_small = run
+                    .iter()
+                    .filter(|slot| matches!(slot, RunSlot::Small(_)))
+                    .count();
+                if existing_small >= 2 {
                     flush_run(run, conditions);
                 }
                 run.push(RunSlot::Small(small));
@@ -486,6 +544,21 @@ fn simplify_group(mut children: Vec<CandidateExpr>, and: bool) -> CandidateExpr 
             CandidateExpr::And(_) => (2_u8, std::cmp::Reverse(0)),
             CandidateExpr::Or(_) => (3_u8, std::cmp::Reverse(0)),
         });
+        let literals: Vec<Vec<u8>> = flattened
+            .iter()
+            .filter_map(|child| match child {
+                CandidateExpr::Literal(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        if literals.len() > 1 {
+            flattened.retain(|child| match child {
+                CandidateExpr::Literal(bytes) => !literals.iter().any(|other| {
+                    other.len() > bytes.len() && memchr::memmem::find(other, bytes).is_some()
+                }),
+                _ => true,
+            });
+        }
     }
     if flattened.len() == 1 {
         flattened.pop().expect("one element")

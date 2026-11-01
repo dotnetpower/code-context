@@ -110,6 +110,16 @@ pub const TEXT_GLOBS: &[&str] = &[
     "*.dhall",
     "*.pkl",
     "*.rego",
+    "*.wit",
+    "*.fbs",
+    "*.capnp",
+    "*.smithy",
+    "*.avsc",
+    "*.graphqls",
+    "*.mmd",
+    "*.mermaid",
+    "*.puml",
+    "*.plantuml",
 ];
 
 pub const DEFAULT_SOURCE_GLOBS: &[&str] = &[

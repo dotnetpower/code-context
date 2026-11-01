@@ -1156,6 +1156,22 @@ fn round_12_jsonl_vtt_srt_xliff2_ipynb_errors_svg_and_inline_slug_stripping() {
     let svg_outline = inspect_structure("diagram.svg", svg_src);
     assert!(svg_outline.iter().any(|s| s.contains("[svg:title] Architecture Diagram")));
     assert!(svg_outline.iter().any(|s| s.contains("[svg:id] #cache-layer")));
+
+    // 8. Unit anchors (#cell-2, #slide-2), Org-mode heading slug, and Mermaid definition priority
+    assert_eq!(
+        github_heading_slug("** Org Mode Subheading"),
+        "org-mode-subheading"
+    );
+    assert_eq!(
+        code_context::document::document_definition_priority("sequenceDiagram"),
+        4
+    );
+    let nb_extracted = "## [Notebook Cell 1: markdown]\n# Intro\n\n## [Notebook Cell 2: code (python) In[1]]\nx = 42\nprint(x)\n\n## [Notebook Cell 3: markdown]\n# End\n";
+    let (c2_start, c2_end) =
+        code_context::document::resolve_markdown_anchor_range(nb_extracted, "#cell-2").unwrap();
+    let nb_lines: Vec<&str> = nb_extracted.lines().collect();
+    assert_eq!(nb_lines[c2_start - 1], "## [Notebook Cell 2: code (python) In[1]]");
+    assert_eq!(nb_lines[c2_end - 1], "print(x)");
 }
 
 
