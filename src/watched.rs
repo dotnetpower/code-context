@@ -1658,6 +1658,22 @@ impl Watched {
         } else {
             self.io_profile.read_policy_cache_hits += 1;
         }
+        if !needs_compile
+            && request
+                .ranges
+                .iter()
+                .all(|range| self.stamps.contains_key(&range.path))
+            && let Ok(ranges) = self.plan_read_ranges(request)
+            && let Ok(snippets) = self.resident.read_many(&ranges)
+        {
+            let (_, workspace, _) = self.read_policy.as_ref().expect("compiled read policy");
+            if self
+                .stale_snippet_path_with_workspace(workspace, &snippets)?
+                .is_none()
+            {
+                return Ok(snippets);
+            }
+        }
         let mut requested = BTreeSet::new();
         let mut directories = BTreeMap::new();
         for range in &request.ranges {
@@ -1882,7 +1898,7 @@ impl Watched {
                 {
                     return Ok(true);
                 }
-                if (meta.len() > 4096 || crate::document::is_binary_container_document(rel_path))
+                if (meta.len() > 64 || crate::document::is_binary_container_document(rel_path))
                     && let Ok(current_stamp) = crate::incremental::stamp_from_metadata(&meta)
                     && stamps.get(&snippet.path) == Some(&current_stamp)
                 {
