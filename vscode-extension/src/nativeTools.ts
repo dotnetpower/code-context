@@ -172,8 +172,9 @@ export class NativeToolBridge implements vscode.Disposable {
       if (root) {
         this.lastResolvedRoot = { root, at: Date.now() };
       }
+      const preparedArgs = definition.arguments(input, root);
       const result = await this.client.requestTraced<JsonValue>(
-        request(root, definition.operation, definition.arguments(input, root)),
+        request(root, definition.operation, preparedArgs),
         token,
         traceId,
         performance.now() - started,
@@ -189,10 +190,21 @@ export class NativeToolBridge implements vscode.Disposable {
       result.trace.started_unix_ms = startedUnixMs;
       result.trace.completed_unix_ms = Date.now();
       result.trace.outcome = 'success';
+      const rangesArg = preparedArgs.ranges;
+      const turnCompressed =
+        definition.operation === 'code_context' ||
+        (definition.operation === 'code_read' &&
+          Array.isArray(rangesArg) &&
+          (rangesArg.length > 1 ||
+            rangesArg.some(
+              (r) => typeof r === 'object' && r !== null && !Array.isArray(r) && typeof r.path === 'string' && r.path.includes('#'),
+            )));
       this.onUsage?.({
         operation: definition.operation,
         root,
         totalMs: result.trace.total_ms,
+        deliveredChars: JSON.stringify(result.value).length,
+        turnCompressed,
       });
       if (definition.operation === 'code_sync') {
         this.registry.invalidate();

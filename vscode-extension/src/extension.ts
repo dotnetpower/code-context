@@ -89,8 +89,15 @@ export function activate(context: vscode.ExtensionContext): void {
   status.show();
   renderUsage = (): void => {
     if (usage.last) {
+      usage.refreshSessionTelemetry();
       status.text = usage.text();
-      status.tooltip = usage.tooltip();
+      if (typeof vscode.MarkdownString === 'function') {
+        const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
+        md.isTrusted = true;
+        status.tooltip = md;
+      } else {
+        status.tooltip = usage.tooltip();
+      }
     }
   };
 
@@ -125,7 +132,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.commands.registerCommand('codeContextNative.showStatus', async () => {
-      await showStatus(bridge, status, output, usage.lastRoot);
+      await showStatus(bridge, status, output, usage, usage.lastRoot);
     }),
     vscode.commands.registerCommand('codeContextNative.selfTest', async (root?: string) => {
       await runSelfTest(bridge, output, context.extension, root ?? usage.lastRoot);
@@ -186,6 +193,7 @@ async function showStatus(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
   output: vscode.LogOutputChannel,
+  usage: UsageSummary,
   explicitRoot?: string,
 ): Promise<void> {
   try {
@@ -214,6 +222,7 @@ async function showStatus(
         { root },
         source.token,
       );
+      output.info(usage.formatDashboard(value));
       output.info(formatLogDetails('Code Context status', value));
       output.show(true);
     } finally {

@@ -61,7 +61,7 @@ bash scripts/install.sh && ~/.local/bin/cctx ping
 **2. Download the [VSIX](https://github.com/dotnetpower/code-context/releases/latest/download/code-context-native.vsix).**
 In VS Code choose **Extensions → … → Install from VSIX…**.
 
-**3. Run Code Context: Getting Started** in a trusted workspace.
+**3. Run Code Context: Getting Started** in a trusted workspace (hover the `CCTX N` status bar item or run `cctx usage --hours 24` to view live LLM model, token, cache hit, and AIC/$ cost savings).
 On Windows local folders (`C:\...`), `cctx.exe daemon` starts automatically in the background:
 
 > Use `#cctxNativeFiles` to find `*Service*`, then `#cctxNativeContext` for nearby source.

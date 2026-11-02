@@ -327,6 +327,72 @@ class AdoptionAuditTests(unittest.TestCase):
         )
         self.assertEqual(res_line["classification"], "eligible")
 
+    def test_model_usage_token_summary_and_pretty_dashboard_rendering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sess_dir = Path(directory) / "sess-abc"
+            sess_dir.mkdir(parents=True)
+            trace = sess_dir / "events.jsonl"
+            records = [
+                {
+                    "type": "session.start",
+                    "timestamp": "2027-01-15T07:59:59Z",
+                    "data": {"context": {"cwd": "/home/dev/code-context"}},
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:00Z",
+                    "data": {
+                        "usage": {
+                            "model": "gemini-4-argon",
+                            "modelDisplayName": "Gemini 4 Argon",
+                            "reasoningEffort": "high",
+                            "inputTokens": 80_000,
+                            "cacheReadTokens": 76_000,
+                            "outputTokens": 500,
+                            "reasoningTokens": 300,
+                            "duration": 6400,
+                            "timeToFirstTokenMs": 1200,
+                        }
+                    },
+                },
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:01Z",
+                    "data": {
+                        "toolName": "cctxNativeContext",
+                        "toolCallId": "c1",
+                        "model": "gemini-4-argon",
+                        "arguments": {"pattern": "Resident"},
+                    },
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:02Z",
+                    "data": {
+                        "toolCallId": "c1",
+                        "model": "gemini-4-argon",
+                        "success": True,
+                        "result": {"content": "--- src/resident.rs:1-10\n1: pub struct Resident {}"},
+                    },
+                },
+            ]
+            trace.write_text("\n".join(map(json.dumps, records)))
+            report = MODULE.build_report([trace], 24, now=1_800_000_010)
+            self.assertIn("gemini-4-argon", report["model_usage"])
+            m = report["model_usage"]["gemini-4-argon"]
+            self.assertEqual(m["display_name"], "Gemini 4 Argon")
+            self.assertEqual(m["turns"], 1)
+            self.assertEqual(m["input_tokens"], 80_000)
+            self.assertEqual(m["prompt_cache_hit_percent"], 95.0)
+            self.assertEqual(m["cctx_calls"], 1)
+            self.assertEqual(m["cctx_cache_hit_percent"], 100.0)
+            self.assertEqual(m["turn_compression_calls"], 1)
+            self.assertGreater(report["token_summary"]["estimated_total_tokens_saved"], 1500)
+            pretty = MODULE.format_pretty_report(report)
+            self.assertIn("Gemini 4 Argon (high)", pretty)
+            self.assertIn("code-context", pretty)
+            self.assertIn("100.0%", pretty)
+
 
 if __name__ == "__main__":
     unittest.main()

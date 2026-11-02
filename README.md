@@ -26,7 +26,7 @@ or run `code --install-extension dotnetpower.code-context-native` (or install th
 The backend is installed separately; installing the extension alone is not enough.
 Existing VSIX users should follow the [publisher migration guide](vscode-extension/docs/SETUP.md#extension-details-resources-and-vsix-updates).
 
-**3. Open a trusted project** and run **Code Context: Getting Started**.
+**3. Open a trusted project** and run **Code Context: Getting Started** (or `cctx usage --hours 24` in the terminal for the live model, token, cache hit, and AIC/$ cost savings dashboard).
 On native Windows, `cctx.exe daemon` starts automatically in the background on first use. Try:
 
 > Use `#cctxNativeFiles` to find `*Service*`, then `#cctxNativeContext` to inspect a symbol.

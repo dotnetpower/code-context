@@ -62,6 +62,12 @@ enum Action {
     Status,
     Doctor,
     Coverage,
+    Usage {
+        #[arg(long, default_value_t = 24.0)]
+        hours: f64,
+        #[arg(long)]
+        json: bool,
+    },
     Prepare,
     Migrate {
         #[arg(long)]
@@ -148,6 +154,12 @@ fn run() -> Result<()> {
         Action::NativeBridge => return daemon::native_bridge(io::stdin().lock(), io::stdout().lock()),
         Action::Doctor => return print(&code_context::diagnostics::doctor(&args.root)?),
         Action::Coverage => return print(&code_context::diagnostics::coverage()?),
+        Action::Usage { hours, json } => {
+            let output = code_context::diagnostics::usage(&args.root, *hours, *json)?;
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(output.as_bytes())?;
+            return stdout.write_all(b"\n").map_err(Into::into);
+        }
         Action::Prepare => {
             return print(&serde_json::json!({
                 "root":code_context::registration::prepare_root(&args.root)?

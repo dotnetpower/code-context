@@ -400,7 +400,7 @@ impl std::fmt::Display for CacheMiss {
         };
         write!(
             formatter,
-            "CACHE_MISS root={} state={} background_load={}: no cached source result is available.{previous} Skip CCTX for this lookup and continue with a permitted host search/read under the same access policy. Do not poll, repeat this request, switch CCTX transports or run code_sync merely to wait for warmup. A later independent lookup can use the cache once ready; this is not a zero-match or absence result.",
+            "CACHE_MISS root={} state={} background_load={}: no cached source result is available.{previous} Use a permitted host search/read for THIS single lookup only under the same access policy, then RESUME using CCTX (#cctxNative* / code_*) on your next turn once background load finishes (~1-2s). Do not poll, repeat this request, switch CCTX transports or run code_sync merely to wait for warmup; this is not a zero-match or absence result.",
             self.root.display(),
             self.state,
             self.scheduled

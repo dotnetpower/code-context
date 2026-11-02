@@ -255,7 +255,10 @@ impl Controller {
         };
         let policy = self.policy.as_ref().ok_or_else(|| invalid("memory policy is absent"))?;
         let local = policy.calculate(total, available, anon, parent_room(group, own, self.managed)?);
-        let host_max = self.host_ceiling(policy, anon);
+        let wsl_reclaimable = field(&text, "Cached:")
+            .unwrap_or(0)
+            .saturating_add(field(&text, "Buffers:").unwrap_or(0));
+        let host_max = self.host_ceiling(policy, anon.saturating_add(wsl_reclaimable));
         static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let page = *PAGE_SIZE.get_or_init(|| {
             usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)

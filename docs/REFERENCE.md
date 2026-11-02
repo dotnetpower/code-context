@@ -62,6 +62,7 @@ cctx --backend shared --root /path/to/project grep 'create_service'
 cctx --backend shared --root /path/to/project context 'create_service' --radius 5
 cctx --backend shared --root /path/to/project read src/lib.rs 1 40
 cctx --backend shared --root /path/to/project status
+cctx usage --hours 24
 ```
 
 Search patterns are case-sensitive literals unless `--regex` or
@@ -87,7 +88,7 @@ Tool discovery does not prove that a model selects the tools.
 | `#cctxNativeFiles` | Filename/path discovery with a glob |
 | `#cctxNativeGrep` | Exact or regex source search |
 | `#cctxNativeContext` | Search plus nearby source |
-| `#cctxNativeRead` | Batched ranges with whole-file hashes (supports `path:line:col`, `#Lstart-Lend`, and `path.md#heading-slug`) |
+| `#cctxNativeRead` | Batched ranges with whole-file hashes (supports `path:line:col`, `#Lstart-Lend`, `path.md#heading-slug`, `#toc`, and `#slide-N-M`) |
 | `#cctxNativeStatus` | Observational state, no source loading |
 | `#cctxNativeSync` | Explicit full-source freshness barrier |
 | `#cctxNativeWorkspaces` | Registered roots and coverage |

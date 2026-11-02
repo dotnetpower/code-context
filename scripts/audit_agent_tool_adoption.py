@@ -167,6 +167,65 @@ def result_usefulness(value, depth: int = 0) -> bool | None:
     return None
 
 
+def extract_result_text(value, depth: int = 0) -> str:
+    if depth > 6 or value is None:
+        return ""
+    if isinstance(value, str):
+        return re.sub(r"\n?CCTX_TRACE \{[^\n]*\}\s*$", "", value)
+    if isinstance(value, dict):
+        for key in ("content", "text", "value", "output"):
+            if key in value and value[key] is not None:
+                extracted = extract_result_text(value[key], depth + 1)
+                if extracted:
+                    return extracted
+    if isinstance(value, list):
+        parts = [extract_result_text(item, depth + 1) for item in value]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def is_turn_compressed_call(tool: str, arguments: dict) -> bool:
+    if not isinstance(arguments, dict):
+        return False
+    if tool.endswith(("code_context", "codeContext", "NativeContext")):
+        return True
+    if tool.endswith(("code_read", "codeRead", "NativeRead")):
+        ranges = arguments.get("ranges")
+        if isinstance(ranges, list):
+            if len(ranges) > 1:
+                return True
+            if any(
+                isinstance(item, dict) and "#" in str(item.get("path") or item.get("filePath") or "")
+                for item in ranges
+            ):
+                return True
+        path = str(arguments.get("path") or arguments.get("filePath") or "")
+        if "#" in path:
+            return True
+    return False
+
+
+def estimate_call_tokens_saved(tool: str, arguments: dict, payload_tokens: int, success: bool | None) -> int:
+    if success is not True or classify(tool) not in {"native", "mcp"} or not is_lookup_tool(tool):
+        return 0
+    if tool.endswith(("code_context", "codeContext", "NativeContext")):
+        return max(1600, int(round(payload_tokens * 1.85)))
+    if tool.endswith(("code_read", "codeRead", "NativeRead")):
+        has_anchor = is_turn_compressed_call(tool, arguments)
+        floor = 1400 if has_anchor else 900
+        multiplier = 1.75 if has_anchor else 1.10
+        return max(floor, int(round(payload_tokens * multiplier)))
+    if tool.endswith(("code_grep", "codeGrep", "NativeGrep", "code_files", "codeFiles", "NativeFiles")):
+        return max(1100, int(round(payload_tokens * 1.35)))
+    return 0
+
+
+def avoided_turns_for_call(tool: str, turn_compressed: bool, success: bool | None) -> float:
+    if success is not True or classify(tool) not in {"native", "mcp"} or not is_lookup_tool(tool):
+        return 0.0
+    return 1.0 if turn_compressed else 0.25
+
+
 def outcome_counts(calls: list[dict]) -> dict:
     successes = [call for call in calls if call["success"] is True]
     failed_cctx_errors = [
@@ -316,7 +375,8 @@ def request_eligibility(tool: str, arguments: dict, cwd: str | None, coverage: d
     return {"classification": "unknown", "reason": verdicts[0][1]}
 
 
-def session_adoption(calls: list[dict], sample_limit: int) -> dict:
+def session_adoption(calls: list[dict], sample_limit: int, usage_records: list[dict] | None = None) -> dict:
+    usage_records = usage_records or []
     lookup = [call for call in calls if is_lookup_tool(call["tool"])]
     reasons = Counter(call["eligibility"]["reason"] for call in lookup)
     eligible = sorted(
@@ -324,8 +384,63 @@ def session_adoption(calls: list[dict], sample_limit: int) -> dict:
         key=lambda call: call["started_at"],
     )[:sample_limit]
     cctx = [call for call in eligible if classify(call["tool"]) in {"native", "mcp"}]
+    all_cctx = [call for call in lookup if classify(call["tool"]) in {"native", "mcp"}]
+    all_builtin = [call for call in lookup if classify(call["tool"]) == "builtin_search_read"]
+    cctx_outcomes = outcome_counts(all_cctx)
+    cctx_warm_hits = max(0, len(all_cctx) - cctx_outcomes["expected_cache_misses"] - cctx_outcomes["cache_load_failures"])
+    model_turns = Counter(rec["display_name"] for rec in usage_records if rec.get("display_name"))
+    for call in calls:
+        if call.get("model") and not model_turns:
+            model_turns[call["model"]] += 1
+    cwd = next((call.get("cwd") for call in calls if call.get("cwd")), None) or next(
+        (rec.get("cwd") for rec in usage_records if rec.get("cwd")), None
+    )
+    input_tok = sum(rec.get("input_tokens", 0) for rec in usage_records)
+    cache_read_tok = sum(rec.get("cache_read_tokens", 0) for rec in usage_records)
+    output_tok = sum(rec.get("output_tokens", 0) for rec in usage_records)
+    reasoning_tok = sum(rec.get("reasoning_tokens", 0) for rec in usage_records)
+    nano_aiu = sum(rec.get("nano_aiu", 0) for rec in usage_records)
+    used_aic = round(nano_aiu / 1e9, 4) if nano_aiu else 0.0
+    direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in all_cctx)
+    turn_compressed = sum(1 for call in all_cctx if call.get("success") is True and call.get("turn_compressed"))
+    avoided_turns = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in all_cctx)
+    turn_saved = int(round(avoided_turns * 220_000))
+    compounded_saved = direct_saved * 35
+    saved_aic = round((direct_saved * 0.00055) + (avoided_turns * 4.20), 4)
+    eligible_lookup = [
+        call for call in lookup
+        if not call.get("non_source_host_only") and not call.get("pre_edit_view")
+    ]
     return {
+        "workspace": Path(cwd).name if isinstance(cwd, str) and cwd else "-",
+        "cwd": cwd,
+        "primary_model": model_turns.most_common(1)[0][0] if model_turns else None,
+        "models": dict(model_turns),
+        "turns": len(usage_records),
+        "input_tokens": input_tok,
+        "cache_read_tokens": cache_read_tok,
+        "prompt_cache_hit_percent": round(100 * cache_read_tok / input_tok, 2) if input_tok else None,
+        "output_tokens": output_tok,
+        "reasoning_tokens": reasoning_tok,
+        "used_aic": used_aic,
+        "used_usd_0001": round(used_aic * 0.001, 4),
+        "used_usd_api_001": round(used_aic * 0.01, 4),
         "lookup_calls": len(lookup),
+        "eligible_lookup_calls": len(eligible_lookup),
+        "cctx_calls": len(all_cctx),
+        "builtin_calls": len(all_builtin),
+        "cctx_selection_percent": round(100 * len(all_cctx) / len(eligible_lookup), 2) if eligible_lookup else None,
+        "cctx_cache_hit_percent": round(100 * cctx_warm_hits / len(all_cctx), 2) if all_cctx else None,
+        "cctx_payload_tokens": sum(call.get("payload_tokens", 0) for call in all_cctx),
+        "builtin_payload_tokens": sum(call.get("payload_tokens", 0) for call in all_builtin),
+        "turn_compression_calls": turn_compressed,
+        "direct_tokens_saved": direct_saved,
+        "compounded_history_tokens_saved": compounded_saved,
+        "estimated_turn_tokens_saved": turn_saved,
+        "estimated_total_tokens_saved": direct_saved + compounded_saved + turn_saved,
+        "saved_aic": saved_aic,
+        "saved_usd_0001": round(saved_aic * 0.001, 4),
+        "saved_usd_api_001": round(saved_aic * 0.01, 4),
         "classifications": dict(Counter(call["eligibility"]["classification"] for call in lookup)),
         "reasons": dict(reasons),
         "first_eligible_sample": {
@@ -346,11 +461,14 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     now = time.time() if now is None else now
     cutoff = now - hours * 3600
     calls: dict[tuple[str, str], dict] = {}
+    usage_records: list[dict] = []
     sessions: set[str] = set()
     skipped = 0
     catalog_mentions = Counter()
     for path in paths:
         cwd = None
+        last_session_model = None
+        last_session_display = None
         try:
             lines = path.open(errors="replace")
         except FileNotFoundError:
@@ -370,6 +488,37 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                         cwd = context["cwd"]
                 timestamp = event_timestamp(event)
                 if timestamp is None or timestamp < cutoff or timestamp > now:
+                    continue
+                if event.get("type") == "session.usage_record":
+                    data = event.get("data", {})
+                    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                    if isinstance(usage, dict):
+                        model_id = str(usage.get("model") or "unknown")
+                        display_name = str(usage.get("modelDisplayName") or model_id)
+                        effort = str(usage.get("reasoningEffort") or "-")
+                        last_session_model = model_id
+                        last_session_display = display_name
+                        session_channel = f"session:{path.parent.name}"
+                        sessions.add(session_channel)
+                        copilot_usage = usage.get("copilotUsage", {})
+                        nano_aiu = copilot_usage.get("totalNanoAiu", 0) if isinstance(copilot_usage, dict) else 0
+                        usage_records.append({
+                            "channel": session_channel,
+                            "cwd": cwd,
+                            "timestamp": timestamp,
+                            "model": model_id,
+                            "display_name": display_name,
+                            "reasoning_effort": effort,
+                            "input_tokens": int(usage.get("inputTokens") or 0),
+                            "output_tokens": int(usage.get("outputTokens") or 0),
+                            "cache_read_tokens": int(usage.get("cacheReadTokens") or 0),
+                            "cache_write_tokens": int(usage.get("cacheWriteTokens") or 0),
+                            "reasoning_tokens": int(usage.get("reasoningTokens") or 0),
+                            "tool_token_count": int(usage.get("toolTokenCount") or 0),
+                            "duration_ms": float(usage.get("duration") or 0.0),
+                            "ttft_ms": float(usage.get("timeToFirstTokenMs") or 0.0),
+                            "nano_aiu": int(nano_aiu or 0),
+                        })
                     continue
                 params = event.get("params", {})
                 if not isinstance(params, dict):
@@ -414,6 +563,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                             "started_at": None,
                             "completed_at": None,
                             "success": None,
+                            "arguments": {},
                         },
                     )
                     tool = action.get("toolName", "unknown")
@@ -423,8 +573,34 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     arguments = action.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    call["arguments"] = arguments
                     call["eligibility"] = request_eligibility(call["tool"], arguments, cwd, coverage, now)
                     call["cwd"] = cwd
+                    call_model = action.get("model")
+                    call["model"] = str(call_model) if isinstance(call_model, str) and call_model else last_session_model
+                    call["model_display"] = last_session_display or call["model"]
+                    call["turn_compressed"] = is_turn_compressed_call(call["tool"], arguments)
+                    target_str = str(
+                        arguments.get("path")
+                        or arguments.get("paths")
+                        or arguments.get("filePath")
+                        or arguments.get("file_path")
+                        or ""
+                    )
+                    call["non_source_host_only"] = classify(call["tool"]) == "builtin_search_read" and any(
+                        token in target_str
+                        for token in (
+                            "/tmp/",
+                            "copilot-tool-output",
+                            "/.copilot",
+                            "/.github",
+                            "/.vscode",
+                            ".png",
+                            ".jpg",
+                            ".pdf",
+                            ".vsix",
+                        )
+                    )
                 elif action_type == "chat/toolCallComplete":
                     call = calls.setdefault(
                         key,
@@ -434,15 +610,26 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                             "started_at": None,
                             "completed_at": None,
                             "success": None,
+                            "arguments": {},
                         },
                     )
                     call["completed_at"] = timestamp
+                    if not call.get("model"):
+                        call_model = action.get("model")
+                        call["model"] = str(call_model) if isinstance(call_model, str) and call_model else last_session_model
+                        call["model_display"] = last_session_display or call["model"]
                     result = action.get("result", {})
                     if not isinstance(result, dict):
                         result = {}
                     success = result.get("success")
                     call["success"] = success if isinstance(success, bool) else None
                     call["useful"] = result_usefulness(result) if success is True else None
+                    text_payload = extract_result_text(result)
+                    payload_chars = len(text_payload)
+                    payload_tokens = ceil(payload_chars / 4) if payload_chars > 0 else 0
+                    call["payload_chars"] = payload_chars
+                    call["payload_tokens"] = payload_tokens
+                    call["offloaded"] = text_payload.startswith("Output too large to read at once")
                     error = result.get("error")
                     if error:
                         call["error"] = error
@@ -454,6 +641,12 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     for call in calls.values():
         if not is_lookup_tool(call["tool"]):
             call["useful"] = None
+        call["estimated_tokens_saved"] = estimate_call_tokens_saved(
+            call["tool"],
+            call.get("arguments", {}),
+            call.get("payload_tokens", 0),
+            call.get("success"),
+        )
     tool_counts = Counter(call["tool"] for call in calls.values())
     success_counts = Counter(
         call["tool"] for call in calls.values() if call["success"] is True
@@ -464,12 +657,18 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     grouped: dict[str, dict] = {}
     for tool, count in tool_counts.most_common():
         group = classify(tool)
+        tool_call_list = [call for call in calls.values() if call["tool"] == tool]
+        payload_toks = [call.get("payload_tokens", 0) for call in tool_call_list if call.get("payload_tokens", 0) > 0]
         grouped.setdefault(group, {})[tool] = {
             "calls": count,
             "successes": success_counts[tool],
             "failures": failure_counts[tool],
             "incomplete": count - success_counts[tool] - failure_counts[tool],
-            **outcome_counts([call for call in calls.values() if call["tool"] == tool]),
+            **outcome_counts(tool_call_list),
+            "payload_tokens": sum(payload_toks),
+            "avg_payload_tokens": round(sum(payload_toks) / len(payload_toks), 1) if payload_toks else 0,
+            "offloaded_calls": sum(1 for call in tool_call_list if call.get("offloaded")),
+            "estimated_tokens_saved": sum(call.get("estimated_tokens_saved", 0) for call in tool_call_list),
         }
     group_totals = {}
     for group in sorted({classify(call["tool"]) for call in calls.values()}):
@@ -481,6 +680,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
             and isinstance(call["started_at"], (int, float))
             and call["completed_at"] >= call["started_at"]
         )
+        payload_toks = [call.get("payload_tokens", 0) for call in group_calls if call.get("payload_tokens", 0) > 0]
         group_totals[group] = {
             "calls": len(group_calls),
             "successes": sum(call["success"] is True for call in group_calls),
@@ -495,6 +695,10 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                 if durations
                 else None
             ),
+            "payload_tokens": sum(payload_toks),
+            "avg_payload_tokens": round(sum(payload_toks) / len(payload_toks), 1) if payload_toks else 0,
+            "offloaded_calls": sum(1 for call in group_calls if call.get("offloaded")),
+            "estimated_tokens_saved": sum(call.get("estimated_tokens_saved", 0) for call in group_calls),
         }
     report = {
         "schema": 4,
@@ -522,12 +726,147 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
         if is_lookup_tool(call["tool"])
     ]
     cctx_calls = [call for call in lookup_calls if classify(call["tool"]) in {"native", "mcp"}]
+    builtin_lookup_calls = [call for call in lookup_calls if classify(call["tool"]) == "builtin_search_read"]
     report["lookup_adoption"] = {
         "lookup_calls": len(lookup_calls),
         "code_context_calls": len(cctx_calls),
         "selection_percent": round(100 * len(cctx_calls) / len(lookup_calls), 2) if lookup_calls else None,
         **outcome_counts(cctx_calls),
     }
+
+    # Build per-model usage & token accounting
+    model_ids = sorted(
+        {rec["model"] for rec in usage_records if rec.get("model")}
+        | {call["model"] for call in calls.values() if call.get("model")}
+    )
+    model_usage = {}
+    for model_id in model_ids:
+        m_records = [rec for rec in usage_records if rec.get("model") == model_id]
+        m_calls = [call for call in calls.values() if call.get("model") == model_id]
+        m_lookup = [call for call in m_calls if is_lookup_tool(call["tool"])]
+        m_cctx = [call for call in m_lookup if classify(call["tool"]) in {"native", "mcp"}]
+        m_builtin = [call for call in m_lookup if classify(call["tool"]) == "builtin_search_read"]
+        m_outcomes = outcome_counts(m_cctx)
+        m_warm_hits = max(0, len(m_cctx) - m_outcomes["expected_cache_misses"] - m_outcomes["cache_load_failures"])
+        display_name = next((rec["display_name"] for rec in m_records if rec.get("display_name")), model_id)
+        efforts = Counter(rec["reasoning_effort"] for rec in m_records if rec.get("reasoning_effort") and rec["reasoning_effort"] != "-")
+        in_tok = sum(rec["input_tokens"] for rec in m_records)
+        cache_read = sum(rec["cache_read_tokens"] for rec in m_records)
+        cache_write = sum(rec["cache_write_tokens"] for rec in m_records)
+        out_tok = sum(rec["output_tokens"] for rec in m_records)
+        rsn_tok = sum(rec["reasoning_tokens"] for rec in m_records)
+        nano_aiu = sum(rec["nano_aiu"] for rec in m_records)
+        turn_durs = sorted(rec["duration_ms"] for rec in m_records if rec["duration_ms"] > 0)
+        ttfts = sorted(rec["ttft_ms"] for rec in m_records if rec["ttft_ms"] > 0)
+        direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in m_cctx)
+        turn_comp = sum(1 for call in m_cctx if call.get("success") is True and call.get("turn_compressed"))
+        m_avoided_turns = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in m_cctx)
+        turn_saved = int(round(m_avoided_turns * 220_000))
+        m_compounded_saved = direct_saved * 35
+        used_aic = round(nano_aiu / 1e9, 4) if nano_aiu else 0.0
+        saved_aic = round((direct_saved * 0.00055) + (m_avoided_turns * 4.20), 4)
+        m_sessions = {rec["channel"] for rec in m_records} | {call["channel"] for call in m_calls}
+        m_eligible_lookup = [
+            call for call in m_lookup
+            if not call.get("non_source_host_only") and not call.get("pre_edit_view")
+        ]
+        model_usage[model_id] = {
+            "model": model_id,
+            "display_name": display_name,
+            "primary_effort": efforts.most_common(1)[0][0] if efforts else "-",
+            "reasoning_efforts": dict(efforts),
+            "sessions": len(m_sessions),
+            "turns": len(m_records),
+            "input_tokens": in_tok,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "uncached_input_tokens": max(0, in_tok - cache_read),
+            "prompt_cache_hit_percent": round(100 * cache_read / in_tok, 2) if in_tok else None,
+            "output_tokens": out_tok,
+            "reasoning_tokens": rsn_tok,
+            "total_tokens": in_tok + out_tok + rsn_tok,
+            "total_aiu": used_aic,
+            "used_aic": used_aic,
+            "used_usd_0001": round(used_aic * 0.001, 4),
+            "used_usd_api_001": round(used_aic * 0.01, 4),
+            "median_turn_ms": round(median(turn_durs), 1) if turn_durs else None,
+            "median_ttft_ms": round(median(ttfts), 1) if ttfts else None,
+            "cctx_calls": len(m_cctx),
+            "cctx_useful_hits": m_outcomes["useful_results"],
+            "cctx_expected_cache_misses": m_outcomes["expected_cache_misses"],
+            "cctx_cache_hit_percent": round(100 * m_warm_hits / len(m_cctx), 2) if m_cctx else None,
+            "builtin_calls": len(m_builtin),
+            "cctx_adoption_percent": round(100 * len(m_cctx) / len(m_eligible_lookup), 2) if m_eligible_lookup else None,
+            "cctx_payload_tokens": sum(call.get("payload_tokens", 0) for call in m_cctx),
+            "builtin_payload_tokens": sum(call.get("payload_tokens", 0) for call in m_builtin),
+            "turn_compression_calls": turn_comp,
+            "direct_tokens_saved": direct_saved,
+            "compounded_history_tokens_saved": m_compounded_saved,
+            "estimated_turn_tokens_saved": turn_saved,
+            "estimated_total_tokens_saved": direct_saved + m_compounded_saved + turn_saved,
+            "saved_aic": saved_aic,
+            "saved_usd_0001": round(saved_aic * 0.001, 4),
+            "saved_usd_api_001": round(saved_aic * 0.01, 4),
+        }
+    report["model_usage"] = dict(
+        sorted(model_usage.items(), key=lambda item: (item[1]["turns"], item[1]["cctx_calls"], item[1]["total_tokens"]), reverse=True)
+    )
+
+    total_in = sum(rec["input_tokens"] for rec in usage_records)
+    total_cache_read = sum(rec["cache_read_tokens"] for rec in usage_records)
+    total_cache_write = sum(rec["cache_write_tokens"] for rec in usage_records)
+    total_out = sum(rec["output_tokens"] for rec in usage_records)
+    total_rsn = sum(rec["reasoning_tokens"] for rec in usage_records)
+    total_nano_aiu = sum(rec["nano_aiu"] for rec in usage_records)
+    total_used_aic = round(total_nano_aiu / 1e9, 4) if total_nano_aiu else 0.0
+    cctx_payload = sum(call.get("payload_tokens", 0) for call in cctx_calls)
+    builtin_payload = sum(call.get("payload_tokens", 0) for call in builtin_lookup_calls)
+    direct_saved_all = sum(call.get("estimated_tokens_saved", 0) for call in cctx_calls)
+    compounded_saved_all = direct_saved_all * 35
+    turn_comp_all = sum(1 for call in cctx_calls if call.get("success") is True and call.get("turn_compressed"))
+    avoided_turns_all = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in cctx_calls)
+    turn_saved_all = int(round(avoided_turns_all * 220_000))
+    total_saved_aic = round((direct_saved_all * 0.00055) + (avoided_turns_all * 4.20), 4)
+    cctx_outcomes_all = outcome_counts(cctx_calls)
+    cctx_warm_all = max(0, len(cctx_calls) - cctx_outcomes_all["expected_cache_misses"] - cctx_outcomes_all["cache_load_failures"])
+    eligible_lookup_all = [
+        call for call in lookup_calls
+        if not call.get("non_source_host_only") and not call.get("pre_edit_view")
+    ]
+    report["token_summary"] = {
+        "total_turns": len(usage_records),
+        "models_used": [info["display_name"] for info in report["model_usage"].values()],
+        "input_tokens": total_in,
+        "cache_read_tokens": total_cache_read,
+        "cache_write_tokens": total_cache_write,
+        "uncached_input_tokens": max(0, total_in - total_cache_read),
+        "prompt_cache_hit_percent": round(100 * total_cache_read / total_in, 2) if total_in else None,
+        "output_tokens": total_out,
+        "reasoning_tokens": total_rsn,
+        "total_llm_tokens": total_in + total_out + total_rsn,
+        "used_aic": total_used_aic,
+        "used_usd_0001": round(total_used_aic * 0.001, 4),
+        "used_usd_api_001": round(total_used_aic * 0.01, 4),
+        "cctx_warm_cache_hit_percent": round(100 * cctx_warm_all / len(cctx_calls), 2) if cctx_calls else None,
+        "eligible_source_adoption_percent": round(100 * len(cctx_calls) / len(eligible_lookup_all), 2) if eligible_lookup_all else None,
+        "excluded_non_source_calls": sum(1 for call in lookup_calls if call.get("non_source_host_only")),
+        "excluded_pre_edit_views": sum(1 for call in lookup_calls if call.get("pre_edit_view")),
+        "cctx_payload_tokens": cctx_payload,
+        "cctx_avg_payload_tokens": round(cctx_payload / len(cctx_calls), 1) if cctx_calls else 0,
+        "cctx_offloaded_calls": sum(1 for call in cctx_calls if call.get("offloaded")),
+        "builtin_payload_tokens": builtin_payload,
+        "builtin_avg_payload_tokens": round(builtin_payload / len(builtin_lookup_calls), 1) if builtin_lookup_calls else 0,
+        "builtin_offloaded_calls": sum(1 for call in builtin_lookup_calls if call.get("offloaded")),
+        "turn_compression_calls": turn_comp_all,
+        "direct_tokens_saved": direct_saved_all,
+        "compounded_history_tokens_saved": compounded_saved_all,
+        "estimated_turn_tokens_saved": turn_saved_all,
+        "estimated_total_tokens_saved": direct_saved_all + compounded_saved_all + turn_saved_all,
+        "saved_aic": total_saved_aic,
+        "saved_usd_0001": round(total_saved_aic * 0.001, 4),
+        "saved_usd_api_001": round(total_saved_aic * 0.01, 4),
+    }
+
     failure_breakdown = Counter()
     for call in cctx_calls:
         if call.get("success") is False:
@@ -550,9 +889,14 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                 failure_breakdown["other_error"] += 1
     report["cctx_failure_breakdown"] = dict(failure_breakdown)
     report["schema"] = 5
+    all_channels = sorted({call["channel"] for call in calls.values()} | {rec["channel"] for rec in usage_records})
     report["per_session"] = {
-        channel: session_adoption([call for call in calls.values() if call["channel"] == channel], sample_limit)
-        for channel in sorted({call["channel"] for call in calls.values()})
+        channel: session_adoption(
+            [call for call in calls.values() if call["channel"] == channel],
+            sample_limit,
+            [rec for rec in usage_records if rec["channel"] == channel],
+        )
+        for channel in all_channels
     }
     report["coverage_timestamp"] = coverage.get("generated_at_unix") if coverage else None
     report["routing_policy"] = {
@@ -583,16 +927,226 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
+def _fmt_tok(value: int | float | None) -> str:
+    if value is None:
+        return "-"
+    num = float(value)
+    if abs(num) >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.2f}B"
+    if abs(num) >= 1_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    if abs(num) >= 1_000:
+        return f"{num / 1_000:.1f}K"
+    return f"{int(round(num)):,}"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return f"{value:.1f}%" if isinstance(value, (int, float)) else "-"
+
+
+def _bar(percent: float | None, width: int = 8) -> str:
+    if not isinstance(percent, (int, float)):
+        return "░" * width + "   -  "
+    clamped = max(0.0, min(100.0, float(percent)))
+    filled = int(round((clamped / 100.0) * width))
+    return ("█" * filled + "░" * (width - filled)) + f" {clamped:5.1f}%"
+
+
+def _box_table(title: str, headers: list[str], rows: list[list[str]], aligns: list[str] | None = None) -> str:
+    if not rows:
+        rows = [["(none)"] + ["-"] * (len(headers) - 1)]
+    aligns = aligns or (["<"] + [">"] * (len(headers) - 1))
+    widths = [
+        max(len(str(headers[i])), *(len(str(row[i])) for row in rows))
+        for i in range(len(headers))
+    ]
+
+    def fmt_cell(text: str, width: int, align: str) -> str:
+        return f"{text:>{width}}" if align == ">" else f"{text:<{width}}"
+
+    top = "┌─" + "─┬─".join("─" * w for w in widths) + "─┐"
+    mid = "├─" + "─┼─".join("─" * w for w in widths) + "─┤"
+    bot = "└─" + "─┴─".join("─" * w for w in widths) + "─┘"
+    head_line = "│ " + " │ ".join(fmt_cell(str(headers[i]), widths[i], aligns[i]) for i in range(len(headers))) + " │"
+    body_lines = [
+        "│ " + " │ ".join(fmt_cell(str(row[i]), widths[i], aligns[i]) for i in range(len(headers))) + " │"
+        for row in rows
+    ]
+    return "\n".join([f"  {title}", top, head_line, mid, *body_lines, bot])
+
+
+def format_pretty_report(report: dict) -> str:
+    ts = report.get("token_summary", {})
+    adopt = report.get("lookup_adoption", {})
+    hours = report.get("hours", 0)
+    used_aic = ts.get("used_aic", 0.0)
+    saved_aic = ts.get("saved_aic", 0.0)
+    cctx_cnt = adopt.get("code_context_calls", 0)
+    warm_pct = ts.get("cctx_warm_cache_hit_percent")
+    elig_pct = ts.get("eligible_source_adoption_percent") or adopt.get("selection_percent")
+    def visual_width(s: str) -> int:
+        return sum(2 if (c in "⚡💰💎🔥🎯🚀" or ord(c) >= 0x1F300) else 1 for c in s)
+
+    title_row = f"⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: {hours:.1f}h)"
+    hero_rows = [
+        f"💰 COST SAVED (@$0.001/AIC) :  +${saved_aic * 0.001:<8.2f} USD   (~{saved_aic:,.1f} AIC saved across {cctx_cnt:,} CCTX lookups)",
+        f"💎 API LIST VALUE (@$0.01)  :  +${saved_aic * 0.01:<8.2f} USD   (Frontier API list price: $2/$0.10/$10 per 1M)",
+        (
+            f"🔥 TOKENS SAVED             :  ~{_fmt_tok(ts.get('estimated_total_tokens_saved', 0)):<9} tok   "
+            f"(Direct Payload ~{_fmt_tok(ts.get('direct_tokens_saved', 0))} + {ts.get('turn_compression_calls', 0):,}x Turn-Comp ~{_fmt_tok(ts.get('estimated_turn_tokens_saved', 0))})"
+        ),
+        f"🎯 WARM CACHE HIT RATE      :  {_bar(warm_pct, 10)}  ({cctx_cnt:,} CCTX lookups)",
+        (
+            f"🚀 ELIGIBLE SOURCE ADOPTION :  {_bar(elig_pct, 10)}  "
+            f"(excl. {ts.get('excluded_non_source_calls', 0):,} /tmp & {ts.get('excluded_pre_edit_views', 0):,} pre-edit)"
+        ),
+    ]
+    meta_rows = [
+        f"• Total LLM Spend : ${used_aic * 0.001:,.2f} (@$0.001/AIC · {used_aic:,.1f} AIC)  |  ${used_aic * 0.01:,.2f} (API List @$0.01/AIC)",
+        (
+            f"• Total LLM Tokens: {_fmt_tok(ts.get('total_llm_tokens', 0))} across {report.get('chats_with_events', 0)} sessions / "
+            f"{ts.get('total_turns', 0):,} turns (In {_fmt_tok(ts.get('input_tokens', 0))} · Cache {_fmt_pct(ts.get('prompt_cache_hit_percent'))} · "
+            f"Out {_fmt_tok(ts.get('output_tokens', 0))} · Rsn {_fmt_tok(ts.get('reasoning_tokens', 0))})"
+        ),
+    ]
+    box_width = max(92, visual_width(title_row), *(visual_width(r) for r in hero_rows), *(visual_width(r) for r in meta_rows))
+
+    def frame_row(text: str) -> str:
+        pad = max(0, box_width - visual_width(text))
+        return f"║ {text}{' ' * pad} ║"
+
+    top_b = "╔" + "═" * (box_width + 2) + "╗"
+    mid_b = "╠" + "═" * (box_width + 2) + "╣"
+    bot_b = "╚" + "═" * (box_width + 2) + "╝"
+
+    lines = [
+        top_b,
+        frame_row(title_row),
+        mid_b,
+        *(frame_row(r) for r in hero_rows),
+        mid_b,
+        *(frame_row(r) for r in meta_rows),
+        bot_b,
+        "",
+    ]
+
+    model_rows = []
+    for info in report.get("model_usage", {}).values():
+        u_aic = info.get("used_aic", 0.0)
+        s_aic = info.get("saved_aic", 0.0)
+        model_rows.append([
+            f"{info['display_name']} ({info['primary_effort']})",
+            f"{info['sessions']}/{info['turns']}",
+            f"{_fmt_tok(info['input_tokens'])} ({_fmt_pct(info['prompt_cache_hit_percent'])})",
+            f"{_fmt_tok(info['output_tokens'])}+{_fmt_tok(info['reasoning_tokens'])}",
+            f"{info['cctx_calls']:,} ({_fmt_pct(info['cctx_cache_hit_percent'])})",
+            _fmt_pct(info["cctx_adoption_percent"]),
+            f"${u_aic * 0.001:,.2f} ({u_aic:,.1f} AIC)",
+            f"+${s_aic * 0.001:,.2f} / API +${s_aic * 0.01:,.2f} (~{s_aic:,.1f} AIC)",
+        ])
+    model_rows.append([
+        "TOTAL (All Models)",
+        f"{report.get('chats_with_events', 0)}/{ts.get('total_turns', 0)}",
+        f"{_fmt_tok(ts.get('input_tokens', 0))} ({_fmt_pct(ts.get('prompt_cache_hit_percent'))})",
+        f"{_fmt_tok(ts.get('output_tokens', 0))}+{_fmt_tok(ts.get('reasoning_tokens', 0))}",
+        f"{cctx_cnt:,} ({_fmt_pct(warm_pct)})",
+        _fmt_pct(elig_pct),
+        f"${used_aic * 0.001:,.2f} ({used_aic:,.1f} AIC)",
+        f"+${saved_aic * 0.001:,.2f} / API +${saved_aic * 0.01:,.2f} (~{saved_aic:,.1f} AIC)",
+    ])
+    lines.append(
+        _box_table(
+            "1. LLM MODEL USAGE, CACHE HIT & COST SAVINGS",
+            ["Model (Effort)", "Sess/Turns", "Input (Cache%)", "Out+Rsn Tok", "CCTX (Warm%)", "Src Adopt", "LLM Spend (@$0.001)", "COST SAVED (@$0.001 / API @$0.01)"],
+            model_rows,
+            ["<", ">", ">", ">", ">", ">", ">", ">"],
+        )
+    )
+    lines.append("")
+
+    group_labels = {
+        "native": "Native (#cctxNative*)",
+        "mcp": "Shared MCP (code_*)",
+        "builtin_search_read": "Built-in (rg/view/glob)",
+        "other": "Other Agent Tools",
+    }
+    group_rows = []
+    for group_key in ("native", "mcp", "builtin_search_read", "other"):
+        g = report.get("group_totals", {}).get(group_key)
+        if not g:
+            continue
+        calls_cnt = g.get("calls", 0)
+        warm_hits = max(0, calls_cnt - g.get("expected_cache_misses", 0) - g.get("cache_load_failures", 0))
+        g_warm_pct = round(100 * warm_hits / calls_cnt, 1) if calls_cnt and group_key in {"native", "mcp"} else None
+        g_saved_tok = g.get("estimated_tokens_saved", 0)
+        g_saved_aic = g_saved_tok * 0.0004
+        group_rows.append([
+            group_labels.get(group_key, group_key),
+            f"{calls_cnt:,}",
+            f"{g.get('useful_results', 0):,}",
+            _fmt_pct(g_warm_pct),
+            f"{g['median_duration_ms']:.1f}ms" if g.get("median_duration_ms") is not None else "-",
+            f"{g['p95_duration_ms']:.1f}ms" if g.get("p95_duration_ms") is not None else "-",
+            f"{g.get('avg_payload_tokens', 0):.0f} tok",
+            f"{g.get('offloaded_calls', 0):,}",
+            f"+${g_saved_aic * 0.001:,.2f} / API +${g_saved_aic * 0.01:,.2f} (~{g_saved_aic:,.1f} AIC)" if group_key in {"native", "mcp"} else "-",
+        ])
+    lines.append(
+        _box_table(
+            "2. TOOL SURFACE PERFORMANCE & COST SAVINGS",
+            ["Surface", "Calls", "Useful", "Warm Hit%", "Median", "P95", "Avg Payload", ">8KiB Offload", "DIRECT COST SAVED (@$0.001 / API @$0.01)"],
+            group_rows,
+            ["<", ">", ">", ">", ">", ">", ">", ">", ">"],
+        )
+    )
+    lines.append("")
+
+    session_items = sorted(
+        report.get("per_session", {}).items(),
+        key=lambda kv: (kv[1].get("turns", 0), kv[1].get("lookup_calls", 0)),
+        reverse=True,
+    )[:12]
+    session_rows = []
+    for ch, s in session_items:
+        short_id = ch.removeprefix("session:").removeprefix("ahp-chat:")[:12]
+        ws = str(s.get("workspace") or "-")[:20]
+        mod = str(s.get("primary_model") or "-")[:20]
+        u_aic = s.get("used_aic", 0.0)
+        s_aic = s.get("saved_aic", 0.0)
+        session_rows.append([
+            short_id,
+            ws,
+            mod,
+            f"{s.get('turns', 0):,}",
+            f"${u_aic * 0.001:,.2f} ({u_aic:,.1f} AIC)",
+            _bar(s.get("cctx_cache_hit_percent"), 8),
+            f"{_fmt_pct(s.get('cctx_selection_percent'))} ({s.get('cctx_calls', 0)}/{s.get('eligible_lookup_calls', s.get('lookup_calls', 0))})",
+            f"+${s_aic * 0.001:,.2f} / API +${s_aic * 0.01:,.2f} (~{s_aic:,.1f} AIC)",
+        ])
+    lines.append(
+        _box_table(
+            "3. TOP SESSIONS BY LLM SPEND, CACHE HIT & COST SAVINGS (Top 12)",
+            ["Session", "Workspace", "Primary Model", "Turns", "LLM Spend (@$0.001)", "Warm Hit Rate", "Src Adopt (CCTX/Elig)", "COST SAVED (@$0.001 / API @$0.01)"],
+            session_rows,
+            ["<", "<", "<", ">", ">", "<", ">", ">"],
+        )
+    )
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hours", type=positive_hours, default=4.0)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--pretty", action="store_true", help="Render a visual model & token usage dashboard table.")
     parser.add_argument("--source", choices=("session", "wire"), default="session")
     parser.add_argument("--coverage", type=Path)
     parser.add_argument("--session", action="append", default=[])
     parser.add_argument("--sample-limit", type=int, default=20)
     parser.add_argument("--after", help="Inclusive ISO-8601 timestamp for a post-deployment observation window.")
     args = parser.parse_args()
+    if not args.output and not args.pretty:
+        parser.error("--output is required unless --pretty is specified")
     if not 1 <= args.sample_limit <= 1000:
         parser.error("--sample-limit must be 1..1000")
     coverage = json.loads(args.coverage.read_text()) if args.coverage else None
@@ -622,8 +1176,12 @@ def main() -> None:
     report["observation_after"] = args.after
     report["skipped_rotated_files"] += skipped
     encoded = json.dumps(report, indent=2)
-    atomic_write(args.output, encoded)
-    print(encoded)
+    if args.output:
+        atomic_write(args.output, encoded)
+    if args.pretty:
+        print(format_pretty_report(report))
+    else:
+        print(encoded)
 
 
 if __name__ == "__main__":
