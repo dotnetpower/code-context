@@ -1174,6 +1174,237 @@ fn round_12_jsonl_vtt_srt_xliff2_ipynb_errors_svg_and_inline_slug_stripping() {
     assert_eq!(nb_lines[c2_end - 1], "print(x)");
 }
 
+#[test]
+fn round_13_pptx_docx_token_efficiency_and_hardening_critiques() {
+    use code_context::catalog::Spec;
+    use code_context::document::{
+        ZipArchive, build_zip_archive, clamp_document_snippet, extract_docx, extract_pptx,
+        format_markdown_table, resolve_markdown_anchor_range, resolve_toc_ranges,
+    };
+    use code_context::policy::MemoryPolicy;
+    use code_context::watched::Watched;
+    use serde_json::json;
+
+    // 1. DOCX hardening: duplicate headers across header1/header2, PAGE field suppression,
+    //    noBreakHyphen, >40-char delText truncation, [url](url) dedup, empty table cols & 1x1 callout box
+    let doc_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="sec_overview"/>
+      <w:r><w:t>1. UTF</w:t><w:noBreakHyphen/><w:t>8 토큰 최적화 아키텍처</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>공식 문서: </w:t></w:r>
+      <w:hyperlink r:id="rId1"><w:r><w:t>https://example.com/docs/</w:t></w:r></w:hyperlink>
+    </w:p>
+    <w:p>
+      <w:r><w:t>유효 본문. </w:t></w:r>
+      <w:del>
+        <w:r><w:delText>이 문장은 매우 긴 구버전 삭제 이력 텍스트로서 </w:delText></w:r>
+        <w:r><w:delText>사십 글자를 초과하여 토큰 낭비를 유발하는 문단입니다.</w:delText></w:r>
+      </w:del>
+    </w:p>
+    <w:tbl>
+      <w:tr><w:tc><w:p><w:r><w:t>핵심 요약 콜아웃 박스</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>항목</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>수식 (a | b)</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>항목</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>수식 (a | b)</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>절감률</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>   </w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>85% | 90%</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+
+    let rels_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Target="https://example.com/docs"/>
+</Relationships>"#;
+
+    let hdr_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p><w:r><w:t>ENTERPRISE ARCHITECTURE SPEC</w:t></w:r></w:p>
+  <w:p><w:fldSimple w:instr="PAGE \* MERGEFORMAT"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>
+</w:hdr>"#;
+
+    let docx_bytes = build_zip_archive(&[
+        ("word/document.xml", doc_xml.as_bytes(), true),
+        ("word/_rels/document.xml.rels", rels_xml.as_bytes(), false),
+        ("word/header1.xml", hdr_xml.as_bytes(), false),
+        ("word/header2.xml", hdr_xml.as_bytes(), false),
+    ]);
+    let docx_out = extract_docx(&ZipArchive::parse(&docx_bytes).unwrap()).unwrap();
+
+    // Header deduplicated once, PAGE number suppressed
+    assert_eq!(docx_out.matches("ENTERPRISE ARCHITECTURE SPEC").count(), 1);
+    assert!(docx_out.contains("# {#sec_overview} 1. UTF-8 토큰 최적화 아키텍처"));
+    // [url](url) deduplicated to single url
+    assert!(docx_out.contains("공식 문서: https://example.com/docs"));
+    assert!(!docx_out.contains("](https://example.com/docs)"));
+    // Contiguous delText >40 chars truncated with char count
+    assert!(docx_out.contains("...[deleted 57 chars]~~"), "{docx_out}");
+    // 1x1 table unwrapped to blockquote
+    assert!(docx_out.contains("> 핵심 요약 콜아웃 박스"), "{docx_out}");
+    // Empty middle column stripped, repeated header row deduplicated, pipe single-escaped
+    assert!(
+        docx_out.contains("| 항목 | 수식 (a \\| b) |\n| --- | --- |\n| 절감률 | 85% \\| 90% |"),
+        "{docx_out}"
+    );
+    assert!(!docx_out.contains("\\\\|"), "must not double-escape pipe: {docx_out}");
+
+    // 2. PPTX hardening: self-closing <p:sp/>, sldNum/ftr/dt placeholders, 3-slide floating banner hoisting,
+    //    split-run hyperlink coalescing, chart series compression + IEEE754 float cleanup, slide chart rels
+    let make_slide = |num: usize, title: &str, body: &str| -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld><p:spTree>
+    <p:sp/>
+    <p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{title}</a:t></a:r></a:p></p:txBody></p:sp>
+    <p:sp><p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr><p:txBody>
+      <a:p><a:pPr lvl="0"/><a:r><a:t>{body}</a:t></a:r></a:p>
+      <a:p><a:pPr lvl="1"/>
+        <a:r><a:rPr><a:hlinkClick r:id="rIdLink"/></a:rPr><a:t>분할된 </a:t></a:r>
+        <a:r><a:rPr><a:hlinkClick r:id="rIdLink"/></a:rPr><a:t>링크 텍스트</a:t></a:r>
+      </a:p>
+    </p:txBody></p:sp>
+    <p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>CONFIDENTIAL - INTERNAL USE ONLY</a:t></a:r></a:p></p:txBody></p:sp>
+    <p:sp><p:nvSpPr><p:nvPr><p:ph type="ftr"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>© 2026 Platform Team</a:t></a:r></a:p></p:txBody></p:sp>
+    <p:sp><p:nvSpPr><p:nvPr><p:ph type="sldNum"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{num}</a:t></a:r></a:p></p:txBody></p:sp>
+  </p:spTree></p:cSld>
+</p:sld>"#
+        )
+    };
+    let s1 = make_slide(1, "1장 요약", "핵심 목표 달성");
+    let s2 = make_slide(2, "2장 아키텍처", "인메모리 인덱스");
+    let s3 = make_slide(3, "3장 성능", "벤치마크 결과");
+
+    let s1_rels = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships>
+  <Relationship Id="rIdLink" Target="https://example.com/spec"/>
+  <Relationship Id="rIdChart" Target="../charts/chart1.xml"/>
+</Relationships>"#;
+
+    let chart1_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p><a:r><a:t>분기별 처리량</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea><c:barChart>
+      <c:ser>
+        <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>RPS</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt idx="0"><c:v>Q1</c:v></c:pt>
+          <c:pt idx="1"><c:v>Q2</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache>
+          <c:pt idx="0"><c:v>142.50000000000003</c:v></c:pt>
+          <c:pt idx="1"><c:v>299.99999999999994</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:barChart></c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    let pptx_bytes = build_zip_archive(&[
+        ("ppt/slides/slide1.xml", s1.as_bytes(), true),
+        ("ppt/slides/slide2.xml", s2.as_bytes(), true),
+        ("ppt/slides/slide3.xml", s3.as_bytes(), true),
+        ("ppt/slides/_rels/slide1.xml.rels", s1_rels.as_bytes(), false),
+        ("ppt/charts/chart1.xml", chart1_xml.as_bytes(), true),
+    ]);
+    let pptx_out = extract_pptx(&ZipArchive::parse(&pptx_bytes).unwrap()).unwrap();
+
+    // Repeated floating banner & footer hoisted once into Banner metadata
+    assert_eq!(pptx_out.matches("CONFIDENTIAL - INTERNAL USE ONLY").count(), 1, "{pptx_out}");
+    assert_eq!(pptx_out.matches("© 2026 Platform Team").count(), 1, "{pptx_out}");
+    assert!(pptx_out.contains("Banner: CONFIDENTIAL - INTERNAL USE ONLY | © 2026 Platform Team"));
+    // Split hyperlink runs coalesced into single link
+    assert!(pptx_out.contains("[분할된 링크 텍스트](https://example.com/spec)"), "{pptx_out}");
+    // Chart attributed inline to Slide 1 with IEEE754 float noise cleaned
+    assert!(pptx_out.contains("### [Slide 1 Chart]\n- [Chart Title]: 분기별 처리량\n- RPS: Q1=142.5, Q2=300"), "{pptx_out}");
+    assert!(!pptx_out.contains("## [Charts]"), "consumed slide chart must not duplicate at end");
+
+    // 3. Anchor resolution: #slide-1-2 range, #sec_overview bookmark, and #toc expansion via Watched
+    let (s12_start, s12_end) = resolve_markdown_anchor_range(&pptx_out, "#slide-1-2").unwrap();
+    let pptx_lines: Vec<String> = pptx_out.lines().map(str::to_owned).collect();
+    assert_eq!(pptx_lines[s12_start - 1], "## [Slide 1] 1장 요약");
+    assert!(pptx_lines[s12_end - 1].contains("분할된 링크 텍스트"));
+
+    let (bm_start, _) = resolve_markdown_anchor_range(&docx_out, "#sec_overview").unwrap();
+    let docx_lines: Vec<String> = docx_out.lines().map(str::to_owned).collect();
+    assert_eq!(docx_lines[bm_start - 1], "# {#sec_overview} 1. UTF-8 토큰 최적화 아키텍처");
+
+    let toc_ranges = resolve_toc_ranges(&pptx_out, 16);
+    assert!(toc_ranges.len() >= 3);
+
+    // Table match inside a Slide preserves the enclosing ## [Slide N] header in clamp_document_snippet
+    let slide_tbl_lines: Vec<String> = vec![
+        "## [Slide 1] 개요",
+        "- 소개",
+        "## [Slide 2] 지표 표",
+        "- 부연 설명 1",
+        "- 부연 설명 2",
+        "| 지표 | 값 |",
+        "| --- | --- |",
+        "| 지연시간 | 0.15ms |",
+        "## [Slide 3] 결론",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        clamp_document_snippet("deck.pptx", &slide_tbl_lines, 7, 7),
+        Some((2, 7))
+    );
+    let _ = format_markdown_table(&[]);
+
+    // End-to-end Watched #toc read on PPTX
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("deck.pptx"), &pptx_bytes).unwrap();
+    let mut watched = Watched::new(Spec {
+        root: dir.path().to_path_buf(),
+        scopes: vec![".".into()],
+        globs: vec!["*.pptx".into()],
+        excludes: vec![],
+        default_excludes: true,
+        prewarm: false,
+        policy: MemoryPolicy::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let toc_snippets = watched
+        .call(
+            "code_read",
+            json!({"ranges": [{"path": "deck.pptx#toc", "start": 1, "end": 120}]}),
+        )
+        .unwrap();
+    let all_toc_text: String = toc_snippets
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["lines"].as_array().unwrap())
+        .filter_map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all_toc_text.contains("## [Slide 1] 1장 요약"), "{all_toc_text}");
+    assert!(all_toc_text.contains("## [Slide 2] 2장 아키텍처"), "{all_toc_text}");
+    assert!(all_toc_text.contains("## [Slide 3] 3장 성능"), "{all_toc_text}");
+}
+
 
 
 

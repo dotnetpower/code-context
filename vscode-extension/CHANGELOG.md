@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.22.0
+
+- Eliminate false-positive watcher directory and full-workspace scans on `.py`
+  profile markers, atomic saves, and excluded/temp files, and make
+  `Resident::update` $O(|\text{changed}|)$ with incremental byte tracking so
+  multi-million-line workspace reads execute in `< 0.1 ms`.
+- Enforce an inline `< 8 KiB` budget across all Native tool formatters and
+  compact `code_status` / `code_workspaces` payloads so responses stay inline
+  without triggering `/tmp` host offloading.
+- Add `#toc` / `#outline` virtual Table-of-Contents expansion, `#slide-N-M`
+  multi-slide range anchors, inline DOCX `{#bookmark}` resolution, PPTX banner /
+  footer / `sldNum` deduplication, series-compressed charts with IEEE 754 float
+  cleanup and slide attribution, empty-column table pruning, and `w:delText` /
+  duplicate-URL compaction.
+- Sync WSL and Windows `.vscode/extensions` installations automatically in
+  `scripts/install-vscode-extension.sh` and preserve `#anchor` fragments when
+  `start: 1` is passed to `#cctxNativeRead`.
+
 ## 0.21.0
 
 - Boost exact whole-word identifier matches (`has_whole_word_match`) above

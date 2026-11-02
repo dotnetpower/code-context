@@ -384,3 +384,48 @@ fn explicit_read_pages_cover_large_content_once_and_stay_under_the_response_cap(
         .unwrap();
     assert_eq!(second["complete"], true);
 }
+
+#[test]
+fn excluded_and_temp_renames_in_watched_dirs_do_not_trigger_directory_scans() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/a.rs"), "keep\n").unwrap();
+    std::fs::write(root.path().join("src/excluded.rs"), "ignored_by_exclude\n").unwrap();
+    let mut watched = Watched::new(Spec {
+        root: root.path().into(),
+        scopes: vec![".".into()],
+        globs: vec!["*.rs".into()],
+        excludes: vec!["src/excluded.rs".into()],
+        default_excludes: true,
+        prewarm: false,
+        policy: Default::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let before = profile(&mut watched);
+    for round in 0..5 {
+        let tmp = root.path().join(format!("src/scratch-{round}.tmp"));
+        let pyc = root.path().join(format!("src/scratch-{round}.pyc"));
+        std::fs::write(&tmp, "temp").unwrap();
+        std::fs::rename(&tmp, &pyc).unwrap();
+        std::fs::remove_file(&pyc).unwrap();
+        std::fs::write(
+            root.path().join("src/excluded.rs"),
+            format!("excluded-{round}\n"),
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(25));
+    let res = watched
+        .call("code_grep", json!({"pattern":"keep"}))
+        .unwrap();
+    assert_eq!(res["total_matches"], 1);
+    let after = profile(&mut watched);
+    assert_eq!(after["full_inventory_scans"], before["full_inventory_scans"]);
+    assert_eq!(
+        after["directory_inventory_scans"],
+        before["directory_inventory_scans"]
+    );
+    assert_eq!(after["source_files_read"], before["source_files_read"]);
+}

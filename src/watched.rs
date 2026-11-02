@@ -356,6 +356,7 @@ pub struct Watched {
     transparent_read_recovery_failures: u64,
     io_profile: IoProfile,
     cached_workspace: Option<(Spec, crate::workspace::Workspace)>,
+    watcher_policy: Option<(Spec, crate::workspace::CandidatePolicy)>,
     read_policy: Option<(
         Spec,
         crate::workspace::Workspace,
@@ -388,6 +389,11 @@ impl Watched {
             filter.add(Glob::new(pattern)?);
         }
         let filter = filter.build()?;
+        let mut exclude_filter = GlobSetBuilder::new();
+        for pattern in workspace.effective_excludes() {
+            exclude_filter.add(Glob::new(&pattern)?);
+        }
+        let exclude_filter = exclude_filter.build()?;
         let root = workspace.root.clone();
         let mut watcher = RecommendedWatcher::new(
             move |event: notify::Result<Event>| {
@@ -417,11 +423,27 @@ impl Watched {
                                 .file_name()
                                 .is_some_and(|name| name == ".ignore" || name == ".gitignore")
                             || path.strip_prefix(&root).is_ok_and(|relative| {
-                                let included = filter.is_match(relative)
+                                if exclusion_policy::is_profile_marker(relative) {
+                                    return true;
+                                }
+                                let is_excluded = relative
+                                    .components()
+                                    .any(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."))
+                                    || relative
+                                        .ancestors()
+                                        .filter(|a| !a.as_os_str().is_empty())
+                                        .any(|a| {
+                                            exclude_filter.is_match(a)
+                                                || a.file_name()
+                                                    .is_some_and(|n| exclude_filter.is_match(n))
+                                        });
+                                if is_excluded {
+                                    return false;
+                                }
+                                filter.is_match(relative)
                                     || relative
                                         .file_name()
-                                        .is_some_and(|name| filter.is_match(name));
-                                included || exclusion_policy::is_profile_marker(relative)
+                                        .is_some_and(|name| filter.is_match(name))
                             })
                     })
                 {
@@ -451,6 +473,9 @@ impl Watched {
             inventory,
         )?;
         let stamps = stamps(&workspace, &spec.policy)?;
+        let watcher_policy = crate::workspace::CandidatePolicy::compile(workspace.candidate_policy_key())
+            .ok()
+            .map(|policy| (spec.clone(), policy));
         let cached_workspace = Some((spec.clone(), workspace.clone()));
         let watched_dir_bytes = watched_dirs
             .iter()
@@ -482,6 +507,7 @@ impl Watched {
                 ..IoProfile::default()
             },
             cached_workspace,
+            watcher_policy,
             read_policy: None,
         };
         // Inventory precedes watch installation so ignored dependency trees are
@@ -544,7 +570,41 @@ impl Watched {
     pub fn release_caches(&mut self) {
         self.query_cache.clear_memory();
         self.cached_workspace = None;
+        self.watcher_policy = None;
         self.read_policy = None;
+    }
+
+    fn is_watcher_candidate(&mut self, name: &str) -> Result<bool> {
+        if self
+            .watcher_policy
+            .as_ref()
+            .is_none_or(|(saved_spec, _)| saved_spec != &self.spec)
+        {
+            let ws = self.workspace()?.into_owned();
+            let policy = crate::workspace::CandidatePolicy::compile(ws.candidate_policy_key())?;
+            self.cached_workspace = Some((self.spec.clone(), ws));
+            self.watcher_policy = Some((self.spec.clone(), policy));
+        }
+        let (_, policy) = self.watcher_policy.as_ref().expect("watcher policy");
+        Ok(policy.candidate_path(name).unwrap_or(false))
+    }
+
+    fn profile_exclusions_changed(&mut self) -> Result<bool> {
+        let ws = self.workspace()?.into_owned();
+        let current_excludes = ws.effective_excludes();
+        let changed = self
+            .watcher_policy
+            .as_ref()
+            .is_none_or(|(saved_spec, policy)| {
+                saved_spec != &self.spec || policy.key.excludes != current_excludes
+            });
+        if changed {
+            let policy = crate::workspace::CandidatePolicy::compile(ws.candidate_policy_key())?;
+            self.cached_workspace = Some((self.spec.clone(), ws));
+            self.watcher_policy = Some((self.spec.clone(), policy));
+            self.read_policy = None;
+        }
+        Ok(changed)
     }
 
     fn workspace(&self) -> Result<std::borrow::Cow<'_, crate::workspace::Workspace>> {
@@ -612,11 +672,12 @@ impl Watched {
         if !verify_all && iter.peek().is_none() {
             return Ok(());
         }
+        let drained: Vec<_> = iter.collect();
         let mut changed: BTreeSet<String> = BTreeSet::new();
         let mut directories = BTreeMap::new();
         let mut reconcile = verify_all || self.blocked.is_some();
         let mut watcher_rescan = false;
-        for event in iter {
+        for event in drained {
             let event = event.map_err(|e| invalid(format!("filesystem watcher failed: {e}")))?;
             if matches!(
                 event.kind,
@@ -639,11 +700,9 @@ impl Watched {
                 ))
             ) && event.paths.iter().any(|absolute| {
                 absolute.strip_prefix(&self.spec.root).is_ok_and(|path| {
+                    let normalized = crate::workspace::normalize(path);
+                    let path = normalized.as_path();
                     self.watched_dirs.contains(path)
-                        || self
-                            .stamps
-                            .keys()
-                            .any(|name| Path::new(name).starts_with(path))
                 })
             }) {
                 reconcile = true;
@@ -658,35 +717,51 @@ impl Watched {
                     if path
                         .file_name()
                         .is_some_and(|p| p == ".gitignore" || p == ".ignore")
-                        || exclusion_policy::is_profile_marker(path)
+                    {
+                        reconcile = true;
+                        continue;
+                    }
+                    if exclusion_policy::is_profile_marker(path)
+                        && (!self.stamps.contains_key(name) || !self.spec.root.join(path).is_file())
+                        && self.profile_exclusions_changed()?
                     {
                         reconcile = true;
                     }
-                    if self.spec.root.join(path).is_dir() || self.watched_dirs.contains(path) {
+                    if self.spec.root.join(path).is_dir() || self.watched_dirs.contains(path)
+                    {
                         directories.insert(path.to_path_buf(), true);
-                    } else if !self.stamps.contains_key(name)
-                        || !matches!(
+                    } else if !self.stamps.contains_key(name) {
+                        if !self.is_watcher_candidate(name)? {
+                            continue;
+                        }
+                        directories
+                            .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
+                            .or_insert(false);
+                        changed.insert(name.into());
+                    } else {
+                        if !matches!(
                             event.kind,
                             notify::EventKind::Modify(
                                 notify::event::ModifyKind::Data(_)
                                     | notify::event::ModifyKind::Metadata(_)
                             )
-                        )
-                    {
-                        directories
-                            .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
-                            .or_insert(false);
+                        ) && !self.spec.root.join(path).is_file()
+                        {
+                            directories
+                                .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
+                                .or_insert(false);
+                        }
+                        changed.insert(name.into());
                     }
-                    changed.insert(name.into());
                 } else {
                     reconcile = true;
                 }
             }
         }
-        if changed.is_empty() && !reconcile {
+        if changed.is_empty() && directories.is_empty() && !reconcile {
             return Ok(());
         }
-        let workspace = self.spec.workspace()?;
+        let workspace = self.workspace()?.into_owned();
         if !reconcile && !directories.is_empty() {
             return self.reconcile_directories(&directories, &changed);
         }
@@ -753,21 +828,41 @@ impl Watched {
         }
         self.io_profile.full_inventory_scans += 1;
         let current = stamps(&workspace, &self.spec.policy)?;
+        if let Some((_, cached_policy)) = &self.watcher_policy
+            && workspace.candidate_policy_key() != cached_policy.key
+        {
+            self.watcher_policy = None;
+        }
         if let Some((_, _, cached_policy)) = &self.read_policy
             && workspace.candidate_policy_key() != cached_policy.key
         {
             self.read_policy = None;
         }
-        self.refresh_watch_directories(&workspace, current.keys().map(std::path::Path::new))?;
+        let mut need_watch_refresh = false;
         for (path, stamp) in &current {
-            if self.stamps.get(path) != Some(stamp) {
-                changed.insert(path.clone());
+            match self.stamps.get(path) {
+                Some(old) if old == stamp => {}
+                Some(_) => {
+                    changed.insert(path.clone());
+                }
+                None => {
+                    if let Some(parent) = Path::new(path).parent()
+                        && !self.watched_dirs.contains(parent)
+                    {
+                        need_watch_refresh = true;
+                    }
+                    changed.insert(path.clone());
+                }
             }
         }
         for path in self.stamps.keys() {
             if !current.contains_key(path) {
+                need_watch_refresh = true;
                 changed.insert(path.clone());
             }
+        }
+        if need_watch_refresh {
+            self.refresh_watch_directories(&workspace, current.keys().map(std::path::Path::new))?;
         }
         // Unchanged files are not reopened except for an explicit strict barrier.
         let update =
@@ -808,7 +903,7 @@ impl Watched {
         directories: &BTreeMap<PathBuf, bool>,
         forced: &BTreeSet<String>,
     ) -> Result<()> {
-        let workspace = self.spec.workspace()?;
+        let workspace = self.workspace()?.into_owned();
         let mut current = self.stamps.clone();
         for (directory, recursive) in directories {
             if !directory.as_os_str().is_empty()
@@ -859,23 +954,43 @@ impl Watched {
             }
         }
         validate_stamps(&current, &self.spec.policy)?;
+        if let Some((_, cached_policy)) = &self.watcher_policy
+            && workspace.candidate_policy_key() != cached_policy.key
+        {
+            self.watcher_policy = None;
+        }
         if let Some((_, _, cached_policy)) = &self.read_policy
             && workspace.candidate_policy_key() != cached_policy.key
         {
             self.read_policy = None;
         }
         let mut changed = forced.clone();
+        let mut need_watch_refresh = false;
         for (name, metadata) in &current {
-            if self.stamps.get(name) != Some(metadata) {
-                changed.insert(name.clone());
+            match self.stamps.get(name) {
+                Some(old) if old == metadata => {}
+                Some(_) => {
+                    changed.insert(name.clone());
+                }
+                None => {
+                    if let Some(parent) = Path::new(name).parent()
+                        && !self.watched_dirs.contains(parent)
+                    {
+                        need_watch_refresh = true;
+                    }
+                    changed.insert(name.clone());
+                }
             }
         }
         for name in self.stamps.keys() {
             if !current.contains_key(name) {
+                need_watch_refresh = true;
                 changed.insert(name.clone());
             }
         }
-        self.refresh_watch_directories(&workspace, current.keys().map(Path::new))?;
+        if need_watch_refresh {
+            self.refresh_watch_directories(&workspace, current.keys().map(Path::new))?;
+        }
         let update = self
             .resident
             .update(&workspace, &changed, &current, false)?;
@@ -939,18 +1054,31 @@ impl Watched {
                 continue;
             }
             let mut changed = BTreeSet::new();
+            let mut need_watch_refresh = false;
             for (path, stamp) in &current {
-                if self.stamps.get(path) != Some(stamp) {
-                    changed.insert(path.clone());
+                match self.stamps.get(path) {
+                    Some(old) if old == stamp => {}
+                    Some(_) => {
+                        changed.insert(path.clone());
+                    }
+                    None => {
+                        if let Some(parent) = Path::new(path).parent()
+                            && !self.watched_dirs.contains(parent)
+                        {
+                            need_watch_refresh = true;
+                        }
+                        changed.insert(path.clone());
+                    }
                 }
             }
             for path in self.stamps.keys() {
                 if !current.contains_key(path) {
+                    need_watch_refresh = true;
                     changed.insert(path.clone());
                 }
             }
-            let workspace = self.spec.workspace()?;
-            if !changed.is_empty() {
+            let workspace = self.workspace()?.into_owned();
+            if need_watch_refresh {
                 self.refresh_watch_directories(
                     &workspace,
                     current.keys().map(std::path::Path::new),
@@ -1366,7 +1494,9 @@ impl Watched {
             *paths = expanded;
         }
         if let Some(ranges) = arguments.get_mut("ranges").and_then(Value::as_array_mut) {
-            for range in ranges {
+            let initial_len = ranges.len();
+            let mut expanded_ranges = Vec::with_capacity(initial_len);
+            for (idx, mut range) in ranges.drain(..).enumerate() {
                 let mut md_anchor: Option<String> = None;
                 if let Some(path_val) = range.get_mut("path")
                     && let Some(text) = path_val.as_str()
@@ -1390,21 +1520,46 @@ impl Watched {
                     }
                 }
                 if let Some(anchor) = md_anchor
-                    && let Some(path_str) = range.get("path").and_then(Value::as_str)
-                    && crate::document::is_document_path(path_str)
+                    && let Some(path_str) =
+                        range.get("path").and_then(Value::as_str).map(str::to_owned)
+                    && crate::document::is_document_path(&path_str)
                     && range.get("start").and_then(Value::as_u64).unwrap_or(1) == 1
-                    && let Some(&doc_id) = self.resident.paths.get(path_str)
-                    && let Some((sec_start, sec_end)) =
+                    && let Some(&doc_id) = self.resident.paths.get(path_str.as_str())
+                {
+                    if anchor.eq_ignore_ascii_case("toc") || anchor.eq_ignore_ascii_case("outline")
+                    {
+                        let remaining_after = initial_len.saturating_sub(idx + 1);
+                        let budget = 64usize
+                            .saturating_sub(expanded_ranges.len() + remaining_after)
+                            .max(1);
+                        let toc_ranges = crate::document::resolve_toc_ranges(
+                            &self.resident.documents[doc_id].text,
+                            budget,
+                        );
+                        if !toc_ranges.is_empty() {
+                            for (s, e) in toc_ranges {
+                                expanded_ranges.push(json!({
+                                    "path": path_str,
+                                    "start": s,
+                                    "end": e,
+                                }));
+                            }
+                            continue;
+                        }
+                    } else if let Some((sec_start, sec_end)) =
                         crate::document::resolve_markdown_anchor_range(
                             &self.resident.documents[doc_id].text,
                             &anchor,
                         )
-                    && let Some(obj) = range.as_object_mut()
-                {
-                    obj.insert("start".into(), json!(sec_start));
-                    obj.insert("end".into(), json!(sec_end));
+                        && let Some(obj) = range.as_object_mut()
+                    {
+                        obj.insert("start".into(), json!(sec_start));
+                        obj.insert("end".into(), json!(sec_end));
+                    }
                 }
+                expanded_ranges.push(range);
             }
+            *ranges = expanded_ranges;
         }
     }
 
@@ -1660,14 +1815,22 @@ impl Watched {
                 .as_ref()
                 .is_none_or(|(_, _, policy)| policy.key != key)
             {
-                let policy = match crate::workspace::CandidatePolicy::compile(key) {
-                    Ok(policy) => policy,
-                    Err(error) => {
-                        self.io_profile.read_policy_rejections += 1;
-                        return Err(error);
+                let policy = if let Some((saved_spec, watcher_pol)) = &self.watcher_policy
+                    && saved_spec == &self.spec
+                    && watcher_pol.key == key
+                {
+                    watcher_pol.clone()
+                } else {
+                    match crate::workspace::CandidatePolicy::compile(key) {
+                        Ok(policy) => policy,
+                        Err(error) => {
+                            self.io_profile.read_policy_rejections += 1;
+                            return Err(error);
+                        }
                     }
                 };
                 self.cached_workspace = Some((self.spec.clone(), workspace.clone()));
+                self.watcher_policy = Some((self.spec.clone(), policy.clone()));
                 self.read_policy = Some((self.spec.clone(), workspace, policy));
                 self.io_profile.read_policy_compilations += 1;
             } else {

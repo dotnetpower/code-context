@@ -1002,24 +1002,34 @@ pub fn extract_docx_xml_paragraphs(
     let mut lines = Vec::new();
     let mut cursor = 0usize;
     while cursor < xml.len() {
-        let next_tbl = xml[cursor..].find("<w:tbl").and_then(|pos| {
-            let after = xml.as_bytes().get(cursor + pos + 6).copied().unwrap_or(b' ');
-            (after == b'>' || after.is_ascii_whitespace()).then_some(cursor + pos)
-        });
+        let next_tbl = find_word_tag(xml, cursor, "w:tbl");
         let next_p = find_word_tag(xml, cursor, "w:p");
         match (next_tbl, next_p) {
             (Some(tbl_pos), Some(p_pos)) if tbl_pos < p_pos => {
-                if let Some(end_tbl) = xml[tbl_pos..].find("</w:tbl>") {
-                    let tbl_slice = &xml[tbl_pos..tbl_pos + end_tbl + 8];
+                if let Some(end_tbl) = find_matching_close_tag(xml, tbl_pos, "w:tbl") {
+                    let tbl_slice = &xml[tbl_pos..end_tbl];
                     let table_lines = extract_word_table(tbl_slice, rels);
                     if !table_lines.is_empty() {
                         lines.extend(table_lines);
                         lines.push(String::new());
                     }
-                    cursor = tbl_pos + end_tbl + 8;
+                    cursor = end_tbl;
                     continue;
                 }
                 cursor = tbl_pos + 6;
+            }
+            (Some(tbl_pos), None) => {
+                if let Some(end_tbl) = find_matching_close_tag(xml, tbl_pos, "w:tbl") {
+                    let tbl_slice = &xml[tbl_pos..end_tbl];
+                    let table_lines = extract_word_table(tbl_slice, rels);
+                    if !table_lines.is_empty() {
+                        lines.extend(table_lines);
+                        lines.push(String::new());
+                    }
+                    cursor = end_tbl;
+                    continue;
+                }
+                break;
             }
             (_, Some(p_pos)) => {
                 if let Some((p_text, next_pos)) = extract_single_word_paragraph(xml, p_pos, rels) {
@@ -1035,6 +1045,39 @@ pub fn extract_docx_xml_paragraphs(
         }
     }
     lines
+}
+
+fn find_matching_close_tag(xml: &str, open_pos: usize, tag_name: &str) -> Option<usize> {
+    let close_pat = format!("</{tag_name}>");
+    let mut depth = 0usize;
+    let mut cursor = open_pos;
+    while cursor < xml.len() {
+        let next_open = find_word_tag(xml, cursor, tag_name);
+        let next_close = xml[cursor..].find(&close_pat).map(|rel| cursor + rel);
+        match (next_open, next_close) {
+            (Some(op), Some(cl)) if op < cl => {
+                let gt = xml[op..].find('>')?;
+                let is_self = xml[op + 1..op + gt].trim_end().ends_with('/');
+                if !is_self {
+                    depth += 1;
+                }
+                cursor = op + gt + 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            (_, Some(cl)) => {
+                depth = depth.saturating_sub(1);
+                let after = cl + close_pat.len();
+                if depth == 0 {
+                    return Some(after);
+                }
+                cursor = after;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn find_word_tag(xml: &str, from: usize, tag_name: &str) -> Option<usize> {
@@ -1074,6 +1117,33 @@ fn extract_single_word_paragraph(
     let mut active_hyperlink: Option<String> = None;
     let mut hyperlink_text = String::new();
     let mut in_del = false;
+    let mut del_buf = String::new();
+    let mut skip_page_field = false;
+
+    let flush_del = |del: &mut String,
+                     active_link: &Option<String>,
+                     link_buf: &mut String,
+                     out_buf: &mut String| {
+        if del.is_empty() {
+            return;
+        }
+        let trimmed_del = del.trim();
+        if !trimmed_del.is_empty() {
+            let char_count = trimmed_del.chars().count();
+            let formatted = if char_count <= 40 {
+                format!("~~{trimmed_del}~~")
+            } else {
+                let preview: String = trimmed_del.chars().take(24).collect();
+                format!("~~{}...[deleted {} chars]~~", preview.trim_end(), char_count)
+            };
+            if active_link.is_some() {
+                link_buf.push_str(&formatted);
+            } else {
+                out_buf.push_str(&formatted);
+            }
+        }
+        del.clear();
+    };
 
     let mut pos = 0usize;
     while let Some(lt) = p_body[pos..].find('<') {
@@ -1106,14 +1176,27 @@ fn extract_single_word_paragraph(
             "w:ilvl" if !is_close => {
                 list_ilvl = extract_xml_attr(trimmed, "val").and_then(|v| v.parse().ok());
             }
+            "w:fldSimple" if !is_close && !is_self_close => {
+                if let Some(instr) = extract_xml_attr(trimmed, "instr") {
+                    let upper = instr.trim().to_ascii_uppercase();
+                    if upper.starts_with("PAGE") || upper.starts_with("NUMPAGES") {
+                        skip_page_field = true;
+                    }
+                }
+            }
+            "w:fldSimple" if is_close => {
+                skip_page_field = false;
+            }
             "w:bookmarkStart" if !is_close => {
                 if let Some(bm) = extract_xml_attr(trimmed, "name")
                     && !bm.starts_with('_')
                 {
+                    flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
                     text_buf.push_str(&format!("{{#{bm}}} "));
                 }
             }
             "w:hyperlink" if !is_close && !is_self_close => {
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
                 let target = extract_xml_attr(trimmed, "id")
                     .and_then(|id| rels.get(&id).cloned())
                     .or_else(|| extract_xml_attr(trimmed, "anchor").map(|a| format!("#{a}")));
@@ -1121,11 +1204,15 @@ fn extract_single_word_paragraph(
                 hyperlink_text.clear();
             }
             "w:hyperlink" if is_close => {
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
                 if let Some(url) = active_hyperlink.take() {
-                    if hyperlink_text.is_empty() {
+                    let label = hyperlink_text.trim();
+                    if label.is_empty()
+                        || label.trim_end_matches('/') == url.trim_end_matches('/')
+                    {
                         text_buf.push_str(&url);
                     } else {
-                        text_buf.push_str(&format!("[{}]({})", hyperlink_text.trim(), url));
+                        text_buf.push_str(&format!("[{label}]({url})"));
                     }
                     hyperlink_text.clear();
                 }
@@ -1135,29 +1222,45 @@ fn extract_single_word_paragraph(
             }
             "w:del" if is_close => {
                 in_del = false;
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
             }
             "w:br" | "w:cr" if !is_close => {
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
                 text_buf.push(' ');
             }
             "w:tab" if !is_close => {
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
                 text_buf.push('\t');
+            }
+            "w:noBreakHyphen" if !is_close => {
+                flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
+                if active_hyperlink.is_some() {
+                    hyperlink_text.push('-');
+                } else {
+                    text_buf.push('-');
+                }
             }
             "w:t" | "w:delText" if !is_close && !is_self_close => {
                 let close_needle = format!("</{name}>");
                 if let Some(close_t) = p_body[next_tag_end..].find(&close_needle) {
-                    let raw_inner = &p_body[next_tag_end..next_tag_end + close_t];
-                    let decoded = decode_xml_entities(raw_inner);
-                    if name == "w:delText" || in_del {
-                        let snippet = format!("~~{}~~", decoded);
-                        if active_hyperlink.is_some() {
-                            hyperlink_text.push_str(&snippet);
+                    if !skip_page_field {
+                        let raw_inner = &p_body[next_tag_end..next_tag_end + close_t];
+                        let decoded = decode_xml_entities(raw_inner);
+                        if name == "w:delText" || in_del {
+                            del_buf.push_str(&decoded);
                         } else {
-                            text_buf.push_str(&snippet);
+                            flush_del(
+                                &mut del_buf,
+                                &active_hyperlink,
+                                &mut hyperlink_text,
+                                &mut text_buf,
+                            );
+                            if active_hyperlink.is_some() {
+                                hyperlink_text.push_str(&decoded);
+                            } else {
+                                text_buf.push_str(&decoded);
+                            }
                         }
-                    } else if active_hyperlink.is_some() {
-                        hyperlink_text.push_str(&decoded);
-                    } else {
-                        text_buf.push_str(&decoded);
                     }
                     pos = next_tag_end + close_t + close_needle.len();
                     continue;
@@ -1167,8 +1270,9 @@ fn extract_single_word_paragraph(
         }
         pos = next_tag_end;
     }
+    flush_del(&mut del_buf, &active_hyperlink, &mut hyperlink_text, &mut text_buf);
 
-    let cleaned = text_buf.trim().to_owned();
+    let cleaned = collapse_inline_spaces(text_buf.trim());
     if cleaned.is_empty() {
         return Some((String::new(), next_pos));
     }
@@ -1194,17 +1298,17 @@ fn extract_word_table(tbl_xml: &str, rels: &BTreeMap<String, String>) -> Vec<Str
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut tr_cursor = 0usize;
     while let Some(tr_pos) = find_word_tag(tbl_xml, tr_cursor, "w:tr") {
-        let Some(end_tr) = tbl_xml[tr_pos..].find("</w:tr>") else {
+        let Some(end_tr) = find_matching_close_tag(tbl_xml, tr_pos, "w:tr") else {
             break;
         };
-        let tr_slice = &tbl_xml[tr_pos..tr_pos + end_tr + 7];
+        let tr_slice = &tbl_xml[tr_pos..end_tr];
         let mut row_cells = Vec::new();
         let mut tc_cursor = 0usize;
         while let Some(tc_pos) = find_word_tag(tr_slice, tc_cursor, "w:tc") {
-            let Some(end_tc) = tr_slice[tc_pos..].find("</w:tc>") else {
+            let Some(end_tc) = find_matching_close_tag(tr_slice, tc_pos, "w:tc") else {
                 break;
             };
-            let tc_slice = &tr_slice[tc_pos..tc_pos + end_tc + 7];
+            let tc_slice = &tr_slice[tc_pos..end_tc];
             let mut cell_parts = Vec::new();
             let mut p_cursor = 0usize;
             while let Some(p_pos) = find_word_tag(tc_slice, p_cursor, "w:p") {
@@ -1212,7 +1316,7 @@ fn extract_word_table(tbl_xml: &str, rels: &BTreeMap<String, String>) -> Vec<Str
                 {
                     let trimmed = p_text.trim();
                     if !trimmed.is_empty() {
-                        cell_parts.push(trimmed.replace('|', "\\|"));
+                        cell_parts.push(trimmed.to_owned());
                     }
                     p_cursor = next_p;
                 } else {
@@ -1220,39 +1324,89 @@ fn extract_word_table(tbl_xml: &str, rels: &BTreeMap<String, String>) -> Vec<Str
                 }
             }
             row_cells.push(cell_parts.join(" "));
-            tc_cursor = tc_pos + end_tc + 7;
+            tc_cursor = end_tc;
         }
         if !row_cells.is_empty() && row_cells.iter().any(|c| !c.is_empty()) {
             rows.push(row_cells);
         }
-        tr_cursor = tr_pos + end_tr + 7;
+        tr_cursor = end_tr;
     }
     format_markdown_table(&rows)
+}
+
+fn collapse_inline_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch == ' ' {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
 }
 
 pub fn format_markdown_table(rows: &[Vec<String>]) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
     }
-    let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
-    if col_count == 0 {
+    let raw_col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if raw_col_count == 0 {
+        return Vec::new();
+    }
+    let active_cols: Vec<usize> = (0..raw_col_count)
+        .filter(|&col_idx| {
+            rows.iter()
+                .any(|row| row.get(col_idx).is_some_and(|cell| !cell.trim().is_empty()))
+        })
+        .collect();
+    if active_cols.is_empty() {
+        return Vec::new();
+    }
+    let col_count = active_cols.len();
+    let normalize_cell = |cell: &str| -> String {
+        let joined = cell
+            .replace("\r\n", " ")
+            .replace(['\r', '\n'], " ")
+            .replace("\\|", "|");
+        collapse_inline_spaces(joined.trim()).replace('|', "\\|")
+    };
+    if col_count == 1 && rows.len() == 1 {
+        let single = rows[0]
+            .get(active_cols[0])
+            .map(|c| normalize_cell(c))
+            .unwrap_or_default();
+        if !single.is_empty() {
+            return vec![format!("> {single}")];
+        }
         return Vec::new();
     }
     let mut lines = Vec::with_capacity(rows.len() + 1);
+    let mut header_row: Option<Vec<String>> = None;
     for (idx, row) in rows.iter().enumerate() {
-        let mut padded: Vec<String> = row
+        let padded: Vec<String> = active_cols
             .iter()
-            .map(|cell| {
-                cell.replace("\r\n", " ")
-                    .replace(['\r', '\n'], " ")
-                    .replace('|', "\\|")
+            .map(|&col_idx| {
+                row.get(col_idx)
+                    .map(|c| normalize_cell(c))
+                    .unwrap_or_default()
             })
             .collect();
-        while padded.len() < col_count {
-            padded.push(String::new());
+        if padded.iter().all(String::is_empty) {
+            continue;
+        }
+        if idx == 0 {
+            header_row = Some(padded.clone());
+        } else if header_row.as_ref() == Some(&padded) {
+            continue;
         }
         lines.push(format!("| {} |", padded.join(" | ")));
-        if idx == 0 {
+        if lines.len() == 1 {
             let sep = vec!["---"; col_count].join(" | ");
             lines.push(format!("| {sep} |"));
         }
@@ -1305,6 +1459,21 @@ fn extract_word_notes_or_comments(xml: &str, item_tag: &str, prefix_label: &str)
     out
 }
 
+fn dedup_header_or_footer_lines(lines: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.parse::<usize>().is_ok() {
+            continue;
+        }
+        if seen.insert(trimmed.to_owned()) {
+            out.push(line);
+        }
+    }
+    out
+}
+
 pub fn extract_docx(archive: &ZipArchive) -> Result<String> {
     let meta = extract_archive_metadata(archive);
     let mut out = meta.format_header();
@@ -1324,6 +1493,7 @@ pub fn extract_docx(archive: &ZipArchive) -> Result<String> {
             header_lines.extend(extract_docx_xml_paragraphs(&xml, &rels));
         }
     }
+    let header_lines = dedup_header_or_footer_lines(header_lines);
     if !header_lines.is_empty() {
         out.push_str("## [Document Header]\n");
         for line in header_lines {
@@ -1337,9 +1507,15 @@ pub fn extract_docx(archive: &ZipArchive) -> Result<String> {
         .get_text("word/document.xml")
         .ok_or_else(|| invalid("missing word/document.xml in DOCX container"))?;
     let body_lines = extract_docx_xml_paragraphs(&doc_xml, &rels);
+    let mut prev_blank = false;
     for line in body_lines {
+        let is_blank = line.trim().is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
         out.push_str(&line);
         out.push('\n');
+        prev_blank = is_blank;
     }
 
     if let Some(footnotes_xml) = archive.get_text("word/footnotes.xml") {
@@ -1386,6 +1562,7 @@ pub fn extract_docx(archive: &ZipArchive) -> Result<String> {
             footer_lines.extend(extract_docx_xml_paragraphs(&xml, &rels));
         }
     }
+    let footer_lines = dedup_header_or_footer_lines(footer_lines);
     if !footer_lines.is_empty() {
         out.push_str("\n## [Document Footer]\n");
         for line in footer_lines {
@@ -1420,17 +1597,41 @@ fn extract_drawingml_paragraphs(
             continue;
         }
         let body_start = p_pos + gt + 1;
-        let Some(end_rel) = xml[body_start..].find("</a:p>") else {
+        let close_ap = xml[body_start..].find("</a:p>");
+        let close_tx = xml[body_start..].find("</p:txBody>");
+        let Some((end_rel, advance_len)) = (match (close_ap, close_tx) {
+            (Some(ap), Some(tx)) if tx < ap => Some((tx, 0)),
+            (Some(ap), _) => Some((ap, 6)),
+            (None, Some(tx)) => Some((tx, 0)),
+            (None, None) => None,
+        }) else {
             break;
         };
         let p_body = &xml[body_start..body_start + end_rel];
-        cursor = body_start + end_rel + 6;
+        cursor = body_start + end_rel + advance_len;
 
         let mut lvl: Option<usize> = None;
         let mut has_bu_none = false;
         let mut has_bu = false;
         let mut text_buf = String::new();
-        let mut pending_link: Option<String> = None;
+        let mut run_link: Option<String> = None;
+        let mut active_link: Option<String> = None;
+        let mut active_link_text = String::new();
+
+        let flush_active_link =
+            |link: &mut Option<String>, link_text: &mut String, out: &mut String| {
+                if let Some(url) = link.take() {
+                    let label = link_text.trim();
+                    if label.is_empty()
+                        || label.trim_end_matches('/') == url.trim_end_matches('/')
+                    {
+                        out.push_str(&url);
+                    } else {
+                        out.push_str(&format!("[{label}]({url})"));
+                    }
+                    link_text.clear();
+                }
+            };
 
         let mut pos = 0usize;
         while let Some(lt) = p_body[pos..].find('<') {
@@ -1459,17 +1660,22 @@ fn extract_drawingml_paragraphs(
                 "a:buChar" | "a:buAutoNum" if !is_close => {
                     has_bu = true;
                 }
+                "a:r" if !is_close => {
+                    run_link = None;
+                }
                 "a:hlinkClick" if !is_close => {
                     if let Some(id) = extract_xml_attr(trimmed, "id")
                         && let Some(target) = rels.get(&id)
                     {
-                        pending_link = Some(target.clone());
+                        run_link = Some(target.clone());
                     }
                 }
                 "a:br" if !is_close => {
+                    flush_active_link(&mut active_link, &mut active_link_text, &mut text_buf);
                     text_buf.push(' ');
                 }
                 "a:tab" if !is_close => {
+                    flush_active_link(&mut active_link, &mut active_link_text, &mut text_buf);
                     text_buf.push('\t');
                 }
                 "a:t" | "dgm:t" | "c:v" if !is_close && !is_self_close => {
@@ -1477,9 +1683,24 @@ fn extract_drawingml_paragraphs(
                     if let Some(close_t) = p_body[next_tag_end..].find(&close_needle) {
                         let raw_inner = &p_body[next_tag_end..next_tag_end + close_t];
                         let decoded = decode_xml_entities(raw_inner);
-                        if let Some(url) = pending_link.take() {
-                            text_buf.push_str(&format!("[{}]({})", decoded.trim(), url));
+                        if let Some(url) = run_link.take() {
+                            if active_link.as_deref() == Some(url.as_str()) {
+                                active_link_text.push_str(&decoded);
+                            } else {
+                                flush_active_link(
+                                    &mut active_link,
+                                    &mut active_link_text,
+                                    &mut text_buf,
+                                );
+                                active_link = Some(url);
+                                active_link_text.push_str(&decoded);
+                            }
                         } else {
+                            flush_active_link(
+                                &mut active_link,
+                                &mut active_link_text,
+                                &mut text_buf,
+                            );
                             text_buf.push_str(&decoded);
                         }
                         pos = next_tag_end + close_t + close_needle.len();
@@ -1490,7 +1711,8 @@ fn extract_drawingml_paragraphs(
             }
             pos = next_tag_end;
         }
-        let cleaned = text_buf.trim().to_owned();
+        flush_active_link(&mut active_link, &mut active_link_text, &mut text_buf);
+        let cleaned = collapse_inline_spaces(text_buf.trim());
         if cleaned.is_empty() {
             continue;
         }
@@ -1536,14 +1758,27 @@ fn extract_drawingml_table(tbl_xml: &str, rels: &BTreeMap<String, String>) -> Ve
     format_markdown_table(&rows)
 }
 
-fn extract_pptx_slide_content(
+struct ParsedSlide {
+    slide_num: usize,
+    title: Option<String>,
+    subtitle: Option<String>,
+    body_items: Vec<(String, bool)>,
+    footer_items: Vec<String>,
+    charts: Vec<String>,
+    diagrams: Vec<String>,
+    notes: Vec<String>,
+    comments: Vec<String>,
+}
+
+fn extract_pptx_slide_parsed(
     slide_num: usize,
     slide_xml: &str,
     rels: &BTreeMap<String, String>,
-) -> Vec<String> {
+) -> ParsedSlide {
     let mut title: Option<String> = None;
     let mut subtitle: Option<String> = None;
-    let mut body_lines: Vec<String> = Vec::new();
+    let mut body_items: Vec<(String, bool)> = Vec::new();
+    let mut footer_items: Vec<String> = Vec::new();
 
     let mut sp_cursor = 0usize;
     while sp_cursor < slide_xml.len() {
@@ -1554,8 +1789,8 @@ fn extract_pptx_slide_content(
                 if let Some(end_tbl) = slide_xml[tbl_pos..].find("</a:tbl>") {
                     let tbl_slice = &slide_xml[tbl_pos..tbl_pos + end_tbl + 8];
                     let table_lines = extract_drawingml_table(tbl_slice, rels);
-                    if !table_lines.is_empty() {
-                        body_lines.extend(table_lines);
+                    for tl in table_lines {
+                        body_items.push((tl, false));
                     }
                     sp_cursor = tbl_pos + end_tbl + 8;
                     continue;
@@ -1566,8 +1801,8 @@ fn extract_pptx_slide_content(
                 if let Some(end_tbl) = slide_xml[tbl_pos..].find("</a:tbl>") {
                     let tbl_slice = &slide_xml[tbl_pos..tbl_pos + end_tbl + 8];
                     let table_lines = extract_drawingml_table(tbl_slice, rels);
-                    if !table_lines.is_empty() {
-                        body_lines.extend(table_lines);
+                    for tl in table_lines {
+                        body_items.push((tl, false));
                     }
                     sp_cursor = tbl_pos + end_tbl + 8;
                     continue;
@@ -1575,6 +1810,13 @@ fn extract_pptx_slide_content(
                 break;
             }
             (_, Some(sp_pos)) => {
+                let Some(sp_gt) = slide_xml[sp_pos..].find('>') else {
+                    break;
+                };
+                if slide_xml[sp_pos + 1..sp_pos + sp_gt].trim_end().ends_with('/') {
+                    sp_cursor = sp_pos + sp_gt + 1;
+                    continue;
+                }
                 let Some(end_sp) = slide_xml[sp_pos..].find("</p:sp>") else {
                     break;
                 };
@@ -1587,10 +1829,12 @@ fn extract_pptx_slide_content(
                     extract_xml_attr(tag, "type").or_else(|| Some("body".into()))
                 });
 
-                let is_title = matches!(
-                    ph_type.as_deref(),
-                    Some("title") | Some("ctrTitle")
-                );
+                if matches!(ph_type.as_deref(), Some("sldNum")) {
+                    continue;
+                }
+                let is_footer_or_date =
+                    matches!(ph_type.as_deref(), Some("ftr") | Some("dt") | Some("hdr"));
+                let is_title = matches!(ph_type.as_deref(), Some("title") | Some("ctrTitle"));
                 let is_subtitle = matches!(ph_type.as_deref(), Some("subTitle"));
                 let is_body_placeholder = matches!(ph_type.as_deref(), Some("body") | Some("obj"));
 
@@ -1598,7 +1842,14 @@ fn extract_pptx_slide_content(
                 if paras.is_empty() {
                     continue;
                 }
-                if is_title && title.is_none() {
+                if is_footer_or_date {
+                    for p in paras {
+                        let t = p.trim();
+                        if !t.is_empty() && t.parse::<usize>().is_err() {
+                            footer_items.push(t.to_owned());
+                        }
+                    }
+                } else if is_title && title.is_none() {
                     title = Some(
                         paras
                             .into_iter()
@@ -1615,23 +1866,182 @@ fn extract_pptx_slide_content(
                             .join(" "),
                     );
                 } else {
-                    body_lines.extend(paras);
+                    let is_floating = ph_type.is_none();
+                    for p in paras {
+                        body_items.push((p, is_floating));
+                    }
                 }
             }
             (None, None) => break,
         }
     }
 
+    ParsedSlide {
+        slide_num,
+        title,
+        subtitle,
+        body_items,
+        footer_items,
+        charts: Vec::new(),
+        diagrams: Vec::new(),
+        notes: Vec::new(),
+        comments: Vec::new(),
+    }
+}
+
+fn extract_pptx_notes_paragraphs(notes_xml: &str) -> Vec<String> {
+    let empty_rels = BTreeMap::new();
     let mut out = Vec::new();
-    if let Some(title) = title {
-        out.push(format!("## [Slide {slide_num}] {title}"));
-    } else {
-        out.push(format!("## [Slide {slide_num}]"));
+    let mut sp_cursor = 0usize;
+    let mut found_sp = false;
+    while let Some(sp_pos) = find_word_tag(notes_xml, sp_cursor, "p:sp") {
+        found_sp = true;
+        let Some(sp_gt) = notes_xml[sp_pos..].find('>') else {
+            break;
+        };
+        if notes_xml[sp_pos + 1..sp_pos + sp_gt].trim_end().ends_with('/') {
+            sp_cursor = sp_pos + sp_gt + 1;
+            continue;
+        }
+        let Some(end_sp) = notes_xml[sp_pos..].find("</p:sp>") else {
+            break;
+        };
+        let sp_slice = &notes_xml[sp_pos..sp_pos + end_sp + 7];
+        sp_cursor = sp_pos + end_sp + 7;
+        let ph_type = find_word_tag(sp_slice, 0, "p:ph").and_then(|ph_pos| {
+            let gt = sp_slice[ph_pos..].find('>')?;
+            let tag = &sp_slice[ph_pos + 1..ph_pos + gt];
+            extract_xml_attr(tag, "type")
+        });
+        if matches!(
+            ph_type.as_deref(),
+            Some("sldNum") | Some("dt") | Some("ftr") | Some("hdr") | Some("sldImg")
+        ) {
+            continue;
+        }
+        for line in extract_drawingml_paragraphs(sp_slice, &empty_rels, false) {
+            let trimmed = line.trim();
+            if !(trimmed.len() <= 3 && trimmed.parse::<usize>().is_ok()) {
+                out.push(line);
+            }
+        }
     }
-    if let Some(sub) = subtitle {
-        out.push(format!("### {sub}"));
+    if !found_sp {
+        for line in extract_drawingml_paragraphs(notes_xml, &empty_rels, false) {
+            let trimmed = line.trim();
+            if !(trimmed.len() <= 3 && trimmed.parse::<usize>().is_ok()) {
+                out.push(line);
+            }
+        }
     }
-    out.extend(body_lines);
+    out
+}
+
+fn clean_ooxml_numeric_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((_int_part, frac_part)) = trimmed.split_once('.')
+        && frac_part.len() >= 10
+        && (frac_part.contains("00000") || frac_part.contains("99999"))
+        && let Ok(val) = trimmed.parse::<f64>()
+    {
+        let rounded = format!("{val:.4}");
+        return rounded
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn extract_pptx_chart_lines(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chart_title = find_word_tag(xml, 0, "c:title").and_then(|t_pos| {
+        let end_t = xml[t_pos..].find("</c:title>")?;
+        let slice = &xml[t_pos..t_pos + end_t + 10];
+        let parts = extract_all_local_tag_texts(slice, &["t", "v"]);
+        (!parts.is_empty()).then(|| parts.join(" "))
+    });
+    if let Some(title) = &chart_title {
+        out.push(format!("- [Chart Title]: {title}"));
+    }
+
+    let mut ser_cursor = 0usize;
+    let mut found_ser = false;
+    while let Some(ser_pos) = find_word_tag(xml, ser_cursor, "c:ser") {
+        let Some(ser_gt) = xml[ser_pos..].find('>') else {
+            break;
+        };
+        if xml[ser_pos + 1..ser_pos + ser_gt].trim_end().ends_with('/') {
+            ser_cursor = ser_pos + ser_gt + 1;
+            continue;
+        }
+        let Some(end_ser) = xml[ser_pos..].find("</c:ser>") else {
+            break;
+        };
+        found_ser = true;
+        let ser_slice = &xml[ser_pos..ser_pos + end_ser + 8];
+        ser_cursor = ser_pos + end_ser + 8;
+
+        let ser_name = find_word_tag(ser_slice, 0, "c:tx").and_then(|tx_pos| {
+            let end_tx = ser_slice[tx_pos..].find("</c:tx>")?;
+            let tx_slice = &ser_slice[tx_pos..tx_pos + end_tx + 7];
+            let vals = extract_all_local_tag_texts(tx_slice, &["v", "t"]);
+            vals.into_iter().next()
+        });
+        let cats = find_word_tag(ser_slice, 0, "c:cat")
+            .and_then(|cat_pos| {
+                let end_cat = ser_slice[cat_pos..].find("</c:cat>")?;
+                Some(extract_all_local_tag_texts(
+                    &ser_slice[cat_pos..cat_pos + end_cat + 8],
+                    &["v", "t"],
+                ))
+            })
+            .unwrap_or_default();
+        let vals = find_word_tag(ser_slice, 0, "c:val")
+            .or_else(|| find_word_tag(ser_slice, 0, "c:yVal"))
+            .and_then(|val_pos| {
+                let close_tag = if ser_slice[val_pos..].starts_with("<c:yVal") {
+                    "</c:yVal>"
+                } else {
+                    "</c:val>"
+                };
+                let end_val = ser_slice[val_pos..].find(close_tag)?;
+                Some(
+                    extract_all_local_tag_texts(
+                        &ser_slice[val_pos..val_pos + end_val + close_tag.len()],
+                        &["v"],
+                    )
+                    .into_iter()
+                    .map(|v| clean_ooxml_numeric_value(&v))
+                    .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+
+        let pairs: Vec<String> = if !cats.is_empty() && cats.len() == vals.len() {
+            cats.iter()
+                .zip(vals.iter())
+                .map(|(c, v)| format!("{c}={v}"))
+                .collect()
+        } else if !vals.is_empty() {
+            vals
+        } else {
+            cats
+        };
+        if !pairs.is_empty() {
+            if let Some(name) = ser_name {
+                out.push(format!("- {name}: {}", pairs.join(", ")));
+            } else {
+                out.push(format!("- {}", pairs.join(", ")));
+            }
+        }
+    }
+
+    if !found_ser {
+        for v in extract_all_local_tag_texts(xml, &["v"]) {
+            out.push(format!("- {}", clean_ooxml_numeric_value(&v)));
+        }
+    }
     out
 }
 
@@ -1688,6 +2098,9 @@ pub fn extract_pptx(archive: &ZipArchive) -> Result<String> {
         return Err(invalid("no slides found in PPTX container").into());
     }
 
+    let mut parsed_slides = Vec::with_capacity(slide_entries.len());
+    let mut consumed_charts = std::collections::HashSet::new();
+    let mut consumed_diagrams = std::collections::HashSet::new();
     for (slide_num, slide_path) in slide_entries {
         let Some(slide_xml) = archive.get_text(&slide_path) else {
             continue;
@@ -1698,35 +2111,142 @@ pub fn extract_pptx(archive: &ZipArchive) -> Result<String> {
             .map(|xml| parse_ooxml_relationships(&xml))
             .unwrap_or_default();
 
-        let lines = extract_pptx_slide_content(slide_num, &slide_xml, &rels);
-        for line in lines {
-            out.push_str(&line);
-            out.push('\n');
-        }
+        let mut slide = extract_pptx_slide_parsed(slide_num, &slide_xml, &rels);
 
-        let notes_path = format!("ppt/notesSlides/notesSlide{slide_num}.xml");
-        if let Some(notes_xml) = archive.get_text(&notes_path) {
-            let note_paras = extract_drawingml_paragraphs(&notes_xml, &BTreeMap::new(), false)
-                .into_iter()
-                .filter(|line| line.parse::<usize>().is_err())
-                .collect::<Vec<_>>();
-            if !note_paras.is_empty() {
-                out.push_str(&format!("### [Slide {slide_num} Notes]\n"));
-                for note in note_paras {
-                    out.push_str(&note);
-                    out.push('\n');
+        for target in rels.values() {
+            let clean = target
+                .trim_start_matches("../")
+                .trim_start_matches("/ppt/")
+                .trim_start_matches("ppt/");
+            let archive_key = format!("ppt/{clean}");
+            if archive_key.starts_with("ppt/charts/chart") && archive_key.ends_with(".xml") {
+                if consumed_charts.insert(archive_key.clone())
+                    && let Some(c_xml) = archive.get_text(&archive_key)
+                {
+                    slide.charts.extend(extract_pptx_chart_lines(&c_xml));
+                }
+            } else if archive_key.starts_with("ppt/diagrams/data") && archive_key.ends_with(".xml")
+                && consumed_diagrams.insert(archive_key.clone())
+                && let Some(d_xml) = archive.get_text(&archive_key)
+            {
+                let mut seen_d = std::collections::HashSet::new();
+                for t in extract_all_local_tag_texts(&d_xml, &["t"]) {
+                    if seen_d.insert(t.clone()) {
+                        slide.diagrams.push(format!("- {t}"));
+                    }
                 }
             }
         }
 
+        let notes_path = format!("ppt/notesSlides/notesSlide{slide_num}.xml");
+        if let Some(notes_xml) = archive.get_text(&notes_path) {
+            slide.notes = extract_pptx_notes_paragraphs(&notes_xml);
+        }
+
         let comments_path = format!("ppt/comments/comment{slide_num}.xml");
         if let Some(comments_xml) = archive.get_text(&comments_path) {
-            let comment_texts = extract_all_local_tag_texts(&comments_xml, &["text"]);
-            if !comment_texts.is_empty() {
-                out.push_str(&format!("### [Slide {slide_num} Comments]\n"));
-                for comment in comment_texts {
-                    out.push_str(&format!("- {comment}\n"));
+            slide.comments = extract_all_local_tag_texts(&comments_xml, &["text"]);
+        }
+        parsed_slides.push(slide);
+    }
+
+    // Detect repeated floating banner shapes and deck-wide footer/date placeholders
+    let total_slides = parsed_slides.len();
+    let mut floating_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut deck_footers: Vec<String> = Vec::new();
+    let mut seen_footers = std::collections::HashSet::new();
+    for slide in &parsed_slides {
+        let mut slide_seen_floating = std::collections::HashSet::new();
+        for (line, is_floating) in &slide.body_items {
+            if *is_floating && slide_seen_floating.insert(line.as_str()) {
+                *floating_counts.entry(line.clone()).or_insert(0) += 1;
+            }
+        }
+        for ftr in &slide.footer_items {
+            if seen_footers.insert(ftr.clone()) {
+                deck_footers.push(ftr.clone());
+            }
+        }
+    }
+    let hoisted_banners: std::collections::HashSet<String> = if total_slides >= 3 {
+        floating_counts
+            .into_iter()
+            .filter(|(_, cnt)| *cnt >= 3 && *cnt * 2 >= total_slides)
+            .map(|(line, _)| line)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    if !hoisted_banners.is_empty() || !deck_footers.is_empty() {
+        let mut banner_parts: Vec<String> = Vec::new();
+        let mut banner_seen = std::collections::HashSet::new();
+        for slide in &parsed_slides {
+            for (line, is_floating) in &slide.body_items {
+                if *is_floating
+                    && hoisted_banners.contains(line)
+                    && banner_seen.insert(line.clone())
+                {
+                    banner_parts.push(line.clone());
                 }
+            }
+        }
+        for ftr in deck_footers {
+            if banner_seen.insert(ftr.clone()) {
+                banner_parts.push(ftr);
+            }
+        }
+        if !banner_parts.is_empty() {
+            if out.is_empty() {
+                out.push_str("# [Document Metadata]\n");
+            } else if out.ends_with("\n\n") {
+                out.pop();
+            }
+            out.push_str(&format!("Banner: {}\n\n", banner_parts.join(" | ")));
+        }
+    }
+
+    for slide in parsed_slides {
+        if let Some(title) = slide.title {
+            out.push_str(&format!("## [Slide {}] {title}\n", slide.slide_num));
+        } else {
+            out.push_str(&format!("## [Slide {}]\n", slide.slide_num));
+        }
+        if let Some(sub) = slide.subtitle {
+            out.push_str(&format!("### {sub}\n"));
+        }
+        for (line, is_floating) in slide.body_items {
+            if is_floating && hoisted_banners.contains(&line) {
+                continue;
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if !slide.diagrams.is_empty() {
+            out.push_str(&format!("### [Slide {} SmartArt]\n", slide.slide_num));
+            for d in slide.diagrams {
+                out.push_str(&d);
+                out.push('\n');
+            }
+        }
+        if !slide.charts.is_empty() {
+            out.push_str(&format!("### [Slide {} Chart]\n", slide.slide_num));
+            for c in slide.charts {
+                out.push_str(&c);
+                out.push('\n');
+            }
+        }
+        if !slide.notes.is_empty() {
+            out.push_str(&format!("### [Slide {} Notes]\n", slide.slide_num));
+            for note in slide.notes {
+                out.push_str(&note);
+                out.push('\n');
+            }
+        }
+        if !slide.comments.is_empty() {
+            out.push_str(&format!("### [Slide {} Comments]\n", slide.slide_num));
+            for comment in slide.comments {
+                out.push_str(&format!("- {comment}\n"));
             }
         }
         out.push('\n');
@@ -1734,13 +2254,22 @@ pub fn extract_pptx(archive: &ZipArchive) -> Result<String> {
 
     let mut diagram_entries: Vec<&str> = archive
         .entry_names()
-        .filter(|n| n.starts_with("ppt/diagrams/data") && n.ends_with(".xml"))
+        .filter(|n| {
+            n.starts_with("ppt/diagrams/data")
+                && n.ends_with(".xml")
+                && !consumed_diagrams.contains(*n)
+        })
         .collect();
     diagram_entries.sort_unstable();
     let mut diagram_lines = Vec::new();
+    let mut seen_diag = std::collections::HashSet::new();
     for entry in diagram_entries {
         if let Some(xml) = archive.get_text(entry) {
-            diagram_lines.extend(extract_all_local_tag_texts(&xml, &["t"]));
+            for t in extract_all_local_tag_texts(&xml, &["t"]) {
+                if seen_diag.insert(t.clone()) {
+                    diagram_lines.push(t);
+                }
+            }
         }
     }
     if !diagram_lines.is_empty() {
@@ -1753,19 +2282,23 @@ pub fn extract_pptx(archive: &ZipArchive) -> Result<String> {
 
     let mut chart_entries: Vec<&str> = archive
         .entry_names()
-        .filter(|n| n.starts_with("ppt/charts/chart") && n.ends_with(".xml"))
+        .filter(|n| {
+            n.starts_with("ppt/charts/chart")
+                && n.ends_with(".xml")
+                && !consumed_charts.contains(*n)
+        })
         .collect();
     chart_entries.sort_unstable();
     let mut chart_lines = Vec::new();
     for entry in chart_entries {
         if let Some(xml) = archive.get_text(entry) {
-            chart_lines.extend(extract_all_local_tag_texts(&xml, &["v"]));
+            chart_lines.extend(extract_pptx_chart_lines(&xml));
         }
     }
     if !chart_lines.is_empty() {
         out.push_str("## [Charts]\n");
         for line in chart_lines {
-            out.push_str(&format!("- {line}\n"));
+            out.push_str(&format!("{line}\n"));
         }
     }
 
@@ -4301,7 +4834,8 @@ pub fn clamp_document_snippet(
         }
         tbl_start = tbl_start.min(min_idx);
         tbl_end = tbl_end.max(max_idx);
-        // Include an immediately preceding heading or caption (allowing 1 blank line)
+        // Include an immediately preceding heading or caption (allowing 1 blank line),
+        // or an enclosing Slide/Sheet/Page unit boundary within 12 lines above tbl_start.
         if tbl_start > 0 {
             let prev = tbl_start - 1;
             if effective_heading_level_at(lines, prev, &masks).is_some()
@@ -4314,6 +4848,13 @@ pub fn clamp_document_snippet(
                 && effective_heading_level_at(lines, prev - 1, &masks).is_some()
             {
                 tbl_start = prev - 1;
+            }
+            let min_look = tbl_start.saturating_sub(12);
+            for look in (min_look..tbl_start).rev() {
+                if !masks.in_fence[look] && is_extracted_unit_boundary(&lines[look]) {
+                    tbl_start = look;
+                    break;
+                }
             }
         }
         return Some((tbl_start, tbl_end));
@@ -4528,6 +5069,9 @@ pub fn clamp_document_snippet(
     while new_end > max_idx && lines[new_end].trim().is_empty() {
         new_end -= 1;
     }
+    if new_end.saturating_sub(new_start) > 80 {
+        new_end = new_end.min(max_idx + 45);
+    }
     Some((new_start, new_end))
 }
 
@@ -4542,20 +5086,30 @@ fn strip_inline_markdown_for_slug(raw: &str) -> (String, Option<String>) {
             break;
         }
     }
-    // Check explicit {#custom-id} suffix
+    // Check explicit {#custom-id} anywhere on the line (e.g. prefix `{#sec_intro} Title` or suffix `Title {#sec_intro}`)
+    let mut owned_without_id: Option<String> = None;
     let mut explicit_id = None;
-    if let Some(open_brace) = text.rfind("{#")
-        && text.ends_with('}')
+    if let Some(open_brace) = text.find("{#")
+        && let Some(close_rel) = text[open_brace + 2..].find('}')
     {
-        let id = text[open_brace + 2..text.len() - 1].trim();
+        let close_brace = open_brace + 2 + close_rel;
+        let id = text[open_brace + 2..close_brace].trim();
         if !id.is_empty() && !id.contains(' ') {
             explicit_id = Some(id.to_ascii_lowercase());
-            text = text[..open_brace].trim_end();
+            let mut combined = String::with_capacity(text.len());
+            combined.push_str(text[..open_brace].trim_end());
+            let after = text[close_brace + 1..].trim_start();
+            if !combined.is_empty() && !after.is_empty() {
+                combined.push(' ');
+            }
+            combined.push_str(after);
+            owned_without_id = Some(combined);
         }
     }
+    let text_ref = owned_without_id.as_deref().unwrap_or(text);
     // Unwrap inline links [label](url) -> label
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut out = String::with_capacity(text_ref.len());
+    let mut rest = text_ref;
     while let Some(open_br) = rest.find('[') {
         out.push_str(&rest[..open_br]);
         let after_open = &rest[open_br + 1..];
@@ -4638,58 +5192,146 @@ fn collapse_hyphens(s: &str) -> String {
     out
 }
 
+pub fn resolve_toc_ranges(text: &str, max_ranges: usize) -> Vec<(usize, usize)> {
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if lines.is_empty() || max_ranges == 0 {
+        return Vec::new();
+    }
+    let masks = compute_markdown_block_masks(&lines);
+    let mut selected_lines: Vec<usize> = Vec::new();
+    if lines[0].trim() == "# [Document Metadata]" {
+        for (idx, line) in lines.iter().enumerate().take(16) {
+            if idx > 0 && line.trim().is_empty() {
+                break;
+            }
+            selected_lines.push(idx + 1);
+        }
+    }
+    for (idx, line) in lines.iter().enumerate() {
+        if masks.in_fence[idx] {
+            continue;
+        }
+        if is_extracted_unit_boundary(line)
+            || effective_heading_level_at(&lines, idx, &masks).is_some()
+        {
+            let line_no = idx + 1;
+            if selected_lines.last().copied() != Some(line_no) {
+                selected_lines.push(line_no);
+            }
+        }
+    }
+    if selected_lines.is_empty() {
+        return vec![(1, lines.len().min(25))];
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for line_no in selected_lines {
+        if let Some(last) = ranges.last_mut()
+            && line_no <= last.1 + 1
+        {
+            last.1 = line_no;
+            continue;
+        }
+        if ranges.len() >= max_ranges {
+            break;
+        }
+        ranges.push((line_no, line_no));
+    }
+    ranges
+}
+
 pub fn resolve_markdown_anchor_range(text: &str, anchor: &str) -> Option<(usize, usize)> {
     let target = anchor.trim().trim_start_matches('#').to_lowercase();
     if target.is_empty() {
         return None;
     }
-    let target_collapsed = collapse_hyphens(&target);
+    if target == "toc" || target == "outline" {
+        return resolve_toc_ranges(text, 1).into_iter().next();
+    }
+    let target_collapsed = collapse_hyphens(&target.replace('_', "-"));
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     if lines.is_empty() {
         return None;
     }
     let masks = compute_markdown_block_masks(&lines);
-    let unit_prefix = if let Some(num) = target.strip_prefix("cell-") {
-        Some(format!("## [notebook cell {num}:"))
-    } else if let Some(num) = target.strip_prefix("slide-") {
-        Some(format!("## [slide {num}]"))
-    } else if let Some(num) = target.strip_prefix("page-") {
-        Some(format!("## [page {num}]"))
-    } else {
-        target
-            .strip_prefix("record-")
-            .map(|num| format!("## [record {num}]"))
-    };
-    if let Some(prefix) = unit_prefix {
-        for (idx, line) in lines.iter().enumerate() {
-            if !masks.in_fence[idx] && line.trim_start().to_lowercase().starts_with(&prefix) {
-                let mut end_idx = lines.len() - 1;
-                for (next_idx, next_line) in lines.iter().enumerate().skip(idx + 1) {
-                    if !masks.in_fence[next_idx] && is_extracted_unit_boundary(next_line) {
-                        end_idx = next_idx - 1;
+    for (prefix_key, header_tag) in [
+        ("cell-", "## [notebook cell "),
+        ("slide-", "## [slide "),
+        ("page-", "## [page "),
+        ("record-", "## [record "),
+    ] {
+        if let Some(rest) = target.strip_prefix(prefix_key) {
+            let (start_num, end_num) = if let Some((s, e)) = rest.split_once('-') {
+                match (s.parse::<usize>(), e.parse::<usize>()) {
+                    (Ok(sn), Ok(en)) if sn > 0 && en >= sn => (sn, en),
+                    _ => break,
+                }
+            } else if let Ok(sn) = rest.parse::<usize>() {
+                (sn, sn)
+            } else {
+                break;
+            };
+            let start_pat = if prefix_key == "cell-" {
+                format!("{header_tag}{start_num}:")
+            } else {
+                format!("{header_tag}{start_num}]")
+            };
+            let end_pat = if prefix_key == "cell-" {
+                format!("{header_tag}{end_num}:")
+            } else {
+                format!("{header_tag}{end_num}]")
+            };
+            let mut found_start = None;
+            let mut in_end_unit = false;
+            let mut end_idx = lines.len() - 1;
+            for (idx, line) in lines.iter().enumerate() {
+                if masks.in_fence[idx] {
+                    continue;
+                }
+                let lower = line.trim_start().to_lowercase();
+                if found_start.is_none() && lower.starts_with(&start_pat) {
+                    found_start = Some(idx);
+                    if start_num == end_num {
+                        in_end_unit = true;
+                    }
+                    continue;
+                }
+                if found_start.is_some() {
+                    if !in_end_unit && lower.starts_with(&end_pat) {
+                        in_end_unit = true;
+                        continue;
+                    }
+                    if in_end_unit && is_extracted_unit_boundary(line) {
+                        end_idx = idx - 1;
                         break;
                     }
                 }
+            }
+            if let Some(idx) = found_start {
                 while end_idx > idx && lines[end_idx].trim().is_empty() {
                     end_idx -= 1;
                 }
-                return Some((idx + 1, (end_idx + 1).min(idx + 120)));
+                return Some((idx + 1, (end_idx + 1).min(idx + 160)));
             }
         }
     }
     let mut slug_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let inline_bm_exact = format!("{{#{target}}}");
+    let inline_bm_underscore = format!("{{#{}}}", target.replace('-', "_"));
 
     for idx in 0..lines.len() {
         if masks.in_fence[idx] {
             continue;
         }
-        // Check explicit HTML <a id="..."> or <a name="...">
+        // Check explicit HTML <a id="..."> / <a name="..."> or inline Word bookmark {#bm}
         let lower_line = lines[idx].to_lowercase();
         if lower_line.contains(&format!("id=\"{target}\""))
             || lower_line.contains(&format!("name=\"{target}\""))
             || lower_line.contains(&format!("id='{target}'"))
             || lower_line.contains(&format!("name='{target}'"))
+            || (effective_heading_level_at(&lines, idx, &masks).is_none()
+                && (lower_line.contains(&inline_bm_exact)
+                    || lower_line.contains(&inline_bm_underscore)))
         {
             let end = (idx + 40).min(lines.len());
             return Some((idx + 1, end));
@@ -4709,9 +5351,21 @@ pub fn resolve_markdown_anchor_range(text: &str, anchor: &str) -> Option<(usize,
         };
         *count += 1;
 
+        let base_collapsed = collapse_hyphens(&base_slug.replace('_', "-"));
+        let versioned_collapsed = collapse_hyphens(&versioned_slug.replace('_', "-"));
+        let bracket_alias_match = matches!(
+            (target_collapsed.as_str(), base_collapsed.as_str()),
+            ("smartart", "smartart-diagrams")
+                | ("header", "document-header")
+                | ("footer", "document-footer")
+                | ("metadata", "document-metadata")
+        ) || (target_collapsed == "notes" && base_collapsed.ends_with("-notes"));
+
         if versioned_slug == target
             || base_slug == target
-            || collapse_hyphens(&versioned_slug) == target_collapsed
+            || versioned_collapsed == target_collapsed
+            || base_collapsed == target_collapsed
+            || bracket_alias_match
         {
             let mut end_idx = lines.len() - 1;
             let skip_from = if heading_level_of_line(&lines[idx]).is_some() {

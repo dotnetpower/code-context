@@ -1,17 +1,39 @@
 import type { JsonValue } from './types.js';
 
+const MAX_INLINE_CHARS = 7_400;
+
 export function formatToolResult(operation: string, value: JsonValue): string {
   switch (operation) {
     case 'code_files': {
       const result = recordValue(value, 'file result');
-      const paths = arrayValue(result.paths, 'file paths');
+      const paths = arrayValue(result.paths, 'file paths').map((path) =>
+        stringValue(path, 'file path'),
+      );
       const total = integerValue(result.total_matches, 'total_matches');
-      const lines = [
-        `files=${total} truncated=${booleanValue(result.truncated, 'truncated')}`,
-        ...paths.map((path) => stringValue(path, 'file path')),
-      ];
-      if (result.freshness !== undefined) {
-        lines.splice(1, 0, formatFreshness(result.freshness, total === 0));
+      let truncated = booleanValue(result.truncated, 'truncated');
+      const freshnessLine =
+        result.freshness !== undefined
+          ? formatFreshness(result.freshness, total === 0)
+          : undefined;
+      const kept: string[] = [];
+      let used = 64 + (freshnessLine ? freshnessLine.length + 1 : 0);
+      for (const p of paths) {
+        if (kept.length > 0 && used + p.length + 1 > MAX_INLINE_CHARS - 120) {
+          truncated = true;
+          break;
+        }
+        kept.push(p);
+        used += p.length + 1;
+      }
+      const lines = [`files=${total} truncated=${truncated}`];
+      if (freshnessLine !== undefined) {
+        lines.push(freshnessLine);
+      }
+      lines.push(...kept);
+      if (kept.length < paths.length) {
+        lines.push(
+          `... [${paths.length - kept.length} more path(s) omitted to stay inline (<8KiB); narrow glob/paths or set limit]`,
+        );
       }
       return lines.join('\n');
     }
@@ -23,12 +45,13 @@ export function formatToolResult(operation: string, value: JsonValue): string {
     case 'code_read':
       if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
         const result=recordValue(value,'read page');
-        return `page=true complete=${booleanValue(result.complete,'complete')}\n`
-          + `${stringValue(result.notice,'page notice')}\n`
-          + `${formatSnippets(requiredValue(result,'snippets','read page'))}\n`
-          + `next_ranges=${JSON.stringify(arrayValue(result.next_ranges,'next ranges'))}`;
+        const header = `page=true complete=${booleanValue(result.complete,'complete')}\n`
+          + `${stringValue(result.notice,'page notice')}\n`;
+        const footer = `\nnext_ranges=${JSON.stringify(arrayValue(result.next_ranges,'next ranges'))}`;
+        const budget = Math.max(1_500, MAX_INLINE_CHARS - header.length - footer.length);
+        return `${header}${formatSnippets(requiredValue(result,'snippets','read page'), budget)}${footer}`;
       }
-      return formatSnippets(value);
+      return formatSnippets(value, MAX_INLINE_CHARS);
     case 'code_status':
       return formatCompactStatusJson(value);
     case 'code_workspaces':
@@ -53,11 +76,26 @@ function formatCompactStatusJson(value: JsonValue): string {
   }
   if (typeof clone.performance === 'object' && clone.performance !== null && !Array.isArray(clone.performance)) {
     const perf = { ...clone.performance };
+    const keepRecent = clone.index_state === 'loaded' ? 1 : 3;
     for (const key of ['recent_requests', 'recent_clients', 'recent_background', 'evictions']) {
       const arr = perf[key];
-      if (Array.isArray(arr) && arr.length > 3) {
-        perf[`${key}_total`] = arr.length;
-        perf[key] = arr.slice(-3);
+      if (Array.isArray(arr)) {
+        const sliced = arr.length > keepRecent ? arr.slice(-keepRecent) : arr;
+        if (arr.length > keepRecent) {
+          perf[`${key}_total`] = arr.length;
+        }
+        if (key === 'recent_clients') {
+          perf[key] = sliced.map((entry) => {
+            if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+              const clientCopy = { ...entry };
+              delete clientCopy.host_memory;
+              return clientCopy;
+            }
+            return entry;
+          });
+        } else {
+          perf[key] = sliced;
+        }
       }
     }
     clone.performance = perf;
@@ -69,12 +107,24 @@ function formatCompactWorkspacesJson(value: JsonValue): string {
   if (!Array.isArray(value) || value.length <= 2) {
     return JSON.stringify(value);
   }
+  const manyWorkspaces = value.length > 8;
   const compacted = value.map((item) => {
     if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
       const copy: Record<string, JsonValue> = { ...item };
+      delete copy.policy;
       if (Array.isArray(copy.globs) && copy.globs.length > 8) {
         copy.globs_count = copy.globs.length;
-        copy.globs = copy.globs.slice(0, 6);
+        if (manyWorkspaces && typeof copy.managed_parent === 'string') {
+          delete copy.globs;
+          delete copy.default_excludes;
+          delete copy.prewarm;
+          delete copy.allow_worktrees;
+          if (Array.isArray(copy.excludes) && copy.excludes.length === 0) {
+            delete copy.excludes;
+          }
+        } else {
+          copy.globs = copy.globs.slice(0, 6);
+        }
       }
       return copy;
     }
@@ -120,18 +170,17 @@ export function compressLineNumbers(nums: readonly number[]): string {
   return parts.join(',');
 }
 
-function formatSearch(value: JsonValue, includeFreshness = true): string {
+function formatSearch(value: JsonValue, includeFreshness = true, maxChars = MAX_INLINE_CHARS): string {
   const search = recordValue(value, 'search result');
   const matches = arrayValue(search.matches, 'search matches');
   const total = integerValue(search.total_matches, 'total_matches');
-  const lines = [
-    `matches=${total} truncated=${booleanValue(search.truncated, 'truncated')}`,
-  ];
+  let truncated = booleanValue(search.truncated, 'truncated');
+  const bodyLines: string[] = [];
   let previousPath: string | undefined;
   let pendingLines: number[] = [];
   const flushPending = (): void => {
     if (previousPath !== undefined && pendingLines.length > 0) {
-      lines.push(`${previousPath}:${compressLineNumbers(pendingLines)}`);
+      bodyLines.push(`${previousPath}:${compressLineNumbers(pendingLines)}`);
       pendingLines = [];
     }
   };
@@ -153,16 +202,37 @@ function formatSearch(value: JsonValue, includeFreshness = true): string {
       const preview = rawText.length > 512 ? `${rawText.slice(0, 512)}...` : rawText;
       const text = ` ${preview}`;
       if (previousPath === path) {
-        lines.push(`:${line}${text}`);
+        bodyLines.push(`:${line}${text}`);
       } else {
-        lines.push(`${path}:${line}${text}`);
+        bodyLines.push(`${path}:${line}${text}`);
         previousPath = path;
       }
     }
   }
   flushPending();
-  if (includeFreshness && search.freshness !== undefined) {
-    lines.splice(1, 0, formatFreshness(search.freshness, total === 0));
+  const freshnessLine =
+    includeFreshness && search.freshness !== undefined
+      ? formatFreshness(search.freshness, total === 0)
+      : undefined;
+  const kept: string[] = [];
+  let used = 64 + (freshnessLine ? freshnessLine.length + 1 : 0);
+  for (const line of bodyLines) {
+    if (kept.length > 0 && used + line.length + 1 > maxChars - 120) {
+      truncated = true;
+      break;
+    }
+    kept.push(line);
+    used += line.length + 1;
+  }
+  const lines = [`matches=${total} truncated=${truncated}`];
+  if (freshnessLine !== undefined) {
+    lines.push(freshnessLine);
+  }
+  lines.push(...kept);
+  if (kept.length < bodyLines.length) {
+    lines.push(
+      `... [${bodyLines.length - kept.length} more match line(s) omitted to stay inline (<8KiB); set max_matches_per_file or narrow paths]`,
+    );
   }
   return lines.join('\n');
 }
@@ -172,9 +242,10 @@ function formatContext(value: JsonValue): string {
   const searchVal = requiredValue(context, 'search', 'context result');
   const searchRec = recordValue(searchVal, 'search result');
   const total = integerValue(searchRec.total_matches, 'total_matches');
-  const search = formatSearch(searchVal, context.freshness === undefined);
-  const snippets = formatSnippets(requiredValue(context, 'snippets', 'context result'));
+  const search = formatSearch(searchVal, context.freshness === undefined, 2_400);
   const notice = context.freshness === undefined ? '' : `\n${formatFreshness(context.freshness, total === 0)}`;
+  const snippetBudget = Math.max(1_500, MAX_INLINE_CHARS - search.length - notice.length - 2);
+  const snippets = formatSnippets(requiredValue(context, 'snippets', 'context result'), snippetBudget);
   return `${search}${notice}\n\n${snippets}`;
 }
 
@@ -189,11 +260,15 @@ function formatFreshness(value: JsonValue, includeNotice = true): string {
     : `NOTICE freshness=${basis} returned_file_check=${check} full_disk_verified=${verified}`;
 }
 
-function formatSnippets(value: JsonValue): string {
+function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
   const snippets = arrayValue(value, 'snippets');
-  const output: string[] = [];
-  let previousPath: string | undefined;
-  let previousSha: string | undefined;
+  const validated: Array<{
+    path: string;
+    start: number;
+    end: number;
+    sha: string;
+    lines: string[];
+  }> = [];
   for (const [index, snippet] of snippets.entries()) {
     const label = `snippet ${index}`;
     const item = recordValue(snippet, label);
@@ -201,27 +276,84 @@ function formatSnippets(value: JsonValue): string {
     const start = integerValue(item.start, `${label} start`, 1);
     const end = integerValue(item.end, `${label} end`, start);
     const sha = stringValue(item.sha256, `${label} sha256`);
-    const lines = arrayValue(item.lines, `${label} lines`);
-    if (lines.length !== end - start + 1) {
+    const rawLines = arrayValue(item.lines, `${label} lines`);
+    if (rawLines.length !== end - start + 1) {
       throw new Error(
-        `Invalid Code Context ${label}: expected ${end - start + 1} lines, received ${lines.length}.`,
+        `Invalid Code Context ${label}: expected ${end - start + 1} lines, received ${rawLines.length}.`,
       );
     }
-    if (previousPath === path && previousSha === sha) {
-      output.push(`--- ${path}:${start}-${end}`);
-    } else {
-      output.push(`--- ${path}:${start}-${end} sha256=${sha}`);
-      previousPath = path;
-      previousSha = sha;
-    }
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-      const rawLine = stringValue(lines[lineIndex], `${label} line ${lineIndex}`);
+    const formattedLines: string[] = [];
+    for (let lineIndex = 0; lineIndex < rawLines.length; lineIndex += 1) {
+      const rawLine = stringValue(rawLines[lineIndex], `${label} line ${lineIndex}`);
       const boundedLine =
         rawLine.length > 2048 ? `${rawLine.slice(0, 2048)}... [truncated]` : rawLine;
-      output.push(`${start + lineIndex}: ${boundedLine}`);
+      formattedLines.push(`${start + lineIndex}: ${boundedLine}`);
+    }
+    validated.push({ path, start, end, sha, lines: formattedLines });
+  }
+  if (validated.length === 0) {
+    return 'snippets=0';
+  }
+  const output: string[] = [];
+  const nextRanges: Array<{ path: string; start: number; end: number }> = [];
+  let previousPath: string | undefined;
+  let previousSha: string | undefined;
+  let used = 0;
+  const charLimit = Math.max(512, maxChars - 180);
+  for (let i = 0; i < validated.length; i += 1) {
+    const item = validated[i]!;
+    const sameFileHeader = previousPath === item.path && previousSha === item.sha;
+    const baseHeaderLen = item.path.length + (sameFileHeader ? 16 : 88);
+    if (output.length > 0 && used + baseHeaderLen + (item.lines[0]?.length ?? 0) > charLimit) {
+      for (let rest = i; rest < validated.length; rest += 1) {
+        const rem = validated[rest]!;
+        nextRanges.push({ path: rem.path, start: rem.start, end: rem.end });
+      }
+      break;
+    }
+    let keptCount = 0;
+    let snippetChars = baseHeaderLen;
+    for (const line of item.lines) {
+      if (
+        (output.length > 0 || keptCount > 0) &&
+        used + snippetChars + line.length + 1 > charLimit
+      ) {
+        break;
+      }
+      snippetChars += line.length + 1;
+      keptCount += 1;
+    }
+    if (keptCount === 0) {
+      keptCount = 1;
+    }
+    const actualEnd = item.start + keptCount - 1;
+    const header = sameFileHeader
+      ? `--- ${item.path}:${item.start}-${actualEnd}`
+      : `--- ${item.path}:${item.start}-${actualEnd} sha256=${item.sha}`;
+    previousPath = item.path;
+    previousSha = item.sha;
+    output.push(header);
+    used += header.length + 1;
+    for (let k = 0; k < keptCount; k += 1) {
+      const line = item.lines[k]!;
+      output.push(line);
+      used += line.length + 1;
+    }
+    if (actualEnd < item.end) {
+      nextRanges.push({ path: item.path, start: actualEnd + 1, end: item.end });
+      for (let rest = i + 1; rest < validated.length; rest += 1) {
+        const rem = validated[rest]!;
+        nextRanges.push({ path: rem.path, start: rem.start, end: rem.end });
+      }
+      break;
     }
   }
-  return output.length > 0 ? output.join('\n') : 'snippets=0';
+  if (nextRanges.length > 0) {
+    output.push(
+      `... [inline budget reached (<8KiB); next_ranges=${JSON.stringify(nextRanges.slice(0, 8))}]`,
+    );
+  }
+  return output.join('\n');
 }
 
 function recordValue(

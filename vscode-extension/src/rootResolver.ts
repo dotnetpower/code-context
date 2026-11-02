@@ -1058,10 +1058,12 @@ export function buildReadArguments(
       extracted.end ??
       Math.max(clampedStart, clampedStart + defaultSpan);
     const clampedEnd = Math.max(1, Math.trunc(rawEndCandidate));
-    const hasExplicitStart =
-      explicitStart !== undefined || lineCandidate !== undefined || extracted.start !== undefined;
+    const hasNonDefaultStart =
+      (explicitStart !== undefined && Math.trunc(explicitStart) > 1) ||
+      lineCandidate !== undefined ||
+      extracted.start !== undefined;
     const finalPath =
-      extracted.anchor && !hasExplicitStart
+      extracted.anchor && !hasNonDefaultStart
         ? `${baseTargetPath}#${extracted.anchor}`
         : baseTargetPath;
     return {

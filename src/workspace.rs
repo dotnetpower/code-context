@@ -132,13 +132,14 @@ pub struct FileInventory {
     pub metadata_source_bytes: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CandidatePolicyKey {
-    scopes: Vec<String>,
-    globs: Vec<String>,
-    excludes: Vec<String>,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) globs: Vec<String>,
+    pub(crate) excludes: Vec<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CandidatePolicy {
     pub(crate) key: CandidatePolicyKey,
     includes: GlobSet,
@@ -292,7 +293,9 @@ impl Workspace {
 
     pub fn command(&self) -> Command {
         let mut command = Command::new(rg_executable());
-        command.current_dir(&self.root).arg("--no-config");
+        command
+            .current_dir(&self.root)
+            .args(["--no-config", "--threads", "2"]);
         #[cfg(windows)]
         command.arg("--path-separator=/");
         // Explicit search roots do not reliably inherit cwd ignore rules outside
@@ -416,7 +419,7 @@ impl Workspace {
         policy.validate().map_err(invalid)?;
         let mut command = self.command();
         if shallow {
-            command.args(["--max-depth", "1"]);
+            command.args(["--max-depth", "1", "--threads", "1"]);
         }
         command.args(["--files", "--null", "--"]).args(targets);
         let output = capture(&mut command)?;

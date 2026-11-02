@@ -792,7 +792,49 @@ impl Server {
                         value.load(std::sync::atomic::Ordering::Acquire))}),
                 );
             }
-            "code_workspaces" => return Ok(serde_json::to_value(&self.registry)?),
+            "code_workspaces" => {
+                if request.compact && self.registry.len() > 8 {
+                    let many = self.registry.len() > 12;
+                    let compacted: Vec<Value> = self
+                        .registry
+                        .iter()
+                        .map(|spec| {
+                            if spec.managed_parent.is_some() {
+                                if many {
+                                    json!({
+                                        "root": spec.root,
+                                        "scopes": spec.scopes,
+                                        "globs": spec.globs.iter().take(1).collect::<Vec<_>>(),
+                                    })
+                                } else {
+                                    json!({
+                                        "root": spec.root,
+                                        "scopes": spec.scopes,
+                                        "globs": spec.globs.iter().take(1).collect::<Vec<_>>(),
+                                        "managed_parent": spec.managed_parent,
+                                    })
+                                }
+                            } else {
+                                let mut val =
+                                    serde_json::to_value(spec).unwrap_or_else(|_| json!({}));
+                                if let Some(obj) = val.as_object_mut() {
+                                    obj.remove("policy");
+                                    if many && spec.globs.len() > 8 {
+                                        obj.insert("globs_count".into(), json!(spec.globs.len()));
+                                        obj.insert(
+                                            "globs".into(),
+                                            json!(spec.globs.iter().take(6).collect::<Vec<_>>()),
+                                        );
+                                    }
+                                }
+                                val
+                            }
+                        })
+                        .collect();
+                    return Ok(Value::Array(compacted));
+                }
+                return Ok(serde_json::to_value(&self.registry)?);
+            }
             "code_status" => {
                 if request.arguments != json!({}) {
                     return Err(invalid("code_status takes empty arguments").into());
@@ -819,7 +861,7 @@ impl Server {
                 };
                 self.add_status_metrics(&mut value, &effective)?;
                 return if request.compact {
-                    Ok(value)
+                    Ok(Self::compact_result(&request.name, value))
                 } else {
                     Ok(json!({"root":root,"data":value}))
                 };
@@ -1803,6 +1845,54 @@ impl Server {
     }
 
     fn compact_result(name: &str, mut result: Value) -> Value {
+        if name == "code_status"
+            && let Some(object) = result.as_object_mut()
+        {
+            let is_loaded = object.get("index_state").and_then(Value::as_str) == Some("loaded");
+            let keep_recent = if is_loaded { 1 } else { 3 };
+            if let Some(cov) = object.get_mut("coverage").and_then(Value::as_object_mut)
+                && let Some(globs_len) = cov
+                    .get("globs")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .filter(|&len| len > 12)
+            {
+                if let Some(globs) = cov.get_mut("globs").and_then(Value::as_array_mut) {
+                    globs.truncate(8);
+                }
+                cov.insert("globs_count".into(), json!(globs_len));
+            }
+            if let Some(perf) = object.get_mut("performance").and_then(Value::as_object_mut) {
+                for key in [
+                    "recent_requests",
+                    "recent_clients",
+                    "recent_background",
+                    "evictions",
+                ] {
+                    if let Some(arr_len) = perf
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .filter(|&len| len > keep_recent)
+                    {
+                        if let Some(arr) = perf.get_mut(key).and_then(Value::as_array_mut) {
+                            let drain_count = arr.len().saturating_sub(keep_recent);
+                            arr.drain(..drain_count);
+                        }
+                        perf.insert(format!("{key}_total"), json!(arr_len));
+                    }
+                    if key == "recent_clients"
+                        && let Some(arr) = perf.get_mut(key).and_then(Value::as_array_mut)
+                    {
+                        for item in arr {
+                            if let Some(client_obj) = item.as_object_mut() {
+                                client_obj.remove("host_memory");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if matches!(name, "code_grep" | "code_context")
             && let Some(object) = result.as_object_mut()
         {

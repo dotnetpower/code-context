@@ -313,6 +313,16 @@ pub(crate) fn build_line_starts(text: &str) -> Result<Vec<u32>> {
 
 impl Document {
     #[inline]
+    pub(crate) fn owned_bytes(&self) -> usize {
+        std::mem::size_of::<Document>()
+            + self.path.len()
+            + self.text.capacity()
+            + self.sha256.len()
+            + self.sha256_hex.len()
+            + self.starts.capacity() * std::mem::size_of::<u32>()
+    }
+
+    #[inline]
     pub(crate) fn line(&self, index: usize) -> &str {
         let mut end = self
             .starts
@@ -354,6 +364,8 @@ pub struct Resident {
     pub(crate) policy: MemoryPolicy,
     pub(crate) max_owned_bytes: usize,
     pub(crate) ids_are_path_sorted: bool,
+    pub(crate) doc_owned_bytes: usize,
+    pub(crate) posting_heap_bytes: usize,
     pub stats: Stats,
 }
 
@@ -412,6 +424,7 @@ impl Resident {
         let mut documents = Vec::new();
         let mut source_bytes = 0;
         let mut line_count = 0usize;
+        let mut doc_owned_bytes = 0usize;
         let mut digest = Sha256::new();
         for path in paths {
             let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
@@ -432,13 +445,15 @@ impl Resident {
             if line_count > policy.max_total_lines {
                 return Err(invalid("resident line count exceeds configured limit").into());
             }
-            documents.push(Document {
+            let doc = Document {
                 path: Arc::from(name),
                 text,
                 starts,
                 sha256,
                 sha256_hex,
-            });
+            };
+            doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
+            documents.push(doc);
             let floor = source_bytes
                 .saturating_add(inventory.total_path_bytes.saturating_mul(2))
                 .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
@@ -481,6 +496,8 @@ impl Resident {
             policy,
             max_owned_bytes,
             ids_are_path_sorted: true,
+            doc_owned_bytes,
+            posting_heap_bytes: 0,
             stats,
         };
         if indexed {
@@ -623,6 +640,7 @@ impl Resident {
             self.stats.index_build_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.stats.unique_trigrams = index.len();
             self.stats.postings = count;
+            self.posting_heap_bytes = index.values().map(PostingList::heap_bytes).sum();
             self.postings = Some(index);
             return Ok(());
         }
@@ -759,29 +777,14 @@ impl Resident {
         self.stats.index_build_ms = start.elapsed().as_secs_f64() * 1000.0;
         self.stats.unique_trigrams = index.len();
         self.stats.postings = count;
+        self.posting_heap_bytes = index.values().map(PostingList::heap_bytes).sum();
         self.postings = Some(index);
         Ok(())
     }
 
     pub(crate) fn estimated_bytes(&self) -> usize {
-        let source: usize = self
-            .documents
-            .iter()
-            .map(|d| {
-                std::mem::size_of::<Document>()
-                    + d.path.len()
-                    + d.text.capacity()
-                    + d.sha256.len()
-                    + d.sha256_hex.len()
-                    + d.starts.capacity() * std::mem::size_of::<u32>()
-            })
-            .sum();
-        let index = self.postings.as_ref().map_or(0, |p| {
-            p.capacity() * (std::mem::size_of::<(u32, PostingList)>() + 1)
-                + p.values().map(PostingList::heap_bytes).sum::<usize>()
-        });
-        source
-            + index
+        self.doc_owned_bytes
+            + self.posting_bytes_estimate()
             + self
                 .stats
                 .path_bytes
@@ -791,10 +794,7 @@ impl Resident {
     pub(crate) fn posting_bytes_estimate(&self) -> usize {
         self.postings.as_ref().map_or(0, |postings| {
             postings.capacity() * (std::mem::size_of::<(u32, PostingList)>() + 1)
-                + postings
-                    .values()
-                    .map(PostingList::heap_bytes)
-                    .sum::<usize>()
+                + self.posting_heap_bytes
         })
     }
 

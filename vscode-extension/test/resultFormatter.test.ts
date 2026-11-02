@@ -225,3 +225,51 @@ void test('file discovery returns filenames without fabricated source lines', ()
     paths: ['README.md', 'src/a.rs'], total_matches: 2, truncated: false,
   }), 'files=2 truncated=false\nREADME.md\nsrc/a.rs');
 });
+
+void test('oversized tool outputs are bounded to stay under 8KiB inline host limit', () => {
+  const manyPaths = Array.from({ length: 200 }, (_, i) => `services/operator-service/src/module_${i}/routes_${i}.py`);
+  const filesOut = formatToolResult('code_files', {
+    paths: manyPaths, total_matches: 200, truncated: false, freshness,
+  });
+  assert.ok(filesOut.length <= 7600, `files length=${filesOut.length}`);
+  assert.match(filesOut, /^files=200 truncated=true\n/);
+  assert.match(filesOut, /omitted to stay inline/);
+
+  const manyMatches = Array.from({ length: 150 }, (_, i) => ({
+    path: `src/module_${i}.rs`,
+    line: i + 1,
+    text: `pub fn handler_${i}() { println!("processing item ${i} with some extra context text"); }`,
+  }));
+  const grepOut = formatToolResult('code_grep', {
+    total_matches: 150, truncated: false, matches: manyMatches, freshness,
+  });
+  assert.ok(grepOut.length <= 7600, `grep length=${grepOut.length}`);
+  assert.match(grepOut, /^matches=150 truncated=true\n/);
+
+  const bigLines = Array.from({ length: 250 }, (_, i) => `  const value_${i} = computeSomething(${i}, "payload_string_for_testing_inline_budget");`);
+  const readOut = formatToolResult('code_read', [
+    {
+      path: 'src/large.ts',
+      start: 1,
+      end: 250,
+      sha256: 'abc12345',
+      lines: bigLines,
+    },
+  ]);
+  assert.ok(readOut.length <= 7600, `read length=${readOut.length}`);
+  assert.match(readOut, /inline budget reached \(<8KiB\); next_ranges=/);
+
+  const manyWorkspaces = Array.from({ length: 50 }, (_, i) => ({
+    root: `/worktrees/project-${i}`,
+    scopes: ['.'],
+    globs: Array.from({ length: 90 }, (__, g) => `*.ext${g}`),
+    excludes: [],
+    default_excludes: true,
+    prewarm: false,
+    allow_worktrees: false,
+    managed_parent: i === 0 ? null : '/worktrees/project-0',
+    policy: { max_files: 100000, max_source_bytes: 268435456 },
+  }));
+  const wsOut = formatToolResult('code_workspaces', manyWorkspaces);
+  assert.ok(wsOut.length <= 7600, `workspaces length=${wsOut.length}`);
+});

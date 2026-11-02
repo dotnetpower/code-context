@@ -223,6 +223,12 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
   assert.deepEqual(mdAnchorRead.ranges, [
     { path: 'docs/SETUP.md#windows-agent-sessions', start: 1, end: 120 },
   ]);
+  const mdAnchorWithStart1 = buildReadArguments({
+    ranges: [{ path: 'docs/roadmap.pptx#toc', start: 1, end: 120 }],
+  });
+  assert.deepEqual(mdAnchorWithStart1.ranges, [
+    { path: 'docs/roadmap.pptx#toc', start: 1, end: 120 },
+  ]);
   assert.equal(normalizeGlobPattern('*.ts, *.tsx'), '*.{ts,tsx}');
   assert.equal(normalizeGlobPattern('*.{ts, tsx, js}'), '*.{ts,tsx,js}');
   assert.equal(wslCandidateToLinuxPath('file://wsl.localhost/Ubuntu/home/user/repo'), '/home/user/repo');

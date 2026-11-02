@@ -3,8 +3,8 @@ use crate::resident::{Document, MAX_POSTINGS, Resident, TrigramMap, trigram};
 use crate::workspace::Workspace;
 use crate::{Result, invalid};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -183,11 +183,11 @@ impl Resident {
         if changed.is_empty() && !verify_all {
             return Ok(self.unchanged_update(started));
         }
-        let allowed: HashSet<PathBuf> = current.keys().map(PathBuf::from).collect();
         let mut replacements = Vec::new();
         let mut source_bytes = self.stats.source_bytes;
         let mut line_count = self.stats.line_count;
         let mut posting_count = self.stats.postings;
+        let mut projected_path_bytes = self.stats.path_bytes;
         let mut staged_bytes = 0usize;
         let mut staged_postings = 0usize;
         let current_owned = self.estimated_bytes();
@@ -206,10 +206,22 @@ impl Resident {
         };
         for path in targets {
             let old = self.paths.get(path.as_str()).map(|id| &self.documents[*id]);
-            let new = if allowed.contains(Path::new(&path)) {
-                let bytes = workspace.read_allowed_with_limit(
-                    &path,
-                    &allowed,
+            let is_allowed = if current.contains_key(path.as_str()) {
+                crate::workspace::safe_relative(Path::new(&path))?;
+                true
+            } else {
+                let p = Path::new(&path);
+                let normalized = crate::workspace::normalize(p);
+                if normalized.to_str().is_some_and(|n| current.contains_key(n)) {
+                    crate::workspace::safe_relative(p)?;
+                    true
+                } else {
+                    false
+                }
+            };
+            let new = if is_allowed {
+                let bytes = workspace.read_known_with_limit(
+                    Path::new(&path),
                     self.policy.max_file_bytes,
                 )?;
                 source_files_read += 1;
@@ -220,6 +232,11 @@ impl Resident {
             };
             if old.map(|d| &d.sha256) == new.as_ref().map(|d| &d.sha256) {
                 continue;
+            }
+            if old.is_none() && new.is_some() {
+                projected_path_bytes = projected_path_bytes.saturating_add(path.len());
+            } else if old.is_some() && new.is_none() {
+                projected_path_bytes = projected_path_bytes.saturating_sub(path.len());
             }
             let old_keys = match old {
                 Some(document) => keys(&document.text, self.policy.max_unique_trigrams_per_file)?,
@@ -307,7 +324,6 @@ impl Resident {
         if unique_trigrams > self.policy.max_unique_trigrams {
             return Err(invalid("incremental update exceeds max_unique_trigrams").into());
         }
-        let projected_path_bytes = current.keys().map(String::len).sum::<usize>();
         let projected_owned = source_bytes
             .saturating_add(projected_path_bytes.saturating_mul(2))
             .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
@@ -337,20 +353,34 @@ impl Resident {
                 if let Some(index) = &mut self.postings {
                     for key in old_keys {
                         if let Some(list) = index.get_mut(&key) {
+                            let before_heap = list.heap_bytes();
                             list.remove_sorted(id as u32);
                             if list.is_empty() {
+                                self.posting_heap_bytes =
+                                    self.posting_heap_bytes.saturating_sub(before_heap);
                                 index.remove(&key);
+                            } else {
+                                let after_heap = list.heap_bytes();
+                                self.posting_heap_bytes = self
+                                    .posting_heap_bytes
+                                    .saturating_add(after_heap)
+                                    .saturating_sub(before_heap);
                             }
                         }
                     }
                 }
-                self.documents[id] = Document {
+                let empty_doc = Document {
                     path: Arc::from(""),
                     text: String::new(),
                     starts: Vec::new(),
                     sha256: [0; 32],
                     sha256_hex: Arc::from(""),
                 };
+                self.doc_owned_bytes = self
+                    .doc_owned_bytes
+                    .saturating_add(empty_doc.owned_bytes())
+                    .saturating_sub(self.documents[id].owned_bytes());
+                self.documents[id] = empty_doc;
                 if new.is_none() {
                     self.free_ids.push(id);
                 }
@@ -377,13 +407,26 @@ impl Resident {
                 };
                 if let Some(index) = &mut self.postings {
                     for key in new_keys {
-                        index.entry(key).or_default().insert_sorted(id as u32);
+                        let list = index.entry(key).or_default();
+                        let before_heap = list.heap_bytes();
+                        list.insert_sorted(id as u32);
+                        let after_heap = list.heap_bytes();
+                        self.posting_heap_bytes = self
+                            .posting_heap_bytes
+                            .saturating_add(after_heap)
+                            .saturating_sub(before_heap);
                     }
                 }
                 self.paths.insert(Arc::from(path), id);
+                let new_owned = new.owned_bytes();
                 if id == self.documents.len() {
+                    self.doc_owned_bytes = self.doc_owned_bytes.saturating_add(new_owned);
                     self.documents.push(new);
                 } else {
+                    self.doc_owned_bytes = self
+                        .doc_owned_bytes
+                        .saturating_add(new_owned)
+                        .saturating_sub(self.documents[id].owned_bytes());
                     self.documents[id] = new;
                 }
             }
