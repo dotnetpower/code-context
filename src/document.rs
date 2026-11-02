@@ -122,13 +122,19 @@ fn find_eocd(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let min_offset = bytes.len().saturating_sub(22 + 65_535);
-    for pos in (min_offset..=bytes.len() - 22).rev() {
+    let mut search_end = bytes.len() - 21;
+    while search_end > min_offset {
+        let Some(rel) = memchr::memrchr(0x50, &bytes[min_offset..search_end]) else {
+            break;
+        };
+        let pos = min_offset + rel;
         if bytes[pos..pos + 4] == [0x50, 0x4b, 0x05, 0x06] {
             let comment_len = usize::from(read_u16_le(bytes, pos + 20)?);
             if pos + 22 + comment_len <= bytes.len() {
                 return Some(pos);
             }
         }
+        search_end = pos;
     }
     None
 }
@@ -359,9 +365,20 @@ impl<'a> BitReader<'a> {
 
     fn read_exact_bytes(&mut self, len: usize, out: &mut Vec<u8>) -> Result<()> {
         self.align_byte();
-        for _ in 0..len {
-            let b = self.read_bits(8)? as u8;
-            out.push(b);
+        out.reserve(len);
+        let mut remaining = len;
+        while self.bit_count >= 8 && remaining > 0 {
+            out.push((self.bit_buf & 0xff) as u8);
+            self.bit_buf >>= 8;
+            self.bit_count -= 8;
+            remaining -= 1;
+        }
+        if remaining > 0 {
+            if self.byte_pos.saturating_add(remaining) > self.data.len() {
+                return Err(invalid("unexpected EOF in DEFLATE stored block").into());
+            }
+            out.extend_from_slice(&self.data[self.byte_pos..self.byte_pos + remaining]);
+            self.byte_pos += remaining;
         }
         Ok(())
     }
@@ -371,6 +388,7 @@ struct HuffmanTree {
     counts: [u16; 16],
     symbols: Vec<u16>,
     max_bits: u8,
+    fast_table: [u16; 512],
 }
 
 impl HuffmanTree {
@@ -387,41 +405,77 @@ impl HuffmanTree {
             }
         }
         let mut offsets = [0u16; 16];
+        let mut next_code = [0u16; 16];
         let mut total = 0u16;
+        let mut code = 0u16;
         for bits in 1..=15 {
             offsets[bits] = total;
             total = total.saturating_add(counts[bits]);
+            code = (code + counts[bits - 1]) << 1;
+            next_code[bits] = code;
         }
         let mut symbols = vec![0u16; usize::from(total)];
+        let mut fast_table = [0u16; 512];
         for (sym, &len) in lengths.iter().enumerate() {
             if len > 0 {
-                let idx = usize::from(offsets[usize::from(len)]);
-                offsets[usize::from(len)] += 1;
+                let len_usize = usize::from(len);
+                let idx = usize::from(offsets[len_usize]);
+                offsets[len_usize] += 1;
                 symbols[idx] = sym as u16;
+                let c = next_code[len_usize];
+                next_code[len_usize] = c.wrapping_add(1);
+                if len <= 9 && sym < 1024 {
+                    let rev = c.reverse_bits() >> (16 - len);
+                    let entry = ((u16::from(len)) << 10) | (sym as u16);
+                    let step = 1usize << len;
+                    let mut slot = usize::from(rev);
+                    while slot < 512 {
+                        fast_table[slot] = entry;
+                        slot += step;
+                    }
+                }
             }
         }
         Ok(Self {
             counts,
             symbols,
             max_bits,
+            fast_table,
         })
     }
 
-    fn fixed_lit_len() -> Self {
-        let mut lengths = [0u8; 288];
-        lengths[..144].fill(8);
-        lengths[144..256].fill(9);
-        lengths[256..280].fill(7);
-        lengths[280..288].fill(8);
-        Self::from_lengths(&lengths).expect("valid fixed literal/length tree")
+    fn fixed_lit_len() -> &'static Self {
+        static TREE: std::sync::OnceLock<HuffmanTree> = std::sync::OnceLock::new();
+        TREE.get_or_init(|| {
+            let mut lengths = [0u8; 288];
+            lengths[..144].fill(8);
+            lengths[144..256].fill(9);
+            lengths[256..280].fill(7);
+            lengths[280..288].fill(8);
+            Self::from_lengths(&lengths).expect("valid fixed literal/length tree")
+        })
     }
 
-    fn fixed_dist() -> Self {
-        let lengths = [5u8; 32];
-        Self::from_lengths(&lengths).expect("valid fixed distance tree")
+    fn fixed_dist() -> &'static Self {
+        static TREE: std::sync::OnceLock<HuffmanTree> = std::sync::OnceLock::new();
+        TREE.get_or_init(|| {
+            let lengths = [5u8; 32];
+            Self::from_lengths(&lengths).expect("valid fixed distance tree")
+        })
     }
 
+    #[inline]
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        reader.ensure_bits(15);
+        let fast = self.fast_table[(reader.bit_buf & 0x1ff) as usize];
+        if fast != 0 {
+            let len = (fast >> 10) as u8;
+            if reader.bit_count >= len {
+                reader.bit_buf >>= len;
+                reader.bit_count -= len;
+                return Ok(fast & 0x3ff);
+            }
+        }
         let mut code = 0i32;
         let mut first = 0i32;
         let mut index = 0i32;
@@ -446,7 +500,7 @@ impl HuffmanTree {
 
 pub fn inflate_raw_bounded(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(input);
-    let mut out = Vec::with_capacity(input.len().saturating_mul(2).min(max_output).min(65_536));
+    let mut out = Vec::with_capacity(input.len().saturating_mul(3).min(max_output).min(262_144));
     loop {
         let bfinal = reader.read_bits(1)?;
         let btype = reader.read_bits(2)?;
@@ -462,12 +516,17 @@ pub fn inflate_raw_bounded(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
                 }
                 reader.read_exact_bytes(len, &mut out)?;
             }
-            1 | 2 => {
-                let (lit_tree, dist_tree) = if btype == 1 {
-                    (HuffmanTree::fixed_lit_len(), HuffmanTree::fixed_dist())
-                } else {
-                    decode_dynamic_trees(&mut reader)?
-                };
+            1 => {
+                decode_huffman_block(
+                    &mut reader,
+                    HuffmanTree::fixed_lit_len(),
+                    HuffmanTree::fixed_dist(),
+                    &mut out,
+                    max_output,
+                )?;
+            }
+            2 => {
+                let (lit_tree, dist_tree) = decode_dynamic_trees(&mut reader)?;
                 decode_huffman_block(&mut reader, &lit_tree, &dist_tree, &mut out, max_output)?;
             }
             _ => return Err(invalid("reserved DEFLATE block type 3").into()),
@@ -590,9 +649,16 @@ fn decode_huffman_block(
                     return Err(invalid("DEFLATE output exceeds max_output budget").into());
                 }
                 let start = out.len() - distance;
-                for i in 0..length {
-                    let b = out[start + i];
-                    out.push(b);
+                if distance == 1 {
+                    let b = out[start];
+                    out.resize(out.len() + length, b);
+                } else if distance >= length {
+                    out.extend_from_within(start..start + length);
+                } else {
+                    for i in 0..length {
+                        let b = out[start + i];
+                        out.push(b);
+                    }
                 }
             }
             _ => return Err(invalid("invalid literal/length symbol in DEFLATE").into()),
@@ -1001,8 +1067,12 @@ pub fn extract_docx_xml_paragraphs(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let mut cursor = 0usize;
+    let mut cached_next_tbl = find_word_tag(xml, 0, "w:tbl");
     while cursor < xml.len() {
-        let next_tbl = find_word_tag(xml, cursor, "w:tbl");
+        if cached_next_tbl.is_some_and(|pos| pos < cursor) {
+            cached_next_tbl = find_word_tag(xml, cursor, "w:tbl");
+        }
+        let next_tbl = cached_next_tbl;
         let next_p = find_word_tag(xml, cursor, "w:p");
         match (next_tbl, next_p) {
             (Some(tbl_pos), Some(p_pos)) if tbl_pos < p_pos => {
@@ -1082,8 +1152,24 @@ fn find_matching_close_tag(xml: &str, open_pos: usize, tag_name: &str) -> Option
 
 fn find_word_tag(xml: &str, from: usize, tag_name: &str) -> Option<usize> {
     let mut search = from;
-    let needle = format!("<{tag_name}");
-    while let Some(rel) = xml[search..].find(&needle) {
+    let owned_needle;
+    let needle: &str = match tag_name {
+        "w:p" => "<w:p",
+        "w:tbl" => "<w:tbl",
+        "w:tr" => "<w:tr",
+        "w:tc" => "<w:tc",
+        "a:tr" => "<a:tr",
+        "a:tc" => "<a:tc",
+        "a:tbl" => "<a:tbl",
+        "table:table" => "<table:table",
+        "table:table-row" => "<table:table-row",
+        "table:table-cell" => "<table:table-cell",
+        _ => {
+            owned_needle = format!("<{tag_name}");
+            &owned_needle
+        }
+    };
+    while let Some(rel) = xml[search..].find(needle) {
         let pos = search + rel;
         let next_byte = xml.as_bytes().get(pos + needle.len()).copied().unwrap_or(b' ');
         if next_byte == b'>' || next_byte == b'/' || next_byte.is_ascii_whitespace() {
@@ -1335,6 +1421,9 @@ fn extract_word_table(tbl_xml: &str, rels: &BTreeMap<String, String>) -> Vec<Str
 }
 
 fn collapse_inline_spaces(s: &str) -> String {
+    if !s.contains("  ") {
+        return s.to_owned();
+    }
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for ch in s.chars() {

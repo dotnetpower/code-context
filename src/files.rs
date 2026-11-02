@@ -106,39 +106,44 @@ pub fn find<'a>(
         }
         return Ok(result);
     }
-    let candidates: Vec<&'a str> = candidates.into_iter().collect();
-    let mut matches: Vec<&'a str> = Vec::with_capacity(candidates.len().min(request.limit));
-    matches.extend(candidates.iter().copied().filter(|candidate| {
-            if !crate::query::path_matches_str(candidate, &prefixes) {
-                return false;
-            }
-            if let Some(suffix) = ext_suffix {
-                candidate.ends_with(suffix)
-                    || crate::document::matches_extension_case_insensitive(candidate, suffix)
-            } else if let Some(suffixes) = &brace_suffixes {
-                suffixes.iter().any(|s| {
-                    candidate.ends_with(s.as_str())
-                        || crate::document::matches_extension_case_insensitive(
-                            candidate,
-                            s.as_str(),
-                        )
+    let is_fuzzy_eligible = normalized_glob.len() >= 2
+        && !normalized_glob.contains(['*', '?', '[', ']', '{', '}', '/', '\\', '.']);
+    let mut fuzzy_backup: Vec<&'a str> = Vec::new();
+    let mut matches: Vec<&'a str> = Vec::with_capacity(request.limit.min(256));
+    for candidate in candidates {
+        if !crate::query::path_matches_str(candidate, &prefixes) {
+            continue;
+        }
+        if is_fuzzy_eligible {
+            fuzzy_backup.push(candidate);
+        }
+        let matched = if let Some(suffix) = ext_suffix {
+            candidate.ends_with(suffix)
+                || crate::document::matches_extension_case_insensitive(candidate, suffix)
+        } else if let Some(suffixes) = &brace_suffixes {
+            suffixes.iter().any(|s| {
+                candidate.ends_with(s.as_str())
+                    || crate::document::matches_extension_case_insensitive(candidate, s.as_str())
+            })
+        } else if let Some((dir_prefix, suffixes)) = &scoped_ext {
+            candidate.starts_with(*dir_prefix)
+                && candidate.as_bytes().get(dir_prefix.len()) == Some(&b'/')
+                && suffixes.iter().any(|s| {
+                    crate::query::ends_with_ignore_ascii_case(
+                        &candidate[dir_prefix.len() + 1..],
+                        s.as_str(),
+                    )
                 })
-            } else if let Some((dir_prefix, suffixes)) = &scoped_ext {
-                candidate.starts_with(*dir_prefix)
-                    && candidate.as_bytes().get(dir_prefix.len()) == Some(&b'/')
-                    && suffixes
-                        .iter()
-                        .any(|s| candidate[dir_prefix.len() + 1..].ends_with(s.as_str()))
-            } else {
-                let path = Path::new(candidate);
-                let glob = glob.as_ref().expect("compiled glob");
-                glob.is_match(path) || path.file_name().is_some_and(|name| glob.is_match(name))
-            }
-        }));
-    if matches.is_empty()
-        && normalized_glob.len() >= 2
-        && !normalized_glob.contains(['*', '?', '[', ']', '{', '}', '/', '\\', '.'])
-    {
+        } else {
+            let path = Path::new(candidate);
+            let glob = glob.as_ref().expect("compiled glob");
+            glob.is_match(path) || path.file_name().is_some_and(|name| glob.is_match(name))
+        };
+        if matched {
+            matches.push(candidate);
+        }
+    }
+    if matches.is_empty() && is_fuzzy_eligible {
         let stem_lower = normalized_glob.to_ascii_lowercase();
         let stem_alnum: String = stem_lower
             .chars()
@@ -148,12 +153,9 @@ pub fn find<'a>(
             .split(|c: char| !c.is_ascii_alphanumeric())
             .filter(|s| !s.is_empty())
             .collect();
-        matches = candidates
+        matches = fuzzy_backup
             .into_iter()
             .filter(|candidate| {
-                if !crate::query::path_matches_str(candidate, &prefixes) {
-                    return false;
-                }
                 Path::new(candidate)
                     .file_name()
                     .and_then(|n| n.to_str())

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.23.0
+
+- Add live LLM model, token, cache-hit, and AIC/USD cost-savings telemetry
+  across `cctx usage --hours 24` (`--json`), `audit_agent_tool_adoption.py
+  --pretty`, and the VS Code status bar badge, `MarkdownString` hover tooltip,
+  and `Code Context: Show Native Tool Status` dashboard.
+- Fix WSL2 adaptive memory ceiling calculation so reclaimable Linux page cache
+  (`Cached` + `Buffers`) is not double-subtracted against Windows host free
+  memory, restoring up to 24 concurrent resident roots (`34.4 GiB` target).
+- Complete 55 performance and stability optimizations across the Rust backend
+  and VS Code extension: 6-slot inline `PostingList`, single-inventory cold
+  load (`full_inventory_scans: 2 -> 1`, **29.115 ms** cold sync median — 3.39×
+  faster than v0.14), cached directory `lstat` verification (**-79.2%**
+  syscalls), single-pass SHA-256 chaining (**-50%** hash work), adaptive 200 µs
+  `rg` subprocess polling (**13.1×** faster shallow scans), 9-bit $O(1)$
+  DEFLATE Huffman lookup tables (**5.4×** faster `.pptx`/`.docx` extraction),
+  cached `w:tbl` scanning (**8.5×** faster DOCX parsing), and $O(1)$ multi-chunk
+  IPC buffer assembly.
+
 ## 0.22.0
 
 - Eliminate false-positive watcher directory and full-workspace scans on `.py`

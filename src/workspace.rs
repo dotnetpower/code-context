@@ -423,9 +423,10 @@ impl Workspace {
         }
         command.args(["--files", "--null", "--"]).args(targets);
         let output = capture(&mut command)?;
-        let mut paths = HashSet::new();
+        let estimated_count = bytecount_zero(&output).min(policy.max_files);
+        let mut paths = HashSet::with_capacity(estimated_count);
         let mut stamps = std::collections::BTreeMap::new();
-        let mut checked_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut checked_dirs: HashSet<PathBuf> = HashSet::with_capacity((estimated_count / 4).max(16));
         let mut total_path_bytes = 0usize;
         let mut metadata_source_bytes = 0u64;
         for path in output.split(|b| *b == 0).filter(|p| !p.is_empty()) {
@@ -532,6 +533,26 @@ impl Workspace {
     pub fn read_known_with_limit(&self, path: &Path, max_file_bytes: usize) -> Result<Vec<u8>> {
         safe_relative(path)?;
         let metadata = reject_symlinks_metadata(&self.root, path)?;
+        self.read_verified_file_bytes(path, &metadata, max_file_bytes)
+    }
+
+    pub(crate) fn read_known_with_limit_cached(
+        &self,
+        path: &Path,
+        max_file_bytes: usize,
+        checked_dirs: &mut HashSet<PathBuf>,
+    ) -> Result<Vec<u8>> {
+        safe_relative(path)?;
+        let metadata = reject_symlinks_metadata_cached(&self.root, path, checked_dirs)?;
+        self.read_verified_file_bytes(path, &metadata, max_file_bytes)
+    }
+
+    fn read_verified_file_bytes(
+        &self,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+        max_file_bytes: usize,
+    ) -> Result<Vec<u8>> {
         if metadata.len() > max_file_bytes as u64 {
             return Err(invalid(format!(
                 "binary file or file larger than configured limit is unsupported: {}",
@@ -746,6 +767,11 @@ fn reject_symlinks_metadata_cached(
     Ok(meta)
 }
 
+#[inline]
+fn bytecount_zero(bytes: &[u8]) -> usize {
+    memchr::memchr_iter(0, bytes).count()
+}
+
 pub fn capture(command: &mut Command) -> Result<Vec<u8>> {
     capture_with_timeout(command, COMMAND_TIMEOUT)
 }
@@ -782,7 +808,7 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         .name("cctx-rg-stdout".into())
         .stack_size(IO_WORKER_STACK_BYTES)
         .spawn(move || {
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(8192);
             stdout
                 .take(MAX_CAPTURE as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -815,6 +841,7 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
     };
     let started = Instant::now();
     let mut poll_error = None;
+    let mut sleep_us = 200_u64;
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (status, false),
@@ -833,7 +860,8 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
             }
             break (child.wait()?, true);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_micros(sleep_us));
+        sleep_us = (sleep_us * 2).min(5_000);
     };
     let stdout = stdout_reader
         .join()

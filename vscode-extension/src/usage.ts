@@ -247,7 +247,12 @@ export class UsageSummary {
           continue;
         }
         let lastModel = 'unknown';
-        for (const line of raw.split('\n')) {
+        let lineStart = 0;
+        while (lineStart < raw.length) {
+          const nlIdx = raw.indexOf('\n', lineStart);
+          const lineEnd = nlIdx >= 0 ? nlIdx : raw.length;
+          const line = raw.slice(lineStart, lineEnd);
+          lineStart = lineEnd + 1;
           if (!line.includes('"session.usage_record"') && !line.includes('"tool.execution_')) {
             continue;
           }

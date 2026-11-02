@@ -5,7 +5,7 @@
 # Code Context
 
 Fast local file discovery, source search, and smart block-clamped context for coding agents.
-Runs as a **native VS Code Language Model Tools extension** (`#cctxNativeContext`, `#cctxNativeGrep`, `#cctxNativeRead`, `#cctxNativeFiles`) and MCP server backed by one shared Rust cache on **Linux, native Windows (`cctx.exe`), WSL, and SSH**.
+Runs as a **native VS Code Language Model Tools extension** (`#cctxNativeContext`, `#cctxNativeGrep`, `#cctxNativeRead`, `#cctxNativeFiles`) and MCP server backed by one shared Rust cache on **Linux, native Windows (`cctx.exe`), WSL, and SSH**, with `<8 KiB` inline response guards, rich document anchors (`#toc`, `#slide-N-M`, `#heading`), and a live model/token/cost dashboard (`cctx usage`).
 A cold cache returns immediately so normal tools can continue.
 
 ## Install
@@ -39,30 +39,32 @@ use the same extension identity.
 ## Measured performance & token acceleration
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-mixed retrieval suite averaged **15.28× faster with a warm CCTX cache**
-(95% CI **15.06–15.49×**, up from 6.83× in v0.14): **3.944 → 0.258 ms per operation**.
-Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%** and accelerates end-to-end coding agent completion by **24.7%**.
+mixed retrieval suite averaged **15.20× faster with a warm CCTX cache**
+(95% CI **14.53–15.84×**, up from 6.83× in v0.14): **4.450 → 0.293 ms per operation**, with a **29.115 ms** cold sync median (down from 98.813 ms in v0.14).
+Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%**, rich document (`#toc` / `#slide-N`) reads by **86.3–98.9%**, and end-to-end coding agent wall time by **24.7%**.
 
 ![Retrieval latency, paired-session speedup, Rust/Python token savings, and agent acceleration](benchmarks/results/aks-store-demo/latency-speedup.png)
 
 | Retrieval task (AKS Store Demo) | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.385 ms | 0.270 ms | 16.21× |
-| Literal search | 5.151 ms | 0.251 ms | 20.54× |
-| Search + context | 5.304 ms | 0.286 ms | 18.55× |
-| Known file read + hash | **0.081 ms** | 0.219 ms | **0.37× — slower** |
-| Fixed mixed suite | 3.944 ms | 0.258 ms | 15.28× |
+| Filename discovery | 4.923 ms | 0.307 ms | 16.03× |
+| Literal search | 5.885 ms | 0.289 ms | 20.35× |
+| Search + context | 5.935 ms | 0.317 ms | 18.70× |
+| Known file read + hash | **0.083 ms** | 0.251 ms | **0.33× — slower** |
+| Fixed mixed suite | 4.450 ms | 0.293 ms | 15.20× |
 
-| Token & agent acceleration benchmark | Baseline (`rg` + `view`) | With CCTX (`code_context`) | Reduction / speedup |
+| Token & agent acceleration benchmark | Baseline (`rg` + `view`) | With CCTX (`code_context` / `code_read`) | Reduction / speedup |
 |---|---:|---:|---:|
 | Rust 6-symbol lookup payload tokens | 15,028 tok (100L) / 25,133 tok (200L) | **4,031 tok** (6 calls vs 20, **10.3×** faster) | **-73.2% to -84.0% tokens** |
 | Python 6-symbol lookup payload tokens | 13,997 tok (100L) / 24,609 tok (200L) | **2,141 tok** (6 calls vs 15, **13.16×** faster) | **-84.7% to -91.3% tokens** |
+| Rich documents (`.pptx`/`.docx`/`.md` `#toc` & `#slide-N`) | Full-document read | **Virtual `#toc` + `#slide-N-M` (5.4× faster DEFLATE)** | **-86.3% to -98.9% tokens** |
 | Copilot A/B agent tool calls & LLM turns | 7.00 calls / 5.00 turns | **2.67 calls / 3.67 turns** | **-61.9% calls · -26.7% turns** |
 | Copilot A/B agent payload tokens & AIU cost | 6,360 tok / 4.76B nanoAIU | **3,177 tok / 3.55B nanoAIU** | **-50.0% tokens · -25.4% cost** |
 | Copilot A/B end-to-end task wall time | 20.31 s | **15.30 s** (100% accuracy both) | **-24.7% completion time** |
+| Live multi-session telemetry (`cctx usage --hours 24`) | Unmonitored | **Per-model tokens, 96.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
 
 Eight daemon sessions, 40 rounds, 28 tasks, **8,960 correctness-checked pairs**.
-Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.233 ms median**, not a warm-cache speedup.
+Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.837 ms median**, not a warm-cache speedup.
 See [method, cold-start chart, token suites, raw samples, and reproduction](docs/BENCHMARKS.md) for uncertainty and limitations.
 
 ## Learn more

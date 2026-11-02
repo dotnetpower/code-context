@@ -375,7 +375,8 @@ impl Watched {
 
     pub fn new_with_budget(spec: Spec, max_owned_bytes: usize) -> Result<Self> {
         let workspace = spec.workspace()?;
-        let inventory = workspace.files_limited(&spec.policy)?;
+        let mut inventory = workspace.files_limited(&spec.policy)?;
+        let stamps = std::mem::take(&mut inventory.stamps);
         let watched_dirs = workspace.watch_directories_for(
             inventory.files.iter().map(std::path::PathBuf::as_path),
             &spec.policy,
@@ -395,6 +396,7 @@ impl Watched {
         }
         let exclude_filter = exclude_filter.build()?;
         let root = workspace.root.clone();
+        let scopes_for_watcher = spec.scopes.clone();
         let mut watcher = RecommendedWatcher::new(
             move |event: notify::Result<Event>| {
                 // Do not let our own source reads fill the invalidation queue.
@@ -423,7 +425,10 @@ impl Watched {
                                 .file_name()
                                 .is_some_and(|name| name == ".ignore" || name == ".gitignore")
                             || path.strip_prefix(&root).is_ok_and(|relative| {
-                                if exclusion_policy::is_profile_marker(relative) {
+                                if exclusion_policy::is_profile_marker_for_scopes(
+                                    relative,
+                                    &scopes_for_watcher,
+                                ) {
                                     return true;
                                 }
                                 let is_excluded = relative
@@ -472,7 +477,6 @@ impl Watched {
             max_owned_bytes.saturating_sub(ROOT_RUNTIME_HEADROOM),
             inventory,
         )?;
-        let stamps = stamps(&workspace, &spec.policy)?;
         let watcher_policy = crate::workspace::CandidatePolicy::compile(workspace.candidate_policy_key())
             .ok()
             .map(|policy| (spec.clone(), policy));
@@ -503,31 +507,13 @@ impl Watched {
             transparent_read_recoveries: 0,
             transparent_read_recovery_failures: 0,
             io_profile: IoProfile {
-                full_inventory_scans: 2,
+                full_inventory_scans: 1,
                 ..IoProfile::default()
             },
             cached_workspace,
             watcher_policy,
             read_policy: None,
         };
-        // Inventory precedes watch installation so ignored dependency trees are
-        // never watched. Reconcile membership discovered by the post-load stamp
-        // pass, then drain events captured while source bytes were loading.
-        let known: BTreeSet<_> = watched
-            .resident
-            .paths
-            .keys()
-            .map(|path| path.to_string())
-            .collect();
-        let current: BTreeSet<_> = watched.stamps.keys().cloned().collect();
-        let changed: BTreeSet<_> = known.symmetric_difference(&current).cloned().collect();
-        if !changed.is_empty() {
-            watched.last_update =
-                watched
-                    .resident
-                    .update(&workspace, &changed, &watched.stamps, false)?;
-            watched.mutation_epoch = watched.mutation_epoch.wrapping_add(1);
-        }
         let overflowed = watched.overflow.load(Ordering::Acquire);
         watched.synchronize(overflowed)?;
         Ok(watched)
@@ -721,7 +707,7 @@ impl Watched {
                         reconcile = true;
                         continue;
                     }
-                    if exclusion_policy::is_profile_marker(path)
+                    if exclusion_policy::is_profile_marker_for_scopes(path, &self.spec.scopes)
                         && (!self.stamps.contains_key(name) || !self.spec.root.join(path).is_file())
                         && self.profile_exclusions_changed()?
                     {
@@ -1564,7 +1550,7 @@ impl Watched {
     }
 
     pub(crate) fn status_snapshot(&self) -> Result<Value> {
-        let workspace = self.spec.workspace()?;
+        let workspace = self.workspace()?;
         let exclusion_summary = workspace.exclusion_summary();
         Ok(json!({"root":self.spec.root,"index_state":"loaded",
                     "status_freshness":"observational snapshot; status does not load, reconcile, or hash source",
@@ -1689,7 +1675,7 @@ impl Watched {
             } else {
                 match std::fs::symlink_metadata(self.spec.root.join(&path)) {
                     Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                        let reason = self.spec.workspace()?.unindexed_reason(&name, &self.spec.policy)?;
+                        let reason = self.workspace()?.unindexed_reason(&name, &self.spec.policy)?;
                         let action = if reason == "not_yet_indexed" {
                             "Use code_read for known saved ranges or a permitted host read; do not interpret this as absence.".into()
                         } else if reason == "unsupported_glob" {

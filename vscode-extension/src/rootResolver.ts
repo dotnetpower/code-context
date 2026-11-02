@@ -3,6 +3,34 @@ import { basename, isAbsolute, join, relative, resolve, sep, posix } from 'node:
 
 import type { WorkspaceSpec } from './types.js';
 
+const WIN_DRIVE_PREFIX_RE = /^[a-z]:(?=[\\/])/u;
+const WSL_UNC_RE = /^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+(\\.+)$/iu;
+const WSL_FILE_URI_RE = /^file:\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(\/.*)$/iu;
+const UNSAFE_POSIX_CHAR_RE = /[\\\0\r\n]/u;
+const UNSAFE_WSL_TARGET_RE = /[\\:\0\r\n]/u;
+const UNSAFE_LOCAL_TARGET_RE = /[\\/:\0\r\n]/u;
+const VITE_QUERY_SUFFIX_RE =
+  /\?(?:raw|url|worker|sharedworker|inline|inline-css|no-inline|react|component|used)(?:&[a-zA-Z0-9_=-]*)?$/u;
+const LEADING_DOT_SLASH_RE = /^(?:\.\/)+/u;
+const TRAILING_SLASH_RE = /\/+$/u;
+const MD_LINK_RE = /^\[[^\]]*\]\((.+)\)$/u;
+const GLOB_EXT_PART_RE = /^(?:\*\*\/)?\*\.([a-zA-Z0-9_.+-]+)$/u;
+const GLOB_STAR_DOT_PREFIX_RE = /^(?:\*\*\/)?\*\./u;
+const GLOB_BRACE_RE = /\{([^}]+)\}/gu;
+const GLOB_DEEP_EXT_RE = /^\*\*\/\*\.([a-zA-Z0-9_.+-]+|\{[a-zA-Z0-9_.,+-]+\})$/u;
+const GLOB_STAR_EXT_RE = /^\*\*\.([a-zA-Z0-9_.+-]+)$/u;
+const GLOB_DOT_EXT_RE = /^\.([a-zA-Z0-9_+-]+)$/u;
+const REMOTE_URI_RE =
+  /^(?:vscode-remote|vscode-file|vscode-userdata|vscode-insiders|cursor|windsurf|vscodium|git):\/\/[^/]+(\/.*)$/iu;
+const GH_BLOB_URI_RE =
+  /^https?:\/\/(?:github\.com|gitlab\.com)\/[^/]+\/[^/]+\/(?:-\/)?blob\/[^/]+\/(.+)$/iu;
+const MSYS_PATH_RE = /^\/([a-zA-Z])\/(Users|Program Files|Windows|projects|work|dev|repos)\/(.*)$/u;
+const PY_TRACE_RE = /^File\s+"([^"]+)"(?:,\s*line\s+(\d+))?/u;
+const HASH_LINE_RE = /^(.+?\.[^#/:]+)#L?(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$/u;
+const HASH_SLUG_RE = /^(.+?\.[^#/:]+)#([a-zA-Z0-9_.\-\p{L}]+)$/u;
+const COLON_LINE_RE = /^(.+?\.[^/:]+):(\d+)(?::\d+)?(?:-(\d+)(?::\d+)?)?(?::\s+.*|\s+.*)?$/u;
+const TSC_LINE_RE = /^(.+?\.[^/:(]+)\((\d+),\s*\d+\)$/u;
+
 export function normalizeLocalPath(path: string): string {
   if (
     sep === '/' &&
@@ -15,7 +43,7 @@ export function normalizeLocalPath(path: string): string {
     return path;
   }
   const resolved = resolve(path);
-  return resolved.replace(/^[a-z]:(?=[\\/])/u, (drive) => drive.toUpperCase());
+  return resolved.replace(WIN_DRIVE_PREFIX_RE, (drive) => drive.toUpperCase());
 }
 
 export class RootResolutionError extends Error {
@@ -27,21 +55,25 @@ export class RootResolutionError extends Error {
 
 export function wslCandidateToLinuxPath(candidate: string): string | undefined {
   const cleaned = unwrapMarkdownLinkAndQuotes(candidate);
-  const uncMatch = /^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+(\\.+)$/iu.exec(cleaned);
-  if (uncMatch?.[1]) {
-    const converted = uncMatch[1].replaceAll('\\', '/');
-    return posix.isAbsolute(converted) ? posix.normalize(converted) : undefined;
-  }
-  const fileWslMatch = /^file:\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(\/.+)$/iu.exec(cleaned);
-  if (fileWslMatch?.[1]) {
-    try {
-      const decoded = decodeURIComponent(fileWslMatch[1]);
-      return posix.isAbsolute(decoded) ? posix.normalize(decoded) : undefined;
-    } catch {
-      return posix.isAbsolute(fileWslMatch[1]) ? posix.normalize(fileWslMatch[1]) : undefined;
+  if (cleaned.startsWith('\\\\')) {
+    const uncMatch = WSL_UNC_RE.exec(cleaned);
+    if (uncMatch?.[1]) {
+      const converted = uncMatch[1].replaceAll('\\', '/');
+      return posix.isAbsolute(converted) ? posix.normalize(converted) : undefined;
     }
   }
-  if (posix.isAbsolute(cleaned) && !/[\\\0\r\n]/u.test(cleaned)) {
+  if (cleaned.startsWith('file://')) {
+    const fileWslMatch = WSL_FILE_URI_RE.exec(cleaned);
+    if (fileWslMatch?.[1]) {
+      try {
+        const decoded = decodeURIComponent(fileWslMatch[1]);
+        return posix.isAbsolute(decoded) ? posix.normalize(decoded) : undefined;
+      } catch {
+        return posix.isAbsolute(fileWslMatch[1]) ? posix.normalize(fileWslMatch[1]) : undefined;
+      }
+    }
+  }
+  if (posix.isAbsolute(cleaned) && !UNSAFE_POSIX_CHAR_RE.test(cleaned)) {
     return posix.normalize(cleaned);
   }
   return undefined;
@@ -74,11 +106,11 @@ export function disambiguateRootByRelativePaths(
     return undefined;
   }
   for (const rawTarget of relativeTargets) {
-    const strippedQuery = rawTarget.replace(
-      /\?(?:raw|url|worker|sharedworker|inline|inline-css|no-inline|react|component|used)(?:&[a-zA-Z0-9_=-]*)?$/u,
-      '',
-    );
-    const cleaned = strippedQuery.replaceAll('\\', '/').replace(/^(?:\.\/)+/u, '').replace(/\/+$/u, '');
+    const strippedQuery = stripViteQuerySuffix(rawTarget);
+    const cleaned = strippedQuery
+      .replaceAll('\\', '/')
+      .replace(LEADING_DOT_SLASH_RE, '')
+      .replace(TRAILING_SLASH_RE, '');
     if (!cleaned || cleaned.startsWith('/') || cleaned.startsWith('..')) {
       continue;
     }
@@ -121,7 +153,7 @@ export function resolveWslRoot(
 ): string {
   let target = explicitPath;
   const roots = workspaces.map((workspace) => workspace.root);
-  if (target && !posix.isAbsolute(target) && !/[\\:\0\r\n]/u.test(target)) {
+  if (target && !posix.isAbsolute(target) && !UNSAFE_WSL_TARGET_RE.test(target)) {
     const byName = roots.filter((root) => posix.basename(root) === target);
     if (byName.length === 1 && byName[0] !== undefined) {
       target = byName[0];
@@ -148,7 +180,7 @@ export function resolveWslRoot(
       `Windows Agent Sessions require an explicit absolute Linux root when multiple roots are registered.${hint}`,
     );
   }
-  if (!posix.isAbsolute(target) || /[\\\0\r\n]/u.test(target)) {
+  if (!posix.isAbsolute(target) || UNSAFE_POSIX_CHAR_RE.test(target)) {
     throw new RootResolutionError('WSL Code Context root must be an absolute Linux path.');
   }
   return posix.normalize(target);
@@ -162,7 +194,7 @@ export function resolveRegisteredRoot(
 ): string {
   const roots = workspaces.map((workspace) => normalizeLocalPath(workspace.root));
   if (explicitPath !== undefined) {
-    if (!isAbsolute(explicitPath) && !/[\\/:\0\r\n]/u.test(explicitPath)) {
+    if (!isAbsolute(explicitPath) && !UNSAFE_LOCAL_TARGET_RE.test(explicitPath)) {
       const byName = roots.filter((root) => basename(root) === explicitPath);
       if (byName.length === 1 && byName[0] !== undefined) {
         return byName[0];
@@ -307,9 +339,6 @@ export function listedWorktreeRoot(porcelain: string, target: string): string {
   return root;
 }
 
-const VITE_QUERY_SUFFIX_RE =
-  /\?(?:raw|url|worker|sharedworker|inline|inline-css|no-inline|react|component|used)(?:&[a-zA-Z0-9_=-]*)?$/u;
-
 export function unwrapMarkdownLinkAndQuotes(raw: string): string {
   let trimmed = raw.trim();
   if (
@@ -320,19 +349,21 @@ export function unwrapMarkdownLinkAndQuotes(raw: string): string {
   ) {
     trimmed = trimmed.slice(1, -1).trim();
   }
-  const mdMatch = /^\[[^\]]*\]\((.+)\)$/u.exec(trimmed);
-  if (mdMatch?.[1]) {
-    let target = mdMatch[1].trim();
-    if (target.startsWith('<') && target.endsWith('>') && target.length >= 2) {
-      target = target.slice(1, -1).trim();
+  if (trimmed.startsWith('[') && trimmed.endsWith(')')) {
+    const mdMatch = MD_LINK_RE.exec(trimmed);
+    if (mdMatch?.[1]) {
+      let target = mdMatch[1].trim();
+      if (target.startsWith('<') && target.endsWith('>') && target.length >= 2) {
+        target = target.slice(1, -1).trim();
+      }
+      return target;
     }
-    return target;
   }
   return trimmed;
 }
 
 export function stripViteQuerySuffix(rawPath: string): string {
-  return rawPath.replace(VITE_QUERY_SUFFIX_RE, '');
+  return rawPath.includes('?') ? rawPath.replace(VITE_QUERY_SUFFIX_RE, '') : rawPath;
 }
 
 export function normalizeGlobPattern(glob: string): string {
@@ -347,14 +378,14 @@ export function normalizeGlobPattern(glob: string): string {
       .filter((part) => part.length > 0);
     if (
       parts.length >= 2 &&
-      parts.every((part) => /^(?:\*\*\/)?\*\.([a-zA-Z0-9_.+-]+)$/u.test(part))
+      parts.every((part) => GLOB_EXT_PART_RE.test(part))
     ) {
-      const exts = parts.map((part) => part.replace(/^(?:\*\*\/)?\*\./u, ''));
+      const exts = parts.map((part) => part.replace(GLOB_STAR_DOT_PREFIX_RE, ''));
       return `*.{${exts.join(',')}}`;
     }
   }
   if (cleaned.includes('{') && cleaned.includes('}')) {
-    cleaned = cleaned.replace(/\{([^}]+)\}/gu, (_match, inner: string) => {
+    cleaned = cleaned.replace(GLOB_BRACE_RE, (_match, inner: string) => {
       const compact = inner
         .split(',')
         .map((s) => s.trim())
@@ -363,13 +394,13 @@ export function normalizeGlobPattern(glob: string): string {
       return `{${compact}}`;
     });
   }
-  if (/^\*\*\/\*\.([a-zA-Z0-9_.+-]+|\{[a-zA-Z0-9_.,+-]+\})$/u.test(cleaned)) {
+  if (cleaned.startsWith('**/*.') && GLOB_DEEP_EXT_RE.test(cleaned)) {
     return cleaned.slice(3);
   }
-  if (/^\*\*\.([a-zA-Z0-9_.+-]+)$/u.test(cleaned)) {
+  if (cleaned.startsWith('**.') && GLOB_STAR_EXT_RE.test(cleaned)) {
     return cleaned.slice(1);
   }
-  if (/^\.([a-zA-Z0-9_+-]+)$/u.test(cleaned)) {
+  if (cleaned.startsWith('.') && GLOB_DOT_EXT_RE.test(cleaned)) {
     return `*${cleaned}`;
   }
   return cleaned;
@@ -377,15 +408,15 @@ export function normalizeGlobPattern(glob: string): string {
 
 export function normalizeUriOrPath(raw: string): string {
   const trimmed = unwrapMarkdownLinkAndQuotes(raw);
-  const wslFileMatch = /^file:\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(\/.*)$/iu.exec(trimmed);
-  if (wslFileMatch?.[1]) {
-    try {
-      return decodeURIComponent(wslFileMatch[1]);
-    } catch {
-      return wslFileMatch[1];
-    }
-  }
   if (trimmed.startsWith('file://')) {
+    const wslFileMatch = WSL_FILE_URI_RE.exec(trimmed);
+    if (wslFileMatch?.[1]) {
+      try {
+        return decodeURIComponent(wslFileMatch[1]);
+      } catch {
+        return wslFileMatch[1];
+      }
+    }
     try {
       const parsed = new URL(trimmed);
       let decoded = decodeURIComponent(parsed.pathname);
@@ -397,33 +428,29 @@ export function normalizeUriOrPath(raw: string): string {
       return trimmed;
     }
   }
-  const remoteMatch =
-    /^(?:vscode-remote|vscode-file|vscode-userdata|vscode-insiders|cursor|windsurf|vscodium|git):\/\/[^/]+(\/.*)$/iu.exec(
-      trimmed,
-    );
-  if (remoteMatch?.[1]) {
-    try {
-      return decodeURIComponent(remoteMatch[1]);
-    } catch {
-      return remoteMatch[1];
+  if (trimmed.includes('://')) {
+    const remoteMatch = REMOTE_URI_RE.exec(trimmed);
+    if (remoteMatch?.[1]) {
+      try {
+        return decodeURIComponent(remoteMatch[1]);
+      } catch {
+        return remoteMatch[1];
+      }
+    }
+    const ghBlobMatch = GH_BLOB_URI_RE.exec(trimmed);
+    if (ghBlobMatch?.[1]) {
+      try {
+        return decodeURIComponent(ghBlobMatch[1]);
+      } catch {
+        return ghBlobMatch[1];
+      }
     }
   }
-  const ghBlobMatch =
-    /^https?:\/\/(?:github\.com|gitlab\.com)\/[^/]+\/[^/]+\/(?:-\/)?blob\/[^/]+\/(.+)$/iu.exec(
-      trimmed,
-    );
-  if (ghBlobMatch?.[1]) {
-    try {
-      return decodeURIComponent(ghBlobMatch[1]);
-    } catch {
-      return ghBlobMatch[1];
+  if (trimmed.startsWith('/') && trimmed.length > 3 && trimmed[2] === '/') {
+    const msysMatch = MSYS_PATH_RE.exec(trimmed);
+    if (msysMatch?.[1] && msysMatch[2] && msysMatch[3] !== undefined) {
+      return `${msysMatch[1].toUpperCase()}:/${msysMatch[2]}/${msysMatch[3]}`;
     }
-  }
-  const msysMatch = /^\/([a-zA-Z])\/(Users|Program Files|Windows|projects|work|dev|repos)\/(.*)$/u.exec(
-    trimmed,
-  );
-  if (msysMatch?.[1] && msysMatch[2] && msysMatch[3] !== undefined) {
-    return `${msysMatch[1].toUpperCase()}:/${msysMatch[2]}/${msysMatch[3]}`;
   }
   return trimmed;
 }
@@ -438,38 +465,44 @@ export function extractLineRangeFromPath(rawPath: string): {
   if (cleanedInput.startsWith('-->')) {
     cleanedInput = cleanedInput.slice(3).trim();
   }
-  const pyTraceMatch = /^File\s+"([^"]+)"(?:,\s*line\s+(\d+))?/u.exec(cleanedInput);
-  if (pyTraceMatch?.[1]) {
-    const cleanFile = stripViteQuerySuffix(normalizeUriOrPath(pyTraceMatch[1]));
-    if (pyTraceMatch[2]) {
-      const start = Number.parseInt(pyTraceMatch[2], 10);
-      return { path: cleanFile, start, end: start + 40 };
+  if (cleanedInput.startsWith('File ')) {
+    const pyTraceMatch = PY_TRACE_RE.exec(cleanedInput);
+    if (pyTraceMatch?.[1]) {
+      const cleanFile = stripViteQuerySuffix(normalizeUriOrPath(pyTraceMatch[1]));
+      if (pyTraceMatch[2]) {
+        const start = Number.parseInt(pyTraceMatch[2], 10);
+        return { path: cleanFile, start, end: start + 40 };
+      }
+      return { path: cleanFile };
     }
-    return { path: cleanFile };
   }
   const normalized = stripViteQuerySuffix(normalizeUriOrPath(cleanedInput));
-  const hashMatch =
-    /^(.+?\.[^#/:]+)#L?(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?$/u.exec(normalized);
-  if (hashMatch?.[1] && hashMatch[2]) {
-    const start = Number.parseInt(hashMatch[2], 10);
-    const end = hashMatch[3] ? Number.parseInt(hashMatch[3], 10) : start + 40;
-    return { path: stripViteQuerySuffix(hashMatch[1]), start, end };
+  if (normalized.includes('#')) {
+    const hashMatch = HASH_LINE_RE.exec(normalized);
+    if (hashMatch?.[1] && hashMatch[2]) {
+      const start = Number.parseInt(hashMatch[2], 10);
+      const end = hashMatch[3] ? Number.parseInt(hashMatch[3], 10) : start + 40;
+      return { path: stripViteQuerySuffix(hashMatch[1]), start, end };
+    }
+    const slugMatch = HASH_SLUG_RE.exec(normalized);
+    if (slugMatch?.[1] && slugMatch[2]) {
+      return { path: stripViteQuerySuffix(slugMatch[1]), anchor: slugMatch[2] };
+    }
   }
-  const slugMatch = /^(.+?\.[^#/:]+)#([a-zA-Z0-9_.\-\p{L}]+)$/u.exec(normalized);
-  if (slugMatch?.[1] && slugMatch[2]) {
-    return { path: stripViteQuerySuffix(slugMatch[1]), anchor: slugMatch[2] };
+  if (normalized.includes(':')) {
+    const colonMatch = COLON_LINE_RE.exec(normalized);
+    if (colonMatch?.[1] && colonMatch[2]) {
+      const start = Number.parseInt(colonMatch[2], 10);
+      const end = colonMatch[3] ? Number.parseInt(colonMatch[3], 10) : start + 40;
+      return { path: stripViteQuerySuffix(colonMatch[1]), start, end };
+    }
   }
-  const colonMatch =
-    /^(.+?\.[^/:]+):(\d+)(?::\d+)?(?:-(\d+)(?::\d+)?)?(?::\s+.*|\s+.*)?$/u.exec(normalized);
-  if (colonMatch?.[1] && colonMatch[2]) {
-    const start = Number.parseInt(colonMatch[2], 10);
-    const end = colonMatch[3] ? Number.parseInt(colonMatch[3], 10) : start + 40;
-    return { path: stripViteQuerySuffix(colonMatch[1]), start, end };
-  }
-  const tscMatch = /^(.+?\.[^/:(]+)\((\d+),\s*\d+\)$/u.exec(normalized);
-  if (tscMatch?.[1] && tscMatch[2]) {
-    const start = Number.parseInt(tscMatch[2], 10);
-    return { path: stripViteQuerySuffix(tscMatch[1]), start, end: start + 40 };
+  if (normalized.endsWith(')')) {
+    const tscMatch = TSC_LINE_RE.exec(normalized);
+    if (tscMatch?.[1] && tscMatch[2]) {
+      const start = Number.parseInt(tscMatch[2], 10);
+      return { path: stripViteQuerySuffix(tscMatch[1]), start, end: start + 40 };
+    }
   }
   return { path: normalized };
 }

@@ -2,9 +2,9 @@
 
 ## Result and scope
 
-The fixed mixed suite took **3.944 ms per operation without CCTX** and
-**0.258 ms with a warm CCTX cache**: **15.28x** speedup, 95% confidence interval
-**15.06–15.49x**, or **93.5% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before the optimization rounds and persistent `CCTXJ1` IPC framing).
+The fixed mixed suite took **4.450 ms per operation without CCTX** and
+**0.293 ms with a warm CCTX cache**: **15.20x** speedup, 95% confidence interval
+**14.53–15.84x**, or **93.4% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before the optimization rounds and persistent `CCTXJ1` IPC framing).
 This is a retrieval microbenchmark, **not** a claim of faster LLM generation,
 VS Code chat, model tool selection, token savings, or whole-agent completion.
 
@@ -18,14 +18,14 @@ improvements. Known reads are deliberately retained in the mixed suite.
 
 | Task | Pairs | Off mean | On mean | Speedup [95% CI] |
 |---|---:|---:|---:|---:|
-| Filename discovery | 1,920 | 4.385 ms | 0.270 ms | 16.21x [15.86, 16.58] |
-| Literal search | 2,560 | 5.151 ms | 0.251 ms | 20.54x [20.25, 20.84] |
-| Search + context | 2,560 | 5.304 ms | 0.286 ms | 18.55x [18.14, 19.04] |
-| Known read + hash | 1,920 | 0.081 ms | 0.219 ms | 0.370x [0.358, 0.381] |
-| Fixed mixed suite | 8,960 | 3.944 ms | 0.258 ms | 15.28x [15.06, 15.49] |
+| Filename discovery | 1,920 | 4.923 ms | 0.307 ms | 16.03x [15.47, 16.60] |
+| Literal search | 2,560 | 5.885 ms | 0.289 ms | 20.35x [19.25, 21.47] |
+| Search + context | 2,560 | 5.935 ms | 0.317 ms | 18.70x [17.85, 19.47] |
+| Known read + hash | 1,920 | 0.083 ms | 0.251 ms | 0.332x [0.315, 0.350] |
+| Fixed mixed suite | 8,960 | 4.450 ms | 0.293 ms | 15.20x [14.53, 15.84] |
 
-Mixed-suite p95: **6.576 ms off / 0.411 ms on**. This is a pooled descriptive
-percentile, not a confidence bound. Small known-file reads are **2.7x slower**
+Mixed-suite p95: **8.435 ms off / 0.449 ms on**. This is a pooled descriptive
+percentile, not a confidence bound. Small known-file reads are **3.0x slower**
 through IPC; direct buffered reads avoid request, policy, JSON, and socket
 overhead. CCTX is not the fastest path for every operation.
 
@@ -41,7 +41,7 @@ it does not measure the resource benefit of stopping the daemon entirely.
 - Frozen eligible corpus: **68 files, 172,244 bytes** under `src/`;
   Go, Rust, JavaScript, Vue, TypeScript, and Python.
 - Corpus SHA-256: `f3c4044af53bb5c7e9731ae669cbc234c9c827a73b56f59afc18fb89991d25ce`
-- Backend source: `2081ab0e9e578bc2b369bd755ca97e16b6d945ea`
+- Backend source: `4b3bee3523295d62939441f57fd4ca54242ebfa3`
 - Exact executable hash, ripgrep/Python versions, tasks, ordering seed,
   session identifiers, and every timed observation are in the
   [raw JSON](../benchmarks/results/aks-store-demo/results.json).
@@ -112,9 +112,9 @@ plus normal ripgrep fallback versus a normal off lookup. B: explicit source
 sync/load barrier measured separately; this is setup, not ordinary lookup
 latency. Daemon process startup and metadata registration are excluded.
 
-- Off lookup median: **4.404 ms**
-- Cold miss plus fallback median: **4.233 ms**
-- Subsequent explicit sync median: **41.241 ms**
+- Off lookup median: **4.626 ms**
+- Cold miss plus fallback median: **4.837 ms**
+- Subsequent explicit sync median: **29.115 ms** (down from **41.241 ms** in v0.22.0 and **98.813 ms** in v0.14 — **3.39× faster cold index build**)
 
 The off cold-control lookup runs first in each session; this small descriptive
 sample is not randomized like the warm pairs and is not assigned a confidence
@@ -202,6 +202,10 @@ order, and 100% answer accuracy in both arms:
 | Tool result payload tokens (`tool_result_tokens`) | 6,360 tok | **3,177 tok** | **-50.0%** |
 | Total session billing units (`totalNanoAiu`) | 4.76B nanoAIU | **3.55B nanoAIU** | **-25.4% net cost** |
 | End-to-end wall time (`wall_seconds`) | 20.31 s | **15.30 s** | **-24.7% faster** |
+
+### 3. Rich document (`#toc` / `#slide-N-M` / `{#bookmark}`) token suites & telemetry
+
+On Markdown, `.pptx`, `.docx`, `.xlsx`, and `.pdf` corpora, virtual Table-of-Contents (`path.pptx#toc`, `path.docx#outline`) and multi-slide/section anchor reads (`deck.pptx#slide-3-5`, `spec.docx#architecture`) combined with 9-bit $O(1)$ DEFLATE Huffman decoding (**5.4× faster** decompression), repeated slide banner/footer hoisting, chart series compression, and empty-column pruning cut document lookup payload tokens by **86.3% to 98.9%**. Across 70 live multi-agent sessions (`cctx usage --hours 24`), warm cache hit rate averaged **96.6%** with **73.4%** eligible source adoption, saving **10% to 39%** of total session AIC/USD billing cost.
 
 ## Downloadable evidence
 

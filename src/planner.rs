@@ -137,6 +137,7 @@ impl CandidateExpr {
                     return false;
                 }
                 let rest = &positions[1..];
+                let last_pair = rest.last().copied();
                 let last_start = bytes.len() - positions.len();
                 let mut pos = 0usize;
                 while pos <= last_start {
@@ -149,6 +150,13 @@ impl CandidateExpr {
                         return false;
                     };
                     let start = pos + rel;
+                    if let Some([l0, l1]) = last_pair {
+                        let tail_byte = bytes[start + rest.len()];
+                        if tail_byte != l0 && tail_byte != l1 {
+                            pos = start + 1;
+                            continue;
+                        }
+                    }
                     if bytes[start + 1..start + 1 + rest.len()]
                         .iter()
                         .zip(rest)
@@ -570,7 +578,30 @@ fn simplify_group(mut children: Vec<CandidateExpr>, and: bool) -> CandidateExpr 
 }
 
 fn intersect_in_place(left: &mut Vec<usize>, right: &[usize]) {
+    if left.is_empty()
+        || right.is_empty()
+        || left[0] > *right.last().expect("nonempty")
+        || *left.last().expect("nonempty") < right[0]
+    {
+        left.clear();
+        return;
+    }
     let mut cursor = right;
+    if right.len() <= left.len().saturating_mul(4) {
+        let mut j = 0usize;
+        left.retain(|&id| {
+            while j < cursor.len() && cursor[j] < id {
+                j += 1;
+            }
+            if j < cursor.len() && cursor[j] == id {
+                j += 1;
+                true
+            } else {
+                false
+            }
+        });
+        return;
+    }
     left.retain(|id| {
         if cursor.is_empty() {
             return false;
@@ -631,7 +662,8 @@ fn union<'a>(parts: impl Iterator<Item = &'a [usize]>) -> Vec<usize> {
                         words[id / 64] |= 1_u64 << (id % 64);
                     }
                 }
-                let mut out = Vec::new();
+                let popcnt: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+                let mut out = Vec::with_capacity(popcnt);
                 for (word_idx, &word) in words.iter().enumerate() {
                     let mut w = word;
                     while w != 0 {

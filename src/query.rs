@@ -534,11 +534,7 @@ fn search_internal(
     }
 
     let plan_started = collect_profile.then(Instant::now);
-    let mut ids = if scoped {
-        eligible.clone()
-    } else {
-        resident.paths.values().copied().collect()
-    };
+    let mut ids_opt: Option<Vec<usize>> = None;
     let mut path_sorted = !scoped;
     let mut candidate_bytes = eligible_bytes;
     let mut line_prefilter = false;
@@ -566,7 +562,7 @@ fn search_internal(
         let selective = planned_candidate_bytes.saturating_mul(MAX_CANDIDATE_FRACTION_DENOMINATOR)
             <= eligible_bytes.saturating_mul(MAX_CANDIDATE_FRACTION_NUMERATOR);
         if index_cost < eligible_bytes && selective {
-            ids = candidates;
+            ids_opt = Some(candidates);
             candidate_bytes = planned_candidate_bytes;
             path_sorted = resident.ids_are_path_sorted;
             line_prefilter = query.regex
@@ -591,6 +587,15 @@ fn search_internal(
             .into(),
         );
     }
+    let mut ids = match ids_opt {
+        Some(planned_ids) => planned_ids,
+        None if scoped => eligible,
+        None if resident.free_ids.is_empty() && resident.ids_are_path_sorted => {
+            path_sorted = true;
+            (0..resident.documents.len()).collect()
+        }
+        None => resident.paths.values().copied().collect(),
+    };
     if !path_sorted {
         ids.sort_unstable_by(|a, b| {
             resident.documents[*a]
@@ -1194,41 +1199,42 @@ pub(crate) fn definition_priority(line: &str) -> u8 {
             }
             let is_component_or_fn = is_react_component_or_hook_binding(after_trimmed)
                 || after_trimmed.contains("=>")
-                || after_trimmed.contains("memo(")
-                || after_trimmed.contains("forwardRef(")
-                || after_trimmed.contains("createContext(")
-                || after_trimmed.contains("lazy(")
-                || after_trimmed.contains("defineConfig(")
-                || after_trimmed.contains("createSlice(")
-                || after_trimmed.contains("createStore(")
-                || after_trimmed.contains("defineStore(")
-                || after_trimmed.contains("createServerFn(")
-                || after_trimmed.contains("createFileRoute(")
-                || after_trimmed.contains("createRootRoute(")
-                || after_trimmed.contains("createRoute(")
-                || after_trimmed.contains("createLazyFileRoute(")
-                || after_trimmed.contains("defineProps")
-                || after_trimmed.contains("defineEmits")
-                || after_trimmed.contains("defineModel")
-                || after_trimmed.contains("$state(")
-                || after_trimmed.contains("$state.raw(")
-                || after_trimmed.contains("$derived(")
-                || after_trimmed.contains("$derived.by(")
-                || after_trimmed.contains("$props(")
-                || after_trimmed.contains("createSignal(")
-                || after_trimmed.contains("createResource(")
-                || after_trimmed.contains("createMemo(")
-                || after_trimmed.contains("useActionState(")
-                || after_trimmed.contains("useOptimistic(")
-                || after_trimmed.contains("queryOptions(")
-                || after_trimmed.contains("infiniteQueryOptions(")
-                || after_trimmed.contains("atom(")
-                || after_trimmed.contains("pgTable(")
-                || after_trimmed.contains("mysqlTable(")
-                || after_trimmed.contains("sqliteTable(")
-                || after_trimmed.contains("z.object(")
-                || after_trimmed.contains("z.enum(")
-                || after_trimmed.contains("v.object(");
+                || ((after_trimmed.contains('(') || after_trimmed.contains("define"))
+                    && (after_trimmed.contains("memo(")
+                        || after_trimmed.contains("forwardRef(")
+                        || after_trimmed.contains("createContext(")
+                        || after_trimmed.contains("lazy(")
+                        || after_trimmed.contains("defineConfig(")
+                        || after_trimmed.contains("createSlice(")
+                        || after_trimmed.contains("createStore(")
+                        || after_trimmed.contains("defineStore(")
+                        || after_trimmed.contains("createServerFn(")
+                        || after_trimmed.contains("createFileRoute(")
+                        || after_trimmed.contains("createRootRoute(")
+                        || after_trimmed.contains("createRoute(")
+                        || after_trimmed.contains("createLazyFileRoute(")
+                        || after_trimmed.contains("defineProps")
+                        || after_trimmed.contains("defineEmits")
+                        || after_trimmed.contains("defineModel")
+                        || after_trimmed.contains("$state(")
+                        || after_trimmed.contains("$state.raw(")
+                        || after_trimmed.contains("$derived(")
+                        || after_trimmed.contains("$derived.by(")
+                        || after_trimmed.contains("$props(")
+                        || after_trimmed.contains("createSignal(")
+                        || after_trimmed.contains("createResource(")
+                        || after_trimmed.contains("createMemo(")
+                        || after_trimmed.contains("useActionState(")
+                        || after_trimmed.contains("useOptimistic(")
+                        || after_trimmed.contains("queryOptions(")
+                        || after_trimmed.contains("infiniteQueryOptions(")
+                        || after_trimmed.contains("atom(")
+                        || after_trimmed.contains("pgTable(")
+                        || after_trimmed.contains("mysqlTable(")
+                        || after_trimmed.contains("sqliteTable(")
+                        || after_trimmed.contains("z.object(")
+                        || after_trimmed.contains("z.enum(")
+                        || after_trimmed.contains("v.object(")));
             if had_export_or_declare {
                 return if indent == 0 { 4 } else { 3 };
             }
@@ -1512,67 +1518,91 @@ pub(crate) fn is_comment_only_line(line: &str, is_doc_file: bool) -> bool {
 
 fn is_low_signal_usage_line(line: &str) -> bool {
     let trimmed = trim_line_start(line).trim_end();
-    (trimmed.starts_with("</") && trimmed.ends_with('>'))
-        || trimmed.starts_with("console.log(")
-        || trimmed.starts_with("console.debug(")
-        || trimmed.starts_with("console.info(")
-        || trimmed.starts_with("console.warn(")
-        || trimmed.starts_with("console.error(")
-        || trimmed.starts_with("console.trace(")
-        || trimmed.starts_with("logger.debug(")
-        || trimmed.starts_with("logger.trace(")
-        || trimmed.starts_with("tracing::debug!(")
-        || trimmed.starts_with("tracing::trace!(")
-        || trimmed.starts_with("log::debug!(")
-        || trimmed.starts_with("log::trace!(")
-        || trimmed.starts_with("println!(")
-        || trimmed.starts_with("eprintln!(")
-        || trimmed.starts_with("dbg!(")
-        || trimmed == "debugger;"
-        || trimmed == "debugger"
-        || trimmed.starts_with("todo!(")
-        || trimmed.starts_with("unimplemented!(")
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    match first {
+        b'<' => trimmed.starts_with("</") && trimmed.ends_with('>'),
+        b'c' => {
+            trimmed.starts_with("console.log(")
+                || trimmed.starts_with("console.debug(")
+                || trimmed.starts_with("console.info(")
+                || trimmed.starts_with("console.warn(")
+                || trimmed.starts_with("console.error(")
+                || trimmed.starts_with("console.trace(")
+        }
+        b'l' => {
+            trimmed.starts_with("logger.debug(")
+                || trimmed.starts_with("logger.trace(")
+                || trimmed.starts_with("log::debug!(")
+                || trimmed.starts_with("log::trace!(")
+        }
+        b't' => {
+            trimmed.starts_with("tracing::debug!(")
+                || trimmed.starts_with("tracing::trace!(")
+                || trimmed.starts_with("todo!(")
+        }
+        b'p' => trimmed.starts_with("println!("),
+        b'e' => trimmed.starts_with("eprintln!("),
+        b'd' => trimmed.starts_with("dbg!(") || trimmed == "debugger;" || trimmed == "debugger",
+        b'u' => trimmed.starts_with("unimplemented!("),
+        _ => false,
+    }
 }
 
 pub(crate) fn is_import_line(line: &str) -> bool {
     let trimmed = trim_line_start(line);
-    trimmed.starts_with("use ")
-        || trimmed.starts_with("import ")
-        || trimmed.starts_with("import(")
-        || trimmed.starts_with("import (")
-        || trimmed.starts_with("import\"")
-        || trimmed.starts_with("import \"")
-        || trimmed.starts_with("import'")
-        || trimmed.starts_with("import '")
-        || trimmed.starts_with("import{")
-        || trimmed.starts_with("import*")
-        || trimmed.starts_with("from ")
-        || trimmed.starts_with("#include")
-        || trimmed.starts_with("using ")
-        || trimmed.starts_with("extern crate ")
-        || trimmed.starts_with("require ")
-        || trimmed.starts_with("require_relative ")
-        || trimmed.starts_with("require_once ")
-        || trimmed.starts_with("require_once(")
-        || trimmed.starts_with("include_once ")
-        || trimmed.starts_with("include_once(")
-        || trimmed.starts_with("alias ")
-        || trimmed.starts_with("export '")
-        || trimmed.starts_with("part '")
-        || trimmed.starts_with("part of ")
-        || trimmed.starts_with("inherit ")
-        || trimmed.starts_with("} from ")
-        || trimmed.starts_with("}from ")
-        || trimmed.starts_with("@import ")
-        || trimmed.starts_with("@import\"")
-        || trimmed.starts_with("@import'")
-        || trimmed.starts_with("@use ")
-        || trimmed.starts_with("@forward ")
-        || trimmed.starts_with("/// <reference ")
-        || trimmed.starts_with("///<reference ")
-        || trimmed.starts_with("/// <amd-")
-        || is_reexport_from_line(trimmed)
-        || is_cjs_require_import(trimmed)
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    match first {
+        b'u' => trimmed.starts_with("use ") || trimmed.starts_with("using "),
+        b'i' => {
+            trimmed.starts_with("import ")
+                || trimmed.starts_with("import(")
+                || trimmed.starts_with("import (")
+                || trimmed.starts_with("import\"")
+                || trimmed.starts_with("import \"")
+                || trimmed.starts_with("import'")
+                || trimmed.starts_with("import '")
+                || trimmed.starts_with("import{")
+                || trimmed.starts_with("import*")
+                || trimmed.starts_with("include_once ")
+                || trimmed.starts_with("include_once(")
+                || trimmed.starts_with("inherit ")
+        }
+        b'f' => trimmed.starts_with("from "),
+        b'#' => trimmed.starts_with("#include"),
+        b'e' => {
+            trimmed.starts_with("extern crate ")
+                || trimmed.starts_with("export '")
+                || is_reexport_from_line(trimmed)
+        }
+        b'r' => {
+            trimmed.starts_with("require ")
+                || trimmed.starts_with("require_relative ")
+                || trimmed.starts_with("require_once ")
+                || trimmed.starts_with("require_once(")
+                || is_cjs_require_import(trimmed)
+        }
+        b'a' => trimmed.starts_with("alias "),
+        b'p' => trimmed.starts_with("part '") || trimmed.starts_with("part of "),
+        b'}' => trimmed.starts_with("} from ") || trimmed.starts_with("}from "),
+        b'@' => {
+            trimmed.starts_with("@import ")
+                || trimmed.starts_with("@import\"")
+                || trimmed.starts_with("@import'")
+                || trimmed.starts_with("@use ")
+                || trimmed.starts_with("@forward ")
+        }
+        b'/' => {
+            trimmed.starts_with("/// <reference ")
+                || trimmed.starts_with("///<reference ")
+                || trimmed.starts_with("/// <amd-")
+        }
+        b'c' | b'l' | b'v' => is_cjs_require_import(trimmed),
+        _ => false,
+    }
 }
 
 #[inline]
@@ -1592,14 +1622,8 @@ pub(crate) fn has_whole_word_match(line: &str, needle: &str, ignore_case: bool) 
     if l_bytes.len() < n_bytes.len() {
         return false;
     }
-    let max_start = l_bytes.len() - n_bytes.len();
-    for pos in 0..=max_start {
-        let matched = if ignore_case {
-            l_bytes[pos..pos + n_bytes.len()].eq_ignore_ascii_case(n_bytes)
-        } else {
-            &l_bytes[pos..pos + n_bytes.len()] == n_bytes
-        };
-        if matched {
+    if !ignore_case {
+        for pos in memchr::memmem::find_iter(l_bytes, n_bytes) {
             let prev_ok = pos == 0 || !is_ident_byte(l_bytes[pos - 1]);
             let next_ok = pos + n_bytes.len() == l_bytes.len()
                 || !is_ident_byte(l_bytes[pos + n_bytes.len()]);
@@ -1607,6 +1631,26 @@ pub(crate) fn has_whole_word_match(line: &str, needle: &str, ignore_case: bool) 
                 return true;
             }
         }
+        return false;
+    }
+    let b0_lo = n_bytes[0].to_ascii_lowercase();
+    let b0_hi = n_bytes[0].to_ascii_uppercase();
+    let max_start = l_bytes.len() - n_bytes.len();
+    let mut cursor = 0usize;
+    while cursor <= max_start {
+        let Some(rel) = memchr::memchr2(b0_lo, b0_hi, &l_bytes[cursor..=max_start]) else {
+            break;
+        };
+        let pos = cursor + rel;
+        if l_bytes[pos..pos + n_bytes.len()].eq_ignore_ascii_case(n_bytes) {
+            let prev_ok = pos == 0 || !is_ident_byte(l_bytes[pos - 1]);
+            let next_ok = pos + n_bytes.len() == l_bytes.len()
+                || !is_ident_byte(l_bytes[pos + n_bytes.len()]);
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        cursor = pos + 1;
     }
     false
 }

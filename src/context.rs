@@ -110,6 +110,7 @@ pub(crate) fn is_response_budget(error: &(dyn std::error::Error + 'static)) -> b
     error.downcast_ref::<ResponseBudgetError>().is_some()
 }
 
+#[inline]
 pub(crate) fn string_bound(value: &str) -> usize {
     let bytes = value.as_bytes();
     let mut extra = 0usize;
@@ -280,7 +281,6 @@ fn is_sql_statement_start(line: &str) -> bool {
         return false;
     }
     let trimmed = crate::query::trim_line_start(line);
-    let upper = trimmed.get(..36).unwrap_or(trimmed).to_ascii_uppercase();
     [
         "CREATE ",
         "ALTER ",
@@ -292,7 +292,11 @@ fn is_sql_statement_start(line: &str) -> bool {
         "WITH ",
     ]
     .iter()
-    .any(|prefix| upper.starts_with(prefix))
+    .any(|prefix| {
+        trimmed
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn is_sql_statement_end(line: &str) -> bool {
@@ -318,30 +322,34 @@ fn leading_indent_cols(line: &str) -> usize {
 }
 
 fn is_frontend_block_header(trimmed: &str) -> bool {
-    [
-        "useEffect(",
-        "useLayoutEffect(",
-        "useMemo(",
-        "useCallback(",
-        "React.useEffect(",
-        "React.useLayoutEffect(",
-        "describe(",
-        "describe.each(",
-        "test(",
-        "test.each(",
-        "test.describe(",
-        "it(",
-        "it.each(",
-        "beforeEach(",
-        "afterEach(",
-        "configResolved(",
-        "configureServer(",
-        "transform(",
-        "resolveId(",
-        "handleHotUpdate(",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix))
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    match first {
+        b'u' => {
+            trimmed.starts_with("useEffect(")
+                || trimmed.starts_with("useLayoutEffect(")
+                || trimmed.starts_with("useMemo(")
+                || trimmed.starts_with("useCallback(")
+        }
+        b'R' => {
+            trimmed.starts_with("React.useEffect(") || trimmed.starts_with("React.useLayoutEffect(")
+        }
+        b'd' => trimmed.starts_with("describe(") || trimmed.starts_with("describe.each("),
+        b't' => {
+            trimmed.starts_with("test(")
+                || trimmed.starts_with("test.each(")
+                || trimmed.starts_with("test.describe(")
+                || trimmed.starts_with("transform(")
+        }
+        b'i' => trimmed.starts_with("it(") || trimmed.starts_with("it.each("),
+        b'b' => trimmed.starts_with("beforeEach("),
+        b'a' => trimmed.starts_with("afterEach("),
+        b'c' => trimmed.starts_with("configResolved(") || trimmed.starts_with("configureServer("),
+        b'r' => trimmed.starts_with("resolveId("),
+        b'h' => trimmed.starts_with("handleHotUpdate("),
+        _ => false,
+    }
 }
 
 fn is_block_definition_header(line: &str) -> bool {
@@ -357,27 +365,25 @@ fn is_leading_doc_or_attr(line: &str) -> bool {
         return false;
     }
     let trimmed = crate::query::trim_line_start(line);
-    trimmed.starts_with("#[")
-        || trimmed.starts_with("#![")
-        || trimmed.starts_with("# ")
-        || trimmed.starts_with("//")
-        || trimmed.starts_with("-- ")
-        || trimmed.starts_with("/**")
-        || trimmed.starts_with("/*")
-        || trimmed == "*"
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("*/")
-        || trimmed.starts_with('@')
-        || trimmed.starts_with("template<")
-        || trimmed.starts_with("template <")
-        || (trimmed.starts_with('[')
-            && trimmed.ends_with(']')
-            && !trimmed.starts_with("[[")
-            && trimmed.len() >= 3)
-        || trimmed.starts_with("\"use client\"")
-        || trimmed.starts_with("'use client'")
-        || trimmed.starts_with("\"use server\"")
-        || trimmed.starts_with("'use server'")
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    match first {
+        b'#' => {
+            trimmed.starts_with("#[")
+                || trimmed.starts_with("#![")
+                || trimmed.starts_with("# ")
+        }
+        b'/' => trimmed.starts_with("//") || trimmed.starts_with("/*"),
+        b'-' => trimmed.starts_with("-- "),
+        b'*' => trimmed == "*" || trimmed.starts_with("* ") || trimmed.starts_with("*/"),
+        b'@' => true,
+        b't' => trimmed.starts_with("template<") || trimmed.starts_with("template <"),
+        b'[' => trimmed.ends_with(']') && !trimmed.starts_with("[[") && trimmed.len() >= 3,
+        b'"' => trimmed.starts_with("\"use client\"") || trimmed.starts_with("\"use server\""),
+        b'\'' => trimmed.starts_with("'use client'") || trimmed.starts_with("'use server'"),
+        _ => false,
+    }
 }
 
 fn rewind_leading_docs_and_attrs(lines: &[String], mut idx: usize) -> usize {
@@ -466,14 +472,22 @@ fn is_type_or_schema_definition(line: &str) -> bool {
 
 fn is_multiline_signature_open(line: &str) -> bool {
     let trimmed = line.trim_end();
-    if trimmed.contains('(') {
-        let open_parens = trimmed.bytes().filter(|&b| b == b'(').count();
-        let close_parens = trimmed.bytes().filter(|&b| b == b')').count();
-        if open_parens > close_parens
-            || (!trimmed.contains('{') && !trimmed.ends_with(';') && !trimmed.ends_with(':'))
-        {
-            return true;
+    let mut open_parens = 0usize;
+    let mut close_parens = 0usize;
+    let mut has_open_brace = false;
+    for b in trimmed.bytes() {
+        match b {
+            b'(' => open_parens += 1,
+            b')' => close_parens += 1,
+            b'{' => has_open_brace = true,
+            _ => {}
         }
+    }
+    if open_parens > 0
+        && (open_parens > close_parens
+            || (!has_open_brace && !trimmed.ends_with(';') && !trimmed.ends_with(':')))
+    {
+        return true;
     }
     let start = crate::query::trim_line_start(trimmed);
     if (start.starts_with("impl ")
@@ -554,7 +568,7 @@ fn clamp_snippet_to_block(snippet: &mut Snippet, hits: &[Hit], radius: usize) {
     let mut min_hit = usize::MAX;
     let mut max_hit = 0usize;
     for hit in hits {
-        if hit.path == snippet.path && hit.line >= snippet.start && hit.line <= snippet.end {
+        if hit.line >= snippet.start && hit.line <= snippet.end && hit.path == snippet.path {
             min_hit = min_hit.min(hit.line);
             max_hit = max_hit.max(hit.line);
         }
@@ -1049,10 +1063,22 @@ fn assemble_inner(
     }
     coalesce_adjacent_snippets(&mut snippets);
     if verify_lines {
+        let mut snippet_cursor = 0usize;
         for hit in &result.matches {
+            while snippet_cursor < snippets.len()
+                && (snippets[snippet_cursor].path != hit.path
+                    || snippets[snippet_cursor].end < hit.line)
+            {
+                snippet_cursor += 1;
+            }
             let current = snippets
-                .iter()
-                .find(|s| s.path == hit.path && s.start <= hit.line && s.end >= hit.line)
+                .get(snippet_cursor)
+                .filter(|s| s.path == hit.path && s.start <= hit.line && s.end >= hit.line)
+                .or_else(|| {
+                    snippets
+                        .iter()
+                        .find(|s| s.path == hit.path && s.start <= hit.line && s.end >= hit.line)
+                })
                 .and_then(|s| s.lines.get(hit.line - s.start));
             if current != Some(&hit.text) {
                 return Err(
@@ -1090,6 +1116,7 @@ fn coalesce_adjacent_snippets(snippets: &mut Vec<Snippet>) {
             if current.end > prev.end {
                 let skip = (prev.end + 1).saturating_sub(current.start);
                 if skip < current.lines.len() {
+                    prev.lines.reserve(current.lines.len() - skip);
                     prev.lines.extend_from_slice(&current.lines[skip..]);
                     prev.end = current.end;
                 }

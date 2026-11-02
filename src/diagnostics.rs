@@ -1,7 +1,7 @@
 use crate::{Result, catalog, daemon, invalid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{BufRead, Read};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -657,10 +657,20 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         let Ok(file) = std::fs::File::open(path) else {
             continue;
         };
-        let reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
         let mut cwd: Option<String> = None;
         let mut last_model: Option<String> = None;
-        for line in std::io::BufRead::lines(reader).map_while(std::result::Result::ok) {
+        let mut line = String::with_capacity(4096);
+        while {
+            line.clear();
+            reader.read_line(&mut line).unwrap_or(0) > 0
+        } {
+            if !line.contains("\"session.usage_record\"")
+                && !line.contains("\"tool.execution_")
+                && !line.contains("\"session.start\"")
+            {
+                continue;
+            }
             let Ok(event) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };

@@ -69,6 +69,8 @@ export class DaemonClient {
   private socket: Duplex | undefined;
   private socketPath: string | undefined;
   private receiveBuffer: Buffer = EMPTY_BUFFER;
+  private receiveChunks: Buffer[] = [];
+  private receiveBytes = 0;
   private pending: PendingResponse | undefined;
   private queue: Promise<void> = Promise.resolve();
   private disposed = false;
@@ -278,6 +280,8 @@ export class DaemonClient {
     this.socket = socket;
     this.socketPath = expectedPath;
     this.receiveBuffer = EMPTY_BUFFER;
+    this.receiveChunks = [];
+    this.receiveBytes = 0;
     socket.on('data', (chunk: Buffer) => this.onData(socket, chunk));
     socket.on('error', (error: Error) => {
       if (this.socket === socket) {
@@ -347,33 +351,52 @@ export class DaemonClient {
   }
 
   private onData(socket: Duplex, chunk: Buffer): void {
-    if (this.socket !== socket) {
+    if (this.socket !== socket || chunk.byteLength === 0) {
       return;
     }
-    this.receiveBuffer =
-      this.receiveBuffer.byteLength === 0
-        ? chunk
-        : Buffer.concat([this.receiveBuffer, chunk]);
-    if (this.receiveBuffer.byteLength > MAX_FRAME_BYTES + 4) {
+    if (this.receiveBuffer.byteLength > 0) {
+      this.receiveChunks.push(this.receiveBuffer);
+      this.receiveBytes += this.receiveBuffer.byteLength;
+      this.receiveBuffer = EMPTY_BUFFER;
+    }
+    this.receiveChunks.push(chunk);
+    this.receiveBytes += chunk.byteLength;
+    if (this.receiveBytes > MAX_FRAME_BYTES + 4) {
       this.disconnect(new Error('Code Context daemon response exceeds 2 MiB.'));
       return;
     }
-    if (this.receiveBuffer.byteLength < 4) {
+    if (this.receiveBytes < 4) {
       return;
     }
-    const length = this.receiveBuffer.readUInt32BE(0);
+    const firstChunk = this.receiveChunks[0]!;
+    if (firstChunk.byteLength < 4) {
+      this.receiveBuffer = Buffer.concat(this.receiveChunks, this.receiveBytes);
+      this.receiveChunks = [];
+      this.receiveBytes = 0;
+    }
+    const headerBuf = this.receiveBuffer.byteLength > 0 ? this.receiveBuffer : this.receiveChunks[0]!;
+    const length = headerBuf.readUInt32BE(0);
     if (length > MAX_FRAME_BYTES) {
       this.disconnect(new Error('Code Context daemon response exceeds 2 MiB.'));
       return;
     }
-    if (this.receiveBuffer.byteLength < length + 4) {
+    const totalAvailable = this.receiveBuffer.byteLength > 0 ? this.receiveBuffer.byteLength : this.receiveBytes;
+    if (totalAvailable < length + 4) {
       return;
     }
-    const frame = this.receiveBuffer.subarray(4, length + 4);
+    const assembled =
+      this.receiveBuffer.byteLength > 0
+        ? this.receiveBuffer
+        : this.receiveChunks.length === 1
+          ? this.receiveChunks[0]!
+          : Buffer.concat(this.receiveChunks, this.receiveBytes);
+    this.receiveChunks = [];
+    this.receiveBytes = 0;
+    const frame = assembled.subarray(4, length + 4);
     this.receiveBuffer =
-      this.receiveBuffer.byteLength === length + 4
+      assembled.byteLength === length + 4
         ? EMPTY_BUFFER
-        : this.receiveBuffer.subarray(length + 4);
+        : assembled.subarray(length + 4);
     const pending = this.takePending();
     if (!pending) {
       this.disconnect(new Error('Code Context daemon sent an unsolicited response.'));
@@ -421,6 +444,8 @@ export class DaemonClient {
     this.traceOutcomesAvailable = false;
     this.hostMemoryReportingAvailable = false;
     this.receiveBuffer = EMPTY_BUFFER;
+    this.receiveChunks = [];
+    this.receiveBytes = 0;
     const pending = this.takePending();
     pending?.reject(error);
     if (socket && !socket.destroyed) {

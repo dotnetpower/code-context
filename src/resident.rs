@@ -55,7 +55,7 @@ pub(crate) type TrigramMap<V> = HashMap<u32, V, TrigramBuildHasher>;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PostingList {
-    Inline { len: u8, ids: [u32; 5] },
+    Inline { len: u8, ids: [u32; 6] },
     Heap(Vec<u32>),
 }
 
@@ -64,7 +64,7 @@ impl Default for PostingList {
     fn default() -> Self {
         Self::Inline {
             len: 0,
-            ids: [0; 5],
+            ids: [0; 6],
         }
     }
 }
@@ -74,7 +74,7 @@ impl PostingList {
     pub(crate) fn single(id: u32) -> Self {
         Self::Inline {
             len: 1,
-            ids: [id, 0, 0, 0, 0],
+            ids: [id, 0, 0, 0, 0, 0],
         }
     }
 
@@ -112,11 +112,11 @@ impl PostingList {
         match self {
             Self::Inline { len, ids } => {
                 let l = usize::from(*len);
-                if l < 5 {
+                if l < 6 {
                     ids[l] = id;
                     *len += 1;
                 } else {
-                    let mut v = Vec::with_capacity(8);
+                    let mut v = Vec::with_capacity(12);
                     v.extend_from_slice(ids);
                     v.push(id);
                     *self = Self::Heap(v);
@@ -132,15 +132,15 @@ impl PostingList {
             Self::Inline { len, ids } => {
                 let l = usize::from(*len);
                 let pos = ids[..l].binary_search(&id).unwrap_or_else(|i| i);
-                if l < 5 {
+                if l < 6 {
                     ids.copy_within(pos..l, pos + 1);
                     ids[pos] = id;
                     *len += 1;
                 } else {
-                    let mut v = Vec::with_capacity(8);
+                    let mut v = Vec::with_capacity(12);
                     v.extend_from_slice(&ids[..pos]);
                     v.push(id);
-                    v.extend_from_slice(&ids[pos..5]);
+                    v.extend_from_slice(&ids[pos..6]);
                     *self = Self::Heap(v);
                 }
             }
@@ -164,12 +164,9 @@ impl PostingList {
             Self::Heap(v) => {
                 if let Ok(pos) = v.binary_search(&id) {
                     v.remove(pos);
-                    if v.len() <= 5 {
-                        let mut ids = [0_u32; 5];
-                        ids[..v.len()].copy_within(0..v.len(), 0);
-                        for (i, &val) in v.iter().enumerate() {
-                            ids[i] = val;
-                        }
+                    if v.len() <= 6 {
+                        let mut ids = [0_u32; 6];
+                        ids[..v.len()].copy_from_slice(v);
                         *self = Self::Inline {
                             len: v.len() as u8,
                             ids,
@@ -421,24 +418,29 @@ impl Resident {
         let allowed = inventory.files;
         let mut paths: Vec<_> = allowed.iter().collect();
         paths.sort();
-        let mut documents = Vec::new();
+        let mut documents = Vec::with_capacity(paths.len());
+        let mut checked_dirs = std::collections::HashSet::with_capacity((paths.len() / 4).max(16));
         let mut source_bytes = 0;
         let mut line_count = 0usize;
         let mut doc_owned_bytes = 0usize;
         let mut digest = Sha256::new();
         for path in paths {
             let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
-            let bytes = workspace.read_allowed_with_limit(name, &allowed, policy.max_file_bytes)?;
+            let bytes = workspace.read_known_with_limit_cached(
+                path,
+                policy.max_file_bytes,
+                &mut checked_dirs,
+            )?;
             source_bytes += bytes.len();
             if source_bytes > policy.max_source_bytes {
                 return Err(invalid("resident source budget exceeds configured limit").into());
             }
+            let sha256: [u8; 32] = Sha256::digest(&bytes).into();
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
             digest.update((bytes.len() as u64).to_le_bytes());
-            digest.update(&bytes);
-            let sha256: [u8; 32] = Sha256::digest(&bytes).into();
-            let sha256_hex: Arc<str> = Arc::from(digest_hex(&sha256));
+            digest.update(sha256);
+            let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
             let text = String::from_utf8(bytes)?;
             let starts = build_line_starts(&text)?;
             line_count = line_count.saturating_add(starts.len());
@@ -610,17 +612,27 @@ impl Resident {
                     })
                     .collect::<Result<Vec<_>>>()
             })?;
+            let max_unique_trigrams = self.policy.max_unique_trigrams;
             for (id, keys) in per_doc_keys.into_iter().flatten().enumerate() {
                 count += keys.len();
                 if count > MAX_POSTINGS {
                     return Err(invalid("resident index budget exceeds 64M postings").into());
                 }
                 let doc_id = u32::try_from(id)?;
+                let mut current_len = index.len();
                 for key in keys {
-                    if index.len() >= self.policy.max_unique_trigrams && !index.contains_key(&key) {
-                        return Err(invalid("root exceeds max_unique_trigrams").into());
+                    match index.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().push(doc_id);
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            if current_len >= max_unique_trigrams {
+                                return Err(invalid("root exceeds max_unique_trigrams").into());
+                            }
+                            current_len += 1;
+                            entry.insert(PostingList::single(doc_id));
+                        }
                     }
-                    index.entry(key).or_default().push(doc_id);
                 }
                 let projected = self
                     .stats
@@ -837,9 +849,14 @@ impl Resident {
                 return active[0].1.iter().map(|&id| id as usize).collect();
             }
             let first = active[0].1;
+            let first_min = first[0];
+            let first_max = *first.last().expect("nonempty posting list");
             let mut cursors: [&[u32]; 7] = [&[]; 7];
             let cursor_len = key_len - 1;
             for (i, &(_, list)) in active[1..].iter().enumerate() {
+                if list[0] > first_max || *list.last().expect("nonempty") < first_min {
+                    return Vec::new();
+                }
                 cursors[i] = list;
             }
             let active_cursors = &mut cursors[..cursor_len];
@@ -899,9 +916,14 @@ impl Resident {
             return keyed_lists[0].1.iter().map(|&id| id as usize).collect();
         }
         let first = keyed_lists[0].1;
+        let first_min = first[0];
+        let first_max = *first.last().expect("nonempty posting list");
         let mut cursors: [&[u32]; MAX_QUERY_POSTING_INTERSECTIONS] = [&[]; MAX_QUERY_POSTING_INTERSECTIONS];
         let cursor_len = keyed_lists.len() - 1;
         for (i, &(_, list)) in keyed_lists[1..].iter().enumerate() {
+            if list[0] > first_max || *list.last().expect("nonempty") < first_min {
+                return Vec::new();
+            }
             cursors[i] = list;
         }
         let active_cursors = &mut cursors[..cursor_len];
@@ -933,13 +955,20 @@ impl Resident {
         if positions.len() < 3 {
             return (0..self.documents.len()).collect();
         }
-        let mut window_lists: Vec<Vec<u32>> = Vec::new();
-        let mut seen_windows: Vec<&[[u8; 2]]> = Vec::new();
-        for window in positions.windows(3) {
-            if seen_windows.contains(&window) {
+        let mut window_lists: Vec<Vec<u32>> = Vec::with_capacity(positions.len().saturating_sub(2).min(16));
+        let mut seen_windows: [[u8; 6]; 16] = [[0; 6]; 16];
+        let mut seen_len = 0usize;
+        for window in positions.windows(3).take(16) {
+            let sig = [
+                window[0][0], window[0][1],
+                window[1][0], window[1][1],
+                window[2][0], window[2][1],
+            ];
+            if seen_windows[..seen_len].contains(&sig) {
                 continue;
             }
-            seen_windows.push(window);
+            seen_windows[seen_len] = sig;
+            seen_len += 1;
             let mut trigram_keys = [0_u32; 8];
             let mut trigram_len = 0usize;
             for b0 in [window[0][0], window[0][1]] {
@@ -975,10 +1004,20 @@ impl Resident {
             return window_lists[0].iter().map(|&id| id as usize).collect();
         }
         let first = window_lists[0].as_slice();
-        let mut cursors: Vec<&[u32]> = window_lists[1..].iter().map(Vec::as_slice).collect();
+        let first_min = first[0];
+        let first_max = *first.last().expect("nonempty window list");
+        let mut cursors: [&[u32]; MAX_QUERY_POSTING_INTERSECTIONS] = [&[]; MAX_QUERY_POSTING_INTERSECTIONS];
+        let cursor_len = window_lists.len() - 1;
+        for (i, list) in window_lists[1..].iter().enumerate() {
+            if list[0] > first_max || *list.last().expect("nonempty") < first_min {
+                return Vec::new();
+            }
+            cursors[i] = list.as_slice();
+        }
+        let active_cursors = &mut cursors[..cursor_len];
         let mut out = Vec::with_capacity(first.len());
         'outer: for &id in first {
-            for cursor in &mut cursors {
+            for cursor in active_cursors.iter_mut() {
                 match cursor.binary_search(&id) {
                     Ok(pos) => {
                         *cursor = &cursor[pos + 1..];
@@ -1072,26 +1111,32 @@ impl Resident {
     pub fn read_many(&self, ranges: &[ReadRange]) -> Result<Vec<Snippet>> {
         validate_ranges(ranges)?;
         let mut snippets = Vec::with_capacity(ranges.len());
+        let mut last_lookup: Option<(&str, usize)> = None;
         for range in ranges {
-            let (name_cow, id) = if let Some(&id) = self.paths.get(range.path.as_str()) {
-                (std::borrow::Cow::Borrowed(range.path.as_str()), id)
+            let id = if let Some((prev_path, prev_id)) = last_lookup
+                && prev_path == range.path.as_str()
+            {
+                prev_id
+            } else if let Some(&id) = self.paths.get(range.path.as_str()) {
+                last_lookup = Some((range.path.as_str(), id));
+                id
             } else {
                 safe_relative(Path::new(&range.path))?;
                 let path = normalize(Path::new(&range.path));
                 let name = path
                     .to_str()
-                    .ok_or_else(|| invalid("non-UTF8 path"))?
-                    .to_owned();
+                    .ok_or_else(|| invalid("non-UTF8 path"))?;
                 let id = *self
                     .paths
-                    .get(name.as_str())
-                    .ok_or_else(|| SnapshotMissError { path: name.clone() })?;
-                (std::borrow::Cow::Owned(name), id)
+                    .get(name)
+                    .ok_or_else(|| SnapshotMissError { path: name.to_owned() })?;
+                last_lookup = Some((range.path.as_str(), id));
+                id
             };
             let document = &self.documents[id];
             if range.start > document.starts.len() {
                 return Err(SnapshotRangeError {
-                    path: name_cow.into_owned(),
+                    path: document.path.to_string(),
                     start: range.start,
                     end: range.end,
                     lines: document.starts.len(),
@@ -1104,7 +1149,7 @@ impl Resident {
                 lines.push(document.line(line).into());
             }
             snippets.push(Snippet {
-                path: name_cow.into_owned(),
+                path: document.path.to_string(),
                 start: range.start,
                 end,
                 sha256: document.sha256_hex.to_string(),
@@ -1149,11 +1194,28 @@ pub(crate) fn find_line_gallop(starts: &[u32], cursor: usize, offset: usize) -> 
     if rem.len() == 3 || (rem[3] as usize) > offset {
         return cursor + 2;
     }
-    cursor + 3 + rem[3..].partition_point(|&start| (start as usize) <= offset) - 1
+    let tail = &rem[3..];
+    let mut lo = 0usize;
+    let mut step = 4usize;
+    while lo + step < tail.len() && (tail[lo + step] as usize) <= offset {
+        lo += step;
+        step <<= 2;
+    }
+    let hi = (lo + step).min(tail.len());
+    cursor + 3 + lo + tail[lo + 1..hi].partition_point(|&start| (start as usize) <= offset)
 }
 
 fn merge_u32_in_place(target: &mut Vec<u32>, right: &[u32]) {
     if right.is_empty() {
+        return;
+    }
+    if let Some(&last_left) = target.last()
+        && last_left < right[0]
+    {
+        target.extend_from_slice(right);
+        return;
+    }
+    if right.len() <= 4 && right.iter().all(|id| target.binary_search(id).is_ok()) {
         return;
     }
     let mut out = Vec::with_capacity(target.len() + right.len());
@@ -1185,12 +1247,24 @@ pub(crate) fn trigram(bytes: &[u8]) -> u32 {
     u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
 }
 
-pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
+#[inline]
+pub(crate) fn digest_hex_buf(digest: &[u8; 32]) -> [u8; 64] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 64];
     for (i, &byte) in digest.iter().enumerate() {
         out[i * 2] = HEX[(byte >> 4) as usize];
         out[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
     }
+    out
+}
+
+pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
+    let out = digest_hex_buf(digest);
     String::from_utf8(out.to_vec()).expect("ASCII hex digits")
+}
+
+#[inline]
+pub(crate) fn digest_hex_arc(digest: &[u8; 32]) -> Arc<str> {
+    let out = digest_hex_buf(digest);
+    Arc::from(std::str::from_utf8(&out).expect("ASCII hex digits"))
 }

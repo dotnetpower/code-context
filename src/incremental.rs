@@ -153,7 +153,7 @@ fn accumulate_differences(
 
 fn document(path: String, bytes: Vec<u8>) -> Result<Document> {
     let sha256: [u8; 32] = Sha256::digest(&bytes).into();
-    let sha256_hex: Arc<str> = Arc::from(crate::resident::digest_hex(&sha256));
+    let sha256_hex: Arc<str> = crate::resident::digest_hex_arc(&sha256);
     let text = String::from_utf8(bytes)?;
     let starts = crate::resident::build_line_starts(&text)?;
     Ok(Document {
@@ -183,7 +183,8 @@ impl Resident {
         if changed.is_empty() && !verify_all {
             return Ok(self.unchanged_update(started));
         }
-        let mut replacements = Vec::new();
+        let mut replacements = Vec::with_capacity(changed.len().min(64));
+        let mut checked_dirs = std::collections::HashSet::with_capacity(changed.len().clamp(8, 64));
         let mut source_bytes = self.stats.source_bytes;
         let mut line_count = self.stats.line_count;
         let mut posting_count = self.stats.postings;
@@ -220,9 +221,10 @@ impl Resident {
                 }
             };
             let new = if is_allowed {
-                let bytes = workspace.read_known_with_limit(
+                let bytes = workspace.read_known_with_limit_cached(
                     Path::new(&path),
                     self.policy.max_file_bytes,
+                    &mut checked_dirs,
                 )?;
                 source_files_read += 1;
                 source_bytes_read += bytes.len();

@@ -579,6 +579,11 @@ fn base_universal_patterns() -> &'static BTreeSet<String> {
     })
 }
 
+fn base_universal_patterns_vec() -> &'static Vec<String> {
+    static VEC: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    VEC.get_or_init(|| base_universal_patterns().iter().cloned().collect())
+}
+
 pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
     let mut roots = vec![(String::new(), root.to_path_buf())];
     roots.extend(
@@ -588,7 +593,7 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             .map(|scope| (scope.clone(), root.join(scope))),
     );
     let mut profiles = BTreeSet::new();
-    let mut patterns = base_universal_patterns().clone();
+    let mut extra_patterns = BTreeSet::new();
 
     for (prefix, project_root) in roots {
         let snapshot = RootSnapshot::scan(project_root.as_path());
@@ -599,7 +604,7 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
                 rule.name,
                 rule.patterns,
                 &mut profiles,
-                &mut patterns,
+                &mut extra_patterns,
             );
         }
         apply_scoped(
@@ -611,19 +616,47 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             "r",
             R_PROJECT,
             &mut profiles,
-            &mut patterns,
+            &mut extra_patterns,
         );
         if snapshot.has_packages
             && project_root.join("packages/repositories.config").is_file()
         {
-            patterns.insert(scoped_pattern(prefix.as_str(), "packages/**"));
+            extra_patterns.insert(scoped_pattern(prefix.as_str(), "packages/**"));
         }
     }
 
+    let patterns = if extra_patterns.is_empty() {
+        base_universal_patterns_vec().clone()
+    } else {
+        let mut merged = base_universal_patterns().clone();
+        merged.extend(extra_patterns);
+        merged.into_iter().collect()
+    };
+
     EffectiveExclusions {
         profiles: profiles.into_iter().collect(),
-        patterns: patterns.into_iter().collect(),
+        patterns,
     }
+}
+
+pub fn is_profile_marker_for_scopes(path: &Path, scopes: &[String]) -> bool {
+    if !is_profile_marker(path) {
+        return false;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let Some(parent_str) = parent.to_str() else {
+        return true;
+    };
+    parent_str.is_empty()
+        || parent_str == "."
+        || parent_str == "ProjectSettings"
+        || parent_str == "packages"
+        || scopes.iter().any(|s| {
+            s == parent_str
+                || parent_str
+                    .strip_prefix(s.as_str())
+                    .is_some_and(|rest| rest == "/ProjectSettings" || rest == "/packages")
+        })
 }
 
 pub fn is_profile_marker(path: &Path) -> bool {

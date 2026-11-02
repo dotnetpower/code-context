@@ -476,6 +476,14 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
             continue
         with lines:
             for raw in lines:
+                if (
+                    '"tool.execution_' not in raw
+                    and '"session.usage_record"' not in raw
+                    and '"session.start"' not in raw
+                    and '"chat/toolCall' not in raw
+                    and not any(name in raw for name in CATALOG_NAMES)
+                ):
+                    continue
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:

@@ -268,7 +268,8 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     start: number;
     end: number;
     sha: string;
-    lines: string[];
+    rawLines: readonly JsonValue[];
+    label: string;
   }> = [];
   for (const [index, snippet] of snippets.entries()) {
     const label = `snippet ${index}`;
@@ -283,18 +284,21 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
         `Invalid Code Context ${label}: expected ${end - start + 1} lines, received ${rawLines.length}.`,
       );
     }
-    const formattedLines: string[] = [];
     for (let lineIndex = 0; lineIndex < rawLines.length; lineIndex += 1) {
-      const rawLine = stringValue(rawLines[lineIndex], `${label} line ${lineIndex}`);
-      const boundedLine =
-        rawLine.length > 2048 ? `${rawLine.slice(0, 2048)}... [truncated]` : rawLine;
-      formattedLines.push(`${start + lineIndex}: ${boundedLine}`);
+      if (typeof rawLines[lineIndex] !== 'string') {
+        stringValue(rawLines[lineIndex], `${label} line ${lineIndex}`);
+      }
     }
-    validated.push({ path, start, end, sha, lines: formattedLines });
+    validated.push({ path, start, end, sha, rawLines, label });
   }
   if (validated.length === 0) {
     return 'snippets=0';
   }
+  const formatLine = (rawLine: string, lineNum: number): string => {
+    const boundedLine =
+      rawLine.length > 2048 ? `${rawLine.slice(0, 2048)}... [truncated]` : rawLine;
+    return `${lineNum}: ${boundedLine}`;
+  };
   const output: string[] = [];
   const nextRanges: Array<{ path: string; start: number; end: number }> = [];
   let previousPath: string | undefined;
@@ -305,29 +309,32 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     const item = validated[i]!;
     const sameFileHeader = previousPath === item.path && previousSha === item.sha;
     const baseHeaderLen = item.path.length + (sameFileHeader ? 16 : 88);
-    if (output.length > 0 && used + baseHeaderLen + (item.lines[0]?.length ?? 0) > charLimit) {
+    const firstRaw = item.rawLines[0] as string | undefined;
+    const firstLen = firstRaw !== undefined ? Math.min(firstRaw.length, 2064) + 8 : 0;
+    if (output.length > 0 && used + baseHeaderLen + firstLen > charLimit) {
       for (let rest = i; rest < validated.length; rest += 1) {
         const rem = validated[rest]!;
         nextRanges.push({ path: rem.path, start: rem.start, end: rem.end });
       }
       break;
     }
-    let keptCount = 0;
+    const keptLines: string[] = [];
     let snippetChars = baseHeaderLen;
-    for (const line of item.lines) {
+    for (let k = 0; k < item.rawLines.length; k += 1) {
+      const formatted = formatLine(item.rawLines[k] as string, item.start + k);
       if (
-        (output.length > 0 || keptCount > 0) &&
-        used + snippetChars + line.length + 1 > charLimit
+        (output.length > 0 || keptLines.length > 0) &&
+        used + snippetChars + formatted.length + 1 > charLimit
       ) {
         break;
       }
-      snippetChars += line.length + 1;
-      keptCount += 1;
+      snippetChars += formatted.length + 1;
+      keptLines.push(formatted);
     }
-    if (keptCount === 0) {
-      keptCount = 1;
+    if (keptLines.length === 0 && item.rawLines.length > 0) {
+      keptLines.push(formatLine(item.rawLines[0] as string, item.start));
     }
-    const actualEnd = item.start + keptCount - 1;
+    const actualEnd = item.start + keptLines.length - 1;
     const header = sameFileHeader
       ? `--- ${item.path}:${item.start}-${actualEnd}`
       : `--- ${item.path}:${item.start}-${actualEnd} sha256=${item.sha}`;
@@ -335,8 +342,7 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     previousSha = item.sha;
     output.push(header);
     used += header.length + 1;
-    for (let k = 0; k < keptCount; k += 1) {
-      const line = item.lines[k]!;
+    for (const line of keptLines) {
       output.push(line);
       used += line.length + 1;
     }

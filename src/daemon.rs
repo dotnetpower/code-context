@@ -451,6 +451,7 @@ pub struct Client {
     tracing: bool,
     write_buf: Vec<u8>,
     args_buf: Vec<u8>,
+    read_buf: Vec<u8>,
 }
 
 impl Client {
@@ -467,6 +468,7 @@ impl Client {
             tracing: false,
             write_buf: Vec::with_capacity(512),
             args_buf: Vec::with_capacity(256),
+            read_buf: Vec::with_capacity(4096),
         })
     }
 
@@ -487,7 +489,7 @@ impl Client {
         self.tracing
     }
 
-    pub(crate) fn call_raw(&mut self, request: &Request) -> Result<Vec<u8>> {
+    fn call_into_read_buf(&mut self, request: &Request) -> Result<()> {
         self.args_buf.clear();
         serde_json::to_writer(&mut self.args_buf, &request.arguments)?;
         self.write_buf.clear();
@@ -526,18 +528,28 @@ impl Client {
         if payload_len != length - 9 {
             return Err(invalid("corrupt binary response payload length").into());
         }
-        let mut payload = vec![0_u8; payload_len];
-        std::io::Read::read_exact(&mut self.reader, &mut payload)?;
+        self.read_buf.resize(payload_len, 0);
+        std::io::Read::read_exact(&mut self.reader, &mut self.read_buf)?;
         if ok {
-            Ok(payload)
+            Ok(())
         } else {
-            Err(ApplicationError(String::from_utf8(payload)?).into())
+            let err_msg = String::from_utf8(std::mem::take(&mut self.read_buf))?;
+            Err(ApplicationError(err_msg).into())
         }
     }
 
+    pub(crate) fn call_raw(&mut self, request: &Request) -> Result<Vec<u8>> {
+        self.call_into_read_buf(request)?;
+        Ok(self.read_buf.clone())
+    }
+
     pub fn call(&mut self, request: &Request) -> Result<Value> {
-        let payload = self.call_raw(request)?;
-        Ok(serde_json::from_slice(&payload)?)
+        self.call_into_read_buf(request)?;
+        let val = serde_json::from_slice(&self.read_buf)?;
+        if self.read_buf.capacity() > 256 * 1024 {
+            self.read_buf.shrink_to(16 * 1024);
+        }
+        Ok(val)
     }
 }
 

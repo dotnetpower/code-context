@@ -5,21 +5,33 @@ import type { Outcome } from './usage.js';
 export type LogLevel = 'info' | 'warn' | 'error';
 
 export function singleLine(value: string): string {
-  let hasControl = false;
+  let firstControl = -1;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
     if (code < 32 || code === 127) {
-      hasControl = true;
+      firstControl = index;
       break;
     }
   }
-  if (!hasControl) {
+  if (firstControl < 0) {
     return value;
   }
-  return Array.from(value, (character) => {
-    if (character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127) { return character; }
-    return character === '\n' ? '\\n' : character === '\r' ? '\\r' : character === '\t' ? '\\t' : '?';
-  }).join('');
+  let out = value.slice(0, firstControl);
+  let last = firstControl;
+  for (let index = firstControl; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 32 || code === 127) {
+      if (index > last) {
+        out += value.slice(last, index);
+      }
+      out += code === 10 ? '\\n' : code === 13 ? '\\r' : code === 9 ? '\\t' : '?';
+      last = index + 1;
+    }
+  }
+  if (last < value.length) {
+    out += value.slice(last);
+  }
+  return out;
 }
 
 export function outcomeLevel(outcome: Outcome): LogLevel {
