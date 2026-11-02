@@ -438,9 +438,10 @@ def render(report, output, extension_image=None):
     plt.close(figure)
 
     figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), constrained_layout=True)
+    sync_med = statistics.median(r["sync_ms"] for r in report["cold"])
     for axis, field, title in zip(
         axes, ("fallback_ms", "sync_ms"),
-        ("A  Cold miss + normal fallback", "B  Explicit source-load barrier\n(setup: 76.0ms v0.14 → 50.9ms current)"),
+        ("A  Cold miss + normal fallback", f"B  Explicit source-load barrier\n(setup: 76.0ms v0.14 → {sync_med:.1f}ms current)"),
     ):
         values = [row[field] for row in report["cold"]]
         axis.plot(range(1, len(values) + 1), values, "o-", color=colors[2], linewidth=1.2, label="CCTX current")

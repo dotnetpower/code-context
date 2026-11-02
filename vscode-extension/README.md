@@ -22,17 +22,17 @@ For VSIX-only installations, use the links above instead.
 ## Performance
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-retrieval mix averaged **15.02× faster** with a warm CCTX cache
-(95% CI **14.70–15.36×**, up from 6.83× in v0.14): **4.112 → 0.274 ms per operation**.
+retrieval mix averaged **15.28× faster** with a warm CCTX cache
+(95% CI **15.06–15.49×**, up from 6.83× in v0.14): **3.944 → 0.258 ms per operation**.
 Replacing separate `rg` + `view` calls with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%** and reduces end-to-end coding agent wall time by **24.7%**.
 
 | Task | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.601 ms | 0.287 ms | 16.02× |
-| Literal search | 5.365 ms | 0.265 ms | 20.26× |
-| Search + context | 5.514 ms | 0.303 ms | 18.21× |
-| Known read + hash | **0.083 ms** | 0.234 ms | **0.35× — slower** |
-| Fixed mixed suite | 4.112 ms | 0.274 ms | 15.02× |
+| Filename discovery | 4.385 ms | 0.270 ms | 16.21× |
+| Literal search | 5.151 ms | 0.251 ms | 20.54× |
+| Search + context | 5.304 ms | 0.286 ms | 18.55× |
+| Known read + hash | **0.081 ms** | 0.219 ms | **0.37× — slower** |
+| Fixed mixed suite | 3.944 ms | 0.258 ms | 15.28× |
 
 | Token & agent acceleration suite | Baseline (`rg` + `view`) | With CCTX (`code_context`) | Savings / speedup |
 |---|---:|---:|---:|
