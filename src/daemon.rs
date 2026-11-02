@@ -1848,8 +1848,6 @@ impl Server {
         if name == "code_status"
             && let Some(object) = result.as_object_mut()
         {
-            let is_loaded = object.get("index_state").and_then(Value::as_str) == Some("loaded");
-            let keep_recent = if is_loaded { 1 } else { 3 };
             if let Some(cov) = object.get_mut("coverage").and_then(Value::as_object_mut)
                 && let Some(globs_len) = cov
                     .get("globs")
@@ -1863,11 +1861,11 @@ impl Server {
                 cov.insert("globs_count".into(), json!(globs_len));
             }
             if let Some(perf) = object.get_mut("performance").and_then(Value::as_object_mut) {
-                for key in [
-                    "recent_requests",
-                    "recent_clients",
-                    "recent_background",
-                    "evictions",
+                for (key, keep_recent) in [
+                    ("recent_requests", 4usize),
+                    ("recent_clients", 2usize),
+                    ("recent_background", 2usize),
+                    ("evictions", 2usize),
                 ] {
                     if let Some(arr_len) = perf
                         .get(key)

@@ -76,8 +76,9 @@ function formatCompactStatusJson(value: JsonValue): string {
   }
   if (typeof clone.performance === 'object' && clone.performance !== null && !Array.isArray(clone.performance)) {
     const perf = { ...clone.performance };
-    const keepRecent = clone.index_state === 'loaded' ? 1 : 3;
+    const isLoaded = clone.index_state === 'loaded';
     for (const key of ['recent_requests', 'recent_clients', 'recent_background', 'evictions']) {
+      const keepRecent = isLoaded && key !== 'recent_requests' ? 2 : 3;
       const arr = perf[key];
       if (Array.isArray(arr)) {
         const sliced = arr.length > keepRecent ? arr.slice(-keepRecent) : arr;
