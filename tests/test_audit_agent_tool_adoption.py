@@ -393,6 +393,132 @@ class AdoptionAuditTests(unittest.TestCase):
             self.assertIn("code-context", pretty)
             self.assertIn("100.0%", pretty)
 
+    def test_subagent_usage_isolation_and_configure_subagents_idempotence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sess_dir = Path(directory) / "sess-sub"
+            sess_dir.mkdir(parents=True)
+            trace = sess_dir / "events.jsonl"
+            records = [
+                {
+                    "type": "session.start",
+                    "timestamp": "2027-01-15T07:59:59Z",
+                    "data": {"context": {"cwd": "/home/dev/code-context"}},
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:00Z",
+                    "data": {
+                        "usage": {
+                            "model": "gpt-6.1-sol",
+                            "modelDisplayName": "GPT-6.1 Sol",
+                            "reasoningEffort": "high",
+                            "inputTokens": 50_000,
+                            "cacheReadTokens": 48_000,
+                            "outputTokens": 400,
+                        }
+                    },
+                },
+                {
+                    "type": "subagent.started",
+                    "timestamp": "2027-01-15T08:00:01Z",
+                    "agentId": "sub-1",
+                    "data": {
+                        "toolCallId": "tc-task-1",
+                        "agentName": "explore",
+                        "model": "gpt-5.6-luna",
+                    },
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:02Z",
+                    "agentId": "sub-1",
+                    "data": {
+                        "usage": {
+                            "model": "gpt-5.6-luna",
+                            "modelDisplayName": "GPT-5.6 Luna",
+                            "initiator": "sub-agent",
+                            "interactionType": "conversation-subagent",
+                            "inputTokens": 10_000,
+                            "cacheReadTokens": 8_000,
+                            "outputTokens": 100,
+                        }
+                    },
+                },
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:03Z",
+                    "agentId": "sub-1",
+                    "data": {
+                        "toolName": "cctxNativeContext",
+                        "toolCallId": "sub-c1",
+                        "parentToolCallId": "tc-task-1",
+                        "arguments": {"pattern": "Planner"},
+                    },
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:04Z",
+                    "agentId": "sub-1",
+                    "data": {
+                        "toolCallId": "sub-c1",
+                        "success": True,
+                        "result": {"content": "--- src/planner.rs:1-5\n1: pub struct Planner;"},
+                    },
+                },
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:05Z",
+                    "data": {
+                        "toolName": "cctxNativeRead",
+                        "toolCallId": "main-c1",
+                        "arguments": {"ranges": [{"path": "src/lib.rs", "start": 1, "end": 10}]},
+                    },
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:06Z",
+                    "data": {
+                        "toolCallId": "main-c1",
+                        "success": True,
+                        "result": {"content": "--- src/lib.rs:1-10\n1: pub mod planner;"},
+                    },
+                },
+            ]
+            trace.write_text("\n".join(map(json.dumps, records)))
+            report = MODULE.build_report([trace], 24, now=1_800_000_010)
+            self.assertEqual(report["model_usage"]["gpt-6.1-sol"]["cctx_calls"], 1)
+            self.assertEqual(report["model_usage"]["gpt-5.6-luna"]["cctx_calls"], 1)
+            self.assertEqual(report["subagent_usage"]["main"]["cctx_calls"], 1)
+            self.assertEqual(report["subagent_usage"]["explore"]["cctx_calls"], 1)
+            self.assertEqual(report["subagent_usage"]["explore"]["cctx_adoption_percent"], 100.0)
+            pretty = MODULE.format_pretty_report(report)
+            self.assertIn("subagent:explore", pretty)
+
+            cfg_script = Path(__file__).parents[1] / "scripts" / "configure_subagents.py"
+            cfg_spec = importlib.util.spec_from_file_location("configure_subagents", cfg_script)
+            cfg_mod = importlib.util.module_from_spec(cfg_spec)
+            assert cfg_spec.loader is not None
+            cfg_spec.loader.exec_module(cfg_mod)
+
+            defs_dir = Path(directory) / "definitions"
+            defs_dir.mkdir(parents=True)
+            explore_yaml = defs_dir / "explore.agent.yaml"
+            explore_yaml.write_text(
+                "name: explore\ntools:\n  - grep\n  - lsp\nprompt: |\n  You are an exploration agent.\n",
+                encoding="utf-8",
+            )
+            first = cfg_mod.configure_all(Path(directory), [defs_dir])
+            self.assertEqual(first["patched_yaml"], 1)
+            patched_text = explore_yaml.read_text(encoding="utf-8")
+            self.assertIn("cctxNativeContext", patched_text)
+            self.assertIn("code-context-code_context", patched_text)
+            self.assertIn("tctxNativeRun", patched_text)
+            self.assertIn("[cctx-subagent-instructions]", patched_text)
+            second = cfg_mod.configure_all(Path(directory), [defs_dir])
+            self.assertEqual(second["patched_yaml"], 0)
+            self.assertIn("tool_search_diagnostics", report)
+            self.assertIn("subagent_cctx_failure_breakdown", report)
+
 
 if __name__ == "__main__":
     unittest.main()

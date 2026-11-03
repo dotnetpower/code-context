@@ -380,3 +380,81 @@ fn context_cache_is_bounded_and_generation_aware() {
         1
     );
 }
+
+#[test]
+fn subagent_resilience_repairs_llm_regex_filters_mixed_paths_and_suggests_similar_files() {
+    let (dir, mut watched) = fixture();
+    std::fs::write(
+        dir.path().join("src/c.rs"),
+        "fn _entry(x: i32) {\n    let captureEnabled = {false};\n    let key = {assessment};\n}\n",
+    )
+    .unwrap();
+    watched.call("code_sync", json!({})).unwrap();
+
+    // 1. Unbalanced '(' or non-quantifier '{false}' / '{assessment' in regex=true is auto-repaired
+    for (pattern, expected_count) in [
+        ("_entry(", 1u64),
+        ("terminal(|_entry(", 1u64),
+        ("captureEnabled = {false}|notCaptured", 1u64),
+        ("key = {assessment|_entry", 2u64),
+    ] {
+        let hit = watched
+            .call("code_grep", json!({"pattern": pattern, "regex": true}))
+            .unwrap();
+        assert_eq!(hit["total_matches"], expected_count, "failed on pattern: {pattern}");
+    }
+    // Single '[' still fails as an invalid character class
+    assert!(
+        watched
+            .call("code_grep", json!({"pattern": "[", "regex": true}))
+            .is_err()
+    );
+
+    // 2. Multi-path search drops hidden/unindexed entries when at least one indexed path remains
+    let multi = watched
+        .call(
+            "code_grep",
+            json!({
+                "pattern": "needle",
+                "paths": [".github/workflows/ci.yml", "src/a.rs"]
+            }),
+        )
+        .unwrap();
+    assert_eq!(multi["total_matches"], 1);
+
+    // 3. Compact mode clamps oversized context limit/radius instead of failing
+    let clamped = watched
+        .call_with_mode(
+            "code_context",
+            json!({"pattern": "needle", "limit": 100, "radius": 120}),
+            true,
+        )
+        .unwrap();
+    assert_eq!(clamped["search"]["total_matches"], 2);
+
+    // 4. Redundant past-EOF continuation range on the same file in a single batch is skipped
+    let multi_range = watched
+        .call(
+            "code_read",
+            json!({
+                "ranges": [
+                    {"path": "src/a.rs", "start": 1, "end": 150},
+                    {"path": "src/a.rs", "start": 151, "end": 300}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(multi_range.as_array().unwrap().len(), 1);
+    assert_eq!(multi_range[0]["end"], 4);
+
+    // 5. READ_UNAVAILABLE includes did_you_mean suggestion when filename matches
+    let err = watched
+        .call(
+            "code_read",
+            json!({"ranges": [{"path": "src/nested/a.rs", "start": 1, "end": 10}]}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("READ_UNAVAILABLE"), "{err}");
+    assert!(err.contains("did_you_mean=[src/a.rs]"), "{err}");
+}

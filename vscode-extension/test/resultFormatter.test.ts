@@ -272,4 +272,23 @@ void test('oversized tool outputs are bounded to stay under 8KiB inline host lim
   }));
   const wsOut = formatToolResult('code_workspaces', manyWorkspaces);
   assert.ok(wsOut.length <= 7600, `workspaces length=${wsOut.length}`);
+
+  const multibyteLines = Array.from(
+    { length: 200 },
+    (_, i) => `  // 한글 주석 및 유니코드 박스 문자 테스트 라인 ${i}: ╔══════════════════════════════════════════╗`,
+  );
+  const multibyteReadOut = formatToolResult('code_read', [
+    {
+      path: 'src/korean.ts',
+      start: 1,
+      end: 200,
+      sha256: 'abc12345',
+      lines: multibyteLines,
+    },
+  ]);
+  assert.ok(
+    Buffer.byteLength(multibyteReadOut, 'utf8') <= 7600,
+    `multibyte byteLength=${Buffer.byteLength(multibyteReadOut, 'utf8')}`,
+  );
+  assert.match(multibyteReadOut, /inline budget reached \(<8KiB\); next_ranges=/);
 });

@@ -146,11 +146,27 @@ pub(crate) struct CandidatePolicy {
     excludes: GlobSet,
 }
 
+fn companion_globs(pattern: &str) -> &'static [&'static str] {
+    match pattern {
+        "Dockerfile" => &["*.Dockerfile", "*.dockerfile", "Dockerfile.*"],
+        "Containerfile" => &["*.Containerfile", "*.containerfile", "Containerfile.*"],
+        "Makefile" => &["Caddyfile", "Jenkinsfile", "Rakefile", "Gemfile"],
+        "*.cfg" => &["*.service", "*.socket", "*.timer", "*.conf"],
+        "*.h" => &["*.H", "*.hxx"],
+        "*.clj" => &["*.cljc"],
+        "*.ps1" => &["*.psd1"],
+        _ => &[],
+    }
+}
+
 impl CandidatePolicy {
     pub(crate) fn compile(key: CandidatePolicyKey) -> Result<Self> {
         let mut includes = GlobSetBuilder::new();
         for pattern in &key.globs {
             includes.add(Glob::new(pattern)?);
+            for extra in companion_globs(pattern) {
+                includes.add(Glob::new(extra)?);
+            }
         }
         let mut excludes = GlobSetBuilder::new();
         for pattern in &key.excludes {
@@ -314,6 +330,9 @@ impl Workspace {
         }
         for glob in &self.globs {
             command.arg("--type-add").arg(format!("cctx:{glob}"));
+            for extra in companion_globs(glob) {
+                command.arg("--type-add").arg(format!("cctx:{extra}"));
+            }
         }
         command.args(["--type", "cctx"]);
         for exclude in &self.excludes {
@@ -379,7 +398,9 @@ impl Workspace {
         for scope in &self.scopes {
             let mut directory = normalize(Path::new(scope));
             loop {
-                insert(&directory)?;
+                if self.root.join(&directory).is_dir() {
+                    insert(&directory)?;
+                }
                 if !directory.pop() {
                     break;
                 }
@@ -407,6 +428,16 @@ impl Workspace {
     }
 
     pub fn files_limited(&self, policy: &MemoryPolicy) -> Result<FileInventory> {
+        for scope in &self.scopes {
+            let rel = if scope == "." {
+                Path::new("")
+            } else {
+                Path::new(scope)
+            };
+            if !self.root.join(rel).is_dir() {
+                return Err(invalid("scopes must be directories inside root").into());
+            }
+        }
         self.files_limited_at(policy, &self.scopes, false)
     }
 
@@ -417,11 +448,36 @@ impl Workspace {
         shallow: bool,
     ) -> Result<FileInventory> {
         policy.validate().map_err(invalid)?;
+        let mut active_targets = Vec::with_capacity(targets.len());
+        for target in targets {
+            let rel = Path::new(target);
+            if !rel.as_os_str().is_empty() && target != "." {
+                match reject_symlinks_metadata(&self.root, rel) {
+                    Ok(meta) if meta.is_dir() => active_targets.push(target.as_str()),
+                    Ok(_) => {}
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
+            } else if self.root.is_dir() {
+                active_targets.push(target.as_str());
+            }
+        }
+        if active_targets.is_empty() {
+            return Ok(FileInventory {
+                files: HashSet::new(),
+                stamps: std::collections::BTreeMap::new(),
+                total_path_bytes: 0,
+                metadata_source_bytes: 0,
+            });
+        }
         let mut command = self.command();
         if shallow {
             command.args(["--max-depth", "1", "--threads", "1"]);
         }
-        command.args(["--files", "--null", "--"]).args(targets);
+        command.args(["--files", "--null", "--"]).args(&active_targets);
         let output = capture(&mut command)?;
         let estimated_count = bytecount_zero(&output).min(policy.max_files);
         let mut paths = HashSet::with_capacity(estimated_count);
@@ -433,7 +489,17 @@ impl Workspace {
             let text = std::str::from_utf8(path)?;
             let path = Path::new(text);
             safe_relative(path)?;
-            let metadata = reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs)?;
+            let metadata = match reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let normalized = normalize(path);
             if paths.insert(normalized.clone()) {
                 total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());

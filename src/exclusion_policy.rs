@@ -146,6 +146,10 @@ const NODE: &[&str] = &[
     "**/vite.config.*.timestamp-*",
     "**/__generated__/**",
     "**/routeTree.gen.ts",
+    "**/win-unpacked/**",
+    "**/linux-unpacked/**",
+    "**/mac-unpacked/**",
+    "**/LICENSES.chromium.html",
 ];
 const VITE: &[&str] = &[
     "**/dist-ssr/**",
@@ -197,6 +201,8 @@ const RUBY: &[&str] = &[
     "**/vendor/bundle/**",
     "**/tmp/**",
     "**/log/**",
+    "**/logs",
+    "**/logs/**",
     "**/pkg/**",
     "**/spec/reports/**",
     "**/public/system/**",

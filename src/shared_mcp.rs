@@ -112,6 +112,21 @@ fn clean_target_candidate(raw: &str) -> &str {
     }
     if let Some(rest) = s.strip_prefix("file://") {
         s = rest;
+    } else if let Some(scheme_end) = s.find("://")
+        && matches!(
+            &s[..scheme_end],
+            "vscode-remote"
+                | "vscode-file"
+                | "vscode-userdata"
+                | "vscode-insiders"
+                | "cursor"
+                | "windsurf"
+                | "vscodium"
+                | "git"
+        )
+        && let Some(slash) = s[scheme_end + 3..].find('/')
+    {
+        s = &s[scheme_end + 3 + slash..];
     }
     if let Some((base, _)) = s.rsplit_once('#') {
         s = base;
@@ -138,6 +153,23 @@ fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Opti
                 .filter_map(|r| r.get("path").and_then(Value::as_str)),
         );
     }
+    if let Some(glob_str) = arguments.get("glob").and_then(Value::as_str) {
+        let trimmed = glob_str.trim();
+        if !trimmed.is_empty() {
+            if let Some(wild_pos) = trimmed.find(['*', '?', '[', '{']) {
+                if let Some(slash) = trimmed[..wild_pos].rfind('/')
+                    && slash > 0
+                {
+                    let prefix = &trimmed[..slash];
+                    if prefix != "." {
+                        raw_candidates.push(prefix);
+                    }
+                }
+            } else {
+                raw_candidates.push(trimmed);
+            }
+        }
+    }
     if raw_candidates.is_empty() {
         return None;
     }
@@ -156,11 +188,33 @@ fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Opti
             }
         }
     }
-    if specs.len() > 1 {
+    if !specs.is_empty() {
         for raw in &raw_candidates {
-            let cleaned = clean_target_candidate(raw).trim_start_matches("./");
+            let mut cleaned = clean_target_candidate(raw).trim_start_matches("./");
+            if let Some(rest) = cleaned
+                .strip_prefix("a/")
+                .or_else(|| cleaned.strip_prefix("b/"))
+                && !rest.is_empty()
+            {
+                cleaned = rest;
+            }
             if cleaned.is_empty() || cleaned.starts_with('/') || cleaned.starts_with("..") {
                 continue;
+            }
+            if let Some((first_seg, rest_rel)) = cleaned.split_once('/')
+                && !first_seg.is_empty()
+                && !rest_rel.is_empty()
+            {
+                let by_basename: Vec<_> = specs
+                    .iter()
+                    .filter(|spec| {
+                        spec.root.file_name().and_then(|n| n.to_str()) == Some(first_seg)
+                            && spec.root.join(rest_rel).exists()
+                    })
+                    .collect();
+                if by_basename.len() == 1 {
+                    return Some(by_basename[0].root.clone());
+                }
             }
             let matching: Vec<_> = specs
                 .iter()
@@ -268,6 +322,38 @@ fn parse_diagnostic_or_inline_range(raw: &str) -> (String, Option<u64>, Option<u
     (trimmed.to_owned(), None, None)
 }
 
+fn value_as_i64_coerced(val: &Value) -> Option<i64> {
+    val.as_i64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+fn value_as_u64_coerced(val: &Value) -> Option<u64> {
+    val.as_u64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+fn value_as_bool_coerced(val: &Value) -> Option<bool> {
+    val.as_bool().or_else(|| match val.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    })
+}
+
+fn clean_lexical_absolute_path(path: &std::path::Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn normalize_single_range_map(
     map: &mut serde_json::Map<String, Value>,
     default_span: u64,
@@ -324,7 +410,7 @@ fn normalize_single_range_map(
         map,
         &["radius", "context_lines", "contextLines", "context"],
     )
-    .and_then(|v| v.as_u64());
+    .and_then(|v| value_as_u64_coerced(&v));
     let mut end = map.remove("end").or_else(|| {
         take_first_alias(
             map,
@@ -339,10 +425,10 @@ fn normalize_single_range_map(
         )
     });
     let count_span = take_first_alias(map, &["numLines", "lineCount", "limit"])
-        .and_then(|v| v.as_u64())
+        .and_then(|v| value_as_u64_coerced(&v))
         .filter(|&n| n > 0);
     let mut start = explicit_start;
-    if let Some(Value::Array(vr)) = map.remove("view_range")
+    if let Some(Value::Array(vr)) = take_first_alias(map, &["view_range", "line_range", "lineRange", "lines"])
         && vr.len() == 2
     {
         start = start.or_else(|| vr.first().cloned());
@@ -353,7 +439,7 @@ fn normalize_single_range_map(
         && let Some(center) = center_alias
             .as_ref()
             .or(line_alias.as_ref())
-            .and_then(Value::as_i64)
+            .and_then(value_as_i64_coerced)
             .filter(|&n| n > 0)
             .map(|n| n as u64)
         && (center_alias.is_some() || radius_alias.is_some())
@@ -366,8 +452,8 @@ fn normalize_single_range_map(
         return;
     }
     start = start.or(line_alias).or(center_alias);
-    let raw_s = start.as_ref().and_then(Value::as_i64);
-    let raw_e = end.as_ref().and_then(Value::as_i64);
+    let raw_s = start.as_ref().and_then(value_as_i64_coerced);
+    let raw_e = end.as_ref().and_then(value_as_i64_coerced);
     let mut s = match raw_s {
         Some(n) if n > 0 => n as u64,
         Some(0) => 1,
@@ -381,7 +467,9 @@ fn normalize_single_range_map(
             .or(extracted_end)
             .unwrap_or(s + default_span),
     };
-    if s > e && e >= 1 {
+    if s == e + 1 && e >= 20 {
+        e = s + default_span;
+    } else if s > e && e >= 1 {
         std::mem::swap(&mut s, &mut e);
     }
     map.insert("start".into(), json!(s));
@@ -464,20 +552,29 @@ pub(crate) fn normalize_mcp_argument_aliases(
         {
             arguments.insert("pattern".into(), val);
         }
-        let regex_alias = take_first_alias(arguments, &["isRegexp", "is_regex", "useRegex"]);
-        if !arguments.contains_key("regex")
-            && let Some(val) = regex_alias
-        {
-            arguments.insert("regex".into(), val);
+        let regex_alias = take_first_alias(arguments, &["isRegexp", "is_regex", "useRegex", "regexp"]);
+        let fixed_alias = take_first_alias(arguments, &["fixed_strings", "fixedStrings", "literal"]);
+        if !arguments.contains_key("regex") {
+            if let Some(val) = regex_alias {
+                arguments.insert("regex".into(), val);
+            } else if let Some(b) = fixed_alias.as_ref().and_then(value_as_bool_coerced) {
+                arguments.insert("regex".into(), Value::Bool(!b));
+            }
         }
-        let ci_alias = take_first_alias(arguments, &["caseInsensitive", "case_insensitive"]);
+        if let Some(b) = arguments.get("regex").and_then(value_as_bool_coerced) {
+            arguments.insert("regex".into(), Value::Bool(b));
+        }
+        let ci_alias = take_first_alias(arguments, &["caseInsensitive", "case_insensitive", "-i"]);
         let cs_alias = arguments.remove("isCaseSensitive");
         if !arguments.contains_key("ignore_case") {
             if let Some(val) = ci_alias {
                 arguments.insert("ignore_case".into(), val);
-            } else if let Some(Value::Bool(cs)) = cs_alias {
+            } else if let Some(cs) = cs_alias.as_ref().and_then(value_as_bool_coerced) {
                 arguments.insert("ignore_case".into(), Value::Bool(!cs));
             }
+        }
+        if let Some(b) = arguments.get("ignore_case").and_then(value_as_bool_coerced) {
+            arguments.insert("ignore_case".into(), Value::Bool(b));
         }
         let max_per_file = arguments.remove("maxMatchesPerFile");
         if !arguments.contains_key("max_matches_per_file")
@@ -486,14 +583,31 @@ pub(crate) fn normalize_mcp_argument_aliases(
         {
             arguments.insert("max_matches_per_file".into(), val);
         }
+        if let Some(n) = arguments.get("max_matches_per_file").and_then(value_as_i64_coerced) {
+            arguments.insert("max_matches_per_file".into(), json!(n.clamp(1, 64)));
+        }
     }
     if name == "code_context" {
-        let radius_alias =
-            take_first_alias(arguments, &["contextLines", "context_lines", "context"]);
+        let radius_alias = take_first_alias(
+            arguments,
+            &[
+                "contextLines",
+                "context_lines",
+                "context",
+                "before_context",
+                "after_context",
+                "-C",
+                "-A",
+                "-B",
+            ],
+        );
         if !arguments.contains_key("radius")
             && let Some(val) = radius_alias
         {
             arguments.insert("radius".into(), val);
+        }
+        if let Some(r) = arguments.get("radius").and_then(value_as_i64_coerced) {
+            arguments.insert("radius".into(), json!(r.clamp(0, 100)));
         }
     }
     if matches!(name, "code_files" | "code_grep" | "code_context") {
@@ -503,6 +617,12 @@ pub(crate) fn normalize_mcp_argument_aliases(
             && let Some(val) = limit_alias
         {
             arguments.insert("limit".into(), val);
+        }
+        if let Some(lim) = arguments.get("limit").and_then(value_as_i64_coerced)
+            && lim > 0
+        {
+            let max_lim = if name == "code_context" { 64 } else { 1000 };
+            arguments.insert("limit".into(), json!(lim.clamp(1, max_lim)));
         }
         let glob_alias = take_first_alias(
             arguments,
@@ -519,20 +639,75 @@ pub(crate) fn normalize_mcp_argument_aliases(
                 "includeGlob",
                 "include",
                 "filter",
+                "globs",
+                "patterns",
             ],
         );
         if !arguments.contains_key("glob")
             && let Some(val) = glob_alias
-            && val.as_str().is_some_and(|s| !s.trim().is_empty())
+            && (val.as_str().is_some_and(|s| !s.trim().is_empty()) || val.is_array())
         {
             arguments.insert("glob".into(), val);
+        }
+        if let Some(Value::Array(glob_arr)) = arguments.get("glob").cloned() {
+            let parts: Vec<String> = glob_arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if parts.len() == 1 {
+                arguments.insert("glob".into(), Value::String(parts[0].clone()));
+            } else if parts.len() > 1 {
+                arguments.insert("glob".into(), Value::String(format!("{{{}}}", parts.join(","))));
+            } else {
+                arguments.remove("glob");
+            }
         }
     }
     if name == "code_files"
         && !arguments.contains_key("glob")
-        && let Some(pattern) = arguments.remove("pattern")
+        && let Some(pattern) = take_first_alias(arguments, &["pattern", "query", "search"])
     {
         arguments.insert("glob".into(), pattern);
+    }
+    if matches!(name, "code_files" | "code_grep" | "code_context")
+        && let Some(raw_glob) = arguments.get("glob").and_then(Value::as_str).map(str::to_owned)
+    {
+        let mut cleaned_glob = raw_glob.trim().to_owned();
+        while cleaned_glob.starts_with("./") && cleaned_glob.len() > 2 {
+            cleaned_glob = cleaned_glob[2..].to_owned();
+        }
+        if !cleaned_glob.contains('{') && cleaned_glob.contains(',') {
+            let parts: Vec<&str> = cleaned_glob
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2
+                && parts
+                    .iter()
+                    .all(|p| p.starts_with("*.") || p.starts_with("**/*."))
+            {
+                let exts: Vec<&str> = parts
+                    .iter()
+                    .map(|p| p.trim_start_matches("**/").trim_start_matches("*."))
+                    .collect();
+                cleaned_glob = format!("*.{{{}}}", exts.join(","));
+            }
+        }
+        if cleaned_glob.starts_with('.')
+            && cleaned_glob.len() > 1
+            && cleaned_glob[1..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            cleaned_glob = format!("*{cleaned_glob}");
+        }
+        if cleaned_glob != raw_glob {
+            arguments.insert("glob".into(), Value::String(cleaned_glob));
+        }
     }
     if matches!(name, "code_files" | "code_grep" | "code_context") {
         let single_path = take_first_alias(
@@ -596,6 +771,22 @@ pub(crate) fn normalize_mcp_argument_aliases(
                 cleaned_paths.push(item);
             }
         }
+        if cleaned_paths.len() > 1 {
+            let non_hidden: Vec<Value> = cleaned_paths
+                .iter()
+                .filter(|v| {
+                    v.as_str().is_none_or(|p| {
+                        !std::path::Path::new(p)
+                            .components()
+                            .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.') && s != "."))
+                    })
+                })
+                .cloned()
+                .collect();
+            if !non_hidden.is_empty() && non_hidden.len() < cleaned_paths.len() {
+                cleaned_paths = non_hidden;
+            }
+        }
         *paths_arr = cleaned_paths;
         if !arguments.contains_key("glob")
             && let Some(g) = extracted_glob
@@ -609,6 +800,18 @@ pub(crate) fn normalize_mcp_argument_aliases(
             && !split_alias.is_null()
         {
             arguments.insert("split_ranges".into(), split_alias);
+        }
+        if let Some(b) = arguments.get("split_ranges").and_then(value_as_bool_coerced) {
+            arguments.insert("split_ranges".into(), Value::Bool(b));
+        }
+        if let Some(b) = arguments.get("page").and_then(value_as_bool_coerced) {
+            arguments.insert("page".into(), Value::Bool(b));
+        }
+        if !arguments.contains_key("paths")
+            && let Some(paths_alias) =
+                take_first_alias(arguments, &["files", "targets", "file_paths", "filePaths"])
+        {
+            arguments.insert("paths".into(), paths_alias);
         }
         if let Some(Value::Array(ranges)) = arguments.get_mut("ranges") {
             let default_span = if ranges.len() > 1 { 79 } else { 119 };
@@ -725,6 +928,112 @@ pub(crate) fn normalize_mcp_argument_aliases(
             }
             normalize_single_range_map(&mut single, 119);
             arguments.insert("ranges".into(), Value::Array(vec![Value::Object(single)]));
+        } else if let Some(raw_root) = arguments.get("root").and_then(Value::as_str)
+            && let cleaned_root = clean_target_candidate(raw_root)
+            && cleaned_root.starts_with('/')
+            && let Ok(specs) = crate::catalog::load()
+        {
+            let target = std::path::Path::new(cleaned_root);
+            if let Some(spec) = specs
+                .iter()
+                .filter(|spec| target.starts_with(&spec.root) && target != spec.root)
+                .max_by_key(|spec| spec.root.components().count())
+                && let Ok(rel) = target.strip_prefix(&spec.root)
+                && let Some(rel_str) = rel.to_str()
+                && !rel_str.is_empty()
+                && (target.is_file()
+                    || raw_root.contains('#')
+                    || raw_root.contains(':')
+                    || arguments.keys().any(|k| {
+                        matches!(
+                            k.as_str(),
+                            "start"
+                                | "end"
+                                | "start_line"
+                                | "end_line"
+                                | "startLine"
+                                | "endLine"
+                                | "line"
+                                | "around_line"
+                                | "view_range"
+                        )
+                    }))
+            {
+                let mut single = serde_json::Map::new();
+                let rebuilt_path = if let Some((_, frag)) = raw_root.rsplit_once('#') {
+                    format!("{rel_str}#{frag}")
+                } else if let Some((_, suffix)) = raw_root.split_once(':')
+                    && suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                {
+                    format!("{rel_str}:{suffix}")
+                } else {
+                    rel_str.to_owned()
+                };
+                single.insert("path".into(), Value::String(rebuilt_path));
+                for key in [
+                    "start",
+                    "end",
+                    "start_line",
+                    "end_line",
+                    "startLine",
+                    "endLine",
+                    "start_line_number",
+                    "end_line_number",
+                    "startLineNumber",
+                    "endLineNumber",
+                    "from_line",
+                    "to_line",
+                    "fromLine",
+                    "toLine",
+                    "line",
+                    "line_number",
+                    "lineNumber",
+                    "around_line",
+                    "aroundLine",
+                    "center_line",
+                    "centerLine",
+                    "radius",
+                    "context_lines",
+                    "contextLines",
+                    "context",
+                    "offset",
+                    "numLines",
+                    "lineCount",
+                    "limit",
+                    "view_range",
+                ] {
+                    if let Some(v) = arguments.remove(key) {
+                        single.insert(key.into(), v);
+                    }
+                }
+                normalize_single_range_map(&mut single, 119);
+                arguments.insert(
+                    "root".into(),
+                    Value::String(spec.root.to_string_lossy().into_owned()),
+                );
+                arguments.insert("ranges".into(), Value::Array(vec![Value::Object(single)]));
+            }
+        }
+        if let Some(Value::Array(ranges_arr)) = arguments.get_mut("ranges")
+            && ranges_arr.len() > 1
+        {
+            let mut deduped: Vec<Value> = Vec::with_capacity(ranges_arr.len());
+            for item in ranges_arr.drain(..) {
+                let is_dup = deduped.iter().any(|existing| {
+                    existing.get("path") == item.get("path")
+                        && existing.get("start").and_then(Value::as_u64).is_some_and(|es| {
+                            item.get("start").and_then(Value::as_u64).is_some_and(|s| es <= s)
+                        })
+                        && existing.get("end").and_then(Value::as_u64).is_some_and(|ee| {
+                            item.get("end").and_then(Value::as_u64).is_some_and(|e| ee >= e)
+                        })
+                });
+                if !is_dup {
+                    deduped.push(item);
+                }
+            }
+            deduped.truncate(64);
+            *ranges_arr = deduped;
         }
     }
 }
@@ -850,7 +1159,14 @@ fn tool_call(
     let root = arguments
         .remove("root")
         .map(serde_json::from_value::<PathBuf>)
-        .transpose()?;
+        .transpose()?
+        .map(|p| {
+            if p.is_absolute() {
+                clean_lexical_absolute_path(&p)
+            } else {
+                p
+            }
+        });
     if root.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err(invalid("root must be absolute when provided").into());
     }
@@ -861,7 +1177,15 @@ fn tool_call(
         None
     } else {
         Some(match root {
-            Some(root) => root,
+            Some(explicit_root) => {
+                if !explicit_root.exists()
+                    && let Some(inferred) = infer_root_from_arguments(&arguments)
+                {
+                    inferred
+                } else {
+                    explicit_root
+                }
+            }
             None => infer_root_from_arguments(&arguments)
                 .or_else(|| default_root.cloned())
                 .ok_or_else(|| invalid("current directory is not inside a registered workspace"))?,

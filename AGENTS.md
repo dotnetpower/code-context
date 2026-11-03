@@ -15,6 +15,7 @@
 4. **Exact or regex line search**: Use `#cctxNativeGrep` (or MCP `code_grep`). Set `regex: true` for alternation (`a|b`) or regex syntax; set `max_matches_per_file` to prevent noisy files from starving results and to prioritize symbol definitions.
 5. **Known line ranges**: Use `#cctxNativeRead` (or MCP `code_read`) for batched 1-based inclusive line ranges with SHA-256 verification (supports `path:line:col`, `path#Lstart-Lend`, and Markdown section anchors such as `docs/REFERENCE.md#native-tools`).
 6. **Cold cache handling**: `CACHE_MISS` means the requested root was queued for background loading, never zero matches or a missing file. Continue that single lookup with permitted host search/read tools without polling or running `code_sync` to wait.
+7. **Subagents & deferred tool discovery**: When delegating to subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`, `security-review`), pass the explicit absolute `root` and instruct the subagent to use `#cctxNative*` or `code-context-code_*` first. When discovering deferred tools via `tool_search`, include exact names for both Native and MCP surfaces (`"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"`) so discovery succeeds even when no UI client is connected.
 
 ## Build, Test, and Verification Commands
 

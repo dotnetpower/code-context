@@ -652,6 +652,137 @@ fn search_internal(
     Ok(ProfiledResult { result, profile })
 }
 
+fn is_valid_repetition_brace_body(body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    if let Some((min_s, max_s)) = body.split_once(',') {
+        !min_s.is_empty()
+            && min_s.bytes().all(|b| b.is_ascii_digit())
+            && max_s.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        body.bytes().all(|b| b.is_ascii_digit())
+    }
+}
+
+fn sanitize_regex_branch(branch: &str) -> String {
+    let chars: Vec<char> = branch.chars().collect();
+    let mut out = String::with_capacity(branch.len() + 8);
+    let mut open_positions: Vec<usize> = Vec::new();
+    let mut escaped_indices = std::collections::HashSet::new();
+    let mut i = 0;
+    let mut in_char_class = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == '[' && !in_char_class {
+            in_char_class = true;
+            i += 1;
+            continue;
+        }
+        if c == ']' && in_char_class {
+            in_char_class = false;
+            i += 1;
+            continue;
+        }
+        if !in_char_class {
+            if c == '(' {
+                open_positions.push(i);
+            } else if c == ')' && open_positions.pop().is_none() {
+                escaped_indices.insert(i);
+            }
+        }
+        i += 1;
+    }
+    for pos in open_positions {
+        escaped_indices.insert(pos);
+    }
+    i = 0;
+    in_char_class = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        if c == '[' && !in_char_class {
+            in_char_class = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ']' && in_char_class {
+            in_char_class = false;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_char_class && (c == '(' || c == ')') && escaped_indices.contains(&i) {
+            out.push('\\');
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_char_class && c == '{' {
+            let mut close = None;
+            for (offset, &ch) in chars[i + 1..].iter().enumerate() {
+                if ch == '}' {
+                    close = Some(i + 1 + offset);
+                    break;
+                }
+                if ch == '{' || ch == '|' {
+                    break;
+                }
+            }
+            let valid = close.is_some_and(|end_idx| {
+                let body: String = chars[i + 1..end_idx].iter().collect();
+                is_valid_repetition_brace_body(&body)
+            });
+            if !valid {
+                out.push('\\');
+                out.push('{');
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn sanitize_llm_regex_fallback(pattern: &str) -> Option<String> {
+    if pattern.len() < 3 || (!pattern.contains('(') && !pattern.contains(')') && !pattern.contains('{')) {
+        return None;
+    }
+    let mut branches = Vec::new();
+    let mut current = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            current.push(c);
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
+        } else if c == '|' {
+            branches.push(sanitize_regex_branch(&current));
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    branches.push(sanitize_regex_branch(&current));
+    let joined = branches.join("|");
+    (joined != pattern).then_some(joined)
+}
+
 fn compile(key: &CacheKey) -> Result<Compiled> {
     if !key.regex && !key.ignore_case {
         return Ok(Compiled {
@@ -662,18 +793,37 @@ fn compile(key: &CacheKey) -> Result<Compiled> {
             plan: Some(CandidateExpr::Literal(key.pattern.as_bytes().to_vec())),
         });
     }
-    let syntax = if key.regex {
+    let mut syntax = if key.regex {
         key.pattern.clone()
     } else {
         regex_syntax::escape(&key.pattern)
     };
-    let hir = regex_syntax::ParserBuilder::new()
+    let hir = match regex_syntax::ParserBuilder::new()
         .multi_line(true)
         .case_insensitive(key.ignore_case)
         .build()
-        .parse(&syntax)?;
+        .parse(&syntax)
+    {
+        Ok(hir) => hir,
+        Err(first_err) => {
+            if key.regex
+                && let Some(repaired) = sanitize_llm_regex_fallback(&syntax)
+                && let Ok(repaired_hir) = regex_syntax::ParserBuilder::new()
+                    .multi_line(true)
+                    .case_insensitive(key.ignore_case)
+                    .build()
+                    .parse(&repaired)
+            {
+                syntax = repaired;
+                repaired_hir
+            } else {
+                return Err(first_err.into());
+            }
+        }
+    };
     let per_line = key.regex && text_anchored(&hir);
     let manual_line_prefilter = key.regex && expensive_leading_repetition(&hir);
+    let matcher_pattern = if key.regex { &syntax } else { &key.pattern };
     let matcher = RegexMatcherBuilder::new()
         .fixed_strings(!key.regex)
         .case_insensitive(key.ignore_case)
@@ -681,7 +831,7 @@ fn compile(key: &CacheKey) -> Result<Compiled> {
         .line_terminator(Some(b'\n'))
         .size_limit(MATCHER_MEMORY_LIMIT)
         .dfa_size_limit(MATCHER_MEMORY_LIMIT)
-        .build(&key.pattern)?;
+        .build(matcher_pattern)?;
     Ok(Compiled {
         matcher: Some(matcher),
         finder: None,

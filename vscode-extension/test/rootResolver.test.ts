@@ -339,4 +339,34 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
     extractLineRangeFromPath('src/query.rs:42:10: pub fn search()'),
     { path: 'src/query.rs', start: 42, end: 82 },
   );
+  const rootAsFilePathRead = buildReadArguments(
+    {
+      root: '/repo/runtime/bootstrap.py',
+      start: 230,
+      end: 265,
+    },
+    '/repo',
+  );
+  assert.deepEqual(rootAsFilePathRead.ranges, [
+    { path: 'runtime/bootstrap.py', start: 230, end: 265 },
+  ]);
+  const offByOnePagination = buildReadArguments({
+    ranges: [{ path: 'src/lib.rs', start: 251, end: 250 }],
+  });
+  assert.deepEqual(offByOnePagination.ranges, [
+    { path: 'src/lib.rs', start: 251, end: 370 },
+  ]);
+  const radiusZeroAround = buildReadArguments({
+    path: 'src/lib.rs',
+    around_line: 42,
+    radius: 0,
+  });
+  assert.deepEqual(radiusZeroAround.ranges, [
+    { path: 'src/lib.rs', start: 42, end: 42 },
+  ]);
+  const mixedHiddenPaths = buildSearchArguments({
+    pattern: 'needle',
+    paths: ['.github/workflows/ci.yml', 'src/lib.rs'],
+  });
+  assert.deepEqual(mixedHiddenPaths.paths, ['src/lib.rs']);
 });

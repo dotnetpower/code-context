@@ -469,6 +469,8 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
         cwd = None
         last_session_model = None
         last_session_display = None
+        last_model_by_agent: dict[str, tuple[str, str]] = {}
+        subagent_types_by_id: dict[str, str] = {}
         try:
             lines = path.open(errors="replace")
         except FileNotFoundError:
@@ -480,6 +482,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     '"tool.execution_' not in raw
                     and '"session.usage_record"' not in raw
                     and '"session.start"' not in raw
+                    and '"subagent.started"' not in raw
                     and '"chat/toolCall' not in raw
                     and not any(name in raw for name in CATALOG_NAMES)
                 ):
@@ -494,6 +497,16 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     context = event.get("data", {}).get("context", {})
                     if isinstance(context, dict) and isinstance(context.get("cwd"), str):
                         cwd = context["cwd"]
+                if event.get("type") == "subagent.started":
+                    sdata = event.get("data", {})
+                    if isinstance(sdata, dict):
+                        atype = str(sdata.get("agentName") or sdata.get("agentType") or "subagent")
+                        for sid in (event.get("agentId"), sdata.get("toolCallId")):
+                            if isinstance(sid, str) and sid:
+                                subagent_types_by_id[sid] = atype
+                                if isinstance(sdata.get("model"), str) and sdata["model"]:
+                                    last_model_by_agent[sid] = (sdata["model"], sdata["model"])
+                    continue
                 timestamp = event_timestamp(event)
                 if timestamp is None or timestamp < cutoff or timestamp > now:
                     continue
@@ -504,8 +517,22 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                         model_id = str(usage.get("model") or "unknown")
                         display_name = str(usage.get("modelDisplayName") or model_id)
                         effort = str(usage.get("reasoningEffort") or "-")
-                        last_session_model = model_id
-                        last_session_display = display_name
+                        agent_id = event.get("agentId") or usage.get("parentToolCallId")
+                        is_subagent = bool(
+                            agent_id
+                            or usage.get("initiator") == "sub-agent"
+                            or usage.get("interactionType") == "conversation-subagent"
+                        )
+                        if isinstance(agent_id, str) and agent_id:
+                            last_model_by_agent[agent_id] = (model_id, display_name)
+                        if not is_subagent:
+                            last_session_model = model_id
+                            last_session_display = display_name
+                        agent_role = (
+                            subagent_types_by_id.get(str(agent_id), "subagent")
+                            if is_subagent
+                            else "main"
+                        )
                         session_channel = f"session:{path.parent.name}"
                         sessions.add(session_channel)
                         copilot_usage = usage.get("copilotUsage", {})
@@ -517,6 +544,8 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                             "model": model_id,
                             "display_name": display_name,
                             "reasoning_effort": effort,
+                            "is_subagent": is_subagent,
+                            "agent_role": agent_role,
                             "input_tokens": int(usage.get("inputTokens") or 0),
                             "output_tokens": int(usage.get("outputTokens") or 0),
                             "cache_read_tokens": int(usage.get("cacheReadTokens") or 0),
@@ -582,11 +611,28 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     if not isinstance(arguments, dict):
                         arguments = {}
                     call["arguments"] = arguments
+                    if call["tool"] == "task" and isinstance(arguments.get("agent_type"), str):
+                        subagent_types_by_id[call_id] = arguments["agent_type"]
                     call["eligibility"] = request_eligibility(call["tool"], arguments, cwd, coverage, now)
                     call["cwd"] = cwd
+                    agent_id = event.get("agentId") or action.get("parentToolCallId")
+                    parent_tc = action.get("parentToolCallId")
+                    is_subagent = bool(agent_id)
+                    agent_role = (
+                        subagent_types_by_id.get(str(agent_id))
+                        or (subagent_types_by_id.get(str(parent_tc)) if parent_tc else None)
+                        or "subagent"
+                    ) if is_subagent else "main"
+                    call["is_subagent"] = is_subagent
+                    call["agent_role"] = agent_role
+                    fallback_model, fallback_display = (
+                        last_model_by_agent.get(str(agent_id), (last_session_model, last_session_display))
+                        if is_subagent
+                        else (last_session_model, last_session_display)
+                    )
                     call_model = action.get("model")
-                    call["model"] = str(call_model) if isinstance(call_model, str) and call_model else last_session_model
-                    call["model_display"] = last_session_display or call["model"]
+                    call["model"] = str(call_model) if isinstance(call_model, str) and call_model else fallback_model
+                    call["model_display"] = fallback_display or call["model"]
                     call["turn_compressed"] = is_turn_compressed_call(call["tool"], arguments)
                     target_str = str(
                         arguments.get("path")
@@ -595,19 +641,31 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                         or arguments.get("file_path")
                         or ""
                     )
-                    call["non_source_host_only"] = classify(call["tool"]) == "builtin_search_read" and any(
-                        token in target_str
-                        for token in (
-                            "/tmp/",
-                            "copilot-tool-output",
-                            "/.copilot",
-                            "/.github",
-                            "/.vscode",
-                            ".png",
-                            ".jpg",
-                            ".pdf",
-                            ".vsix",
+                    call["non_source_host_only"] = classify(call["tool"]) == "builtin_search_read" and (
+                        any(
+                            token in target_str
+                            for token in (
+                                "/tmp/",
+                                "copilot-tool-output",
+                                "/.copilot",
+                                "/.github",
+                                "/.vscode",
+                                "/.git",
+                                ".gitignore",
+                                ".png",
+                                ".jpg",
+                                ".pdf",
+                                ".vsix",
+                            )
                         )
+                        or any(
+                            part.startswith(".") and part not in {".", ".."}
+                            for part in Path(target_str).parts
+                            if target_str and not target_str.startswith("[")
+                        )
+                    )
+                    call["cctx_cli_fallback"] = call["tool"] in {"bash", "run_in_terminal"} and (
+                        "cctx --backend shared" in str(arguments.get("command") or "")
                     )
                 elif action_type == "chat/toolCallComplete":
                     call = calls.setdefault(
@@ -623,9 +681,15 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     )
                     call["completed_at"] = timestamp
                     if not call.get("model"):
+                        agent_id = event.get("agentId") or action.get("parentToolCallId")
+                        fallback_model, fallback_display = (
+                            last_model_by_agent.get(str(agent_id), (last_session_model, last_session_display))
+                            if agent_id
+                            else (last_session_model, last_session_display)
+                        )
                         call_model = action.get("model")
-                        call["model"] = str(call_model) if isinstance(call_model, str) and call_model else last_session_model
-                        call["model_display"] = last_session_display or call["model"]
+                        call["model"] = str(call_model) if isinstance(call_model, str) and call_model else fallback_model
+                        call["model_display"] = fallback_display or call["model"]
                     result = action.get("result", {})
                     if not isinstance(result, dict):
                         result = {}
@@ -638,6 +702,15 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     call["payload_chars"] = payload_chars
                     call["payload_tokens"] = payload_tokens
                     call["offloaded"] = text_payload.startswith("Output too large to read at once")
+                    if call.get("tool") == "tool_search_tool":
+                        call["tool_search_cctx_hit"] = any(
+                            token in text_payload
+                            for token in ("cctxNative", "code-context-code_")
+                        )
+                        call["tool_search_no_client_miss"] = (
+                            "No client is connected" in text_payload
+                            and "No tool name matched" in text_payload
+                        )
                     error = result.get("error")
                     if error:
                         call["error"] = error
@@ -876,26 +949,83 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     }
 
     failure_breakdown = Counter()
+    subagent_failure_breakdown = Counter()
     for call in cctx_calls:
         if call.get("success") is False:
             err = json.dumps(call.get("error"), ensure_ascii=False)
             if "CACHE_MISS root=" in err:
-                failure_breakdown["cache_miss"] += 1
+                bucket = "cache_miss"
             elif "CACHE_LOAD_FAILED root=" in err:
-                failure_breakdown["cache_load_failed"] += 1
+                bucket = "cache_load_failed"
             elif "explicit absolute Linux root" in err or "not inside a registered workspace" in err or "not explicitly registered" in err:
-                failure_breakdown["missing_or_unregistered_root"] += 1
+                bucket = "missing_or_unregistered_root"
             elif "READ_POLICY_DENIED" in err or "TARGET_NOT_INDEXED" in err or "only non-hidden" in err:
-                failure_breakdown["policy_or_hidden_target"] += 1
+                bucket = "policy_or_hidden_target"
             elif "READ_RANGE_" in err or "radius 0.." in err or "exceeds snapshot EOF" in err or "maximum 500 lines" in err:
-                failure_breakdown["range_or_limit_bounds"] += 1
+                bucket = "range_or_limit_bounds"
             elif "RESPONSE_BUDGET_EXCEEDED" in err:
-                failure_breakdown["response_budget_exceeded"] += 1
+                bucket = "response_budget_exceeded"
             elif "READ_UNAVAILABLE" in err or "unavailable after automatic recovery" in err:
-                failure_breakdown["file_unavailable"] += 1
+                bucket = "file_unavailable"
+            elif "No matching client connected" in err or "disconnected before completing" in err:
+                bucket = "client_disconnected"
             else:
-                failure_breakdown["other_error"] += 1
+                bucket = "other_error"
+            failure_breakdown[bucket] += 1
+            if call.get("is_subagent"):
+                subagent_failure_breakdown[bucket] += 1
     report["cctx_failure_breakdown"] = dict(failure_breakdown)
+    report["subagent_cctx_failure_breakdown"] = dict(subagent_failure_breakdown)
+    tool_search_calls = [call for call in calls.values() if call.get("tool") == "tool_search_tool"]
+    report["tool_search_diagnostics"] = {
+        "total_calls": len(tool_search_calls),
+        "subagent_calls": sum(1 for c in tool_search_calls if c.get("is_subagent")),
+        "cctx_discoveries": sum(1 for c in tool_search_calls if c.get("tool_search_cctx_hit")),
+        "no_client_connected_misses": sum(1 for c in tool_search_calls if c.get("tool_search_no_client_miss")),
+        "cctx_cli_fallback_calls": sum(1 for c in calls.values() if c.get("cctx_cli_fallback")),
+    }
+    role_names = sorted(
+        {rec.get("agent_role", "main") for rec in usage_records}
+        | {call.get("agent_role", "main") for call in calls.values()}
+    )
+    subagent_usage = {}
+    for role in role_names:
+        r_records = [rec for rec in usage_records if rec.get("agent_role", "main") == role]
+        r_calls = [call for call in calls.values() if call.get("agent_role", "main") == role]
+        r_lookup = [call for call in r_calls if is_lookup_tool(call["tool"])]
+        r_elig = [
+            call for call in r_lookup
+            if not call.get("non_source_host_only") and not call.get("pre_edit_view")
+        ]
+        r_cctx = [call for call in r_lookup if classify(call["tool"]) in {"native", "mcp"}]
+        r_builtin = [call for call in r_lookup if classify(call["tool"]) == "builtin_search_read"]
+        r_outcomes = outcome_counts(r_cctx)
+        r_warm = max(0, len(r_cctx) - r_outcomes["expected_cache_misses"] - r_outcomes["cache_load_failures"])
+        r_direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in r_cctx)
+        r_avoided = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in r_cctx)
+        r_nano = sum(rec.get("nano_aiu", 0) for rec in r_records)
+        r_used_aic = round(r_nano / 1e9, 4) if r_nano else 0.0
+        r_saved_aic = round((r_direct_saved * 0.00055) + (r_avoided * 4.20), 4)
+        subagent_usage[role] = {
+            "agent_role": role,
+            "is_subagent": role != "main",
+            "turns": len(r_records),
+            "tool_calls": len(r_calls),
+            "lookup_calls": len(r_lookup),
+            "eligible_lookup_calls": len(r_elig),
+            "cctx_calls": len(r_cctx),
+            "builtin_calls": len(r_builtin),
+            "cctx_adoption_percent": round(100 * len(r_cctx) / len(r_elig), 2) if r_elig else None,
+            "cctx_cache_hit_percent": round(100 * r_warm / len(r_cctx), 2) if r_cctx else None,
+            "used_aic": r_used_aic,
+            "saved_aic": r_saved_aic,
+        }
+    report["subagent_usage"] = dict(
+        sorted(
+            subagent_usage.items(),
+            key=lambda kv: (0 if kv[0] == "main" else 1, -kv[1]["lookup_calls"], -kv[1]["turns"]),
+        )
+    )
     report["schema"] = 5
     all_channels = sorted({call["channel"] for call in calls.values()} | {rec["channel"] for rec in usage_records})
     report["per_session"] = {
@@ -1108,6 +1238,34 @@ def format_pretty_report(report: dict) -> str:
         )
     )
     lines.append("")
+
+    sub_usage = report.get("subagent_usage", {})
+    if len(sub_usage) > 1 or any(k != "main" for k in sub_usage):
+        role_rows = []
+        for role, info in sub_usage.items():
+            u_aic = info.get("used_aic", 0.0)
+            s_aic = info.get("saved_aic", 0.0)
+            label = "main (foreground)" if role == "main" else f"subagent:{role}"
+            role_rows.append([
+                label,
+                f"{info.get('turns', 0):,}",
+                f"{info.get('eligible_lookup_calls', 0):,}",
+                f"{info.get('cctx_calls', 0):,}",
+                f"{info.get('builtin_calls', 0):,}",
+                _bar(info.get("cctx_adoption_percent"), 8),
+                _fmt_pct(info.get("cctx_cache_hit_percent")),
+                f"${u_aic * 0.001:,.2f} ({u_aic:,.1f} AIC)",
+                f"+${s_aic * 0.001:,.2f} / API +${s_aic * 0.01:,.2f}",
+            ])
+        lines.append(
+            _box_table(
+                "2b. MAIN vs SUBAGENT ADOPTION & COST SAVINGS",
+                ["Agent Role", "Turns", "Elig Lookups", "CCTX", "Built-in", "Src Adopt", "Warm Hit%", "LLM Spend (@$0.001)", "COST SAVED (@$0.001 / API @$0.01)"],
+                role_rows,
+                ["<", ">", ">", ">", ">", "<", ">", ">", ">"],
+            )
+        )
+        lines.append("")
 
     session_items = sorted(
         report.get("per_session", {}).items(),

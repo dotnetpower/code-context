@@ -221,14 +221,25 @@ impl Resident {
                 }
             };
             let new = if is_allowed {
-                let bytes = workspace.read_known_with_limit_cached(
+                match workspace.read_known_with_limit_cached(
                     Path::new(&path),
                     self.policy.max_file_bytes,
                     &mut checked_dirs,
-                )?;
-                source_files_read += 1;
-                source_bytes_read += bytes.len();
-                Some(document(path.clone(), bytes)?)
+                ) {
+                    Ok(bytes) => {
+                        source_files_read += 1;
+                        source_bytes_read += bytes.len();
+                        Some(document(path.clone(), bytes)?)
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 None
             };

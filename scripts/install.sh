@@ -11,6 +11,7 @@ systemctl --user enable code-context.service
 systemctl --user restart code-context.service
 for attempt in $(seq 1 500); do
     if "$HOME/.local/bin/cctx" ping; then
+        python3 scripts/configure_subagents.py || true
         exit 0
     fi
     sleep 0.01

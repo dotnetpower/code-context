@@ -2,6 +2,10 @@ import type { JsonValue } from './types.js';
 
 const MAX_INLINE_CHARS = 7_400;
 
+function utf8Bytes(text: string): number {
+  return Buffer.byteLength(text, 'utf8');
+}
+
 export function formatToolResult(operation: string, value: JsonValue): string {
   switch (operation) {
     case 'code_files': {
@@ -16,14 +20,15 @@ export function formatToolResult(operation: string, value: JsonValue): string {
           ? formatFreshness(result.freshness, total === 0)
           : undefined;
       const kept: string[] = [];
-      let used = 64 + (freshnessLine ? freshnessLine.length + 1 : 0);
+      let used = 64 + (freshnessLine ? utf8Bytes(freshnessLine) + 1 : 0);
       for (const p of paths) {
-        if (kept.length > 0 && used + p.length + 1 > MAX_INLINE_CHARS - 120) {
+        const pBytes = utf8Bytes(p);
+        if (kept.length > 0 && used + pBytes + 1 > MAX_INLINE_CHARS - 120) {
           truncated = true;
           break;
         }
         kept.push(p);
-        used += p.length + 1;
+        used += pBytes + 1;
       }
       const lines = [`files=${total} truncated=${truncated}`];
       if (freshnessLine !== undefined) {
@@ -48,7 +53,7 @@ export function formatToolResult(operation: string, value: JsonValue): string {
         const header = `page=true complete=${booleanValue(result.complete,'complete')}\n`
           + `${stringValue(result.notice,'page notice')}\n`;
         const footer = `\nnext_ranges=${JSON.stringify(arrayValue(result.next_ranges,'next ranges'))}`;
-        const budget = Math.max(1_500, MAX_INLINE_CHARS - header.length - footer.length);
+        const budget = Math.max(1_500, MAX_INLINE_CHARS - utf8Bytes(header) - utf8Bytes(footer));
         return `${header}${formatSnippets(requiredValue(result,'snippets','read page'), budget)}${footer}`;
       }
       return formatSnippets(value, MAX_INLINE_CHARS);
@@ -216,14 +221,15 @@ function formatSearch(value: JsonValue, includeFreshness = true, maxChars = MAX_
       ? formatFreshness(search.freshness, total === 0)
       : undefined;
   const kept: string[] = [];
-  let used = 64 + (freshnessLine ? freshnessLine.length + 1 : 0);
+  let used = 64 + (freshnessLine ? utf8Bytes(freshnessLine) + 1 : 0);
   for (const line of bodyLines) {
-    if (kept.length > 0 && used + line.length + 1 > maxChars - 120) {
+    const lineBytes = utf8Bytes(line);
+    if (kept.length > 0 && used + lineBytes + 1 > maxChars - 120) {
       truncated = true;
       break;
     }
     kept.push(line);
-    used += line.length + 1;
+    used += lineBytes + 1;
   }
   const lines = [`matches=${total} truncated=${truncated}`];
   if (freshnessLine !== undefined) {
@@ -245,7 +251,7 @@ function formatContext(value: JsonValue): string {
   const total = integerValue(searchRec.total_matches, 'total_matches');
   const search = formatSearch(searchVal, context.freshness === undefined, 2_400);
   const notice = context.freshness === undefined ? '' : `\n${formatFreshness(context.freshness, total === 0)}`;
-  const snippetBudget = Math.max(1_500, MAX_INLINE_CHARS - search.length - notice.length - 2);
+  const snippetBudget = Math.max(1_500, MAX_INLINE_CHARS - utf8Bytes(search) - utf8Bytes(notice) - 2);
   const snippets = formatSnippets(requiredValue(context, 'snippets', 'context result'), snippetBudget);
   return `${search}${notice}\n\n${snippets}`;
 }
@@ -308,9 +314,9 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
   for (let i = 0; i < validated.length; i += 1) {
     const item = validated[i]!;
     const sameFileHeader = previousPath === item.path && previousSha === item.sha;
-    const baseHeaderLen = item.path.length + (sameFileHeader ? 16 : 88);
+    const baseHeaderLen = utf8Bytes(item.path) + (sameFileHeader ? 16 : 88);
     const firstRaw = item.rawLines[0] as string | undefined;
-    const firstLen = firstRaw !== undefined ? Math.min(firstRaw.length, 2064) + 8 : 0;
+    const firstLen = firstRaw !== undefined ? Math.min(utf8Bytes(firstRaw), 2064) + 8 : 0;
     if (output.length > 0 && used + baseHeaderLen + firstLen > charLimit) {
       for (let rest = i; rest < validated.length; rest += 1) {
         const rem = validated[rest]!;
@@ -322,13 +328,14 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     let snippetChars = baseHeaderLen;
     for (let k = 0; k < item.rawLines.length; k += 1) {
       const formatted = formatLine(item.rawLines[k] as string, item.start + k);
+      const formattedBytes = utf8Bytes(formatted);
       if (
         (output.length > 0 || keptLines.length > 0) &&
-        used + snippetChars + formatted.length + 1 > charLimit
+        used + snippetChars + formattedBytes + 1 > charLimit
       ) {
         break;
       }
-      snippetChars += formatted.length + 1;
+      snippetChars += formattedBytes + 1;
       keptLines.push(formatted);
     }
     if (keptLines.length === 0 && item.rawLines.length > 0) {
@@ -341,10 +348,10 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     previousPath = item.path;
     previousSha = item.sha;
     output.push(header);
-    used += header.length + 1;
+    used += utf8Bytes(header) + 1;
     for (const line of keptLines) {
       output.push(line);
-      used += line.length + 1;
+      used += utf8Bytes(line) + 1;
     }
     if (actualEnd < item.end) {
       nextRanges.push({ path: item.path, start: actualEnd + 1, end: item.end });

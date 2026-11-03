@@ -241,11 +241,13 @@ fn is_makefile_or_justfile_path(path: &str) -> bool {
 
 fn is_dockerfile_path(path: &str) -> bool {
     let file_name = path.rsplit('/').next().unwrap_or(path);
+    let lower = file_name.to_ascii_lowercase();
     file_name == "Dockerfile"
         || file_name == "Containerfile"
         || file_name.starts_with("Dockerfile.")
         || file_name.starts_with("Containerfile.")
-        || path.ends_with(".dockerfile")
+        || lower.ends_with(".dockerfile")
+        || lower.ends_with(".containerfile")
 }
 
 fn is_makefile_target_header(line: &str) -> bool {

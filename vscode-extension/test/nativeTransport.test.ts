@@ -130,6 +130,7 @@ void test('WSL roots preserve Linux paths and delegate access checks to the daem
     { root: '/home/test/other', scopes: ['.'], globs: ['*.rs'] },
   ];
   assert.equal(resolveWslRoot(roots, '/home/test/repo/src/..'), '/home/test/repo');
+  assert.equal(resolveWslRoot(roots, '/home/test/repo/src/lib.rs'), '/home/test/repo');
   assert.equal(resolveWslRoot(roots, '/home/test/worktree'), '/home/test/worktree');
   assert.throws(() => resolveWslRoot(roots, undefined), /explicit absolute Linux root/);
   assert.throws(() => resolveWslRoot(roots, 'C:\\Users\\test'), /absolute Linux path/);

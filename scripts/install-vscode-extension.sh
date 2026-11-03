@@ -64,4 +64,6 @@ if os.path.isdir(wsl_src):
             pass
 PY
 
+python3 "$root/scripts/configure_subagents.py" || true
+
 printf 'At a safe boundary reload the affected window, then run: Code Context: Getting Started\n'

@@ -291,6 +291,11 @@ pub fn migrate(
     after.globs.extend(DEFAULT_SOURCE_GLOBS.iter().map(|s| (*s).into()));
     after.globs.sort();
     after.globs.dedup();
+    if after.globs.len() > 128 {
+        after
+            .globs
+            .retain(|g| DEFAULT_SOURCE_GLOBS.contains(&g.as_str()));
+    }
     let workspace = after.workspace()?;
     after.scopes = workspace.scopes;
     let result = json!({"applied":apply,"before":plan(&before)?,"after":plan(&after)?,

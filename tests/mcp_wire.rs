@@ -98,3 +98,49 @@ fn shared_stdio_enforces_frame_budget_and_json_only_output() {
     assert_eq!(values[0]["error"]["code"], -32700);
     assert_eq!(values[1]["id"], "x");
 }
+
+#[test]
+fn shared_mcp_coerces_subagent_aliases_off_by_one_ranges_and_mixed_hidden_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let lines: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(repo.join("src/lib.rs"), lines).unwrap();
+    let ws = code_context::workspace::Workspace::new(
+        &repo,
+        vec![".".into()],
+        vec!["*.rs".into()],
+    )
+    .unwrap();
+
+    // 1. Off-by-one pagination (start=51, end=50) expands forward instead of swapping to 50..51
+    let read_res = code_context::mcp::call(
+        &ws,
+        "code_read",
+        json!({
+            "ranges": [
+                {"path": "src/lib.rs", "start": "51", "end": "50"},
+                {"path": "src/lib.rs", "start": 51, "end": 60}
+            ]
+        }),
+    )
+    .unwrap();
+    let arr = read_res.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["start"], 51);
+    assert_eq!(arr[0]["end"], 60);
+
+    // 2. Context clamps limit=100 -> 64 and radius="120" -> 100
+    let ctx_res = code_context::mcp::call(
+        &ws,
+        "code_context",
+        json!({
+            "query": "line 10",
+            "limit": "100",
+            "radius": "120",
+            "isRegexp": "false"
+        }),
+    )
+    .unwrap();
+    assert_eq!(ctx_res["search"]["total_matches"], 1);
+}

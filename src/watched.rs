@@ -312,6 +312,59 @@ mod io_tests {
         assert!(!error.contains("path=a.rs reason=unstable"), "{error}");
         assert_eq!(watched.io_profile.full_source_verifications, 0);
     }
+
+    #[test]
+    fn deleted_directories_and_deleted_scopes_are_unwatched_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested/deep")).unwrap();
+        std::fs::create_dir_all(root.path().join("tests")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), "keep\n").unwrap();
+        std::fs::write(root.path().join("src/nested/deep/b.rs"), "remove_me\n").unwrap();
+        let mut watched = Watched::new(Spec {
+            root: root.path().into(),
+            scopes: vec!["src".into(), "tests".into()],
+            globs: vec!["*.rs".into()],
+            excludes: vec![],
+            default_excludes: true,
+            prewarm: false,
+            policy: Default::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        })
+        .unwrap();
+        assert!(watched.watched_dirs.contains(Path::new("src/nested/deep")));
+        assert!(watched.watched_dirs.contains(Path::new("tests")));
+
+        // Delete the nested directory tree and recreate an empty directory at the same path.
+        std::fs::remove_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+
+        let started = Instant::now();
+        loop {
+            watched.maintenance_tick().unwrap();
+            if !watched.watched_dirs.contains(Path::new("src/nested/deep"))
+                && !watched.watched_dirs.contains(Path::new("src/nested"))
+            {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(watched.blocked.is_none());
+        let grep = watched
+            .call("code_grep", json!({"pattern":"remove_me"}))
+            .unwrap();
+        assert_eq!(grep["total_matches"], 0);
+
+        // Deleting a configured scope directory un-watches it immediately even though sync errors
+        // until the scope directory is recreated, then re-watches the recreated directory.
+        std::fs::remove_dir_all(root.path().join("tests")).unwrap();
+        assert!(watched.call("code_sync", json!({})).is_err());
+        assert!(!watched.watched_dirs.contains(Path::new("tests")));
+        std::fs::create_dir_all(root.path().join("tests")).unwrap();
+        watched.call("code_sync", json!({})).unwrap();
+        assert!(watched.watched_dirs.contains(Path::new("tests")));
+    }
 }
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
@@ -416,8 +469,11 @@ impl Watched {
                     && !event.paths.is_empty()
                     && !matches!(
                         event.kind,
-                        notify::EventKind::Remove(notify::event::RemoveKind::Folder)
-                            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        notify::EventKind::Remove(
+                            notify::event::RemoveKind::Folder
+                                | notify::event::RemoveKind::Any
+                                | notify::event::RemoveKind::Other
+                        ) | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
                     )
                     && !event.paths.iter().any(|path| {
                         path.is_dir()
@@ -465,9 +521,18 @@ impl Watched {
             },
             Config::default(),
         )?;
-        for directory in &watched_dirs {
-            watcher.watch(&workspace.root.join(directory), RecursiveMode::NonRecursive)?;
+        let mut active_watched_dirs = BTreeSet::new();
+        for directory in watched_dirs {
+            let absolute = workspace.root.join(&directory);
+            match watcher.watch(&absolute, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    active_watched_dirs.insert(directory);
+                }
+                Err(error) if Self::is_missing_watch_target_error(&error, &absolute) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        let watched_dirs = active_watched_dirs;
         // Install the inventory-derived watch plan before loading source bytes.
         let resident = Resident::load_with_inventory(
             &workspace,
@@ -607,28 +672,131 @@ impl Watched {
         Ok(std::borrow::Cow::Owned(self.spec.workspace()?))
     }
 
+    fn is_missing_watch_target_error(error: &notify::Error, absolute: &Path) -> bool {
+        !absolute.is_dir()
+            || matches!(
+                error.kind,
+                notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound
+            )
+            || matches!(
+                &error.kind,
+                notify::ErrorKind::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+            )
+    }
+
+    fn record_affected_directory(
+        root: &Path,
+        directories: &mut BTreeMap<PathBuf, bool>,
+        parent: &Path,
+    ) {
+        let mut current = parent;
+        let mut missing_ancestor: Option<&Path> = None;
+        while !current.as_os_str().is_empty() {
+            if !root.join(current).is_dir() {
+                missing_ancestor = Some(current);
+                current = current.parent().unwrap_or(Path::new(""));
+            } else {
+                break;
+            }
+        }
+        if let Some(missing) = missing_ancestor {
+            directories.insert(missing.to_path_buf(), true);
+        } else {
+            directories.entry(parent.to_path_buf()).or_insert(false);
+        }
+    }
+
+    fn unwatch_prefix(&mut self, prefix: &Path) {
+        if prefix.as_os_str().is_empty() {
+            return;
+        }
+        let matching: Vec<PathBuf> = self
+            .watched_dirs
+            .iter()
+            .filter(|dir| !dir.as_os_str().is_empty() && dir.starts_with(prefix))
+            .cloned()
+            .collect();
+        if matching.is_empty() {
+            return;
+        }
+        for directory in matching {
+            let _ = self.watcher.unwatch(&self.spec.root.join(&directory));
+            self.watched_dirs.remove(&directory);
+        }
+        self.watched_dir_bytes = self
+            .watched_dirs
+            .iter()
+            .map(|path| path.as_os_str().len() + 64)
+            .sum::<usize>();
+    }
+
+    fn prune_deleted_watches(&mut self) {
+        let missing: Vec<PathBuf> = self
+            .watched_dirs
+            .iter()
+            .filter(|dir| !self.spec.root.join(dir).is_dir())
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        for directory in missing {
+            let _ = self.watcher.unwatch(&self.spec.root.join(&directory));
+            self.watched_dirs.remove(&directory);
+        }
+        self.watched_dir_bytes = self
+            .watched_dirs
+            .iter()
+            .map(|path| path.as_os_str().len() + 64)
+            .sum::<usize>();
+    }
+
+    fn needs_watch_refresh(&self, workspace: &crate::workspace::Workspace) -> bool {
+        self.watched_dirs
+            .iter()
+            .any(|dir| !workspace.root.join(dir).is_dir())
+            || workspace.scopes.iter().any(|scope| {
+                let scope_path = if scope == "." {
+                    Path::new("")
+                } else {
+                    Path::new(scope)
+                };
+                !self.watched_dirs.contains(scope_path) && workspace.root.join(scope_path).is_dir()
+            })
+    }
+
     fn refresh_watch_directories<'a>(
         &mut self,
         workspace: &crate::workspace::Workspace,
         paths: impl IntoIterator<Item = &'a std::path::Path>,
     ) -> Result<()> {
-        let desired = workspace.watch_directories_for(paths, &self.spec.policy)?;
+        let mut desired = workspace.watch_directories_for(paths, &self.spec.policy)?;
+        desired.retain(|directory| workspace.root.join(directory).is_dir());
         let mut added = Vec::new();
+        let mut vanished = Vec::new();
         for directory in desired.difference(&self.watched_dirs) {
             let absolute = workspace.root.join(directory);
-            if let Err(error) = self.watcher.watch(&absolute, RecursiveMode::NonRecursive) {
-                for added in added {
-                    let _ = self.watcher.unwatch(&workspace.root.join(added));
+            match self.watcher.watch(&absolute, RecursiveMode::NonRecursive) {
+                Ok(()) => added.push(directory.clone()),
+                Err(error) if Self::is_missing_watch_target_error(&error, &absolute) => {
+                    vanished.push(directory.clone());
                 }
-                return Err(error.into());
+                Err(error) => {
+                    for added in added {
+                        let _ = self.watcher.unwatch(&workspace.root.join(added));
+                    }
+                    return Err(error.into());
+                }
             }
-            added.push(directory.clone());
+        }
+        for directory in vanished {
+            desired.remove(&directory);
         }
         let mut removed = Vec::new();
         for directory in self.watched_dirs.difference(&desired) {
             let absolute = workspace.root.join(directory);
-            if absolute.exists()
-                && let Err(error) = self.watcher.unwatch(&absolute)
+            if let Err(error) = self.watcher.unwatch(&absolute)
+                && !Self::is_missing_watch_target_error(&error, &absolute)
             {
                 for removed in removed {
                     let _ = self
@@ -661,6 +829,7 @@ impl Watched {
         let drained: Vec<_> = iter.collect();
         let mut changed: BTreeSet<String> = BTreeSet::new();
         let mut directories = BTreeMap::new();
+        let mut removed_watch_prefixes = Vec::new();
         let mut reconcile = verify_all || self.blocked.is_some();
         let mut watcher_rescan = false;
         for event in drained {
@@ -715,14 +884,26 @@ impl Watched {
                     }
                     if self.spec.root.join(path).is_dir() || self.watched_dirs.contains(path)
                     {
+                        if matches!(
+                            event.kind,
+                            notify::EventKind::Remove(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                                    notify::event::RenameMode::From
+                                        | notify::event::RenameMode::Any
+                                ))
+                        ) {
+                            removed_watch_prefixes.push(path.to_path_buf());
+                        }
                         directories.insert(path.to_path_buf(), true);
                     } else if !self.stamps.contains_key(name) {
                         if !self.is_watcher_candidate(name)? {
                             continue;
                         }
-                        directories
-                            .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
-                            .or_insert(false);
+                        Self::record_affected_directory(
+                            &self.spec.root,
+                            &mut directories,
+                            path.parent().unwrap_or(Path::new("")),
+                        );
                         changed.insert(name.into());
                     } else {
                         if !matches!(
@@ -733,9 +914,11 @@ impl Watched {
                             )
                         ) && !self.spec.root.join(path).is_file()
                         {
-                            directories
-                                .entry(path.parent().unwrap_or(Path::new("")).to_path_buf())
-                                .or_insert(false);
+                            Self::record_affected_directory(
+                                &self.spec.root,
+                                &mut directories,
+                                path.parent().unwrap_or(Path::new("")),
+                            );
                         }
                         changed.insert(name.into());
                     }
@@ -747,6 +930,10 @@ impl Watched {
         if changed.is_empty() && directories.is_empty() && !reconcile {
             return Ok(());
         }
+        for prefix in removed_watch_prefixes {
+            self.unwatch_prefix(&prefix);
+        }
+        self.prune_deleted_watches();
         let workspace = self.workspace()?.into_owned();
         if !reconcile && !directories.is_empty() {
             return self.reconcile_directories(&directories, &changed);
@@ -781,8 +968,16 @@ impl Watched {
                         if workspace.root.join(name).exists() {
                             return Err(error);
                         }
-                        reconcile = true;
-                        break;
+                        for candidate in &changed {
+                            if !workspace.root.join(candidate).is_file() {
+                                Self::record_affected_directory(
+                                    &workspace.root,
+                                    &mut directories,
+                                    Path::new(candidate).parent().unwrap_or(Path::new("")),
+                                );
+                            }
+                        }
+                        return self.reconcile_directories(&directories, &changed);
                     }
                 }
             }
@@ -813,7 +1008,7 @@ impl Watched {
             }
         }
         self.io_profile.full_inventory_scans += 1;
-        let current = stamps(&workspace, &self.spec.policy)?;
+        let mut current = stamps(&workspace, &self.spec.policy)?;
         if let Some((_, cached_policy)) = &self.watcher_policy
             && workspace.candidate_policy_key() != cached_policy.key
         {
@@ -824,7 +1019,7 @@ impl Watched {
         {
             self.read_policy = None;
         }
-        let mut need_watch_refresh = false;
+        let mut need_watch_refresh = self.needs_watch_refresh(&workspace);
         for (path, stamp) in &current {
             match self.stamps.get(path) {
                 Some(old) if old == stamp => {}
@@ -854,6 +1049,7 @@ impl Watched {
         let update =
             self.resident
                 .update(&workspace, &changed, &current, verify_all || watcher_rescan)?;
+        current.retain(|path, _| self.resident.paths.contains_key(path.as_str()));
         self.record_update(update);
         self.query_cache
             .retain_generation(self.resident.stats.generation);
@@ -867,7 +1063,11 @@ impl Watched {
     }
 
     pub fn maintenance_tick(&mut self) -> Result<()> {
-        self.apply_maintenance()?;
+        if self.blocked.is_none() {
+            self.synchronize_or_block(false)?;
+        } else {
+            self.apply_maintenance()?;
+        }
         self.schedule_maintenance();
         Ok(())
     }
@@ -889,6 +1089,7 @@ impl Watched {
         directories: &BTreeMap<PathBuf, bool>,
         forced: &BTreeSet<String>,
     ) -> Result<()> {
+        self.prune_deleted_watches();
         let workspace = self.workspace()?.into_owned();
         let mut current = self.stamps.clone();
         for (directory, recursive) in directories {
@@ -951,7 +1152,7 @@ impl Watched {
             self.read_policy = None;
         }
         let mut changed = forced.clone();
-        let mut need_watch_refresh = false;
+        let mut need_watch_refresh = self.needs_watch_refresh(&workspace);
         for (name, metadata) in &current {
             match self.stamps.get(name) {
                 Some(old) if old == metadata => {}
@@ -980,6 +1181,7 @@ impl Watched {
         let update = self
             .resident
             .update(&workspace, &changed, &current, false)?;
+        current.retain(|path, _| self.resident.paths.contains_key(path.as_str()));
         self.record_update(update);
         self.query_cache
             .retain_generation(self.resident.stats.generation);
@@ -1000,6 +1202,7 @@ impl Watched {
         self.last_reconcile = Instant::now();
         self.io_profile.full_inventory_scans += 1;
         let spec = self.spec.clone();
+        let cached_ws = self.workspace().ok().map(std::borrow::Cow::into_owned);
         let sender = self.maintenance_tx.clone();
         let active = self.maintenance_active.clone();
         let epoch = self.mutation_epoch;
@@ -1008,9 +1211,11 @@ impl Watched {
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
                 let policy = spec.policy.clone();
-                let result = spec
-                    .workspace()
-                    .and_then(|workspace| stamps(&workspace, &policy));
+                let result = match cached_ws {
+                    Some(workspace) => Ok(workspace),
+                    None => spec.workspace(),
+                }
+                .and_then(|workspace| stamps(&workspace, &policy));
                 let _ = sender.try_send((epoch, result));
                 active.store(false, Ordering::Release);
             })
@@ -1026,21 +1231,31 @@ impl Watched {
             if epoch != self.mutation_epoch {
                 continue;
             }
-            let current = match result {
+            let mut current = match result {
                 Ok(current) => current,
                 Err(error) => {
+                    self.prune_deleted_watches();
                     self.blocked = Some(error.to_string());
                     return Err(error);
                 }
             };
+            self.prune_deleted_watches();
             if current==self.stamps {
+                let workspace = self.workspace()?.into_owned();
+                if self.needs_watch_refresh(&workspace) {
+                    self.refresh_watch_directories(
+                        &workspace,
+                        current.keys().map(std::path::Path::new),
+                    )?;
+                }
                 self.io_profile.maintenance_noop_applies+=1;
                 self.record_update(self.resident.unchanged_update(started));
                 self.blocked=None;
                 continue;
             }
+            let workspace = self.workspace()?.into_owned();
             let mut changed = BTreeSet::new();
-            let mut need_watch_refresh = false;
+            let mut need_watch_refresh = self.needs_watch_refresh(&workspace);
             for (path, stamp) in &current {
                 match self.stamps.get(path) {
                     Some(old) if old == stamp => {}
@@ -1063,7 +1278,6 @@ impl Watched {
                     changed.insert(path.clone());
                 }
             }
-            let workspace = self.workspace()?.into_owned();
             if need_watch_refresh {
                 self.refresh_watch_directories(
                     &workspace,
@@ -1073,6 +1287,7 @@ impl Watched {
             let update = self
                 .resident
                 .update(&workspace, &changed, &current, false)?;
+            current.retain(|path, _| self.resident.paths.contains_key(path.as_str()));
             self.record_update(update);
             self.query_cache
                 .retain_generation(self.resident.stats.generation);
@@ -1095,7 +1310,11 @@ impl Watched {
         self.normalize_root_prefixed_arguments(&mut arguments);
         match name {
             "code_files" => {
-                let request: crate::files::FileQuery = serde_json::from_value(arguments)?;
+                let mut request: crate::files::FileQuery = serde_json::from_value(arguments)?;
+                if compact {
+                    request.limit = request.limit.clamp(1, 1000);
+                }
+                self.filter_multi_search_paths(&mut request.paths);
                 self.check_explicit_search_targets(&request.paths, Some(&request.glob))?;
                 let result =
                     crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?;
@@ -1120,9 +1339,28 @@ impl Watched {
                 Ok(value)
             }
             "code_grep" => {
-                let query: Query = serde_json::from_value(arguments)?;
+                let mut query: Query = serde_json::from_value(arguments)?;
+                if compact {
+                    query.limit = query.limit.clamp(1, 1000);
+                    if let Some(m) = query.max_matches_per_file {
+                        query.max_matches_per_file = Some(m.clamp(1, 64));
+                    }
+                }
+                self.filter_multi_search_paths(&mut query.paths);
                 self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
-                let result = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
+                let mut budget_narrowed = false;
+                let result = match search_fast_arc(&self.resident, &query, &mut self.query_cache) {
+                    Ok(res) => res,
+                    Err(err) if compact && crate::context::is_response_budget(err.as_ref()) => {
+                        budget_narrowed = true;
+                        let mut narrowed = query.clone();
+                        narrowed.limit = narrowed.limit.min(40);
+                        narrowed.max_matches_per_file =
+                            Some(narrowed.max_matches_per_file.unwrap_or(2).min(2));
+                        search_fast_arc(&self.resident, &narrowed, &mut self.query_cache)?
+                    }
+                    Err(err) => return Err(err),
+                };
                 self.check_search_paths(result.matches.iter().map(|hit| hit.path.as_str()))?;
                 let mut freshness = self.search_freshness("metadata");
                 if result.total_matches == 0 && looks_like_unintended_literal_regex(&query.pattern, query.regex) {
@@ -1162,7 +1400,7 @@ impl Watched {
                     return Ok(serde_json::to_value(CompactGrep {
                         matches,
                         total_matches: result.total_matches,
-                        truncated: result.truncated,
+                        truncated: result.truncated || budget_narrowed,
                         freshness,
                     })?);
                 }
@@ -1190,7 +1428,7 @@ impl Watched {
             }
             "code_context" => {
                 let mut args = arguments;
-                let radius = args
+                let mut radius = args
                     .as_object_mut()
                     .ok_or_else(|| invalid("arguments must be an object"))?
                     .remove("radius")
@@ -1203,10 +1441,17 @@ impl Watched {
                         args["max_matches_per_file"] = json!(5);
                     }
                 }
-                let query: Query = serde_json::from_value(args)?;
-                if radius > 100 || query.limit > 64 {
+                let mut query: Query = serde_json::from_value(args)?;
+                if compact {
+                    radius = radius.min(100);
+                    query.limit = query.limit.clamp(1, 64);
+                    if let Some(m) = query.max_matches_per_file {
+                        query.max_matches_per_file = Some(m.clamp(1, 64));
+                    }
+                } else if radius > 100 || query.limit > 64 {
                     return Err(invalid("radius 0..100, context limit 1..64 required; use code_read for larger ranges").into());
                 }
+                self.filter_multi_search_paths(&mut query.paths);
                 self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
                 let regex_hint_needed = !query.regex
                     && looks_like_unintended_literal_regex(&query.pattern, query.regex);
@@ -1220,18 +1465,34 @@ impl Watched {
                     }
                     return Ok(val);
                 }
-                let search_arc = search_fast_arc(&self.resident, &query, &mut self.query_cache)?;
-                let search_owned =
-                    Arc::try_unwrap(search_arc).unwrap_or_else(|shared| (*shared).clone());
-                let result = Arc::new(assemble_trusted(search_owned, radius, |ranges| {
-                    self.resident.read_many(ranges)
-                })?);
-                self.query_cache.put_context(
-                    self.resident.stats.generation,
-                    query,
-                    radius,
-                    result.clone(),
-                );
+                let build_context = |this: &mut Self, q: &Query, r: usize| -> Result<Arc<crate::context::ContextResult>> {
+                    let search_arc = search_fast_arc(&this.resident, q, &mut this.query_cache)?;
+                    let search_owned =
+                        Arc::try_unwrap(search_arc).unwrap_or_else(|shared| (*shared).clone());
+                    Ok(Arc::new(assemble_trusted(search_owned, r, |ranges| {
+                        this.resident.read_many(ranges)
+                    })?))
+                };
+                let result = match build_context(self, &query, radius) {
+                    Ok(res) => {
+                        self.query_cache.put_context(
+                            self.resident.stats.generation,
+                            query,
+                            radius,
+                            res.clone(),
+                        );
+                        res
+                    }
+                    Err(err) if compact && crate::context::is_response_budget(err.as_ref()) => {
+                        let mut narrowed = query.clone();
+                        narrowed.limit = narrowed.limit.min(10);
+                        narrowed.max_matches_per_file =
+                            Some(narrowed.max_matches_per_file.unwrap_or(2).min(2));
+                        let narrowed_radius = radius.min(4);
+                        build_context(self, &narrowed, narrowed_radius)?
+                    }
+                    Err(err) => return Err(err),
+                };
                 let mut val = self.verified_context(&result, compact)?;
                 if result.search.total_matches == 0 && regex_hint_needed {
                     append_regex_hint(&mut val["freshness"]);
@@ -1592,9 +1853,10 @@ impl Watched {
         }
         let relative = crate::workspace::normalize(Path::new(relative_str));
         let mut directories = BTreeMap::new();
-        directories.insert(
-            relative.parent().unwrap_or(Path::new("")).to_path_buf(),
-            false,
+        Self::record_affected_directory(
+            &self.spec.root,
+            &mut directories,
+            relative.parent().unwrap_or(Path::new("")),
         );
         let mut forced = BTreeSet::new();
         forced.insert(relative.to_string_lossy().into_owned());
@@ -1662,6 +1924,42 @@ impl Watched {
             }
         }
         Ok(())
+    }
+
+    fn filter_multi_search_paths(&self, paths: &mut Vec<String>) {
+        if paths.len() < 2 {
+            return;
+        }
+        let is_admitted_search_target = |raw: &str| -> bool {
+            let p = Path::new(raw);
+            if crate::workspace::safe_relative(p).is_err() {
+                return false;
+            }
+            let norm = crate::workspace::normalize(p);
+            let norm_str = norm.to_string_lossy();
+            if norm_str == "." || self.stamps.contains_key(norm_str.as_ref()) {
+                return true;
+            }
+            let prefix = format!("{}/", norm_str.trim_end_matches('/'));
+            if self.stamps.keys().any(|k| k.starts_with(&prefix)) {
+                return true;
+            }
+            // If it is an existing file on disk that is not in stamps, it would fail check_explicit_search_targets
+            if let Ok(meta) = std::fs::symlink_metadata(self.spec.root.join(&norm))
+                && (meta.is_file() || meta.file_type().is_symlink())
+            {
+                return false;
+            }
+            true
+        };
+        let filtered: Vec<String> = paths
+            .iter()
+            .filter(|item| is_admitted_search_target(item.as_str()))
+            .cloned()
+            .collect();
+        if !filtered.is_empty() && filtered.len() < paths.len() {
+            *paths = filtered;
+        }
     }
 
     fn check_explicit_search_targets(&self, paths: &[String], glob: Option<&str>) -> Result<()> {
@@ -1856,13 +2154,19 @@ impl Watched {
                         .unwrap_or("not_admitted");
                     self.io_profile.read_policy_rejections += 1;
                     self.transparent_read_recovery_failures += 1;
+                    let suggestions = self.suggest_similar_paths(&range.path);
+                    let suggest_hint = if suggestions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" did_you_mean=[{}].", suggestions.join(", "))
+                    };
                     let migrate_hint = if reason == "unsupported_glob" {
                         format!(" (To admit standard source/config globs on a legacy registration, run: cctx --root {} migrate --apply)", self.spec.root.display())
                     } else {
                         String::new()
                     };
                     return Err(invalid(format!(
-                        "READ_POLICY_DENIED root={} path={} reason={reason}: no source was read. Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.{migrate_hint}",
+                        "READ_POLICY_DENIED root={} path={} reason={reason}: no source was read.{suggest_hint} Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.{migrate_hint}",
                         self.spec.root.display(), range.path,
                     )).into());
                 }
@@ -1872,7 +2176,11 @@ impl Watched {
                 }
             }
             let path = crate::workspace::normalize(Path::new(&range.path));
-            directories.insert(path.parent().unwrap_or(Path::new("")).to_path_buf(), false);
+            Self::record_affected_directory(
+                &self.spec.root,
+                &mut directories,
+                path.parent().unwrap_or(Path::new("")),
+            );
             requested.insert(path.to_string_lossy().into_owned());
         }
         let workspace = self
@@ -1958,7 +2266,17 @@ impl Watched {
                     Err(error) => return Err(error.into()),
                 }
             };
-            reasons.push(format!("path={path} reason={reason}"));
+            let suggestion = if reason == "missing_on_disk" {
+                let suggestions = self.suggest_similar_paths(path);
+                if suggestions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (did_you_mean=[{}])", suggestions.join(", "))
+                }
+            } else {
+                String::new()
+            };
+            reasons.push(format!("path={path} reason={reason}{suggestion}"));
             if reasons.len() == 8 {
                 break;
             }
@@ -2257,20 +2575,57 @@ impl Watched {
         Ok(value)
     }
 
+    fn suggest_similar_paths(&self, missing: &str) -> Vec<&str> {
+        let req_path = Path::new(missing);
+        let Some(file_name) = req_path.file_name().and_then(|n| n.to_str()) else {
+            return Vec::new();
+        };
+        let stem = req_path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+        let parent_str = req_path.parent().and_then(|p| p.to_str()).unwrap_or("");
+        let mut same_dir_stem = Vec::new();
+        let mut same_filename = Vec::new();
+        for indexed in self.resident.paths.keys() {
+            let p = Path::new(indexed.as_ref());
+            let idx_parent = p.parent().and_then(|pr| pr.to_str()).unwrap_or("");
+            let idx_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let idx_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !parent_str.is_empty() && idx_parent == parent_str && idx_stem == stem {
+                same_dir_stem.push(indexed.as_ref());
+            } else if idx_name == file_name {
+                same_filename.push(indexed.as_ref());
+            }
+        }
+        same_dir_stem.extend(same_filename);
+        same_dir_stem.truncate(3);
+        same_dir_stem
+    }
+
     fn plan_read_ranges(&self, request: &ReadRequest) -> Result<Vec<crate::context::ReadRange>> {
         if !request.split_ranges {
             return Ok(request.ranges.clone());
         }
-        let mut planned = Vec::new();
+        let mut planned: Vec<crate::context::ReadRange> = Vec::new();
+        let mut reached_eof_paths: BTreeSet<String> = BTreeSet::new();
         for range in &request.ranges {
             let path = crate::workspace::normalize(std::path::Path::new(&range.path));
-            let end = self
+            let path_key = path.to_string_lossy().into_owned();
+            let doc_lines = self
                 .resident
                 .paths
-                .get(path.to_string_lossy().as_ref())
-                .map(|id| self.resident.documents[*id].starts.len())
+                .get(path_key.as_str())
+                .map(|id| self.resident.documents[*id].starts.len());
+            if let Some(lines) = doc_lines
+                && range.start > lines
+                && reached_eof_paths.contains(&path_key)
+            {
+                continue;
+            }
+            let end = doc_lines
                 .filter(|lines| *lines >= range.start)
                 .map_or(range.end.min(range.start.saturating_add(499)), |lines| {
+                    if range.end >= lines {
+                        reached_eof_paths.insert(path_key);
+                    }
                     range.end.min(lines)
                 });
             let mut start = range.start;

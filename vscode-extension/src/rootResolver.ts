@@ -158,6 +158,12 @@ export function resolveWslRoot(
     if (byName.length === 1 && byName[0] !== undefined) {
       target = byName[0];
     }
+  } else if (target && posix.isAbsolute(target) && !UNSAFE_POSIX_CHAR_RE.test(target) && roots.length > 0) {
+    const normalizedTarget = posix.normalize(target);
+    const containing = bestContainingPosixRoot(roots, normalizedTarget);
+    if (containing) {
+      target = containing;
+    }
   }
   if (!target && candidates.length > 0) {
     for (const candidate of candidates) {
@@ -270,6 +276,18 @@ export async function resolveRegisteredRootAfterRefresh(
     try {
       return resolveRegisteredRoot(refreshed, explicitPath, candidates, relativeTargets);
     } catch (refreshedError: unknown) {
+      if (
+        refreshedError instanceof RootResolutionError &&
+        explicitPath !== undefined &&
+        !existsSync(explicitPath) &&
+        relativeTargets.length > 0
+      ) {
+        const roots = refreshed.map((workspace) => normalizeLocalPath(workspace.root));
+        const byRelative = disambiguateRootByRelativePaths(roots, relativeTargets, false);
+        if (byRelative) {
+          return byRelative;
+        }
+      }
       if (!(refreshedError instanceof RootResolutionError) || !registerMissingRoot) {
         throw refreshedError;
       }
@@ -834,7 +852,15 @@ function splitPathWithEmbeddedGlob(
       normalized.push(cleaned);
     }
   }
-  const unique = [...new Set(normalized)];
+  let unique = [...new Set(normalized)];
+  if (unique.length > 1) {
+    const nonHidden = unique.filter(
+      (p) => !p.split('/').some((seg) => seg.startsWith('.') && seg !== '.'),
+    );
+    if (nonHidden.length > 0 && nonHidden.length < unique.length) {
+      unique = nonHidden;
+    }
+  }
   if (unique.length > 1 && unique.includes('.')) {
     const filtered = unique.filter((p) => p !== '.');
     return { paths: filtered.length > 0 ? filtered : ['.'], extractedGlob };
@@ -881,8 +907,8 @@ export function buildFilesArguments(
   if (normalizedPaths !== undefined) {
     args.paths = normalizedPaths;
   }
-  const rawLimit = input.limit ?? input.maxResults ?? input.max_results ?? input.head_limit;
-  if (typeof rawLimit === 'number' && Number.isFinite(rawLimit)) {
+  const rawLimit = positiveNumber(input.limit ?? input.maxResults ?? input.max_results ?? input.head_limit);
+  if (rawLimit !== undefined) {
     args.limit = Math.min(1000, Math.max(1, Math.trunc(rawLimit)));
   }
   return args;
@@ -908,24 +934,23 @@ export function buildSearchArguments(
     nonEmptyString(input.needle) ??
     '';
   const args: Record<string, string | number | boolean | string[]> = { pattern };
-  const regexVal = input.regex ?? input.isRegexp ?? input.is_regex ?? input.useRegex;
-  if (typeof regexVal === 'boolean') {
+  const regexVal = coerceBoolean(input.regex ?? input.isRegexp ?? input.is_regex ?? input.useRegex);
+  if (regexVal !== undefined) {
     args.regex = regexVal;
   }
+  const isCaseSens = coerceBoolean(input.isCaseSensitive);
   const ignoreCaseVal =
-    input.ignore_case ??
-    input.caseInsensitive ??
-    input.case_insensitive ??
-    (typeof input.isCaseSensitive === 'boolean' ? !input.isCaseSensitive : undefined);
-  if (typeof ignoreCaseVal === 'boolean') {
+    coerceBoolean(input.ignore_case ?? input.caseInsensitive ?? input.case_insensitive) ??
+    (isCaseSens !== undefined ? !isCaseSens : undefined);
+  if (ignoreCaseVal !== undefined) {
     args.ignore_case = ignoreCaseVal;
   }
-  const rawLimit = input.limit ?? input.maxResults ?? input.max_results ?? input.head_limit;
-  if (typeof rawLimit === 'number' && Number.isFinite(rawLimit)) {
+  const rawLimit = positiveNumber(input.limit ?? input.maxResults ?? input.max_results ?? input.head_limit);
+  if (rawLimit !== undefined) {
     args.limit = Math.min(maxLimit, Math.max(1, Math.trunc(rawLimit)));
   }
-  const rawMaxPerFile = input.max_matches_per_file ?? input.maxMatchesPerFile;
-  if (typeof rawMaxPerFile === 'number' && Number.isFinite(rawMaxPerFile)) {
+  const rawMaxPerFile = positiveNumber(input.max_matches_per_file ?? input.maxMatchesPerFile);
+  if (rawMaxPerFile !== undefined) {
     args.max_matches_per_file = Math.min(64, Math.max(1, Math.trunc(rawMaxPerFile)));
   }
   const rawPathInput =
@@ -971,8 +996,8 @@ export function buildContextArguments(
   root?: string | null,
 ): Record<string, string | number | boolean | string[]> {
   const args = buildSearchArguments(input, root, 64);
-  const rawRadius = input.radius ?? input.contextLines ?? input.context_lines ?? input.context;
-  if (typeof rawRadius === 'number' && Number.isFinite(rawRadius)) {
+  const rawRadius = nonNegativeNumber(input.radius ?? input.contextLines ?? input.context_lines ?? input.context);
+  if (rawRadius !== undefined) {
     args.radius = Math.min(100, Math.max(0, Math.trunc(rawRadius)));
   }
   return args;
@@ -1013,7 +1038,19 @@ export function buildReadArguments(
   ) {
     rawRanges = [input];
   } else {
-    rawRanges = [];
+    const rawRoot = extractRawRootInput(input);
+    const inferredFromRoot =
+      rawRoot && root ? normalizeRelativeTargetPath(rawRoot, root) : undefined;
+    if (
+      rawRoot !== undefined &&
+      inferredFromRoot !== undefined &&
+      inferredFromRoot !== '.' &&
+      !inferredFromRoot.startsWith('/')
+    ) {
+      rawRanges = [{ ...input, path: rawRoot }];
+    } else {
+      rawRanges = [];
+    }
   }
   const defaultSpan = rawRanges.length >= 3 ? 49 : rawRanges.length > 1 ? 79 : 119;
   const splitRanges = input.split_ranges ?? input.splitRanges ?? true;
@@ -1063,10 +1100,10 @@ export function buildReadArguments(
       positiveNumber(range.center_line) ??
       positiveNumber(range.centerLine);
     const radiusCandidate =
-      positiveNumber(range.radius) ??
-      positiveNumber(range.context_lines) ??
-      positiveNumber(range.contextLines) ??
-      positiveNumber(range.context);
+      nonNegativeNumber(range.radius) ??
+      nonNegativeNumber(range.context_lines) ??
+      nonNegativeNumber(range.contextLines) ??
+      nonNegativeNumber(range.context);
     const baseTargetPath = normalizeRelativeTargetPath(extracted.path, root);
     if (
       explicitStart === undefined &&
@@ -1086,10 +1123,14 @@ export function buildReadArguments(
       positiveNumber(range.lineCount) ??
       positiveNumber(range.limit);
     const rawEndCandidate =
-      explicitEnd ??
-      (countSpan !== undefined ? clampedStart + Math.trunc(countSpan) - 1 : undefined) ??
-      extracted.end ??
-      Math.max(clampedStart, clampedStart + defaultSpan);
+      explicitEnd !== undefined &&
+      Math.trunc(explicitEnd) >= 20 &&
+      clampedStart === Math.trunc(explicitEnd) + 1
+        ? clampedStart + defaultSpan
+        : explicitEnd ??
+          (countSpan !== undefined ? clampedStart + Math.trunc(countSpan) - 1 : undefined) ??
+          extracted.end ??
+          Math.max(clampedStart, clampedStart + defaultSpan);
     const clampedEnd = Math.max(1, Math.trunc(rawEndCandidate));
     const hasNonDefaultStart =
       (explicitStart !== undefined && Math.trunc(explicitStart) > 1) ||
@@ -1106,9 +1147,9 @@ export function buildReadArguments(
     };
   });
   return {
-    split_ranges: Boolean(splitRanges),
-    page: Boolean(input.page ?? false),
-    ranges: deduplicateAndMergeRanges(normalized, Boolean(splitRanges)),
+    split_ranges: coerceBoolean(splitRanges) ?? true,
+    page: coerceBoolean(input.page) ?? false,
+    ranges: deduplicateAndMergeRanges(normalized, coerceBoolean(splitRanges) ?? true),
   };
 }
 
@@ -1117,5 +1158,43 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 function positiveNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function coerceBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase();
+    if (lower === 'true' || lower === '1' || lower === 'yes') {
+      return true;
+    }
+    if (lower === 'false' || lower === '0' || lower === 'no') {
+      return false;
+    }
+  }
+  return undefined;
 }

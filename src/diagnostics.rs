@@ -182,12 +182,14 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .map(|spec| spec.root.clone())
         .collect();
     let missing_managed_worktrees = catalog::missing_managed_roots(&specs).unwrap_or_default();
+    let subagent_definitions = inspect_subagent_definitions();
     Ok(
         json!({"client":local,"daemon":remote,"daemon_error":daemon_error,
         "root_resolution":root_resolution,"registrations":specs,"processes":processes,
         "stale_mcp_processes":stale,"daemon_matches_client":daemon_matches_client,
         "legacy_glob_roots":legacy_glob_roots,
         "missing_managed_worktrees":missing_managed_worktrees,
+        "subagent_definitions":subagent_definitions,
         "inspection_errors":inspection_errors,
         "chat_exposure":"unverified; executable/cwd is not a session-to-process mapping",
         "recovery":{
@@ -237,6 +239,41 @@ pub fn coverage() -> Result<Value> {
         .duration_since(std::time::UNIX_EPOCH)?.as_secs(),"roots":roots,
         "preparation_candidates":preparation_candidates,
         "contract":"point-in-time permitted inventory, not historical eligibility or host content-policy authorization"}))
+}
+
+fn inspect_subagent_definitions() -> Value {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return json!({"checked": 0, "configured": 0, "unconfigured": []});
+    };
+    let mut checked = 0usize;
+    let mut configured = 0usize;
+    let mut unconfigured: Vec<String> = Vec::new();
+    let bin_root = home.join(".vscode-server/bin");
+    if let Ok(entries) = std::fs::read_dir(&bin_root) {
+        for entry in entries.flatten() {
+            for rel in [
+                "node_modules/@github/copilot-sdk-linux-x64/definitions/explore.agent.yaml",
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions/explore.agent.yaml",
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions/research.agent.yaml",
+            ] {
+                let candidate = entry.path().join(rel);
+                if let Ok(text) = std::fs::read_to_string(&candidate) {
+                    checked += 1;
+                    if text.contains("cctxNativeContext") && text.contains("code-context/*") {
+                        configured += 1;
+                    } else if unconfigured.len() < 8 {
+                        unconfigured.push(candidate.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    json!({
+        "checked": checked,
+        "configured": configured,
+        "unconfigured": unconfigured,
+        "remediation": if unconfigured.is_empty() { Value::Null } else { json!("Run: python3 scripts/configure_subagents.py") },
+    })
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {

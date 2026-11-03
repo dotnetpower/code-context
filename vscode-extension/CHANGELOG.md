@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.24.0
+
+- Immediately unwatch deleted or moved directories and ancestor trees
+  (`prune_deleted_watches`, `unwatch_prefix`, `record_affected_directory`),
+  drain watcher events during idle 1-second maintenance ticks, and evict deleted
+  workspace/worktree roots immediately (`reason="root_missing"`) instead of
+  waiting for the 15-minute idle lease.
+- Add subagent tool configuration (`scripts/configure_subagents.py`, `cctx
+  doctor` diagnostics, and subagent role/model attribution in
+  `audit_agent_tool_adoption.py`) so Copilot `explore` and `research` subagents
+  use Native and MCP Code Context tools automatically.
+- Harden agent query ergonomics across Native and MCP surfaces: auto-repair
+  malformed LLM regex patterns (unbalanced `(`, non-quantifier `{identifier}`
+  braces), suggest `regex: true` on zero-match literal regexes, filter excluded
+  entries from multi-path search arrays, suggest `did_you_mean` indexed files on
+  missing reads, auto-narrow oversized compact `code_grep`/`code_context`
+  responses, and disambiguate multi-root workspaces from relative target paths.
+
 ## 0.23.0
 
 - Add live LLM model, token, cache-hit, and AIC/USD cost-savings telemetry

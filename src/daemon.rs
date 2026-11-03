@@ -1375,6 +1375,11 @@ impl Server {
     }
 
     fn evict(&mut self, root: &PathBuf, reason: &str) {
+        if reason == "root_missing" {
+            self.root_aliases
+                .retain(|alias, target| alias != root && target != root);
+            self.pending_roots.retain(|job| &job.requested != root);
+        }
         if self.roots.remove(root).is_some() {
             self.evictions.push_back(json!({"root":root,"reason":reason,
                 "at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -1597,6 +1602,13 @@ impl Server {
                         self.fail_background_root(&job, error.to_string());
                         return;
                     }
+                }
+                if !job.spec.root.is_dir() {
+                    self.fail_background_root(
+                        &job,
+                        "root directory was removed during background work".into(),
+                    );
+                    return;
                 }
                 self.root_size_hints.insert(
                     job.spec.root.clone(),
@@ -2038,6 +2050,8 @@ impl Server {
                     .any(|spec| spec.root == *root && spec == &entry.spec)
                 {
                     Some((root.clone(), "registration_changed"))
+                } else if !root.is_dir() {
+                    Some((root.clone(), "root_missing"))
                 } else if entry.idle_for(self.idle_timeout) {
                     Some((root.clone(), "idle_lease_expired"))
                 } else {
@@ -3348,5 +3362,38 @@ mod tests {
         let miss = server.request_cache(canonical.clone()).unwrap();
         assert_eq!(miss.state, "queued");
         assert_eq!(server.pending_roots[0].requested, canonical);
+    }
+
+    #[test]
+    fn deleted_loaded_root_is_evicted_immediately_instead_of_waiting_for_idle_lease() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.rs"), "source").unwrap();
+        let canonical = catalog::canonicalize(root.path()).unwrap();
+        let spec = Spec {
+            root: canonical.clone(),
+            scopes: vec![".".into()],
+            globs: vec!["*.rs".into()],
+            excludes: Vec::new(),
+            default_excludes: true,
+            prewarm: false,
+            policy: MemoryPolicy::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        };
+        let watched = Watched::new(spec.clone()).unwrap();
+        let mut server = Server {
+            registry: vec![spec],
+            idle_timeout: IDLE_ROOT_TIMEOUT,
+            ..Server::default()
+        };
+        server.roots.insert(canonical.clone(), watched);
+        assert!(!server.evict_idle_roots());
+        drop(root);
+        assert!(server.evict_idle_roots());
+        assert!(server.roots.is_empty());
+        assert_eq!(
+            server.evictions.back().unwrap()["reason"],
+            "root_missing"
+        );
     }
 }

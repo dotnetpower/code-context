@@ -23,13 +23,14 @@ import {
   normalizeUriOrPath,
   resolveRegisteredRootAfterRefresh,
   resolveWslRoot,
+  RootResolutionError,
   wslCandidateToLinuxPath,
 } from './rootResolver.js';
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
 
 const REGISTRY_CACHE_MS = 15_000;
-const STICKY_ROOT_TTL_MS = 300_000;
+const STICKY_ROOT_TTL_MS = 3_600_000;
 export const NATIVE_TOOL_NAMES = [
   'code-context-native_codeFiles',
   'code-context-native_codeGrep',
@@ -99,6 +100,10 @@ class WorkspaceRegistry {
   public invalidate(): void {
     this.cached = undefined;
     this.cachedAt = 0;
+  }
+
+  public peek(): WorkspaceSpec[] | undefined {
+    return this.cached;
   }
 }
 
@@ -265,8 +270,19 @@ export class NativeToolBridge implements vscode.Disposable {
       normalizedExplicit !== undefined &&
       (normalizedExplicit.startsWith('/') || /[\\:]/u.test(normalizedExplicit))
     ) {
+      let knownWorkspaces = this.registry.peek() ?? [];
+      if (
+        knownWorkspaces.length === 0 &&
+        /\.[a-zA-Z0-9]{1,10}(?:[#:]|$)/u.test(posix.basename(normalizedExplicit))
+      ) {
+        try {
+          knownWorkspaces = await this.registry.list(token);
+        } catch {
+          knownWorkspaces = [];
+        }
+      }
       // The daemon remains authoritative for registration and access policy.
-      return resolveWslRoot([], normalizedExplicit);
+      return resolveWslRoot(knownWorkspaces, normalizedExplicit);
     }
     const stickyCandidate =
       allowPreparation &&
@@ -278,7 +294,17 @@ export class NativeToolBridge implements vscode.Disposable {
     const candidates = [...workspaceCandidates(), ...extraCandidates, ...stickyCandidate];
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
-      return resolveWslRoot(workspaces, normalizedExplicit, candidates, relativeTargets);
+      try {
+        return resolveWslRoot(workspaces, normalizedExplicit, candidates, relativeTargets);
+      } catch (error: unknown) {
+        if (error instanceof RootResolutionError && stickyCandidate[0]) {
+          const stickyLinux = wslCandidateToLinuxPath(stickyCandidate[0]);
+          if (stickyLinux) {
+            return stickyLinux;
+          }
+        }
+        throw error;
+      }
     }
     return resolveRegisteredRootAfterRefresh(
       workspaces,
@@ -437,7 +463,22 @@ function collectRawInputPaths(input: unknown): string[] {
     return [];
   }
   const raw: string[] = [];
-  for (const key of ['path', 'filePath', 'uri', 'file', 'target'] as const) {
+  for (const key of [
+    'path',
+    'filePath',
+    'file_path',
+    'filepath',
+    'relative_path',
+    'relativePath',
+    'target_file',
+    'targetFile',
+    'uri',
+    'file',
+    'target',
+    'dir',
+    'directory',
+    'folder',
+  ] as const) {
     const val = input[key];
     if (typeof val === 'string' && val.trim().length > 0) {
       raw.push(extractLineRangeFromPath(val).path);
@@ -455,12 +496,40 @@ function collectRawInputPaths(input: unknown): string[] {
   if (Array.isArray(input.ranges)) {
     for (const range of input.ranges) {
       if (isRecord(range)) {
-        for (const key of ['path', 'filePath', 'uri', 'file', 'target'] as const) {
+        for (const key of [
+          'path',
+          'filePath',
+          'file_path',
+          'filepath',
+          'relative_path',
+          'relativePath',
+          'target_file',
+          'targetFile',
+          'uri',
+          'file',
+          'target',
+        ] as const) {
           const rangePath = range[key];
           if (typeof rangePath === 'string' && rangePath.trim().length > 0) {
             raw.push(extractLineRangeFromPath(rangePath).path);
             break;
           }
+        }
+      }
+    }
+  }
+  if (typeof input.glob === 'string' && input.glob.trim().length > 0) {
+    const globVal = input.glob.trim();
+    const wildIdx = globVal.search(/[*?[\]{}]/u);
+    if (wildIdx === -1) {
+      raw.push(extractLineRangeFromPath(globVal).path);
+    } else if (wildIdx > 0) {
+      const beforeWild = globVal.slice(0, wildIdx);
+      const lastSlash = beforeWild.lastIndexOf('/');
+      if (lastSlash > 0) {
+        const prefix = beforeWild.slice(0, lastSlash);
+        if (prefix && prefix !== '.') {
+          raw.push(prefix);
         }
       }
     }
