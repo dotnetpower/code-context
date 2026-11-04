@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- Extend `cctx usage` with failure-cause, P95/P99 latency and offload tables,
+  built-in fallback and per-workspace adoption reports, and optimization
+  advisories; export the savings-model assumptions in `--json`; stop counting
+  `web_search`/`web_fetch` as built-in source lookups.
+- Add native stall diagnostics: `CCTX_TRACE` now carries `started_unix_ms` and
+  `total_ms`, calls over 5 s log a warning and append a `CCTX_SLOW` transport
+  hint, and `cctx usage` flags shared stalls and host-dispatch delay.
+- Keep MCP `code_files`/`code_grep`/`code_context`/`code_read` responses under
+  the 7.4 KiB inline budget with explicit `next_ranges` continuation. A plain
+  `code_read` array is trimmed into the paged shape; an end-to-end `shared-mcp`
+  test covers the real response shapes.
+- State the expected load time in `CACHE_MISS` (per-root history, else recent
+  median) instead of a fixed "~1-2s" so agents stop retrying early.
+- Add a built-in-to-CCTX replacement map to the agent instructions and make the
+  "model without CCTX" advisory report built-in lookup counts.
+- Give busy roots a longer idle lease (2x at 50, 4x at 200 source lookups) to
+  reduce avoidable `CACHE_MISS` reloads.
+- Convert the auto-loaded agent instructions (`prompts/code-context.instructions.md`)
+  and subagent prompt blocks (`scripts/configure_subagents.py --style formula`)
+  to a BPE-aligned symbolic formula specification (9,127 B / 2,048 `o200k_base`
+  tokens -> 2,994 B / 756 tokens, **-63.1% instruction tokens** with 100% 31/31
+  edge-case recognition),cap them at 6,000 bytes in `scripts/verify_vsix.py`,
+  and add `cctx prompt` (`--style formula|hybrid|prose`, `--target`,
+  `--compress`) and `CCTX_PROMPT_STYLE` with bilingual Korean core-noun
+  preservation (`[ko] :: ...`) and Unicode math / backtick BPE normalization.
+
 ## 0.24.0
 
 - Immediately unwatch deleted or moved directories and ancestor trees

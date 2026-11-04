@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { formatLogDetails, formatTrace, outcomeLevel, singleLine } from '../src/logFormatter.js';
+import { SLOW_CALL_MS, formatLogDetails, formatTrace, outcomeLevel, singleLine, slowCallNotice } from '../src/logFormatter.js';
 import type { ClientTrace } from '../src/daemonClient.js';
 
 void test('trace logs show readable phases and correlation without JSON or machine memory dumps', () => {
@@ -40,4 +40,18 @@ void test('status and self-test retain nested diagnostics in plain text with exp
   const bounded = formatLogDetails('Code Context status', Array.from({ length: 300 }, (_, i) => i));
   assert.equal(bounded.split('\n').length, 257);
   assert.match(bounded, /Additional fields omitted.*code_status/);
+});
+
+void test('slow native calls get a transport hint with phase breakdown, fast calls stay silent', () => {
+  const base: ClientTrace = {
+    trace_id: 't', operation: 'code_read', root: '/fixture', total_ms: 120, prepare_ms: 1, queue_ms: 2,
+    ipc_ms: 100, serialize_ms: 1, write_ms: 0, started_unix_ms: 1, completed_unix_ms: 2,
+    success: true, available: true, outcome: 'success', daemon: { execute_ms: 3 },
+  };
+  assert.equal(slowCallNotice(base), undefined);
+  assert.equal(slowCallNotice({ ...base, total_ms: SLOW_CALL_MS - 1 }), undefined);
+  const notice = slowCallNotice({ ...base, total_ms: 77_000, ipc_ms: 76_900 }) ?? '';
+  assert.match(notice, /^CCTX_SLOW code_read took 77\.0s \(prepare=1ms queue=2ms ipc=76900ms daemon=3ms\)/);
+  assert.match(notice, /code-context-code_\* MCP tools or `cctx --backend shared --root \/fixture`/);
+  assert.ok(!notice.includes('\n'));
 });

@@ -1,12 +1,11 @@
 import importlib.util
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("benchmark", ROOT / "benchmarks/benchmark.py")
@@ -128,7 +127,7 @@ class BenchmarkTests(unittest.TestCase):
                     code.chmod(0o700)
                     result = subprocess.run(
                         ["bash", str(ROOT / "scripts/install-vscode-extension.sh")],
-                        env=env, capture_output=True, text=True, timeout=10,
+                        env=env, capture_output=True, text=True, timeout=10, check=False,
                     )
                     self.assertEqual(result.returncode, expected, result.stderr)
                     if expected == 1:

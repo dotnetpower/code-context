@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 
 import { TracedRequestError, type ClientTrace, type DaemonClient } from './daemonClient.js';
 import { formatToolResult } from './resultFormatter.js';
-import { formatTrace, outcomeLevel, singleLine } from './logFormatter.js';
+import { formatTrace, outcomeLevel, singleLine, slowCallNotice } from './logFormatter.js';
 import {
   buildContextArguments,
   buildFilesArguments,
@@ -242,7 +242,8 @@ export class NativeToolBridge implements vscode.Disposable {
 
   public recordTrace(trace: ClientTrace, token: vscode.CancellationToken, reason?: string): void {
     const outcome = trace.success ? 'success' : classifyOutcome(reason ?? 'Unknown native request failure');
-    this.output[outcomeLevel(outcome)](formatTrace(trace, reason));
+    const level = outcomeLevel(outcome);
+    this.output[level === 'info' && slowCallNotice(trace) ? 'warn' : level](formatTrace(trace, reason));
     if (trace.available !== true) {
       return;
     }
@@ -347,15 +348,23 @@ class NativeTool<T> implements vscode.LanguageModelTool<T> {
     result.trace.total_ms += result.trace.serialize_ms;
     result.trace.completed_unix_ms = Date.now();
     this.bridge.recordTrace(result.trace, token);
+    // Timing lets `cctx usage` separate host dispatch delay from extension and daemon time.
     const compactTrace = {
       trace_id: result.trace.trace_id,
       operation: result.trace.operation,
       outcome: result.trace.outcome,
+      started_unix_ms: result.trace.started_unix_ms,
+      total_ms: Math.round(result.trace.total_ms),
     };
-    return new vscode.LanguageModelToolResult([
+    const parts = [
       new vscode.LanguageModelTextPart(text),
       new vscode.LanguageModelTextPart(`CCTX_TRACE ${JSON.stringify(compactTrace)}`),
-    ]);
+    ];
+    const slow = slowCallNotice(result.trace);
+    if (slow) {
+      parts.push(new vscode.LanguageModelTextPart(slow));
+    }
+    return new vscode.LanguageModelToolResult(parts);
   }
 
   public prepareInvocation(

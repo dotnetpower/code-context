@@ -390,6 +390,29 @@ struct CacheMiss {
     state: &'static str,
     scheduled: bool,
     previous_failure: Option<String>,
+    eta_ms: u64,
+}
+
+const DEFAULT_COLD_LOAD_MS: u64 = 2_500;
+
+/// Estimated wait for a root's background load: its own last load plus headroom,
+/// else the median of recent loads, else a default. Agents retry too early on a fixed hint.
+fn expected_load_ms(timings: &VecDeque<Value>, root: &std::path::Path) -> u64 {
+    let loads: Vec<(bool, f64)> = timings
+        .iter()
+        .filter(|t| t["kind"] == "cold_load" && t["success"] == true)
+        .filter_map(|t| Some((t["root"].as_str().is_some_and(|r| std::path::Path::new(r) == root), t["elapsed_ms"].as_f64()?)))
+        .collect();
+    let estimate = if let Some((_, own)) = loads.iter().rev().find(|(same, _)| *same) {
+        own * 1.25
+    } else if loads.is_empty() {
+        DEFAULT_COLD_LOAD_MS as f64
+    } else {
+        let mut all: Vec<f64> = loads.iter().map(|(_, ms)| *ms).collect();
+        all.sort_by(f64::total_cmp);
+        all[all.len() / 2] * 1.25
+    };
+    (estimate.round() as u64).clamp(1_000, 30_000)
 }
 
 impl std::fmt::Display for CacheMiss {
@@ -400,10 +423,11 @@ impl std::fmt::Display for CacheMiss {
         };
         write!(
             formatter,
-            "CACHE_MISS root={} state={} background_load={}: no cached source result is available.{previous} Use a permitted host search/read for THIS single lookup only under the same access policy, then RESUME using CCTX (#cctxNative* / code_*) on your next turn once background load finishes (~1-2s). Do not poll, repeat this request, switch CCTX transports or run code_sync merely to wait for warmup; this is not a zero-match or absence result.",
+            "CACHE_MISS root={} state={} background_load={}: no cached source result is available.{previous} Use a permitted host search/read for THIS single lookup only under the same access policy, then RESUME using CCTX (#cctxNative* / code_*) on your next turn once background load finishes (expected in about {}s; do not retry sooner). Do not poll, repeat this request, switch CCTX transports or run code_sync merely to wait for warmup; this is not a zero-match or absence result.",
             self.root.display(),
             self.state,
-            self.scheduled
+            self.scheduled,
+            self.eta_ms.div_ceil(1_000)
         )
     }
 }
@@ -1021,7 +1045,7 @@ impl Server {
             "registered_roots":self.registry.len(),"limit":catalog::MAX_REGISTERED_ROOTS,
             "managed_worktrees":self.registry.iter().filter(|spec|spec.managed_parent.is_some()).count(),
             "idle_source_lease_seconds":IDLE_ROOT_TIMEOUT.as_secs(),
-            "policy":"source lookups extend the idle lease; status polling does not; active/manual registrations are not automatically removed",
+            "policy":"source lookups extend the idle lease (busy roots with 50+/200+ lookups hold 2x/4x the base); status polling does not; active/manual registrations are not automatically removed",
         }));
         object.insert("process_memory".into(), self.process_memory());
         object.insert("outcome_counts".into(), json!(self.outcome_counts));
@@ -1169,6 +1193,7 @@ impl Server {
                     requested.display(), CACHE_FAILURE_COOLDOWN.as_secs())).into());
         }
         let previous_failure = self.cache_failures.remove(&requested).map(|(_, error)| error);
+        let eta_ms = expected_load_ms(&self.background_timings, &requested);
         let state = if let Some(job) = self
             .background
             .as_ref()
@@ -1197,6 +1222,7 @@ impl Server {
                 state: "queue_full",
                 scheduled: false,
                 previous_failure,
+                eta_ms,
             });
         } else {
             self.pending_roots.push_back(PendingRoot {
@@ -1210,6 +1236,7 @@ impl Server {
             state,
             scheduled: true,
             previous_failure,
+            eta_ms,
         })
     }
 
@@ -3276,6 +3303,33 @@ mod tests {
             serde_json::from_slice::<Value>(&frame).unwrap()["error"],
             "queue full"
         );
+    }
+
+    #[test]
+    fn cache_miss_eta_follows_observed_cold_loads() {
+        let load = |root: &str, ms: f64, ok: bool| {
+            json!({"root": root, "kind": "cold_load", "elapsed_ms": ms, "success": ok})
+        };
+        let mut timings = VecDeque::new();
+        assert_eq!(expected_load_ms(&timings, std::path::Path::new("/a")), DEFAULT_COLD_LOAD_MS);
+        timings.push_back(load("/b", 2_000.0, true));
+        timings.push_back(load("/c", 4_000.0, true));
+        timings.push_back(load("/d", 60.0, false));
+        timings.push_back(json!({"root": "/a", "kind": "strict_sync", "elapsed_ms": 9_000.0, "success": true}));
+        // No history for /a: median of successful cold loads (4000) with headroom.
+        assert_eq!(expected_load_ms(&timings, std::path::Path::new("/a")), 5_000);
+        timings.push_back(load("/a", 8_000.0, true));
+        timings.push_back(load("/a", 1_000.0, true));
+        // Own most recent load wins; very short loads keep a 1 s floor.
+        assert_eq!(expected_load_ms(&timings, std::path::Path::new("/a")), 1_250);
+        timings.push_back(load("/e", 1.0, true));
+        assert_eq!(expected_load_ms(&timings, std::path::Path::new("/e")), 1_000);
+        timings.push_back(load("/f", 120_000.0, true));
+        assert_eq!(expected_load_ms(&timings, std::path::Path::new("/f")), 30_000);
+        let miss = CacheMiss { root: "/a".into(), state: "loading", scheduled: true, previous_failure: None, eta_ms: 2_100 };
+        let text = miss.to_string();
+        assert!(text.contains("expected in about 3s; do not retry sooner"), "{text}");
+        assert!(text.starts_with("CACHE_MISS root=/a state=loading background_load=true"), "{text}");
     }
 
     #[test]

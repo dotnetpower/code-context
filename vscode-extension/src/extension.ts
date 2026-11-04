@@ -365,7 +365,7 @@ function toolResultText(result: vscode.LanguageModelToolResult): string {
         part instanceof vscode.LanguageModelTextPart,
     )
     .map((part) => part.value)
-    .filter((text) => !text.startsWith('CCTX_TRACE '))
+    .filter((text) => !text.startsWith('CCTX_TRACE ') && !text.startsWith('CCTX_SLOW '))
     .join('');
 }
 

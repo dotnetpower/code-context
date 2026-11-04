@@ -81,6 +81,34 @@ MD_PROMPT_BLOCK = """
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.
 """
 
+YAML_FORMULA_PROMPT_BLOCK = """\
+  # [cctx-subagent-instructions]
+  **CCTX & TCTX Formula Rules (Mandatory First Path):**
+  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files) > CLI (cctx --backend shared --root <root>) > Host (view, grep, rg, glob, bash)`
+  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status) > CLI (tctx --root <root> run) > bash`
+  - `Guards`: always pass explicit absolute `root`; `cctxNativeContext(limit <= 64, radius: 0..100)`; `cctxNativeRead(lines <= 120, < 8KiB)`; `target in {.github/*, .vscode/*, .gitignore, /tmp/*} => view directly (!CCTX)`.
+  - `Deferred`: if tools are not visible, call `tool_search` first with `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status"`.
+  - `Transitions`: `Error("No matching client connected") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+"""
+
+MD_FORMULA_PROMPT_BLOCK = """
+<!-- [cctx-subagent-instructions] -->
+## CCTX & TCTX Formula Rules (Mandatory First Path)
+
+- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_*) > Host (rg, view, glob)`
+- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_*) > bash`
+- `Guards`: pass explicit `root`; `limit <= 64`; `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/* => Host view only`.
+- `Deferred`: `tool_search("cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status")`
+- `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+"""
+
+
+def select_blocks(style: str = "formula") -> tuple[str, str]:
+    normalized = (style or os.environ.get("CCTX_PROMPT_STYLE", "formula")).strip().lower()
+    if normalized in {"prose", "standard", "text"}:
+        return YAML_PROMPT_BLOCK, MD_PROMPT_BLOCK
+    return YAML_FORMULA_PROMPT_BLOCK, MD_FORMULA_PROMPT_BLOCK
+
 TARGET_YAML_AGENTS = (
     "explore.agent.yaml",
     "code-review.agent.yaml",
@@ -122,9 +150,10 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def patch_yaml_agent(path: Path) -> bool:
+def patch_yaml_agent(path: Path, style: str = "formula") -> bool:
     if not path.is_file():
         return False
+    yaml_block, _ = select_blocks(style)
     original = path.read_text(encoding="utf-8")
     updated = original
 
@@ -150,15 +179,15 @@ def patch_yaml_agent(path: Path) -> bool:
         head, _sep, tail = updated.partition(f"  {MARKER}")
         if "\nsidekick:\n" in tail:
             _old_block, _, after_sidekick = tail.partition("\nsidekick:\n")
-            updated = head.rstrip() + "\n\n" + YAML_PROMPT_BLOCK + "\nsidekick:\n" + after_sidekick
+            updated = head.rstrip() + "\n\n" + yaml_block + "\nsidekick:\n" + after_sidekick
         else:
-            updated = head.rstrip() + "\n\n" + YAML_PROMPT_BLOCK
+            updated = head.rstrip() + "\n\n" + yaml_block
     elif "\nprompt: |\n" in updated:
         if "\nsidekick:\n" in updated:
             before_sk, _, after_sk = updated.partition("\nsidekick:\n")
-            updated = before_sk.rstrip() + "\n\n" + YAML_PROMPT_BLOCK + "\nsidekick:\n" + after_sk
+            updated = before_sk.rstrip() + "\n\n" + yaml_block + "\nsidekick:\n" + after_sk
         else:
-            updated = updated.rstrip() + "\n\n" + YAML_PROMPT_BLOCK
+            updated = updated.rstrip() + "\n\n" + yaml_block
 
     if updated != original:
         atomic_write(path, updated)
@@ -166,9 +195,10 @@ def patch_yaml_agent(path: Path) -> bool:
     return False
 
 
-def patch_explore_agent_md(path: Path) -> bool:
+def patch_explore_agent_md(path: Path, style: str = "formula") -> bool:
     if not path.is_file():
         return False
+    _, md_block = select_blocks(style)
     original = path.read_text(encoding="utf-8")
     updated = original
     if "tools: [" in updated:
@@ -183,9 +213,9 @@ def patch_explore_agent_md(path: Path) -> bool:
                 updated = updated.replace("\ntools:\n", f"\ntools:\n  - {tool_name}\n", 1)
     if "<!-- [cctx-subagent-instructions] -->" in updated:
         head, _sep, _tail = updated.partition("<!-- [cctx-subagent-instructions] -->")
-        updated = head.rstrip() + "\n" + MD_PROMPT_BLOCK
+        updated = head.rstrip() + "\n" + md_block
     else:
-        updated = updated.rstrip() + "\n" + MD_PROMPT_BLOCK
+        updated = updated.rstrip() + "\n" + md_block
     if updated != original:
         atomic_write(path, updated)
         return True
@@ -228,7 +258,11 @@ def discover_explore_md_files(home: Path) -> list[Path]:
     return found
 
 
-def configure_all(home: Path, extra_dirs: list[Path] | None = None) -> dict[str, int]:
+def configure_all(
+    home: Path,
+    extra_dirs: list[Path] | None = None,
+    style: str = "formula",
+) -> dict[str, int | str]:
     dirs = list(extra_dirs or []) + discover_definition_dirs(home)
     patched_yaml = 0
     checked_yaml = 0
@@ -237,15 +271,16 @@ def configure_all(home: Path, extra_dirs: list[Path] | None = None) -> dict[str,
             target = def_dir / name
             if target.is_file():
                 checked_yaml += 1
-                if patch_yaml_agent(target):
+                if patch_yaml_agent(target, style=style):
                     patched_yaml += 1
     patched_md = 0
     checked_md = 0
     for md_path in discover_explore_md_files(home):
         checked_md += 1
-        if patch_explore_agent_md(md_path):
+        if patch_explore_agent_md(md_path, style=style):
             patched_md += 1
     return {
+        "style": style,
         "definition_dirs": len(dirs),
         "checked_yaml": checked_yaml,
         "patched_yaml": patched_yaml,
@@ -258,10 +293,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--definitions-dir", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--style",
+        choices=("formula", "hybrid", "prose"),
+        default=os.environ.get("CCTX_PROMPT_STYLE", "formula"),
+        help="Prompt instruction style to inject into subagent definitions (default: formula)",
+    )
     args = parser.parse_args()
-    summary = configure_all(args.home, args.definitions_dir)
+    summary = configure_all(args.home, args.definitions_dir, style=args.style)
     print(
-        f"Subagent definitions configured: dirs={summary['definition_dirs']} "
+        f"Subagent definitions configured (style={summary['style']}): dirs={summary['definition_dirs']} "
         f"yaml={summary['patched_yaml']}/{summary['checked_yaml']} "
         f"md={summary['patched_md']}/{summary['checked_md']}"
     )

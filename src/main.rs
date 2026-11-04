@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use code_context::context::{ContextRequest, ReadRange};
 use code_context::engine::{Backend, Engine};
 use code_context::policy::MemoryPolicy;
+use code_context::prompt_formula::{PromptStyle, PromptTarget};
 use code_context::search::Search;
 use code_context::workspace::Workspace;
 use code_context::{Result, catalog, daemon, experiment, mcp, resident_experiment, shared_mcp};
@@ -65,6 +66,16 @@ enum Action {
     Usage {
         #[arg(long, default_value_t = 24.0)]
         hours: f64,
+        #[arg(long)]
+        json: bool,
+    },
+    Prompt {
+        #[arg(long, value_enum, default_value_t = PromptStyle::Formula)]
+        style: PromptStyle,
+        #[arg(long, value_enum, default_value_t = PromptTarget::Instructions)]
+        target: PromptTarget,
+        #[arg(long, help = "Convert a natural-language task prompt into a compact symbolic formula prompt")]
+        compress: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -158,6 +169,28 @@ fn run() -> Result<()> {
             let output = code_context::diagnostics::usage(&args.root, *hours, *json)?;
             let mut stdout = io::stdout().lock();
             stdout.write_all(output.as_bytes())?;
+            return stdout.write_all(b"\n").map_err(Into::into);
+        }
+        Action::Prompt {
+            style,
+            target,
+            compress,
+            json,
+        } => {
+            let root_opt = (args.root.as_os_str() != ".")
+                .then(|| catalog::canonicalize(&args.root).unwrap_or_else(|_| args.root.clone()));
+            let report = code_context::prompt_formula::build_report(
+                *style,
+                *target,
+                root_opt.as_deref(),
+                compress.as_deref(),
+            );
+            if *json {
+                return print(&report);
+            }
+            let mut stdout = io::stdout().lock();
+            let text = report["prompt"].as_str().unwrap_or("");
+            stdout.write_all(text.as_bytes())?;
             return stdout.write_all(b"\n").map_err(Into::into);
         }
         Action::Prepare => {

@@ -63,7 +63,38 @@ cctx --backend shared --root /path/to/project context 'create_service' --radius 
 cctx --backend shared --root /path/to/project read src/lib.rs 1 40
 cctx --backend shared --root /path/to/project status
 cctx usage --hours 24
+cctx --root /path/to/project prompt --style formula --target instructions
+cctx --root /path/to/project prompt --compress "Which function calculates retry delay, and what caps the result?" --json
 ```
+
+`cctx prompt` renders BPE-aligned symbolic formula (`formula`), contract-compatible
+hybrid (`hybrid`), or prose (`prose`) instructions for `.instructions.md`, MCP
+`initialize`, or subagent definitions, and `--compress` converts natural-language
+code-lookup task prompts into symbolic formula prompts with token-savings telemetry.
+
+`cctx usage` also reports per-tool failure causes (`client_disconnected`,
+`cache_miss`, `range_out_of_bounds`, ...), P95/P99 latency, offloaded outputs,
+built-in fallbacks with the CCTX tool to use instead, per-workspace adoption,
+shared-stall detection (slow calls from several sessions finishing at the same
+instant), host-dispatch delay from the native `CCTX_TRACE` timing footer,
+and optimization advisories (long sessions, spend concentration, models with no
+CCTX calls, offload and cold-cache rates). `--json` adds `insights` and the
+savings-model `assumptions`.
+
+Native tool results carry `started_unix_ms` and `total_ms` in the `CCTX_TRACE`
+footer. Calls slower than 5 s also log a warning and append a `CCTX_SLOW` line
+that names the phase timings and tells the agent to switch to the MCP tools or
+`cctx --backend shared` instead of polling.
+
+MCP `code_files`, `code_grep`, `code_context` and `code_read` responses are kept
+under a 7.4 KiB inline budget so hosts do not offload them to temporary files.
+A trimmed response sets `truncated`, `omitted` and `inline_notice`; read tails
+move into `next_ranges` with `complete=false`. A plain `code_read` (a bare array
+of snippets) that must be trimmed is returned in the paged object shape
+(`snippets`, `complete`, `next_ranges`); responses that fit are unchanged.
+`CACHE_MISS` states the expected load time for that root, derived from its last
+cold load or the recent median, so retries wait for the background load. Roots with sustained lookups keep
+their cache longer than the 15-minute base lease (2x at 50 and 4x at 200 lookups).
 
 Search patterns are case-sensitive literals unless `--regex` or
 `--ignore-case` is explicit. Results use relative paths and 1-based lines.
@@ -137,6 +168,7 @@ Budget growth does not immediately allocate that much RAM.
 | `CCTX_MEMORY_MAX_MIB` | Explicit upper ceiling; never a promise to allocate it |
 | `CCTX_MEMORY_RESERVE_MIB` | Explicit reserve override |
 | `CCTX_HOME` | Private registry/socket directory for isolation |
+| `CCTX_PROMPT_STYLE` | Optional MCP/subagent instruction style (`formula`, `hybrid`, `prose`) |
 
 Configure service variables with `systemctl --user edit code-context.service`,
 then restart only that service at a safe boundary. Check `cctx status` and

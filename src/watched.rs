@@ -35,6 +35,21 @@ mod io_tests {
 
     use super::*;
 
+    #[test]
+    fn busy_roots_earn_a_longer_idle_lease_and_idle_roots_do_not() {
+        assert_eq!(lease_multiplier(0), 1);
+        assert_eq!(lease_multiplier(49), 1);
+        assert_eq!(lease_multiplier(50), 2);
+        assert_eq!(lease_multiplier(199), 2);
+        assert_eq!(lease_multiplier(200), 4);
+        let (_root, mut watched) = fixture();
+        assert!(!watched.idle_for(Duration::from_secs(60)));
+        watched.last_used = Instant::now() - Duration::from_secs(90);
+        assert!(watched.idle_for(Duration::from_secs(60)));
+        watched.source_lookups = 50;
+        assert!(!watched.idle_for(Duration::from_secs(60)));
+    }
+
     fn fixture() -> (tempfile::TempDir, Watched) {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "before\n").unwrap();
@@ -370,6 +385,15 @@ mod io_tests {
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const READ_RECOVERY_DELAY: Duration = Duration::from_millis(8);
 pub(crate) const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Roots with sustained source lookups keep their cache longer, avoiding avoidable CACHE_MISS reloads.
+pub(crate) fn lease_multiplier(lookups: u64) -> u32 {
+    match lookups {
+        0..50 => 1,
+        50..200 => 2,
+        _ => 4,
+    }
+}
 const ROOT_RUNTIME_HEADROOM: usize = 160 * 1024 * 1024;
 type MaintenanceResult = (u64, Result<BTreeMap<String, Stamp>>);
 
@@ -397,6 +421,7 @@ pub struct Watched {
     stamps: BTreeMap<String, Stamp>,
     last_reconcile: Instant,
     last_used: Instant,
+    source_lookups: u64,
     blocked: Option<String>,
     last_update: Value,
     query_cache: QueryCache,
@@ -561,6 +586,7 @@ impl Watched {
             stamps,
             last_reconcile: Instant::now(),
             last_used: Instant::now(),
+            source_lookups: 0,
             blocked: None,
             last_update: json!({}),
             query_cache: QueryCache::default(),
@@ -585,7 +611,7 @@ impl Watched {
     }
 
     pub(crate) fn idle_for(&self, max_age: Duration) -> bool {
-        self.last_used.elapsed() > max_age
+        self.last_used.elapsed() > max_age.saturating_mul(lease_multiplier(self.source_lookups))
     }
 
     pub fn idle_age(&self) -> Duration {
@@ -1306,6 +1332,9 @@ impl Watched {
 
     pub fn call_with_mode(&mut self, name: &str, mut arguments: Value, compact: bool) -> Result<Value> {
         self.last_used = Instant::now();
+        if matches!(name, "code_files" | "code_grep" | "code_read" | "code_context") {
+            self.source_lookups = self.source_lookups.saturating_add(1);
+        }
         self.synchronize_or_block(name == "code_sync")?;
         self.normalize_root_prefixed_arguments(&mut arguments);
         match name {

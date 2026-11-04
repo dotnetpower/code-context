@@ -290,6 +290,8 @@ class AdoptionAuditTests(unittest.TestCase):
         self.assertEqual(MODULE.classify("code-context-native_codeRead"), "native")
         self.assertEqual(MODULE.classify("code-context-code_grep"), "mcp")
         self.assertEqual(MODULE.classify("code_context"), "mcp")
+        for web in ("web_search", "web_fetch", "tool_search_tool"):
+            self.assertEqual(MODULE.classify(web), "other")
         for builtin in (
             "copilot_findFiles",
             "copilot_findTextInFiles",
@@ -514,8 +516,14 @@ class AdoptionAuditTests(unittest.TestCase):
             self.assertIn("code-context-code_context", patched_text)
             self.assertIn("tctxNativeRun", patched_text)
             self.assertIn("[cctx-subagent-instructions]", patched_text)
+            self.assertIn("CCTX & TCTX Formula Rules", patched_text)
             second = cfg_mod.configure_all(Path(directory), [defs_dir])
             self.assertEqual(second["patched_yaml"], 0)
+            switched = cfg_mod.configure_all(Path(directory), [defs_dir], style="prose")
+            self.assertEqual(switched["patched_yaml"], 1)
+            prose_text = explore_yaml.read_text(encoding="utf-8")
+            self.assertIn("MANDATORY FIRST PATH", prose_text)
+            self.assertLess(len(patched_text), len(prose_text))
             self.assertIn("tool_search_diagnostics", report)
             self.assertIn("subagent_cctx_failure_breakdown", report)
 

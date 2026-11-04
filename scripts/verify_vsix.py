@@ -9,6 +9,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
+MAX_INSTRUCTION_BYTES = 6000
+
+
 def verify(path: Path) -> dict:
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
@@ -31,6 +34,12 @@ def verify(path: Path) -> dict:
         missing = required - names
         if missing:
             raise ValueError(f"Missing entries: {sorted(missing)}")
+        instructions = archive.read("extension/prompts/code-context.instructions.md")
+        if len(instructions) > MAX_INSTRUCTION_BYTES:
+            raise ValueError(
+                f"Auto-loaded instructions are {len(instructions)} bytes (limit {MAX_INSTRUCTION_BYTES}); "
+                "they are re-read on every agent turn"
+            )
         manifest = json.loads(archive.read("extension/package.json"))
         if manifest.get("enabledApiProposals") or manifest["contributes"].get("languageModelToolSets"):
             raise ValueError("Distributable must use stable tool contributions only")

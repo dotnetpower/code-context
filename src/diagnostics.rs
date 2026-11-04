@@ -1,4 +1,5 @@
-use crate::{Result, catalog, daemon, invalid};
+use crate::usage_insights::{self, CallFacts, ModelFacts, SessionFacts};
+use crate::{Result, catalog, daemon, invalid, outcome};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, Read};
@@ -7,6 +8,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub const CAPABILITY_SCHEMA: u32 = 3;
+
+// Savings model assumptions; surfaced in `cctx usage --json` so they can be audited.
+const COMPOUND_CACHE_MULTIPLIER: u64 = 35;
+const TOKENS_PER_AVOIDED_TURN: f64 = 220_000.0;
+const AIC_PER_SAVED_TOKEN: f64 = 0.00055;
+const AIC_PER_AVOIDED_TURN: f64 = 4.20;
 
 pub fn executable_hash(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
@@ -340,7 +347,7 @@ fn event_unix_ts(event: &Value) -> Option<f64> {
 }
 
 fn classify_tool_group(name: &str) -> &'static str {
-    if name == "tool_search_tool" {
+    if matches!(name, "tool_search_tool" | "web_search" | "web_fetch" | "doSearch") {
         return "other";
     }
     if name.starts_with("cctxNative") || name.starts_with("code-context-native") {
@@ -473,6 +480,27 @@ fn avoided_turns_for_call(name: &str, turn_compressed: bool, success: Option<boo
     }
 }
 
+/// Reads the `CCTX_TRACE {...}` timing footer that the native extension appends to results.
+fn extract_trace_total_ms(val: &Value, depth: usize) -> Option<f64> {
+    if depth > 6 {
+        return None;
+    }
+    match val {
+        Value::String(s) => {
+            let start = if s.starts_with("CCTX_TRACE {") {
+                0
+            } else {
+                s.rfind("\nCCTX_TRACE {")? + 1
+            };
+            let body = s[start + "CCTX_TRACE ".len()..].lines().next()?;
+            serde_json::from_str::<Value>(body).ok()?.get("total_ms")?.as_f64()
+        }
+        Value::Object(map) => map.values().find_map(|v| extract_trace_total_ms(v, depth + 1)),
+        Value::Array(items) => items.iter().find_map(|v| extract_trace_total_ms(v, depth + 1)),
+        _ => None,
+    }
+}
+
 fn extract_result_chars(val: &Value, depth: usize) -> ( usize, bool ) {
     if depth > 6 {
         return (0, false);
@@ -540,7 +568,7 @@ fn fmt_bar(pct: Option<f64>, width: usize) -> String {
     )
 }
 
-fn render_box_table(title: &str, headers: &[&str], rows: &[Vec<String>], right_align: &[bool]) -> String {
+pub(crate) fn render_box_table(title: &str, headers: &[&str], rows: &[Vec<String>], right_align: &[bool]) -> String {
     let fallback = vec![
         std::iter::once("(none)".to_string())
             .chain((1..headers.len()).map(|_| "-".to_string()))
@@ -673,6 +701,8 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         offloaded: bool,
         cache_miss: bool,
         cache_load_failed: bool,
+        error_detail: &'static str,
+        trace_total_ms: Option<f64>,
         turn_compressed: bool,
         non_source_host_only: bool,
         pre_edit_view: bool,
@@ -840,6 +870,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 entry.success = data.get("success").and_then(Value::as_bool);
                 if let Some(res) = data.get("result") {
                     let (chars, offloaded) = extract_result_chars(res, 0);
+                    entry.trace_total_ms = extract_trace_total_ms(res, 0);
                     entry.payload_tokens = chars.div_ceil(4) as u64;
                     entry.offloaded = offloaded;
                 }
@@ -848,6 +879,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                         .get("error")
                         .map(Value::to_string)
                         .unwrap_or_default();
+                    entry.error_detail = outcome::detail(Some(&err_str));
                     entry.cache_miss = err_str.contains("CACHE_MISS root=");
                     entry.cache_load_failed = err_str.contains("CACHE_LOAD_FAILED root=");
                 }
@@ -905,15 +937,15 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
     let total_used_aic = total_nano_aiu as f64 / 1_000_000_000.0;
     let prompt_cache_pct = (total_in > 0).then(|| 100.0 * total_cache as f64 / total_in as f64);
     let direct_saved: u64 = cctx_calls.iter().map(|c| c.saved_tokens).sum();
-    let compounded_saved: u64 = direct_saved * 35;
+    let compounded_saved: u64 = direct_saved * COMPOUND_CACHE_MULTIPLIER;
     let avoided_turns_total: f64 = cctx_calls
         .iter()
         .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
         .sum();
     let turn_comp_cnt = avoided_turns_total.round() as u64;
-    let turn_saved = (avoided_turns_total * 220_000.0).round() as u64;
+    let turn_saved = (avoided_turns_total * TOKENS_PER_AVOIDED_TURN).round() as u64;
     let total_saved = direct_saved + compounded_saved + turn_saved;
-    let total_saved_aic = (direct_saved as f64 * 0.00055) + (avoided_turns_total * 4.20);
+    let total_saved_aic = (direct_saved as f64 * AIC_PER_SAVED_TOKEN) + (avoided_turns_total * AIC_PER_AVOIDED_TURN);
     let savings_pct = if total_used_aic + total_saved_aic > 0.0 {
         100.0 * total_saved_aic / (total_used_aic + total_saved_aic)
     } else {
@@ -967,8 +999,8 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .iter()
             .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
             .sum();
-        let m_total_saved = m_direct_saved * 36 + (m_avoided_turns * 220_000.0).round() as u64;
-        let m_saved_aic = (m_direct_saved as f64 * 0.00055) + (m_avoided_turns * 4.20);
+        let m_total_saved = m_direct_saved * (1 + COMPOUND_CACHE_MULTIPLIER) + (m_avoided_turns * TOKENS_PER_AVOIDED_TURN).round() as u64;
+        let m_saved_aic = (m_direct_saved as f64 * AIC_PER_SAVED_TOKEN) + (m_avoided_turns * AIC_PER_AVOIDED_TURN);
         let mut durs: Vec<f64> = m_turns.iter().map(|t| t.duration_ms).filter(|d| *d > 0.0).collect();
         durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med_turn = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
@@ -987,6 +1019,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             "used_usd_0001": m_used_aic * 0.001,
             "used_usd_api_001": m_used_aic * 0.01,
             "cctx_calls": m_cctx.len(),
+            "lookup_calls": m_lookup.len(),
             "cctx_cache_hit_percent": m_warm_pct,
             "cctx_adoption_percent": m_adopt_pct,
             "estimated_total_tokens_saved": m_total_saved,
@@ -1002,6 +1035,65 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .cmp(&a["turns"].as_u64())
             .then_with(|| b["cctx_calls"].as_u64().cmp(&a["cctx_calls"].as_u64()))
     });
+
+    let call_facts: Vec<CallFacts> = valid_calls
+        .iter()
+        .map(|c| CallFacts {
+            workspace: c
+                .cwd
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name())
+                .map_or_else(|| "-".into(), |n| n.to_string_lossy().into_owned()),
+            session: c.session.clone(),
+            completed_at: c.completed_at,
+            host_delay_ms: match (c.started_at, c.completed_at, c.trace_total_ms) {
+                (Some(s), Some(e), Some(total)) if e >= s => Some(((e - s) * 1000.0 - total).max(0.0)),
+                _ => None,
+            },
+            tool: c.tool.clone(),
+            group: classify_tool_group(&c.tool),
+            success: c.success,
+            offloaded: c.offloaded,
+            error_detail: c.error_detail,
+            duration_ms: match (c.started_at, c.completed_at) {
+                (Some(s), Some(e)) if e >= s => Some((e - s) * 1000.0),
+                _ => None,
+            },
+            payload_tokens: c.payload_tokens,
+            eligible_lookup: is_eligible_lookup(&c),
+        })
+        .collect();
+    let session_facts: Vec<SessionFacts> = active_sessions
+        .iter()
+        .map(|id| SessionFacts {
+            id: id.clone(),
+            workspace: session_cwds
+                .get(id)
+                .and_then(|c| Path::new(c).file_name())
+                .map_or_else(|| "-".into(), |n| n.to_string_lossy().into_owned()),
+            turns: turns.iter().filter(|t| &t.session == id).count(),
+            used_aic: turns.iter().filter(|t| &t.session == id).map(|t| t.nano_aiu).sum::<u64>() as f64
+                / 1_000_000_000.0,
+        })
+        .collect();
+    let model_facts: Vec<ModelFacts> = model_entries
+        .iter()
+        .map(|m| ModelFacts {
+            name: format!(
+                "{} ({})",
+                m["display_name"].as_str().unwrap_or("-"),
+                m["effort"].as_str().unwrap_or("-")
+            ),
+            turns: m["turns"].as_u64().unwrap_or(0) as usize,
+            lookups: m["lookup_calls"].as_u64().unwrap_or(0) as usize,
+            cctx_calls: m["cctx_calls"].as_u64().unwrap_or(0) as usize,
+            used_aic: m["used_aic"].as_f64().unwrap_or(0.0),
+            saved_aic: m["saved_aic"].as_f64().unwrap_or(0.0),
+            output_tokens: m["output_tokens"].as_u64().unwrap_or(0),
+            reasoning_tokens: m["reasoning_tokens"].as_u64().unwrap_or(0),
+        })
+        .collect();
+    let insights = usage_insights::analyze(&call_facts, &session_facts, &model_facts, total_out, total_rsn);
 
     if as_json {
         let payload = json!({
@@ -1032,6 +1124,14 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 "saved_usd_api_001": total_saved_aic * 0.01,
             },
             "model_usage": model_entries,
+            "insights": insights.to_json(),
+            "assumptions": {
+                "compound_cache_multiplier": COMPOUND_CACHE_MULTIPLIER,
+                "tokens_per_avoided_turn": TOKENS_PER_AVOIDED_TURN,
+                "aic_per_saved_token": AIC_PER_SAVED_TOKEN,
+                "aic_per_avoided_turn": AIC_PER_AVOIDED_TURN,
+                "long_session_turns": usage_insights::LONG_SESSION_TURNS,
+            },
         });
         return serde_json::to_string_pretty(&payload).map_err(Into::into);
     }
@@ -1282,7 +1382,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .iter()
             .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
             .sum();
-        let g_saved_aic = (saved as f64 * 0.00055) + (g_avoided * 4.20);
+        let g_saved_aic = (saved as f64 * AIC_PER_SAVED_TOKEN) + (g_avoided * AIC_PER_AVOIDED_TURN);
         surface_rows.push(vec![
             label.to_string(),
             g_calls.len().to_string(),
@@ -1348,8 +1448,8 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .iter()
             .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
             .sum();
-        let s_saved = s_direct * 36 + (s_avoided * 220_000.0).round() as u64;
-        let s_saved_aic = (s_direct as f64 * 0.00055) + (s_avoided * 4.20);
+        let s_saved = s_direct * (1 + COMPOUND_CACHE_MULTIPLIER) + (s_avoided * TOKENS_PER_AVOIDED_TURN).round() as u64;
+        let s_saved_aic = (s_direct as f64 * AIC_PER_SAVED_TOKEN) + (s_avoided * AIC_PER_AVOIDED_TURN);
         let short_id: String = s_id.chars().take(12).collect();
         let short_ws: String = ws.chars().take(20).collect();
         let short_mod: String = primary_model.chars().take(18).collect();
@@ -1387,5 +1487,31 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         &session_rows,
         &[false, false, false, true, true, false, true, true],
     ));
+    lines.extend(insights.render());
+    lines.push(format!(
+        "\n  Savings model: {COMPOUND_CACHE_MULTIPLIER}x cache re-read, {TOKENS_PER_AVOIDED_TURN:.0} tok/avoided turn (see `cctx usage --json` assumptions)."
+    ));
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod trace_timing_tests {
+    use super::extract_trace_total_ms;
+    use serde_json::json;
+
+    #[test]
+    fn reads_total_ms_from_trace_footer_in_any_result_shape() {
+        let footer = "CCTX_TRACE {\"trace_id\":\"t\",\"total_ms\":1234,\"started_unix_ms\":1}";
+        let text = format!("matches=1\n{footer}");
+        assert_eq!(extract_trace_total_ms(&json!({"content": text}), 0), Some(1234.0));
+        assert_eq!(extract_trace_total_ms(&json!([footer]), 0), Some(1234.0));
+        assert_eq!(extract_trace_total_ms(&json!(footer), 0), Some(1234.0));
+    }
+
+    #[test]
+    fn missing_or_untimed_footers_yield_none() {
+        assert_eq!(extract_trace_total_ms(&json!("plain output"), 0), None);
+        assert_eq!(extract_trace_total_ms(&json!("x\nCCTX_TRACE {\"trace_id\":\"t\"}"), 0), None);
+        assert_eq!(extract_trace_total_ms(&json!("x\nCCTX_TRACE {broken"), 0), None);
+    }
 }

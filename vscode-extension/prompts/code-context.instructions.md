@@ -3,104 +3,25 @@ description: "Use when: finding files by name or path, searching code, or readin
 applyTo: "**"
 ---
 
-# Code Context source lookup
-
-**NATIVE-FIRST PRIORITY IN VS CODE**: Whenever `#cctxNativeContext`, `#cctxNativeRead`,
-`#cctxNativeGrep`, and `#cctxNativeFiles` (`code-context-native_*`) are callable in
-the current VS Code session, ALWAYS use those Native tools FIRST before MCP
-(`code_context`/`code_read`/`code_grep`/`code_files`) or built-in search/read tools.
-Native tools use persistent framed IPC with pre-formatted text output, avoiding
-JSON wrapper overhead and multi-project startup contention.
-
-CCTX is an optional accelerator, not a prerequisite for Copilot to continue.
-It is a root-level memory cache: startup and registry/status inspection do not
-prewarm source. A first cold lookup returns `CACHE_MISS` immediately and schedules
-only the requested root for bounded background loading. Loading or syncing roots
-also return a miss instead of making ordinary lookups wait. Treat this as a
-cache miss, never as an empty search, missing disk file, or proof of absence.
-For that lookup continue with a permitted host search/read under the same policy.
-Do not poll/repeat the request, try MCP/CLI against the same cold index, change
-roots, or run `code_sync` just to wait. A later independent lookup may hit the
-cache. `CACHE_LOAD_FAILED` exposes the actual load failure and retry cooldown.
-Only an explicitly needed `code_sync` is a waiting full-source barrier.
-Inactive roots, including legacy prewarm registrations, may be evicted after
-15 minutes or earlier under LRU/memory pressure; a later miss lazily loads them.
-Do not enumerate or prepare sibling worktrees speculatively.
-
-Use `#cctxNativeFiles` (`code-context-native_codeFiles`) first for filename/path discovery with a glob (`*.ts`, `*.{ts,tsx}`, `**/*.test.tsx`, `src/**/*.rs`, `pages/[id].tsx`, or bare stem); a content
-pattern does not search filenames. Use `#cctxNativeContext` (`code-context-native_codeContext`) for a symbol or literal plus surrounding saved
-source. Use `#cctxNativeGrep` (`code-context-native_codeGrep`) for exact or regex search and
-`#cctxNativeRead` (`code-context-native_codeRead`) for known ranges (including `path:line:col`, `path#Lstart-Lend`, `path.md#heading-slug`, `[label](path:line)`, and `@/` aliases). Prefer one context call over separate search
-and read calls. Always pass the explicit absolute `root` parameter when the workspace or worktree path is known (especially in Windows/WSL Agent Sessions, subagents, and multi-root setups). Keep each `#cctxNativeRead` / `code_read` call to `<=150` total lines (`<8KiB`) and set `max_matches_per_file` on broad searches so responses stay inline instead of being offloaded to temporary `/tmp` files by the host. When delegating to subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`, `security-review`), ALWAYS include the target absolute `root` in the prompt and explicitly instruct the subagent to use `#cctxNative*` or `code-context-code_*` MCP tools first (and to discover deferred tools with exact names via `tool_search` if not immediately visible). Do not start with built-in `read_file`, `view`, `grep_search`, or `rg` for registered saved source, even when file paths are already known. If Code Context tools are deferred or not yet visible in the active tool list, discover them first with `tool_search` using exact names for both Native and MCP surfaces: query `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` (when no UI client is connected, `tool_search` only matches exact tool names, so including the `code-context-code_*` names loads all four MCP tools in one call).
-
-Context radius is 0..100 and limit is 1..64. Broad shared reads are split into
-explicit snippets of at most500lines (max64segments total); split_ranges=false
-retains strict input ranges. For large reads use page=true and continue with
-next_ranges until complete=true; compare whole-file hashes across pages and
-restart if they differ. Do not treat a page as complete or bypass256KiB limits.
-For oversized context reduce limit/radius or select one file.
-Content search is literal unless `regex: true`.
-An empty result is not proof that a file does not exist: check the registered
-globs/scopes. Hidden paths (including .github), ignored files, and secret/key
-files remain excluded; use the host's policy-aware tools for permitted excluded
-targets, without retrying Code Context or widening access automatically.
-Do not send hidden paths (including .github/.vscode) or known excluded datasets
-to CCTX. For unknown paths/lines, locate them with Files/Context before batched
-reads. `READ_RANGE_OUT_OF_BOUNDS` reports the actual indexed line count: choose
-a valid range instead of repeating the failed request. A missing member fails
-the whole batch; correct only the reported path, not the workspace root.
-
-Search/file results include a snapshot freshness notice. `STALE_INDEX` means a
-checked disk file differs from the memory index: do not rely on old matches or
-line numbers. Use `code_read`/`#cctxNativeRead` for those known saved ranges or a
-host policy-aware live disk read. `TARGET_NOT_INDEXED` is not proof of absence
-and can indicate a new or policy-excluded file. Do not change roots or bypass
-exclusions to silence it. For recent edits and exhaustive no-match conclusions,
-use an explicit synchronization barrier; candidate checks alone cannot verify
-the whole corpus or editor buffers.
-For known changed files prefer Read/Context or explicit file paths rather than
-a full-root code_sync. Full sync is for exhaustive corpus absence/freshness
-barriers, not routine status checking or every edit.
-Before editing a file, use `#cctxNativeContext` (with `radius >= 8` for full
-function/struct/type signatures and closing delimiters) or `#cctxNativeRead`
-(`around_line` + `radius` or `start`..`end`) so your first edit includes exact
-indentation, complete signatures, and 3+ unique surrounding context lines
-without "No match found" or "Multiple matches found" retries.
-
-Use MCP `code-context-code_files` (`code_files`), `code-context-code_context` (`code_context`), `code-context-code_grep` (`code_grep`), or `code-context-code_read` (`code_read`) when the native tools are
-not callable in the current session, even if their names appear in a tool list.
-If a native `#cctxNative*` call fails with `"No matching client connected"` or `"Client ... disconnected"`, immediately switch to `code-context-code_*` MCP tools (discovering them with exact names `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` if deferred) or `cctx --backend shared --root /actual/root` CLI instead of falling back to built-in `view`/`rg`.
-In an unattended/background session known to depend on foreground VS Code
-external-tool dispatch, prefer backend MCP instead of enqueueing native calls
-that cannot start. A native timeout or repeated host-dispatch delay is not proof
-that the shared index is slow or stale: do not run code_sync to repair it.
-Do not duplicate a still-pending lookup or repeatedly poll native Status; use
-host cancellation for the pending call when available, then use backend MCP
-for subsequent lookups.
-
-If both client surfaces are unavailable or blocked on host dispatch but a backend
-terminal is usable, use the installed `cctx --backend shared --root /actual/root`
-CLI before raw source search/read. This is the same Code Context daemon, not a
-standalone index, and cannot repair `CACHE_MISS`. For example, append `files '*.ts' --limit 20` or
-`read src/example.ts 1 80` with actual discovered paths. Keep the same authorized
-root, scopes, exclusions and host policy. Never use another transport to bypass
-a content exclusion, trust decision or explicit access denial.
-
-Fall back to built-in search/read only
-when neither Code Context surface is available, the workspace is unregistered,
-the target is unsaved or excluded, or Code Context returns an error.
-
-MCP-only worktree calls should pass the actual absolute worktree `root`; never
-substitute its main repository. Shared preparation inherits scope/exclusion
-policy only after a local operator has authorized that registered parent with
-`cctx --root /parent authorize-worktrees`. This is not permission for an agent
-to authorize unrelated paths. Do not retry a denied root or persistently
-excluded target. Report the coverage limitation and use a permitted host tool.
-For an already operator-authorized Git parent, absence of a worktree from
-`code_workspaces` alone is not a reason to skip CCTX: its first lookup performs
-bounded shared preparation. Use the actual root of the files being accessed,
-which can differ from the session's initial workspace.
-
-Installed versions are not session readiness. At a safe boundary use
-`cctx --root /project doctor` to detect stale MCP processes; refresh the host's
-MCP tool list or native extension host without killing active sessions.
+# Code Context (cctx) — Formula Spec
+CCTX is an optional accelerator (nonblocking root cache), not a prerequisite.
+Priority: `#cctxNativeContext` / `#cctxNative*{Read,Grep,Files}` (`code-context-native_*`) > MCP (`code-context-code_*` / `code_*`) > CLI (`cctx --backend shared --root R`) > Host (`rg`, `view`, `read_file`, `grep_search`, `glob`). Never start with Host search/read for saved source.
+Dispatch:
+- `symbol | literal + context` => `#cctxNativeContext` / `code_context` (`root=R`, `radius: 0..100`, `limit: 1..64`; 1 call > grep + read)
+- `filename | glob (!content)` => `#cctxNativeFiles` / `code_files` (`root=R`, `glob=G`)
+- `content (a|b => regex=true)` => `#cctxNativeGrep` / `code_grep` (`root=R`, `max_matches_per_file: 1..64`)
+- `range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/)` => `#cctxNativeRead` / `code_read` (`root=R`, `lines <= 150`, `< 8KiB`; `> 150 => page=true -> next_ranges -> complete=true`)
+- `Swap`: `view | read_file => #cctxNativeRead` ; `rg | grep => #cctxNativeGrep` ; `glob | find => #cctxNativeFiles`
+- `Bilingual`: Korean/multilingual requests (`함수/심볼+주변코드 => #cctxNativeContext`, `파일명/경로 => #cctxNativeFiles`, `문자열/정규식 => #cctxNativeGrep`, `줄범위 => #cctxNativeRead`) follow identical dispatch & preserve reply language (`한글 요청 => 한글 답변`)
+Guards:
+- `known(R) => pass explicit absolute root=R` ; `before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius)`
+- `deferred => tool_search("cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files")`
+- `subagent(explore, general-purpose, code-review, rubber-duck, security-review) => pass root=R & require #cctxNative* | code-context-code_* first`
+Transitions & Fallback:
+- `CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)`
+- `CACHE_LOAD_FAILED => Host read (cooldown)` ; `STALE_INDEX => #cctxNativeRead | Host live read` ; `TARGET_NOT_INDEXED != absent`
+- `READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) & do not repeat` ; `code_sync <=> exhaustive absence claims only (never per edit)`
+- `target in {.github, .vscode, ignored, secrets, /tmp} => Host policy-aware tools only & do not retry CCTX`. Never use another transport to bypass an exclusion, trust decision or access denial.
+- `TTL: idle >= 15m | LRU => evict`. Do not enumerate or prepare sibling worktrees speculatively (`cctx --root /parent authorize-worktrees` is operator-only).
+- `Error("No matching client connected" | disconnected) => code-context-code_* MCP | cctx --backend shared --root /actual/root`
+- `Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*)`. Do not duplicate a still-pending lookup or poll Status; safe boundary => `cctx --root /project doctor`.

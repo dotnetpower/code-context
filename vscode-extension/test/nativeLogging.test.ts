@@ -96,6 +96,9 @@ void test('successful calls log one plain line while preserving JSON trace foote
   const trace = JSON.parse((result.content[1]?.value ?? '').replace(/^CCTX_TRACE /, '')) as ClientTrace;
   assert.equal(trace.operation, 'code_files');
   assert.equal(trace.outcome, 'success');
+  assert.ok(Math.abs(Date.now() - trace.started_unix_ms) < 60_000);
+  assert.equal(typeof trace.total_ms, 'number');
+  assert.equal(result.content.length, 2);
   await tool.invoke({ input: { root: '/first', glob: '*.rs' } }, {});
   const followUp = await tool.invoke({ input: { pattern: '**/*.rs' } }, {});
   assert.match(followUp.content[0]?.value ?? '', /a\.rs/);

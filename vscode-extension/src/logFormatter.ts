@@ -34,6 +34,20 @@ export function singleLine(value: string): string {
   return out;
 }
 
+/** Native calls slower than this get a warn log and an in-band transport hint. */
+export const SLOW_CALL_MS = 5_000;
+
+export function slowCallNotice(trace: ClientTrace): string | undefined {
+  if (!(trace.total_ms >= SLOW_CALL_MS)) { return undefined; }
+  const daemon = trace.daemon;
+  const daemonMs = typeof daemon === 'object' && daemon !== null && !Array.isArray(daemon)
+    && typeof daemon.execute_ms === 'number' ? ` daemon=${Math.round(daemon.execute_ms)}ms` : '';
+  const root = typeof trace.root === 'string' ? ` --root ${singleLine(trace.root)}` : '';
+  return `CCTX_SLOW ${typeof trace.operation === 'string' ? trace.operation : 'call'} took ${(trace.total_ms / 1000).toFixed(1)}s `
+    + `(prepare=${Math.round(trace.prepare_ms)}ms queue=${Math.round(trace.queue_ms)}ms ipc=${Math.round(trace.ipc_ms)}ms${daemonMs}). `
+    + `If native calls keep stalling, use code-context-code_* MCP tools or \`cctx --backend shared${root}\`; do not poll or repeat this call.`;
+}
+
 export function outcomeLevel(outcome: Outcome): LogLevel {
   if (outcome === 'system_error') { return 'error'; }
   return outcome === 'policy_denied' || outcome === 'invalid_request' ? 'warn' : 'info';

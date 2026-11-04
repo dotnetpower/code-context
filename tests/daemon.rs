@@ -287,6 +287,77 @@ fn concurrent_clients_receive_correct_responses_and_mcp_routes() {
 }
 
 #[test]
+fn mcp_responses_stay_inside_the_inline_budget_with_continuation() {
+    const BUDGET: usize = 7_400;
+    let fixture = Fixture::new();
+    for index in 0..40 {
+        let body: String = (1..=150)
+            .map(|line| format!("fn needle_{index}_{line}() {{ let value = \"{}\"; }}\n", "x".repeat(70)))
+            .collect();
+        std::fs::write(fixture.root.join(format!("src/big_{index}.rs")), body).unwrap();
+    }
+    fixture.rpc("code_sync", Some(&fixture.root), json!({})).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cctx"))
+        .env("CCTX_HOME", &fixture.home)
+        .current_dir(&fixture.root)
+        .arg("shared-mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let input = child.stdin.as_mut().unwrap();
+        let calls = [
+            ("code_read", json!({"ranges": [
+                {"path": "src/big_0.rs", "start": 1, "end": 150},
+                {"path": "src/big_1.rs", "start": 1, "end": 150},
+                {"path": "src/big_2.rs", "start": 1, "end": 150},
+            ]})),
+            ("code_grep", json!({"pattern": "needle", "limit": 64, "max_matches_per_file": 5})),
+            ("code_files", json!({"glob": "*.rs", "limit": 64})),
+            ("code_context", json!({"pattern": "needle", "limit": 20, "radius": 8})),
+            ("code_read", json!({"ranges": [{"path": "src/a.rs", "start": 1, "end": 1}]})),
+        ];
+        for (index, (name, arguments)) in calls.iter().enumerate() {
+            writeln!(input, "{}", json!({"jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}})).unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let mut by_id = std::collections::BTreeMap::new();
+    for line in String::from_utf8(output.stdout).unwrap().lines() {
+        let value: Value = serde_json::from_str(line).unwrap();
+        by_id.insert(value["id"].as_u64().unwrap(), value);
+    }
+    let body = |id: u64| -> (String, Value) {
+        let result = &by_id[&id]["result"];
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        let value = serde_json::from_str(&text).unwrap();
+        (text, value)
+    };
+    let (text, read) = body(1);
+    assert!(text.len() <= BUDGET, "read {}", text.len());
+    assert_eq!(read["complete"], false);
+    assert!(!read["next_ranges"].as_array().unwrap().is_empty());
+    assert!(read["inline_notice"].is_string());
+    assert!(read["snippets"][0]["lines"].as_array().unwrap().len() > 1);
+    let (text, grep) = body(2);
+    assert!(text.len() <= BUDGET, "grep {}", text.len());
+    assert_eq!(grep["truncated"], true);
+    assert!(grep["inline_notice"].is_string());
+    // The daemon already narrows context and file lists, so these only need to fit.
+    for id in [3, 4] {
+        assert!(body(id).0.len() <= BUDGET, "id {id}");
+    }
+    let (text, small) = body(5);
+    assert!(text.len() < BUDGET);
+    assert!(small.is_array(), "responses that fit keep their original shape: {small}");
+}
+
+#[test]
 fn native_stdio_bridge_preserves_framed_requests_and_application_errors() {
     use std::io::Read;
     let fixture = Fixture::new();

@@ -1060,7 +1060,10 @@ fn dispatch_with_root(
         "initialize" => Ok(
             json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
             "serverInfo":{"name":"code-context","version":env!("CARGO_PKG_VERSION")},
-            "instructions":format!("{CACHE_GUIDANCE} Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search.")}),
+            "instructions": match crate::prompt_formula::PromptStyle::from_env() {
+                Some(style) => crate::prompt_formula::render(style, crate::prompt_formula::PromptTarget::Mcp, default_root.map(PathBuf::as_path)),
+                None => format!("{CACHE_GUIDANCE} Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search."),
+            }}),
         ),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools()),
@@ -1205,6 +1208,7 @@ fn tool_call(
         arguments.insert(daemon::TRACE_ARGUMENT.into(), trace["trace_id"].clone());
         trace["prepare_ms"] = json!(prepare_started.elapsed().as_secs_f64() * 1000.0);
     }
+    let root_text = root.as_ref().map(|path| path.to_string_lossy().into_owned());
     let request = Request {
         root,
         name: name.into(),
@@ -1245,7 +1249,7 @@ fn tool_call(
             object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
             return Ok(serde_json::to_string(&value)?);
         }
-        return Ok(text);
+        return Ok(crate::inline_budget::fit_inline(name, root_text.as_deref(), text));
     }
     let mut value = daemon::request(&request)?;
     if name == "code_status" {
@@ -1254,7 +1258,7 @@ fn tool_call(
             .ok_or_else(|| invalid("daemon status is not an object"))?;
         object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
     }
-    Ok(serde_json::to_string(&value)?)
+    Ok(crate::inline_budget::fit_inline(name, root_text.as_deref(), serde_json::to_string(&value)?))
 }
 
 pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {

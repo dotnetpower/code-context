@@ -29,7 +29,7 @@ CATALOG_NAMES = (
 
 
 def classify(name: str) -> str:
-    if name == "tool_search_tool":
+    if name in {"tool_search_tool", "web_search", "web_fetch", "doSearch"}:
         return "other"
     if name.startswith(("cctxNative", "code-context-native")):
         return "native"

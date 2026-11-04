@@ -41,6 +41,7 @@ Replacing separate `rg` + `view` calls with one block-clamped `code_context` cal
 | Rich documents (`.pptx`/`.docx`/`.md` `#toc` & `#slide-N`) | Full-document read | **Virtual `#toc` + `#slide-N-M` (5.4× faster DEFLATE)** | **-86.3% to -98.9% tokens** |
 | Copilot A/B agent turns & cost | 7.00 calls / 5.00 turns / 20.31 s | **2.67 calls / 3.67 turns / 15.30 s** | **-50.0% tok · -25.4% AIU · -24.7% time** |
 | Live status bar & `cctx usage` telemetry | Unmonitored | **Per-model tokens, 96.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
+| Auto-loaded instructions & `cctx prompt` | 9,127 B / 2,048 tok prose | **BPE-aligned formula spec (`756 tok`, EN/KO `--compress`)** | **-63.1% instruction tokens** |
 
 ![Warm retrieval latency, speedup, Rust/Python token savings, and agent acceleration](resources/benchmark.png)
 

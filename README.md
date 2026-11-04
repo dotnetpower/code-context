@@ -62,6 +62,7 @@ Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` c
 | Copilot A/B agent payload tokens & AIU cost | 6,360 tok / 4.76B nanoAIU | **3,177 tok / 3.55B nanoAIU** | **-50.0% tokens · -25.4% cost** |
 | Copilot A/B end-to-end task wall time | 20.31 s | **15.30 s** (100% accuracy both) | **-24.7% completion time** |
 | Live multi-session telemetry (`cctx usage --hours 24`) | Unmonitored | **Per-model tokens, 96.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
+| Auto-loaded agent instructions & `cctx prompt --compress` | 9,127 B / 2,048 tok prose | **BPE-aligned formula spec (`756 tok`, EN/KO `--compress`)** | **-63.1% instruction tokens** |
 
 Eight daemon sessions, 40 rounds, 28 tasks, **8,960 correctness-checked pairs**.
 Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.837 ms median**, not a warm-cache speedup.
