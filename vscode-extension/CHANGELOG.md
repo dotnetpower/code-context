@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
 - Extend `cctx usage` with failure-cause, P95/P99 latency and offload tables,
   built-in fallback and per-workspace adoption reports, and optimization
