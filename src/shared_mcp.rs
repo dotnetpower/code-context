@@ -6,8 +6,6 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-const CACHE_GUIDANCE: &str = "CCTX is an optional nonblocking root cache. CACHE_MISS returns immediately and queues only the requested root; continue that lookup with permitted host search/read. Do not poll/repeat, switch CCTX transports or run code_sync to wait for warmup. CACHE_LOAD_FAILED reports the load failure. Neither means zero matches or a missing disk file. Startup and legacy prewarm flags do not load/pin source. Inactive roots expire after15minutes and may be evicted earlier by LRU/memory limits. Do not enumerate sibling worktrees speculatively. Explicitly needed code_sync remains a waiting barrier.";
-
 pub fn tools() -> Value {
     static TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     TOOLS.get_or_init(build_tools).clone()
@@ -1060,10 +1058,11 @@ fn dispatch_with_root(
         "initialize" => Ok(
             json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
             "serverInfo":{"name":"code-context","version":env!("CARGO_PKG_VERSION")},
-            "instructions": match crate::prompt_formula::PromptStyle::from_env() {
-                Some(style) => crate::prompt_formula::render(style, crate::prompt_formula::PromptTarget::Mcp, default_root.map(PathBuf::as_path)),
-                None => format!("{CACHE_GUIDANCE} Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search."),
-            }}),
+            "instructions": crate::prompt_formula::render(
+                crate::prompt_formula::PromptStyle::from_env().unwrap_or_default(),
+                crate::prompt_formula::PromptTarget::Mcp,
+                default_root.map(PathBuf::as_path),
+            )}),
         ),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools()),

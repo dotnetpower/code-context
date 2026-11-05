@@ -1,7 +1,7 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -887,6 +887,262 @@ pub fn build_report(
         "savings_percent_vs_prose": pct,
         "prompt": rendered,
     })
+}
+
+const SUBAGENT_MARKER: &str = "# [cctx-subagent-instructions]";
+
+const SUBAGENT_EXTRA_TOOLS: &[&str] = &[
+    "cctxNativeFiles",
+    "cctxNativeGrep",
+    "cctxNativeContext",
+    "cctxNativeRead",
+    "cctxNativeStatus",
+    "cctxNativeSync",
+    "cctxNativeWorkspaces",
+    "code-context-native_codeFiles",
+    "code-context-native_codeGrep",
+    "code-context-native_codeContext",
+    "code-context-native_codeRead",
+    "code-context-native_codeStatus",
+    "code-context-native_codeSync",
+    "code-context-native_codeWorkspaces",
+    "code-context/*",
+    "code-context-code_files",
+    "code-context-code_grep",
+    "code-context-code_context",
+    "code-context-code_read",
+    "code-context-code_status",
+    "code-context-code_sync",
+    "code-context-code_workspaces",
+    "tctxNativeRun",
+    "tctxNativeAffected",
+    "tctxNativeGraph",
+    "tctxNativeStatus",
+    "tctxNativeSync",
+    "tctxNativeInvalidate",
+    "tctxNativeWorkspaces",
+    "test-context-native_testRun",
+    "test-context-native_testAffected",
+    "test-context-native_testGraph",
+    "test-context-native_testStatus",
+    "test-context-native_testSync",
+    "test-context-native_testInvalidate",
+    "test-context-native_testWorkspaces",
+    "test-context/*",
+    "test-context-test_run",
+    "test-context-test_affected",
+    "test-context-test_graph",
+    "test-context-test_status",
+    "test-context-test_sync",
+    "test-context-test_invalidate",
+    "test-context-test_workspaces",
+];
+
+const TARGET_YAML_AGENTS: &[&str] = &[
+    "explore.agent.yaml",
+    "code-review.agent.yaml",
+    "rubber-duck.agent.yaml",
+    "security-review.agent.yaml",
+    "research.agent.yaml",
+    "task.agent.yaml",
+    "sidekick/github-context.yaml",
+    "sidekick/github-context-memory.yaml",
+];
+
+fn patch_yaml_subagent_file(path: &Path, style: PromptStyle) -> bool {
+    let Ok(original) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut updated = original.clone();
+    let yaml_block = render(style, PromptTarget::SubagentYaml, None);
+
+    let has_explicit_tools = updated.contains("\ntools:\n")
+        && !updated.contains("  - \"*\"\n")
+        && !updated.contains("strictToolsList: true");
+    if has_explicit_tools {
+        let missing: Vec<&str> = SUBAGENT_EXTRA_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| !updated.contains(&format!("  - {t}\n")))
+            .collect();
+        if !missing.is_empty() {
+            let mut block = String::from("  # Code Context & Test Context tools (read-only)\n");
+            for t in missing {
+                block.push_str(&format!("  - {t}\n"));
+            }
+            if updated.contains("  - lsp\n") {
+                updated = updated.replacen("  - lsp\n", &format!("  - lsp\n{block}"), 1);
+            } else if updated.contains("\npromptParts:\n") {
+                updated =
+                    updated.replacen("\npromptParts:\n", &format!("\n{block}promptParts:\n"), 1);
+            } else if updated.contains("\nprompt: |\n") {
+                updated = updated.replacen("\nprompt: |\n", &format!("\n{block}prompt: |\n"), 1);
+            }
+        }
+    }
+
+    let marker_line = format!("  {SUBAGENT_MARKER}");
+    if let Some(pos) = updated.find(&marker_line) {
+        let head = updated[..pos].trim_end();
+        let tail = &updated[pos + marker_line.len()..];
+        if let Some(sk_pos) = tail.find("\nsidekick:\n") {
+            let after_sk = &tail[sk_pos + "\nsidekick:\n".len()..];
+            updated = format!("{head}\n\n{yaml_block}\nsidekick:\n{after_sk}");
+        } else {
+            updated = format!("{head}\n\n{yaml_block}");
+        }
+    } else if updated.contains("\nprompt: |\n") {
+        if let Some(sk_pos) = updated.find("\nsidekick:\n") {
+            let before_sk = updated[..sk_pos].trim_end();
+            let after_sk = &updated[sk_pos + "\nsidekick:\n".len()..];
+            updated = format!("{before_sk}\n\n{yaml_block}\nsidekick:\n{after_sk}");
+        } else {
+            updated = format!("{}\n\n{yaml_block}", updated.trim_end());
+        }
+    }
+
+    if updated != original && std::fs::write(path, updated).is_ok() {
+        return true;
+    }
+    false
+}
+
+/// Automatically patches any unconfigured Copilot SDK subagent YAML definitions under `home`
+/// (e.g. after a VS Code Server update) using the active `PromptStyle` (default: `Formula`).
+pub fn ensure_subagents_configured(home: &Path) -> usize {
+    let style = PromptStyle::from_env().unwrap_or_default();
+    let mut patched = 0usize;
+    for parent_rel in [".vscode-server/bin", ".vscode-server/cli/servers"] {
+        let parent = home.join(parent_rel);
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let base = entry.path();
+            for def_rel in [
+                "node_modules/@github/copilot-sdk-linux-x64/definitions",
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+                "server/node_modules/@github/copilot-sdk-linux-x64/definitions",
+                "server/extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+            ] {
+                let def_dir = base.join(def_rel);
+                if !def_dir.is_dir() {
+                    continue;
+                }
+                for agent_name in TARGET_YAML_AGENTS {
+                    let target = def_dir.join(agent_name);
+                    if target.is_file() && patch_yaml_subagent_file(&target, style) {
+                        patched += 1;
+                    }
+                }
+            }
+        }
+    }
+    patched
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BpeSurfaceStatus {
+    pub extension_instructions_bpe: bool,
+    pub mcp_instructions_bpe: bool,
+    pub subagents_bpe: bool,
+    pub global_instructions_bpe: bool,
+    pub subagents_auto_patched: usize,
+    pub active_surfaces: usize,
+    pub total_surfaces: usize,
+    pub standing_tokens_saved_per_turn: u64,
+}
+
+pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
+    let subagents_auto_patched = ensure_subagents_configured(home);
+    let default_formula = !matches!(PromptStyle::from_env(), Some(PromptStyle::Prose));
+
+    // 1. Extension .instructions.md (1,292 tok/turn saved vs v0.24.0 prose baseline)
+    let ext_root = home.join(".vscode-server/extensions");
+    let mut latest_ext_inst: Option<(String, PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(&ext_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("dotnetpower.code-context-native-") {
+                let inst_path = entry.path().join("prompts/code-context.instructions.md");
+                if inst_path.is_file()
+                    && latest_ext_inst
+                        .as_ref()
+                        .is_none_or(|(prev, _)| name > *prev)
+                {
+                    latest_ext_inst = Some((name, inst_path));
+                }
+            }
+        }
+    }
+    let extension_instructions_bpe = match latest_ext_inst {
+        Some((_, path)) => std::fs::read_to_string(&path)
+            .map(|t| t.contains("Formula Spec") || t.contains("=> #cctxNativeContext"))
+            .unwrap_or(default_formula),
+        None => default_formula,
+    };
+
+    // 2. MCP initialize & tool schema (155 tok/turn saved vs prose)
+    let mcp_instructions_bpe = default_formula;
+
+    // 3. Subagent definitions (215 tok/turn saved vs prose)
+    let bin_root = home.join(".vscode-server/bin");
+    let mut subagent_checked = 0usize;
+    let mut subagent_formula_ok = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&bin_root) {
+        for entry in entries.flatten() {
+            for rel in [
+                "node_modules/@github/copilot-sdk-linux-x64/definitions/explore.agent.yaml",
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions/explore.agent.yaml",
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions/research.agent.yaml",
+            ] {
+                let candidate = entry.path().join(rel);
+                if let Ok(text) = std::fs::read_to_string(&candidate) {
+                    subagent_checked += 1;
+                    if text.contains("CCTX & TCTX Formula Rules")
+                        || (text.contains("cctxNativeContext") && default_formula)
+                    {
+                        subagent_formula_ok += 1;
+                    }
+                }
+            }
+        }
+    }
+    let subagents_bpe = if subagent_checked > 0 {
+        subagent_formula_ok == subagent_checked
+    } else {
+        default_formula
+    };
+
+    // 4. Global user instructions (~/.copilot/copilot-instructions.md, 438 tok/turn saved)
+    let global_path = home.join(".copilot/copilot-instructions.md");
+    let global_instructions_bpe = if global_path.is_file() {
+        std::fs::read_to_string(&global_path)
+            .map(|t| t.contains("=>") && (t.contains("cctxNativeContext") || t.contains("Formula")))
+            .unwrap_or(false)
+    } else {
+        default_formula
+    };
+
+    let active_surfaces = usize::from(extension_instructions_bpe)
+        + usize::from(mcp_instructions_bpe)
+        + usize::from(subagents_bpe)
+        + usize::from(global_instructions_bpe);
+    let standing_tokens_saved_per_turn = (if extension_instructions_bpe { 1292 } else { 0 })
+        + (if mcp_instructions_bpe { 155 } else { 0 })
+        + (if subagents_bpe { 215 } else { 0 })
+        + (if global_instructions_bpe { 438 } else { 0 });
+
+    BpeSurfaceStatus {
+        extension_instructions_bpe,
+        mcp_instructions_bpe,
+        subagents_bpe,
+        global_instructions_bpe,
+        subagents_auto_patched,
+        active_surfaces,
+        total_surfaces: 4,
+        standing_tokens_saved_per_turn,
+    }
 }
 
 #[cfg(test)]

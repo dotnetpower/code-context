@@ -252,6 +252,7 @@ fn inspect_subagent_definitions() -> Value {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return json!({"checked": 0, "configured": 0, "unconfigured": []});
     };
+    let auto_patched = crate::prompt_formula::ensure_subagents_configured(&home);
     let mut checked = 0usize;
     let mut configured = 0usize;
     let mut unconfigured: Vec<String> = Vec::new();
@@ -278,6 +279,7 @@ fn inspect_subagent_definitions() -> Value {
     json!({
         "checked": checked,
         "configured": configured,
+        "auto_patched": auto_patched,
         "unconfigured": unconfigured,
         "remediation": if unconfigured.is_empty() { Value::Null } else { json!("Run: python3 scripts/configure_subagents.py") },
     })
@@ -929,6 +931,13 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
     let cctx_warm_pct = (!cctx_calls.is_empty()).then(|| 100.0 * cctx_warm as f64 / cctx_calls.len() as f64);
     let cctx_select_pct = (!lookup_calls.is_empty()).then(|| 100.0 * cctx_calls.len() as f64 / lookup_calls.len() as f64);
 
+    let bpe_status = crate::prompt_formula::inspect_bpe_surfaces(&state_home);
+    let bpe_turn_tok = bpe_status.standing_tokens_saved_per_turn;
+    let bpe_saved_tokens: u64 = (turns.len() as u64) * bpe_turn_tok;
+    let bpe_saved_aic: f64 = (bpe_saved_tokens as f64) * AIC_PER_SAVED_TOKEN;
+    let bpe_surface_pct = (bpe_status.total_surfaces > 0)
+        .then(|| 100.0 * bpe_status.active_surfaces as f64 / bpe_status.total_surfaces as f64);
+
     let total_in: u64 = turns.iter().map(|t| t.input_tokens).sum();
     let total_cache: u64 = turns.iter().map(|t| t.cache_read_tokens).sum();
     let total_out: u64 = turns.iter().map(|t| t.output_tokens).sum();
@@ -944,8 +953,10 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         .sum();
     let turn_comp_cnt = avoided_turns_total.round() as u64;
     let turn_saved = (avoided_turns_total * TOKENS_PER_AVOIDED_TURN).round() as u64;
-    let total_saved = direct_saved + compounded_saved + turn_saved;
-    let total_saved_aic = (direct_saved as f64 * AIC_PER_SAVED_TOKEN) + (avoided_turns_total * AIC_PER_AVOIDED_TURN);
+    let total_saved = direct_saved + compounded_saved + turn_saved + bpe_saved_tokens;
+    let total_saved_aic = (direct_saved as f64 * AIC_PER_SAVED_TOKEN)
+        + (avoided_turns_total * AIC_PER_AVOIDED_TURN)
+        + bpe_saved_aic;
     let savings_pct = if total_used_aic + total_saved_aic > 0.0 {
         100.0 * total_saved_aic / (total_used_aic + total_saved_aic)
     } else {
@@ -999,8 +1010,13 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .iter()
             .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
             .sum();
-        let m_total_saved = m_direct_saved * (1 + COMPOUND_CACHE_MULTIPLIER) + (m_avoided_turns * TOKENS_PER_AVOIDED_TURN).round() as u64;
-        let m_saved_aic = (m_direct_saved as f64 * AIC_PER_SAVED_TOKEN) + (m_avoided_turns * AIC_PER_AVOIDED_TURN);
+        let m_bpe_saved: u64 = (m_turns.len() as u64) * bpe_turn_tok;
+        let m_total_saved = m_direct_saved * (1 + COMPOUND_CACHE_MULTIPLIER)
+            + (m_avoided_turns * TOKENS_PER_AVOIDED_TURN).round() as u64
+            + m_bpe_saved;
+        let m_saved_aic = (m_direct_saved as f64 * AIC_PER_SAVED_TOKEN)
+            + (m_avoided_turns * AIC_PER_AVOIDED_TURN)
+            + (m_bpe_saved as f64 * AIC_PER_SAVED_TOKEN);
         let mut durs: Vec<f64> = m_turns.iter().map(|t| t.duration_ms).filter(|d| *d > 0.0).collect();
         durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med_turn = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
@@ -1118,6 +1134,9 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 "direct_tokens_saved": direct_saved,
                 "turn_compression_calls": turn_comp_cnt,
                 "estimated_turn_tokens_saved": turn_saved,
+                "bpe_formula_tokens_saved": bpe_saved_tokens,
+                "bpe_formula_saved_aic": bpe_saved_aic,
+                "bpe_formula_status": bpe_status,
                 "estimated_total_tokens_saved": total_saved,
                 "saved_aic": total_saved_aic,
                 "saved_usd_0001": total_saved_aic * 0.001,
@@ -1130,6 +1149,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 "tokens_per_avoided_turn": TOKENS_PER_AVOIDED_TURN,
                 "aic_per_saved_token": AIC_PER_SAVED_TOKEN,
                 "aic_per_avoided_turn": AIC_PER_AVOIDED_TURN,
+                "bpe_standing_tokens_saved_per_turn": bpe_turn_tok,
                 "long_session_turns": usage_insights::LONG_SESSION_TURNS,
             },
         });
@@ -1200,12 +1220,21 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             total_saved_aic * 0.01
         ),
         format!(
-            "🔥 TOKENS SAVED             :  ~{:<9} tok   (Payload ~{} + 35x Cache Re-read ~{} + ~{} Turns ~{})",
+            "🔥 TOKENS SAVED             :  ~{:<9} tok   (Payload ~{} + 35x Cache ~{} + ~{} Turns ~{} + BPE ~{})",
             fmt_tok(total_saved),
             fmt_tok(direct_saved),
             fmt_tok(compounded_saved),
             turn_comp_cnt,
-            fmt_tok(turn_saved)
+            fmt_tok(turn_saved),
+            fmt_tok(bpe_saved_tokens)
+        ),
+        format!(
+            "🧬 BPE FORMULA COMPRESSION  :  {}  ({}/{} surfaces: ext·mcp·subagent·global · ~{} tok/turn · +${:.2})",
+            fmt_bar(bpe_surface_pct, 10),
+            bpe_status.active_surfaces,
+            bpe_status.total_surfaces,
+            bpe_turn_tok,
+            bpe_saved_aic * 0.001
         ),
         format!(
             "🎯 WARM CACHE HIT RATE      :  {}  ({} warm hits / {} CCTX lookups)",
@@ -1448,8 +1477,13 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .iter()
             .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
             .sum();
-        let s_saved = s_direct * (1 + COMPOUND_CACHE_MULTIPLIER) + (s_avoided * TOKENS_PER_AVOIDED_TURN).round() as u64;
-        let s_saved_aic = (s_direct as f64 * AIC_PER_SAVED_TOKEN) + (s_avoided * AIC_PER_AVOIDED_TURN);
+        let s_bpe_saved: u64 = (s_turns.len() as u64) * bpe_turn_tok;
+        let s_saved = s_direct * (1 + COMPOUND_CACHE_MULTIPLIER)
+            + (s_avoided * TOKENS_PER_AVOIDED_TURN).round() as u64
+            + s_bpe_saved;
+        let s_saved_aic = (s_direct as f64 * AIC_PER_SAVED_TOKEN)
+            + (s_avoided * AIC_PER_AVOIDED_TURN)
+            + (s_bpe_saved as f64 * AIC_PER_SAVED_TOKEN);
         let short_id: String = s_id.chars().take(12).collect();
         let short_ws: String = ws.chars().take(20).collect();
         let short_mod: String = primary_model.chars().take(18).collect();

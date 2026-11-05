@@ -543,10 +543,30 @@ pub fn prepare_root(target: &Path) -> Result<PathBuf> {
                 && existing.allow_worktrees
                 && target != existing.root
             {
-                let root = verify(&existing, &target)?;
-                if root != existing.root {
-                    prepared = Some(admit(specs, inherited(&existing, &root))?);
-                    return Ok(());
+                match verify(&existing, &target) {
+                    Ok(root) if root != existing.root => {
+                        prepared = Some(admit(specs, inherited(&existing, &root))?);
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        prepared = Some(existing.root);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        for parent in specs.iter().filter(|s| {
+                            s.allow_worktrees
+                                && s.managed_parent.is_none()
+                                && s.root != existing.root
+                        }) {
+                            if let Ok(root) = verify(parent, &target)
+                                && root != parent.root
+                            {
+                                prepared = Some(admit(specs, inherited(parent, &root))?);
+                                return Ok(());
+                            }
+                        }
+                        return Err(err);
+                    }
                 }
             }
             prepared = Some(existing.root);
