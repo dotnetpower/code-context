@@ -142,6 +142,11 @@ void test('manifest contributes exactly the seven registered native tools', asyn
   assert.match(contributedInstructions, /prefer backend MCP/);
   assert.match(contributedInstructions, /cctx --backend shared --root/);
   assert.match(contributedInstructions, /Do not duplicate a still-pending lookup/);
+  assert.match(contributedInstructions, /dispatch-error MCP fallback lasts only for the current user turn/);
+  assert.match(contributedInstructions, /next foreground user turn, rediscover native tools and try one needed source lookup/);
+  assert.match(contributedInstructions, /success => Native-first; dispatch error => MCP for that turn/);
+  assert.match(contributedInstructions, /Never duplicate a pending call or poll Status/);
+  assert.match(contributedInstructions, /background\/unattended sessions without native dispatch stay on MCP/);
   assert.match(contributedInstructions, /Never use another transport to bypass/);
   for (const [reference, operation] of [
     ['cctxNativeFiles', 'code_files'],

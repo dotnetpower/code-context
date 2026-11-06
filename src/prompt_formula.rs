@@ -146,7 +146,7 @@ pub fn render(style: PromptStyle, target: PromptTarget, root: Option<&Path>) -> 
     let root_binding = root
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<abs_root>".to_string());
-    match (target, style) {
+    let mut rendered = match (target, style) {
         (PromptTarget::Instructions, PromptStyle::Formula) => format!(
             "# CCTX Formula Spec\n\
 Priority: #cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* / code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg, view, read_file, glob)\n\
@@ -278,7 +278,21 @@ Background/unattended session without native dispatch => prefer these backend MC
 - If tools are deferred, discover them with `tool_search` using exact names: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.\n"
         ),
+    };
+    if matches!(target, PromptTarget::Instructions | PromptTarget::Mcp) {
+        rendered.push_str(if target == PromptTarget::Instructions {
+            "\n- "
+        } else {
+            " "
+        });
+        rendered.push_str(
+            "Recovery: dispatch-error MCP fallback lasts only for the current user turn. \
+On the next foreground user turn, rediscover native tools and try one needed source lookup: \
+success => Native-first; dispatch error => MCP for that turn. \
+Never duplicate a pending call or poll Status; background/unattended sessions without native dispatch stay on MCP.",
+        );
     }
+    rendered
 }
 
 pub fn contains_hangul(text: &str) -> bool {
@@ -1190,6 +1204,35 @@ mod tests {
             "Never switch transport to bypass",
         ] {
             assert!(mcp.contains(expected), "mcp formula missing {expected}");
+        }
+    }
+
+    #[test]
+    fn foreground_prompts_recover_native_priority_after_dispatch_failure() {
+        let required = [
+            "dispatch-error MCP fallback lasts only for the current user turn",
+            "next foreground user turn",
+            "rediscover native tools and try one needed source lookup",
+            "success => Native-first; dispatch error => MCP for that turn",
+            "Never duplicate a pending call or poll Status",
+            "background/unattended sessions without native dispatch stay on MCP",
+        ];
+        let contributed = include_str!("../vscode-extension/prompts/code-context.instructions.md");
+        for phrase in required {
+            assert!(contributed.contains(phrase), "extension missing {phrase}");
+            for style in [
+                PromptStyle::Formula,
+                PromptStyle::Hybrid,
+                PromptStyle::Prose,
+            ] {
+                for target in [PromptTarget::Instructions, PromptTarget::Mcp] {
+                    let rendered = render(style, target, None);
+                    assert!(
+                        rendered.contains(phrase),
+                        "{style:?}/{target:?} missing {phrase}"
+                    );
+                }
+            }
         }
     }
 

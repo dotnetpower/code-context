@@ -25,3 +25,4 @@ Transitions & Fallback:
 - `TTL: idle >= 15m | LRU => evict`. Do not enumerate or prepare sibling worktrees speculatively (`cctx --root /parent authorize-worktrees` is operator-only).
 - `Error("No matching client connected" | disconnected) => code-context-code_* MCP | cctx --backend shared --root /actual/root`
 - `Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*)`. Do not duplicate a still-pending lookup or poll Status; safe boundary => `cctx --root /project doctor`.
+- Recovery: dispatch-error MCP fallback lasts only for the current user turn. On the next foreground user turn, rediscover native tools and try one needed source lookup: success => Native-first; dispatch error => MCP for that turn. Never duplicate a pending call or poll Status; background/unattended sessions without native dispatch stay on MCP.

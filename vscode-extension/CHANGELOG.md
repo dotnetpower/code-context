@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.1
+
+- Limit native client-disconnection fallback to the current user turn. On the
+  next foreground user turn, rediscover native tools and use one needed source
+  lookup to restore native-first selection; keep backend MCP for unattended
+  sessions without native dispatch.
+- Apply the recovery contract to contributed instructions and generated
+  instruction/MCP prompts in every style, with regression tests.
+- Document Agents window client-disconnection diagnostics and distinguish
+  them from normal cold-cache responses without restarting the shared daemon.
+
 ## 0.25.0
 
 - Extend `cctx usage` with failure-cause, P95/P99 latency and offload tables,
