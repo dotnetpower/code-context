@@ -124,6 +124,24 @@ pub(crate) fn string_bound(value: &str) -> usize {
     2 + bytes.len() + extra
 }
 
+pub(crate) fn truncate_search_to_budget(result: &mut SearchResult) {
+    let base = 192 + string_bound(&result.consistency);
+    let mut used = base;
+    let mut keep = 0usize;
+    for hit in &result.matches {
+        let cost = 96 + string_bound(&hit.path) + string_bound(&hit.text);
+        if keep > 0 && used + cost > MAX_RESPONSE {
+            break;
+        }
+        used += cost;
+        keep += 1;
+    }
+    if keep < result.matches.len() {
+        result.matches.truncate(keep);
+        result.truncated = true;
+    }
+}
+
 pub(crate) fn check_search_size(result: &SearchResult) -> Result<()> {
     let matches = result
         .matches

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.25.2
+
+- Isolate oversized (`> max_file_bytes`) and binary files during initial and
+  incremental watcher updates so a single large or binary artifact never blocks
+  unrelated `code_read`/`code_grep`/`code_context` lookups in the workspace.
+- Support partial batch success in compact `code_read` (both plain and
+  `page=true` batches), allow `start=1` reads on 0-byte empty files, auto-clamp
+  single-file past-EOF reads to `valid_tail` with `EOF_CLAMPED`, and broaden
+  `did_you_mean` suggestions to sibling files in the same directory.
+- Auto-truncate oversized `code_grep` responses at the 256 KiB budget boundary
+  (`truncated=true`) instead of failing with `RESPONSE_BUDGET_EXCEEDED`.
+- Emit `EOF`, `OVERLAP_READ`, and `SEQUENTIAL_SLICE` unread-symbol outline
+  notices (`unread_outline=[L...:fn/def/class ...]`) on sequential single-file
+  reads, elide unchanged middle lines on exact duplicate MCP reads, and add the
+  per-workspace `low_context_share` advisory to `cctx usage`.
+- Piggyback `_cctx_prev_trace` telemetry across both `cctx shared-mcp` and
+  the VS Code WSL native bridge (`usesWslBridge`), eliminating separate
+  per-call `code_trace` round-trips, and handle `"skipped from another client"`
+  client-tool routing stalls across instructions and diagnostics.
+
 ## 0.25.1
 
 - Limit native client-disconnection fallback to the current user turn. On the

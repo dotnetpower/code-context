@@ -79,6 +79,7 @@ export class DaemonClient {
   private hostMemoryReportingAvailable = false;
   private startingService: Promise<void> | undefined;
   private lastServiceStartAt = 0;
+  private pendingWslTraces: Array<Record<string, JsonValue>> = [];
 
   public constructor(
     private readonly settings: () => ClientSettings,
@@ -94,10 +95,21 @@ export class DaemonClient {
     return nativeEndpoint(this.settings());
   }
 
+  public queueTraceForNextRequest(trace: ClientTrace): void {
+    if (this.pendingWslTraces.length >= 64) {
+      this.pendingWslTraces.shift();
+    }
+    this.pendingWslTraces.push({ ...trace });
+  }
+
   public request<T = JsonValue>(
     request: DaemonRequest,
     cancellation: CancellationLike,
   ): Promise<T> {
+    if (request.name === 'code_trace' && this.usesWslBridge) {
+      this.queueTraceForNextRequest(request.arguments as unknown as ClientTrace);
+      return Promise.resolve({ recorded: true } as unknown as T);
+    }
     return this.enqueue<T>(request, cancellation);
   }
 
@@ -198,11 +210,28 @@ export class DaemonClient {
             delete trace.host_memory;
           }
         }
-        const needsArgMutation = request.name === 'code_trace' || Boolean(trace && this.tracingAvailable);
+        const hasPiggybackTraces =
+          this.pendingWslTraces.length > 0 &&
+          request.name !== 'code_trace' &&
+          request.name !== 'ping' &&
+          request.name !== 'code_workspaces';
+        const needsArgMutation =
+          request.name === 'code_trace' ||
+          Boolean(trace && this.tracingAvailable) ||
+          hasPiggybackTraces;
         const argumentsForDaemon = needsArgMutation ? { ...request.arguments } : request.arguments;
         if (request.name === 'code_trace') {
           if (!this.traceOutcomesAvailable) { delete argumentsForDaemon.outcome; }
           if (!this.hostMemoryReportingAvailable) { delete argumentsForDaemon.host_memory; }
+        }
+        if (hasPiggybackTraces) {
+          const drained = this.pendingWslTraces.splice(0, this.pendingWslTraces.length).map((item) => {
+            const copy = { ...item };
+            if (!this.traceOutcomesAvailable) { delete copy.outcome; }
+            if (!this.hostMemoryReportingAvailable) { delete copy.host_memory; }
+            return copy;
+          });
+          argumentsForDaemon._cctx_prev_trace = drained;
         }
         if (trace && this.tracingAvailable) {
           argumentsForDaemon._cctx_trace = trace.trace_id;

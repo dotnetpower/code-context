@@ -380,6 +380,132 @@ mod io_tests {
         watched.call("code_sync", json!({})).unwrap();
         assert!(watched.watched_dirs.contains(Path::new("tests")));
     }
+
+    #[test]
+    fn oversized_binary_empty_partial_batch_and_grep_budget_resilience() {
+        let (root, mut watched) = fixture();
+        // 1. Empty 0-byte file read at start=1 in compact mode succeeds with 1 empty line
+        std::fs::write(root.path().join("empty.rs"), "").unwrap();
+        watched.call("code_sync", json!({})).unwrap();
+        let empty_read = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[{"path":"empty.rs","start":1,"end":50}]}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(empty_read[0]["start"], 1);
+        assert_eq!(empty_read[0]["end"], 1);
+        assert_eq!(empty_read[0]["lines"], json!([""]));
+
+        // 2. Unrelated oversized (> max_file_bytes) files do not poison sync or other reads
+        std::fs::write(
+            root.path().join("oversized.rs"),
+            "x".repeat(watched.spec.policy.max_file_bytes + 128),
+        )
+        .unwrap();
+        watched.call("code_sync", json!({})).unwrap();
+        assert!(watched.blocked.is_none());
+        let valid_read = watched
+            .call(
+                "code_read",
+                json!({"ranges":[{"path":"a.rs","start":1,"end":1}]}),
+            )
+            .unwrap();
+        assert_eq!(valid_read[0]["lines"], json!(["before"]));
+
+        // 3. Compact multi-file batch returns valid snippets + inline diagnostic when one member is missing
+        let partial = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[
+                    {"path":"a.rs","start":1,"end":1},
+                    {"path":"nonexistent.rs","start":1,"end":10}
+                ]}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(partial.as_array().unwrap().len(), 2);
+        assert_eq!(partial[0]["path"], "a.rs");
+        assert_eq!(partial[0]["lines"], json!(["before"]));
+        assert_eq!(partial[1]["path"], "nonexistent.rs");
+        assert_eq!(partial[1]["sha256"], "READ_UNAVAILABLE");
+        assert!(
+            partial[1]["lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("READ_UNAVAILABLE")
+        );
+
+        // 4. Oversized grep result auto-truncates within 256KiB instead of failing with RESPONSE_BUDGET_EXCEEDED
+        let big_grep_file = (0..500)
+            .map(|i| format!("match_token_{i:04} {}\n", "y".repeat(700)))
+            .collect::<String>();
+        std::fs::write(root.path().join("many.rs"), big_grep_file).unwrap();
+        watched.call("code_sync", json!({})).unwrap();
+        let grep_res = watched
+            .call(
+                "code_grep",
+                json!({"pattern":"match_token_","limit":500}),
+            )
+            .unwrap();
+        assert_eq!(grep_res["truncated"], true);
+        assert!(grep_res["matches"].as_array().unwrap().len() < 500);
+        assert!(!grep_res["matches"].as_array().unwrap().is_empty());
+
+        // 5. Compact single-file out-of-bounds read clamps to valid_tail with EOF_CLAMPED notice
+        let clamped_eof = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[{"path":"a.rs","start":720,"end":765}]}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(clamped_eof[0]["lines"], json!(["before"]));
+        assert!(
+            clamped_eof[0]["notice"]
+                .as_str()
+                .unwrap()
+                .contains("EOF_CLAMPED")
+        );
+
+        // 6. Sequential slicing & overlap detection emit SEQUENTIAL_SLICE outline and OVERLAP_READ notices
+        let mut sliced_lines = Vec::new();
+        for i in 1..=160 {
+            if i == 140 {
+                sliced_lines.push("pub fn unread_target_fn(x: i32) -> i32 {".to_string());
+            } else {
+                sliced_lines.push(format!("let v_{i} = {i};"));
+            }
+        }
+        std::fs::write(
+            root.path().join("sliced.rs"),
+            format!("{}\n", sliced_lines.join("\n")),
+        )
+        .unwrap();
+        watched.call("code_sync", json!({})).unwrap();
+        let _slice1 = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[{"path":"sliced.rs","start":1,"end":60}]}),
+                true,
+            )
+            .unwrap();
+        let slice2 = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[{"path":"sliced.rs","start":30,"end":100}]}),
+                true,
+            )
+            .unwrap();
+        let notice2 = slice2[0]["notice"].as_str().unwrap();
+        assert!(notice2.contains("OVERLAP_READ"), "{notice2}");
+        assert!(notice2.contains("SEQUENTIAL_SLICE #2"), "{notice2}");
+        assert!(
+            notice2.contains("L140:pub fn unread_target_fn"),
+            "{notice2}"
+        );
+    }
 }
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
@@ -440,6 +566,8 @@ pub struct Watched {
         crate::workspace::Workspace,
         crate::workspace::CandidatePolicy,
     )>,
+    file_read_streaks: BTreeMap<String, u32>,
+    recent_read_history: std::collections::VecDeque<(String, String, usize, usize)>,
 }
 
 impl Watched {
@@ -453,8 +581,8 @@ impl Watched {
 
     pub fn new_with_budget(spec: Spec, max_owned_bytes: usize) -> Result<Self> {
         let workspace = spec.workspace()?;
-        let mut inventory = workspace.files_limited(&spec.policy)?;
-        let stamps = std::mem::take(&mut inventory.stamps);
+        let mut inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
+        let mut stamps = std::mem::take(&mut inventory.stamps);
         let watched_dirs = workspace.watch_directories_for(
             inventory.files.iter().map(std::path::PathBuf::as_path),
             &spec.policy,
@@ -567,6 +695,7 @@ impl Watched {
             max_owned_bytes.saturating_sub(ROOT_RUNTIME_HEADROOM),
             inventory,
         )?;
+        stamps.retain(|path, _| resident.paths.contains_key(path.as_str()));
         let watcher_policy = crate::workspace::CandidatePolicy::compile(workspace.candidate_policy_key())
             .ok()
             .map(|policy| (spec.clone(), policy));
@@ -604,6 +733,8 @@ impl Watched {
             cached_workspace,
             watcher_policy,
             read_policy: None,
+            file_read_streaks: BTreeMap::new(),
+            recent_read_history: std::collections::VecDeque::with_capacity(64),
         };
         let overflowed = watched.overflow.load(Ordering::Acquire);
         watched.synchronize(overflowed)?;
@@ -1017,6 +1148,8 @@ impl Watched {
                     .update(&workspace, &actual_changed, &self.stamps, verify_all)
                 {
                     Ok(update) => {
+                        self.stamps
+                            .retain(|path, _| self.resident.paths.contains_key(path.as_str()));
                         self.record_update(update);
                         self.query_cache
                             .retain_generation(self.resident.stats.generation);
@@ -1157,7 +1290,7 @@ impl Watched {
                 continue;
             }
             self.io_profile.directory_inventory_scans += 1;
-            let inventory = workspace.files_limited_at(
+            let inventory = workspace.files_limited_at_skip_oversized(
                 &self.spec.policy,
                 &targets.into_iter().collect::<Vec<_>>(),
                 !recursive,
@@ -1531,10 +1664,130 @@ impl Watched {
             "code_read" => {
                 let request: ReadRequest = serde_json::from_value(arguments)?;
                 if request.page {
-                    return self.read_page(&request);
+                    return self.read_page(&request, compact);
                 }
-                let snippets = self.read_verified_with_recovery(&request)?;
-                Ok(serde_json::to_value(snippets)?)
+                match self.read_verified_with_recovery(&request) {
+                    Ok(snippets) => {
+                        let mut val = serde_json::to_value(snippets)?;
+                        if compact {
+                            self.annotate_read_snippets_value(&mut val, None);
+                        }
+                        Ok(val)
+                    }
+                    Err(single_error)
+                        if compact
+                            && request.ranges.len() == 1
+                            && single_error
+                                .to_string()
+                                .contains("READ_RANGE_OUT_OF_BOUNDS") =>
+                    {
+                        let range = &request.ranges[0];
+                        let norm = crate::workspace::normalize(Path::new(&range.path));
+                        let key = norm.to_string_lossy().into_owned();
+                        let doc_info = self.resident.paths.get(key.as_str()).map(|id| {
+                            let doc = &self.resident.documents[*id];
+                            (doc.starts.len(), doc.sha256_hex.to_string())
+                        });
+                        if let Some((0, ref sha)) = doc_info
+                            && range.start == 1
+                        {
+                            return Ok(json!([{
+                                "path": key,
+                                "start": 1,
+                                "end": 1,
+                                "sha256": sha,
+                                "lines": [""],
+                                "notice": "EMPTY_FILE: total_lines=0 (0 bytes)"
+                            }]));
+                        }
+                        if let Some((lines, _)) = doc_info
+                            && lines > 0
+                            && range.start > lines
+                        {
+                            let tail_start = lines.saturating_sub(79).max(1);
+                            let clamped = ReadRequest {
+                                ranges: vec![crate::context::ReadRange {
+                                    path: range.path.clone(),
+                                    start: tail_start,
+                                    end: lines,
+                                }],
+                                split_ranges: false,
+                                page: false,
+                            };
+                            if let Ok(snippets) = self.read_verified_with_recovery(&clamped) {
+                                let mut val = serde_json::to_value(snippets)?;
+                                self.annotate_read_snippets_value(
+                                    &mut val,
+                                    Some((range.start, range.end, lines)),
+                                );
+                                return Ok(val);
+                            }
+                        }
+                        Err(single_error)
+                    }
+                    Err(batch_error)
+                        if compact
+                            && request.ranges.len() > 1
+                            && !crate::context::is_response_budget(batch_error.as_ref()) =>
+                    {
+                        let mut partial = Vec::with_capacity(request.ranges.len());
+                        let mut any_valid = false;
+                        for range in &request.ranges {
+                            let single = ReadRequest {
+                                ranges: vec![range.clone()],
+                                split_ranges: request.split_ranges,
+                                page: false,
+                            };
+                            match self.read_verified_with_recovery(&single) {
+                                Ok(mut snippets) => {
+                                    any_valid = true;
+                                    partial.append(&mut snippets);
+                                }
+                                Err(err) => {
+                                    let norm = crate::workspace::normalize(Path::new(&range.path));
+                                    let key = norm.to_string_lossy().into_owned();
+                                    let is_empty_doc =
+                                        self.resident.paths.get(key.as_str()).map(|id| {
+                                            let doc = &self.resident.documents[*id];
+                                            (doc.starts.len(), doc.sha256_hex.to_string())
+                                        });
+                                    if let Some((0, sha)) = is_empty_doc
+                                        && range.start == 1
+                                    {
+                                        any_valid = true;
+                                        partial.push(Snippet {
+                                            path: key,
+                                            start: 1,
+                                            end: 1,
+                                            sha256: sha,
+                                            lines: vec![String::new()],
+                                        });
+                                    } else {
+                                        let line_no = range.start.max(1);
+                                        partial.push(Snippet {
+                                            path: range.path.clone(),
+                                            start: line_no,
+                                            end: line_no,
+                                            sha256: "READ_UNAVAILABLE".into(),
+                                            lines: vec![format!(
+                                                "[CCTX_READ_UNAVAILABLE: {}]",
+                                                err.to_string().replace('\n', " ")
+                                            )],
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        if any_valid && crate::context::check_snippets_size(&partial).is_ok() {
+                            let mut val = serde_json::to_value(partial)?;
+                            self.annotate_read_snippets_value(&mut val, None);
+                            Ok(val)
+                        } else {
+                            Err(batch_error)
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             }
             "code_sync" | "code_status" => {
                 if arguments != json!({}) {
@@ -2341,6 +2594,9 @@ impl Watched {
         let mut unique: Vec<&Snippet> = Vec::with_capacity(snippets.len());
         let mut seen = BTreeSet::new();
         for snippet in snippets {
+            if snippet.sha256 == "READ_UNAVAILABLE" {
+                continue;
+            }
             if seen.insert(snippet.path.as_str()) {
                 if !self.stamps.contains_key(&snippet.path) {
                     return Err(invalid(
@@ -2508,7 +2764,7 @@ impl Watched {
         Ok(None)
     }
 
-    fn read_page(&mut self, request: &ReadRequest) -> Result<Value> {
+    fn read_page(&mut self, request: &ReadRequest, compact: bool) -> Result<Value> {
         crate::context::validate_ranges(
             &request
                 .ranges
@@ -2520,11 +2776,14 @@ impl Watched {
                 })
                 .collect::<Vec<_>>(),
         )?;
+        let mut valid_ranges = Vec::with_capacity(request.ranges.len());
+        let mut unavailable_snippets = Vec::new();
+        let mut first_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         for range in &request.ranges {
             if range.end < range.start {
                 return Err(invalid("read range end precedes start").into());
             }
-            self.read_verified_with_recovery(&ReadRequest {
+            match self.read_verified_with_recovery(&ReadRequest {
                 ranges: vec![crate::context::ReadRange {
                     path: range.path.clone(),
                     start: range.start,
@@ -2532,9 +2791,65 @@ impl Watched {
                 }],
                 split_ranges: false,
                 page: false,
-            })?;
+            }) {
+                Ok(_) => valid_ranges.push(range.clone()),
+                Err(err) if compact => {
+                    let norm = crate::workspace::normalize(Path::new(&range.path));
+                    let key = norm.to_string_lossy().into_owned();
+                    let is_empty_doc = self
+                        .resident
+                        .paths
+                        .get(key.as_str())
+                        .map(|id| {
+                            let doc = &self.resident.documents[*id];
+                            (doc.starts.len(), doc.sha256_hex.to_string())
+                        });
+                    if let Some((0, sha)) = is_empty_doc
+                        && range.start == 1
+                    {
+                        unavailable_snippets.push(Snippet {
+                            path: key,
+                            start: 1,
+                            end: 1,
+                            sha256: sha,
+                            lines: vec![String::new()],
+                        });
+                    } else if request.ranges.len() > 1 {
+                        let line_no = range.start.max(1);
+                        unavailable_snippets.push(Snippet {
+                            path: range.path.clone(),
+                            start: line_no,
+                            end: line_no,
+                            sha256: "READ_UNAVAILABLE".into(),
+                            lines: vec![format!(
+                                "[CCTX_READ_UNAVAILABLE: {}]",
+                                err.to_string().replace('\n', " ")
+                            )],
+                        });
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
         }
-        let mut pending: std::collections::VecDeque<_> = self.plan_read_ranges(request)?.into();
+        if valid_ranges.is_empty()
+            && !unavailable_snippets
+                .iter()
+                .any(|s| s.sha256 != "READ_UNAVAILABLE")
+        {
+            return Err(first_err.expect("at least one error recorded"));
+        }
+        let filtered_request = ReadRequest {
+            ranges: valid_ranges,
+            split_ranges: request.split_ranges,
+            page: request.page,
+        };
+        let mut pending: std::collections::VecDeque<_> =
+            self.plan_read_ranges(&filtered_request)?.into();
         let mut snippets = Vec::new();
         let mut splits = 0;
         while let Some(range) = pending.pop_front() {
@@ -2581,8 +2896,18 @@ impl Watched {
                 break;
             }
         }
+        for diag in unavailable_snippets {
+            snippets.push(diag);
+            if crate::context::check_snippets_size(&snippets).is_err() {
+                snippets.pop();
+                break;
+            }
+        }
         let mut hashes = BTreeMap::new();
         for snippet in &snippets {
+            if snippet.sha256 == "READ_UNAVAILABLE" {
+                continue;
+            }
             if let Some(previous) = hashes.insert(&snippet.path, &snippet.sha256)
                 && previous != &snippet.sha256
             {
@@ -2592,7 +2917,11 @@ impl Watched {
         if let Some(path) = self.stale_snippet_path(&snippets)? {
             return Err(self.stale_search_error(&path).into());
         }
-        let value = json!({"root":self.spec.root,"snippets":snippets,"complete":pending.is_empty(),
+        let mut snippets_value = serde_json::to_value(&snippets)?;
+        if compact {
+            self.annotate_read_snippets_value(&mut snippets_value, None);
+        }
+        let value = json!({"root":self.spec.root,"snippets":snippets_value,"complete":pending.is_empty(),
             "next_ranges":pending,"page":true,
             "notice":"Explicit read page, not an implicit complete batch. Continue with page=true and next_ranges. Compare whole-file hashes across pages; if they differ restart the read. No atomic multi-page filesystem view."});
         if serde_json::to_vec(&value)?.len() > crate::workspace::MAX_RESPONSE {
@@ -2613,6 +2942,7 @@ impl Watched {
         let parent_str = req_path.parent().and_then(|p| p.to_str()).unwrap_or("");
         let mut same_dir_stem = Vec::new();
         let mut same_filename = Vec::new();
+        let mut same_dir_siblings = Vec::new();
         for indexed in self.resident.paths.keys() {
             let p = Path::new(indexed.as_ref());
             let idx_parent = p.parent().and_then(|pr| pr.to_str()).unwrap_or("");
@@ -2622,9 +2952,18 @@ impl Watched {
                 same_dir_stem.push(indexed.as_ref());
             } else if idx_name == file_name {
                 same_filename.push(indexed.as_ref());
+            } else if !parent_str.is_empty()
+                && idx_parent == parent_str
+                && idx_name != "__init__.py"
+                && same_dir_siblings.len() < 3
+            {
+                same_dir_siblings.push(indexed.as_ref());
             }
         }
         same_dir_stem.extend(same_filename);
+        if same_dir_stem.is_empty() {
+            same_dir_stem.extend(same_dir_siblings);
+        }
         same_dir_stem.truncate(3);
         same_dir_stem
     }
@@ -2643,6 +2982,19 @@ impl Watched {
                 .paths
                 .get(path_key.as_str())
                 .map(|id| self.resident.documents[*id].starts.len());
+            if doc_lines == Some(0) && range.start == 1 {
+                if reached_eof_paths.insert(path_key) {
+                    if planned.len() >= 64 {
+                        return Err(invalid(format!("READ_PLAN_TOO_LARGE path={}: more than64segments required; split the request into fewer ranges. No partial result returned.",range.path)).into());
+                    }
+                    planned.push(crate::context::ReadRange {
+                        path: range.path.clone(),
+                        start: 1,
+                        end: 1,
+                    });
+                }
+                continue;
+            }
             if let Some(lines) = doc_lines
                 && range.start > lines
                 && reached_eof_paths.contains(&path_key)
@@ -2684,6 +3036,147 @@ impl Watched {
         }
         Ok(())
     }
+
+    fn annotate_read_snippets_value(
+        &mut self,
+        snippets_val: &mut Value,
+        clamped_req: Option<(usize, usize, usize)>,
+    ) {
+        let Some(items) = snippets_val.as_array_mut() else {
+            return;
+        };
+        for item in items.iter_mut() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(path) = obj.get("path").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let Some(sha256) = obj.get("sha256").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            if sha256 == "READ_UNAVAILABLE" {
+                continue;
+            }
+            let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let end = obj
+                .get("end")
+                .and_then(Value::as_u64)
+                .unwrap_or(start as u64) as usize;
+            let doc = self
+                .resident
+                .paths
+                .get(path.as_str())
+                .map(|&id| &self.resident.documents[id]);
+            let total_lines = doc.map_or(end, |d| d.starts.len());
+            let mut notes = Vec::new();
+            if let Some((req_s, req_e, tot)) = clamped_req {
+                notes.push(format!(
+                    "EOF_CLAMPED: requested {req_s}..{req_e} exceeds total_lines={tot}; returned valid_tail {start}..{end} (EOF)"
+                ));
+            } else if end >= total_lines && total_lines > 1 {
+                notes.push(format!(
+                    "EOF: total_lines={total_lines} (no lines beyond {total_lines})"
+                ));
+            }
+            let mut overlap_found = None;
+            for (p, h, pst, pen) in &self.recent_read_history {
+                if p == &path && h == &sha256 {
+                    let ov_s = start.max(*pst);
+                    let ov_e = end.min(*pen);
+                    if ov_e >= ov_s && (ov_e - ov_s + 1) >= 20 {
+                        overlap_found = Some((ov_s, ov_e, *pst, *pen));
+                        break;
+                    }
+                }
+            }
+            if let Some((ov_s, ov_e, pst, pen)) = overlap_found {
+                notes.push(format!(
+                    "OVERLAP_READ: lines {ov_s}..{ov_e} already read in {pst}..{pen} (sha256 unchanged); reuse context"
+                ));
+            }
+            if self.recent_read_history.len() >= 64 {
+                self.recent_read_history.pop_front();
+            }
+            self.recent_read_history
+                .push_back((path.clone(), sha256, start, end));
+
+            if self.file_read_streaks.len() >= 128 && !self.file_read_streaks.contains_key(&path) {
+                self.file_read_streaks.clear();
+            }
+            let streak = {
+                let entry = self.file_read_streaks.entry(path.clone()).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            if streak >= 2
+                && end < total_lines
+                && total_lines > 120
+                && let Some(doc) = doc
+            {
+                let outline = extract_unread_outline(doc, end, 10);
+                if !outline.is_empty() {
+                    notes.push(format!(
+                        "SEQUENTIAL_SLICE #{streak} ({start}..{end} of {total_lines}): unread_outline=[{}] — use code_context(paths=[\"{path}\"], pattern=\"...\") or jump to line",
+                        outline.join(", ")
+                    ));
+                }
+            }
+            if !notes.is_empty() {
+                obj.insert("notice".into(), Value::String(notes.join(" | ")));
+            }
+        }
+    }
+}
+
+fn extract_unread_outline(
+    doc: &crate::resident::Document,
+    from_line_1based: usize,
+    max_items: usize,
+) -> Vec<String> {
+    const PREFIXES: &[&str] = &[
+        "pub fn ",
+        "pub(crate) fn ",
+        "pub async fn ",
+        "async fn ",
+        "fn ",
+        "def ",
+        "async def ",
+        "class ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "export function ",
+        "export async function ",
+        "export class ",
+        "export interface ",
+        "interface ",
+        "## ",
+    ];
+    let mut out = Vec::new();
+    let total = doc.starts.len();
+    for idx in from_line_1based..total {
+        let trimmed = doc.line(idx).trim_start();
+        if PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            let head = trimmed
+                .split(['{', '(', ':'])
+                .next()
+                .unwrap_or(trimmed)
+                .trim();
+            let compact_head: String = head.chars().take(48).collect();
+            if !compact_head.is_empty() {
+                out.push(format!("L{}:{}", idx + 1, compact_head));
+                if out.len() >= max_items {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn looks_like_unintended_literal_regex(pattern: &str, regex: bool) -> bool {

@@ -428,6 +428,21 @@ impl Workspace {
     }
 
     pub fn files_limited(&self, policy: &MemoryPolicy) -> Result<FileInventory> {
+        self.files_limited_inner(policy, false)
+    }
+
+    pub(crate) fn files_limited_skip_oversized(
+        &self,
+        policy: &MemoryPolicy,
+    ) -> Result<FileInventory> {
+        self.files_limited_inner(policy, true)
+    }
+
+    fn files_limited_inner(
+        &self,
+        policy: &MemoryPolicy,
+        skip_oversized: bool,
+    ) -> Result<FileInventory> {
         for scope in &self.scopes {
             let rel = if scope == "." {
                 Path::new("")
@@ -438,14 +453,24 @@ impl Workspace {
                 return Err(invalid("scopes must be directories inside root").into());
             }
         }
-        self.files_limited_at(policy, &self.scopes, false)
+        self.files_limited_at_inner(policy, &self.scopes, false, skip_oversized)
     }
 
-    pub(crate) fn files_limited_at(
+    pub(crate) fn files_limited_at_skip_oversized(
         &self,
         policy: &MemoryPolicy,
         targets: &[String],
         shallow: bool,
+    ) -> Result<FileInventory> {
+        self.files_limited_at_inner(policy, targets, shallow, true)
+    }
+
+    fn files_limited_at_inner(
+        &self,
+        policy: &MemoryPolicy,
+        targets: &[String],
+        shallow: bool,
+        skip_oversized: bool,
     ) -> Result<FileInventory> {
         policy.validate().map_err(invalid)?;
         let mut active_targets = Vec::with_capacity(targets.len());
@@ -501,6 +526,9 @@ impl Workspace {
                 Err(error) => return Err(error),
             };
             let normalized = normalize(path);
+            if skip_oversized && metadata.len() > policy.max_file_bytes as u64 {
+                continue;
+            }
             if paths.insert(normalized.clone()) {
                 total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());
                 if paths.len() > policy.max_files {
@@ -563,6 +591,9 @@ impl Workspace {
         let relative = normalize(Path::new(path));
         match std::fs::symlink_metadata(self.root.join(&relative)) {
             Ok(meta) if meta.file_type().is_symlink() => return Ok("symlink_not_allowed"),
+            Ok(meta) if meta.len() > policy.max_file_bytes as u64 => {
+                return Ok("exceeds_max_file_bytes");
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("missing_on_disk"),
             Err(error) => return Err(error.into()),
@@ -571,7 +602,7 @@ impl Workspace {
         let parent = relative.parent().unwrap_or(Path::new(""));
         let target = if parent.as_os_str().is_empty() { ".".to_owned() }
             else { parent.to_string_lossy().into_owned() };
-        let inventory = self.files_limited_at(policy, &[target], true)?;
+        let inventory = self.files_limited_at_skip_oversized(policy, &[target], true)?;
         Ok(if inventory.files.contains(&relative) { "not_yet_indexed" } else { "ignored_by_discovery" })
     }
 
@@ -621,7 +652,7 @@ impl Workspace {
     ) -> Result<Vec<u8>> {
         if metadata.len() > max_file_bytes as u64 {
             return Err(invalid(format!(
-                "binary file or file larger than configured limit is unsupported: {}",
+                "file larger than configured max_file_bytes is unsupported: {}",
                 path.display()
             ))
             .into());
@@ -634,7 +665,7 @@ impl Workspace {
             .read_to_end(&mut bytes)?;
         if bytes.len() > max_file_bytes {
             return Err(invalid(format!(
-                "binary file or file larger than configured limit is unsupported: {}",
+                "file larger than configured max_file_bytes is unsupported: {}",
                 path.display()
             ))
             .into());

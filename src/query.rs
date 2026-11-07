@@ -1,4 +1,4 @@
-use crate::context::{ContextResult, Snippet, check_search_size};
+use crate::context::{ContextResult, Snippet, check_search_size, truncate_search_to_budget};
 use crate::planner::{self, CandidateExpr};
 use crate::policy::WORKER_STACK_BYTES;
 use crate::resident::Resident;
@@ -467,7 +467,7 @@ fn search_internal(
                 )?;
                 (matches, total)
             };
-            let result = SearchResult {
+            let mut result = SearchResult {
                 matches,
                 total_matches: total,
                 truncated: total > query.limit,
@@ -476,6 +476,7 @@ fn search_internal(
                     resident.stats.generation
                 ),
             };
+            truncate_search_to_budget(&mut result);
             check_search_size(&result)?;
             return Ok(ProfiledResult {
                 result,
@@ -636,7 +637,7 @@ fn search_internal(
     }
 
     let finalize_started = collect_profile.then(Instant::now);
-    let result = SearchResult {
+    let mut result = SearchResult {
         matches,
         total_matches: total,
         truncated: total > query.limit,
@@ -645,6 +646,7 @@ fn search_internal(
             resident.stats.generation
         ),
     };
+    truncate_search_to_budget(&mut result);
     check_search_size(&result)?;
     if collect_profile {
         profile.finalize_us = elapsed_us(finalize_started);

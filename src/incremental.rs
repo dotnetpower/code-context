@@ -36,7 +36,7 @@ pub(crate) fn stamps(
     workspace: &Workspace,
     policy: &MemoryPolicy,
 ) -> Result<BTreeMap<String, Stamp>> {
-    Ok(workspace.files_limited(policy)?.stamps)
+    Ok(workspace.files_limited_skip_oversized(policy)?.stamps)
 }
 
 pub(crate) fn validate_stamps(
@@ -234,7 +234,10 @@ impl Resident {
                     Err(error)
                         if error
                             .downcast_ref::<std::io::Error>()
-                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                            || error.to_string().contains(
+                                "file larger than configured max_file_bytes is unsupported",
+                            ) =>
                     {
                         None
                     }

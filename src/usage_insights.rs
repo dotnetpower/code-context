@@ -366,9 +366,47 @@ fn advisories(
         out.push(Advisory {
             code: "client_disconnected",
             message: format!(
-                "{disconnects} native calls failed on client disconnect: switch to code-context-code_* MCP tools or `cctx --backend shared`."
+                "{disconnects} native calls failed on client disconnect or another-client dispatch stall: switch to code-context-code_* MCP tools or `cctx --backend shared`."
             ),
         });
+    }
+    let context_calls = calls
+        .iter()
+        .filter(|c| matches!(c.tool.as_str(), "cctxNativeContext" | "code-context-code_context" | "code_context"))
+        .count();
+    if cctx_total >= 25 && context_calls * 20 < cctx_total {
+        out.push(Advisory {
+            code: "low_context_share",
+            message: format!(
+                "Only {context_calls}/{cctx_total} ({:.1}%) CCTX calls used code_context: prefer #cctxNativeContext / code_context (1-call symbol + surrounding lines) over Grep->Read chains or sequential 150-line file slicing.",
+                100.0 * ratio(context_calls, cctx_total)
+            ),
+        });
+    } else {
+        for (workspace, stat) in &insights.workspaces {
+            if stat.cctx >= 25 {
+                let ws_ctx = calls
+                    .iter()
+                    .filter(|c| {
+                        &c.workspace == workspace
+                            && matches!(
+                                c.tool.as_str(),
+                                "cctxNativeContext" | "code-context-code_context" | "code_context"
+                            )
+                    })
+                    .count();
+                if ws_ctx * 20 < stat.cctx {
+                    out.push(Advisory {
+                        code: "low_context_share",
+                        message: format!(
+                            "Workspace {workspace} used code_context on only {ws_ctx}/{} ({:.1}%) CCTX calls: prefer #cctxNativeContext / code_context over Grep->Read chains or sequential 150-line file slicing.",
+                            stat.cctx,
+                            100.0 * ratio(ws_ctx, stat.cctx)
+                        ),
+                    });
+                }
+            }
+        }
     }
     let thinking = total_output_tokens + total_reasoning_tokens;
     if thinking > 0 && total_reasoning_tokens as f64 / thinking as f64 >= REASONING_SHARE_ALERT {

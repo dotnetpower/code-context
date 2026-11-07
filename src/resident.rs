@@ -1,4 +1,7 @@
-use crate::context::{ReadRange, Snippet, check_search_size, check_snippets_size, validate_ranges};
+use crate::context::{
+    ReadRange, Snippet, check_search_size, check_snippets_size, truncate_search_to_budget,
+    validate_ranges,
+};
 use crate::policy::MemoryPolicy;
 use crate::search::{Hit, Search, SearchResult};
 use crate::workspace::{FileInventory, Workspace, normalize, safe_relative};
@@ -426,22 +429,35 @@ impl Resident {
         let mut digest = Sha256::new();
         for path in paths {
             let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
-            let bytes = workspace.read_known_with_limit_cached(
+            let bytes = match workspace.read_known_with_limit_cached(
                 path,
                 policy.max_file_bytes,
                 &mut checked_dirs,
-            )?;
-            source_bytes += bytes.len();
+            ) {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                        || error.to_string().contains(
+                            "file larger than configured max_file_bytes is unsupported",
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let text = String::from_utf8(bytes)?;
+            source_bytes += text.len();
             if source_bytes > policy.max_source_bytes {
                 return Err(invalid("resident source budget exceeds configured limit").into());
             }
-            let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+            let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
             digest.update(sha256);
             let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
-            let text = String::from_utf8(bytes)?;
             let starts = build_line_starts(&text)?;
             line_count = line_count.saturating_add(starts.len());
             if line_count > policy.max_total_lines {
@@ -1095,7 +1111,7 @@ impl Resident {
                 }
             }
         }
-        let result = SearchResult {
+        let mut result = SearchResult {
             matches,
             total_matches,
             truncated: total_matches > request.limit,
@@ -1104,6 +1120,7 @@ impl Resident {
                 self.stats.generation
             ),
         };
+        truncate_search_to_budget(&mut result);
         check_search_size(&result)?;
         Ok(result)
     }

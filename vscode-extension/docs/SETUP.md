@@ -127,6 +127,7 @@ with a 4GiB ceiling. Manual limits are documented in the
 | `READ_RANGE_OUT_OF_BOUNDS` | Use the reported line count or locate the current lines. |
 | No native tools in a chat | Check the extension host and agent tool settings. Registration is not proof of per-chat exposure. |
 | `No matching client connected` / `Client ... disconnected before completing cctxNative*` | The agent host lost its native-tool client, not the source index. Use MCP for this user turn; reconnect the Agents window, then rediscover native tools on the next foreground user turn. |
+| `Running cctxNative* on another client... Skip?` / `cctxNative* was skipped from another client` | Another or stale VS Code window client owns client-tool routing for that chat. Click **Skip?** once if prompted; the agent switches to `code-context-code_*` MCP for that chat so later lookups do not block. |
 | No WSL log updates | Windows Agents calls are logged in the Windows output channel. |
 
 MCP remains available independently of the foreground native-tool client. A

@@ -151,7 +151,7 @@ pub fn render(style: PromptStyle, target: PromptTarget, root: Option<&Path>) -> 
             "# CCTX Formula Spec\n\
 Priority: #cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* / code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg, view, read_file, glob)\n\
 Dispatch:\n\
-- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read)\n\
+- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read & !(1..150 -> 151..300 slicing))\n\
 - filename | glob (!content) => #cctxNativeFiles / code_files (root={root_binding}, glob=G)\n\
 - content (a|b => regex=true) => #cctxNativeGrep / code_grep (root={root_binding}, max_matches_per_file: 1..64)\n\
 - range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/) => #cctxNativeRead / code_read (root={root_binding}, lines <= 150, < 8KiB; > 150 => page=true -> next_ranges -> complete=true)\n\
@@ -164,7 +164,7 @@ Transitions:\n\
 - CACHE_LOAD_FAILED => Host read ; STALE_INDEX => #cctxNativeRead | Host live read ; TARGET_NOT_INDEXED != absent\n\
 - READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) & do not repeat ; code_sync <=> exhaustive absence claims only (never per edit)\n\
 - target in {{.github, .vscode, ignored, secrets, /tmp}} => Host policy-aware tools only & do not retry CCTX. Never use another transport to bypass an exclusion, trust decision or access denial.\n\
-- Error(\"No matching client connected\" | disconnected) => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
+- Error(\"No matching client connected\" | disconnected | \"skipped from another client\" | \"not available on this client\") => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
 - Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*). Do not duplicate a still-pending lookup or poll Status."
         ),
         (PromptTarget::Instructions, PromptStyle::Hybrid) => format!(
@@ -176,7 +176,7 @@ applyTo: \"**\"\n\
 CCTX is an optional accelerator (nonblocking root cache), not a prerequisite.\n\
 Priority: #cctxNativeContext / #cctxNative*{{Read,Grep,Files}} (code-context-native_*) > MCP(code-context-code_* / code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg, view, read_file, grep_search, glob). Never start with Host search/read for saved source.\n\
 Dispatch:\n\
-- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read)\n\
+- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read & !(1..150 -> 151..300 slicing))\n\
 - filename | glob (!content) => #cctxNativeFiles / code_files (root={root_binding}, glob=G)\n\
 - content (a|b => regex=true) => #cctxNativeGrep / code_grep (root={root_binding}, max_matches_per_file: 1..64)\n\
 - range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/) => #cctxNativeRead / code_read (root={root_binding}, lines <= 150, < 8KiB; > 150 => page=true -> next_ranges -> complete=true)\n\
@@ -192,7 +192,7 @@ Transitions & Fallback:\n\
 - READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) & do not repeat ; code_sync <=> exhaustive absence claims only (never per edit)\n\
 - target in {{.github, .vscode, ignored, secrets, /tmp}} => Host policy-aware tools only & do not retry CCTX. Never use another transport to bypass an exclusion, trust decision or access denial.\n\
 - TTL: idle >= 15m | LRU => evict. Do not enumerate or prepare sibling worktrees speculatively (authorize-worktrees is operator-only).\n\
-- Error(\"No matching client connected\" | disconnected) => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
+- Error(\"No matching client connected\" | disconnected | \"skipped from another client\" | \"not available on this client\") => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
 - Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*). Do not duplicate a still-pending lookup or poll Status; safe boundary => cctx --root /project doctor."
         ),
         (PromptTarget::Instructions, PromptStyle::Prose) => format!(
@@ -208,7 +208,7 @@ Native-first: when `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep` an
 | Filename or path glob (`*.ts`, `src/**/*.rs`, bare stem; not content) | `#cctxNativeFiles` / `code_files` |\n\
 | Exact or regex content search (`regex: true` for `a\\|b`) | `#cctxNativeGrep` / `code_grep` |\n\
 | Known ranges (`path:line:col`, `path#Lstart-Lend`, `doc.md#slug`, `@/` aliases) | `#cctxNativeRead` / `code_read` |\n\n\
-- Swap, do not fall back: `view`/`read_file` on a known path or range -> `#cctxNativeRead` (`path:start-end`); `rg`/`grep` -> `#cctxNativeGrep`; `glob`/`find` -> `#cctxNativeFiles`. Keep using them after the first lookup.\n\
+- Swap, do not fall back: `view`/`read_file` on a known path or range -> `#cctxNativeRead` (`path:start-end`); `rg`/`grep` -> `#cctxNativeGrep`; `glob`/`find` -> `#cctxNativeFiles`. Keep using them after the first lookup. Never slice a file across turns (`1..150` -> `151..300`) or chain `grep` -> `read` when `#cctxNativeContext` (`paths=[file]`, `radius=25..50`) or batched `ranges` can answer in one turn.\n\
 - Pass the absolute `root` (`{root_binding}`) when the workspace or worktree is known (WSL, subagents, multi-root).\n\
 - Keep each read to `<=150` lines (`<8KiB`) and set `max_matches_per_file` on broad searches so output stays inline; context radius is 0..100, limit 1..64. For large reads use `page=true` and follow `next_ranges` until `complete=true`. Responses that hit the inline budget report `inline_notice` and `next_ranges`.\n\
 - Before editing, use `#cctxNativeContext` (`radius >= 8`) or `#cctxNativeRead` (`around_line` + `radius`) so the first edit has exact indentation, full signatures and 3+ unique context lines.\n\
@@ -222,7 +222,7 @@ Native-first: when `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep` an
 - Hidden paths (`.github`, `.vscode`), ignored files and secrets stay excluded: use host policy-aware tools without retrying CCTX or widening access. Never use another transport to bypass an exclusion, trust decision or access denial. Empty results do not cover files outside registered scopes.\n\
 - Inactive roots may be evicted after at least 15 minutes (longer for busy roots) or under memory pressure. Do not enumerate or prepare sibling worktrees speculatively; the first lookup of an operator-authorized worktree prepares it (`cctx --root /parent authorize-worktrees` is an operator action, not an agent action).\n\n\
 ## Fallback order\n\n\
-1. If a native call fails with `No matching client connected` or `Client ... disconnected`, switch at once to `code-context-code_*` MCP tools or `cctx --backend shared --root /actual/root`, not built-in tools.\n\
+1. If a native call fails with `No matching client connected`, `Client ... disconnected`, `skipped from another client`, or `not available on this client`, switch at once to `code-context-code_*` MCP tools or `cctx --backend shared --root /actual/root`, not built-in tools.\n\
 2. In unattended/background sessions that depend on foreground host dispatch, prefer backend MCP (prefer backend MCP `code_*` whenever native dispatch is unavailable). A native timeout is not proof the index is slow or stale. Do not duplicate a still-pending lookup or repeatedly poll native Status; cancel the pending call when the host allows, then use backend MCP.\n\
 3. If both surfaces are blocked but a terminal works, use `cctx --backend shared --root /actual/root` with `files '*.ts' --limit 20` or `read src/example.ts 1 80`. It is the same daemon and cannot repair `CACHE_MISS`.\n\
 4. Use built-in search/read only when both surfaces are unavailable, the workspace is unregistered, the target is unsaved or excluded, or Code Context returns an error.\n\n\
@@ -246,7 +246,7 @@ Background/unattended session without native dispatch => prefer these backend MC
   - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status) > CLI (tctx --root {root_binding} run) > bash`\n\
   - `Guards`: always pass explicit absolute `root` (`{root_binding}`); `cctxNativeContext(limit <= 64, radius: 0..100)`; `cctxNativeRead(lines <= 120, < 8KiB)`; `target in {{.github/*, .vscode/*, .gitignore, /tmp/*}} => view directly (!CCTX)`.\n\
   - `Deferred`: if tools are not visible, call `tool_search` first with `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
-  - `Transitions`: `Error(\"No matching client connected\") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
+  - `Transitions`: `Error(\"No matching client connected\" | \"skipped from another client\") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
         ),
         (PromptTarget::SubagentYaml, PromptStyle::Prose) => format!(
             "  # [cctx-subagent-instructions]\n\
@@ -256,7 +256,7 @@ Background/unattended session without native dispatch => prefer these backend MC
     2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Keep `cctxNativeContext` `limit <= 64` (`radius 0..100`) and keep `cctxNativeRead` / `code_read` batches `<= 120` total lines (`<8KiB`) so responses stay inline.\n\
     3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` files to Code Context; use `view` directly for those.\n\
     4. If Code Context or Test Context tools are deferred or not visible in your active tool list, call `tool_search` (`tool_search_tool`) FIRST with exact names: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
-    5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No matching client connected\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
+    5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No matching client connected\"` or `\"skipped from another client\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
     6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n\
     7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph`) FIRST before `bash`, passing the explicit absolute `root`.\n"
         ),
@@ -286,7 +286,8 @@ Background/unattended session without native dispatch => prefer these backend MC
             " "
         });
         rendered.push_str(
-            "Recovery: dispatch-error MCP fallback lasts only for the current user turn. \
+            "Recovery: dispatch-error MCP fallback lasts only for the current user turn \
+(except `\"skipped from another client\"`, which means another client owns client-tool routing for this chat — stay on `code-context-code_*` MCP for this chat so calls do not block on `Running ... on another client`). \
 On the next foreground user turn, rediscover native tools and try one needed source lookup: \
 success => Native-first; dispatch error => MCP for that turn. \
 Never duplicate a pending call or poll Status; background/unattended sessions without native dispatch stay on MCP.",
@@ -1211,6 +1212,7 @@ mod tests {
     fn foreground_prompts_recover_native_priority_after_dispatch_failure() {
         let required = [
             "dispatch-error MCP fallback lasts only for the current user turn",
+            "skipped from another client",
             "next foreground user turn",
             "rediscover native tools and try one needed source lookup",
             "success => Native-first; dispatch error => MCP for that turn",

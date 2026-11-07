@@ -36,22 +36,31 @@ or MCP-only clients, see the [setup guide](vscode-extension/docs/SETUP.md) and
 [backend reference](docs/REFERENCE.md). Marketplace and GitHub VSIX distribution
 use the same extension identity.
 
-## Measured performance & token acceleration
+## Measured performance, `cctx usage` example & token acceleration
+
+```sh
+$ cctx usage --hours 2        # or: cctx usage --hours 24 --json
+⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: 2.0h)
+💰 COST SAVED (@$0.001/AIC) : +$2.42 USD (-28.4% of baseline bill · ~2421.6 AIC saved)
+💎 API LIST VALUE (@$0.01)  : +$24.22 USD | 🔥 TOKENS SAVED: ~86.02M tok (244 Turns + 35x Cache + BPE)
+🧬 BPE FORMULA COMPRESSION  : 100.0% (4/4 surfaces: ext·mcp·subagent·global · ~2100 tok/turn)
+🎯 WARM CACHE HIT RATE      :  98.6% (506/513) | 🚀 ELIGIBLE SOURCE ADOPTION: 98.5% (513/521)
+```
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-mixed retrieval suite averaged **15.20× faster with a warm CCTX cache**
-(95% CI **14.53–15.84×**, up from 6.83× in v0.14): **4.450 → 0.293 ms per operation**, with a **29.115 ms** cold sync median (down from 98.813 ms in v0.14).
+mixed retrieval suite averaged **14.92× faster with a warm CCTX cache**
+(95% CI **14.17–15.80×**, up from 6.83× in v0.14): **4.246 → 0.284 ms per operation**, with a **28.675 ms** cold sync median (down from 98.813 ms in v0.14).
 Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%**, rich document (`#toc` / `#slide-N`) reads by **86.3–98.9%**, and end-to-end coding agent wall time by **24.7%**.
 
 ![Retrieval latency, paired-session speedup, Rust/Python token savings, and agent acceleration](benchmarks/results/aks-store-demo/latency-speedup.png)
 
 | Retrieval task (AKS Store Demo) | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.923 ms | 0.307 ms | 16.03× |
-| Literal search | 5.885 ms | 0.289 ms | 20.35× |
-| Search + context | 5.935 ms | 0.317 ms | 18.70× |
-| Known file read + hash | **0.083 ms** | 0.251 ms | **0.33× — slower** |
-| Fixed mixed suite | 4.450 ms | 0.293 ms | 15.20× |
+| Filename discovery | 4.724 ms | 0.304 ms | 15.54× |
+| Literal search | 5.574 ms | 0.273 ms | 20.41× |
+| Search + context | 5.680 ms | 0.319 ms | 17.80× |
+| Known file read + hash | **0.085 ms** | 0.234 ms | **0.36× — slower** |
+| Fixed mixed suite | 4.246 ms | 0.284 ms | 14.92× |
 
 | Token & agent acceleration benchmark | Baseline (`rg` + `view`) | With CCTX (`code_context` / `code_read`) | Reduction / speedup |
 |---|---:|---:|---:|
@@ -61,11 +70,11 @@ Replacing multi-turn `rg` + `view` reads with one block-clamped `code_context` c
 | Copilot A/B agent tool calls & LLM turns | 7.00 calls / 5.00 turns | **2.67 calls / 3.67 turns** | **-61.9% calls · -26.7% turns** |
 | Copilot A/B agent payload tokens & AIU cost | 6,360 tok / 4.76B nanoAIU | **3,177 tok / 3.55B nanoAIU** | **-50.0% tokens · -25.4% cost** |
 | Copilot A/B end-to-end task wall time | 20.31 s | **15.30 s** (100% accuracy both) | **-24.7% completion time** |
-| Live multi-session telemetry (`cctx usage --hours 24`) | Unmonitored | **Per-model tokens, 96.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
+| Live multi-session telemetry (`cctx usage --hours 24`) | Unmonitored | **Per-model tokens, 98.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
 | Auto-loaded agent instructions & `cctx prompt --compress` | 9,127 B / 2,048 tok prose | **BPE-aligned formula spec (`756 tok`, EN/KO `--compress`)** | **-63.1% instruction tokens** |
 
 Eight daemon sessions, 40 rounds, 28 tasks, **8,960 correctness-checked pairs**.
-Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.837 ms median**, not a warm-cache speedup.
+Off bypasses CCTX with ripgrep/direct read/hash; on uses daemon RPC. Small known reads are faster without IPC. A cold miss plus fallback had a **4.491 ms median**, not a warm-cache speedup.
 See [method, cold-start chart, token suites, raw samples, and reproduction](docs/BENCHMARKS.md) for uncertainty and limitations.
 
 ## Learn more

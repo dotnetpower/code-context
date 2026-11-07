@@ -76,8 +76,8 @@ void test('extension details expose resources and numeric benchmarks before inst
     assert.ok(readme.includes(`[${link}](`));
   }
   assert.match(readme, /native right-hand Resources panel uses Marketplace metadata/);
-  for (const text of ['4.923 ms', '0.307 ms', '5.885 ms', '0.289 ms', '5.935 ms',
-    '0.317 ms', '0.083 ms', '0.251 ms', '4.450', '0.293', '15.20', 'slower']) {
+  for (const text of ['4.724 ms', '0.304 ms', '5.574 ms', '0.273 ms', '5.680 ms',
+    '0.319 ms', '0.085 ms', '0.234 ms', '4.246', '0.284', '14.92', 'slower']) {
     assert.ok(readme.includes(text), text);
   }
   assert.match(readme, /!\[.*\]\(resources\/benchmark\.png\)/);
@@ -143,6 +143,7 @@ void test('manifest contributes exactly the seven registered native tools', asyn
   assert.match(contributedInstructions, /cctx --backend shared --root/);
   assert.match(contributedInstructions, /Do not duplicate a still-pending lookup/);
   assert.match(contributedInstructions, /dispatch-error MCP fallback lasts only for the current user turn/);
+  assert.match(contributedInstructions, /skipped from another client/);
   assert.match(contributedInstructions, /next foreground user turn, rediscover native tools and try one needed source lookup/);
   assert.match(contributedInstructions, /success => Native-first; dispatch error => MCP for that turn/);
   assert.match(contributedInstructions, /Never duplicate a pending call or poll Status/);

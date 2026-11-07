@@ -36,13 +36,13 @@ fn build_tools() -> Value {
                 "Use FIRST for filename/path glob discovery, NOT content."
             }
             Some("code_grep") => {
-                "Use FIRST for saved-source search. Literal by default; Set regex=true for alternation (a|b)."
+                "Use FIRST for saved-source search (or prefer code_context when you also need surrounding lines). Literal by default; Set regex=true for alternation (a|b)."
             }
             Some("code_context") => {
-                "Use FIRST for a symbol plus nearby saved source in ONE call. Literal by default; Set regex=true for alternation (a|b)."
+                "Use FIRST for a symbol plus nearby saved source in ONE call (replaces code_grep + code_read and avoids 1..150 -> 151..300 slicing). Literal by default; Set regex=true for alternation (a|b)."
             }
             _ => {
-                "Use FIRST for known saved-source ranges (keep <=150 lines per call to stay inline) with live SHA-256 verification."
+                "Use FIRST for known saved-source ranges (keep <=150 lines per call to stay inline; prefer code_context first to locate symbols instead of sequential 1..150 -> 151..300 slicing) with live SHA-256 verification."
             }
         };
         tool["description"] = json!(format!(
@@ -72,6 +72,66 @@ fn build_tools() -> Value {
 pub fn dispatch(request: Value) -> Option<Value> {
     let mut pending_traces = std::collections::VecDeque::new();
     dispatch_with_root(request, None, None, &mut pending_traces)
+}
+
+fn compact_mcp_read_payload(text: String) -> String {
+    if !text.contains("\"notice\":") {
+        return text;
+    }
+    let Ok(mut parsed) = serde_json::from_str::<Value>(&text) else {
+        return text;
+    };
+    let snippets_opt = if parsed.is_array() {
+        parsed.as_array_mut()
+    } else {
+        parsed.get_mut("snippets").and_then(Value::as_array_mut)
+    };
+    let Some(snippets) = snippets_opt else {
+        return text;
+    };
+    let mut modified = false;
+    for item in snippets.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(notice) = obj.get("notice").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1);
+        let end = obj.get("end").and_then(Value::as_u64).unwrap_or(start);
+        let sha = obj
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let exact_overlap_tag = format!("OVERLAP_READ: lines {start}..{end} already read");
+        if let Some(lines) = obj.get_mut("lines").and_then(Value::as_array_mut) {
+            if notice.contains(&exact_overlap_tag) && lines.len() >= 30 {
+                let omitted = lines.len() - 8;
+                let tail: Vec<Value> = lines.split_off(lines.len() - 4);
+                lines.truncate(4);
+                let short_sha = &sha[..12.min(sha.len())];
+                lines.push(json!(format!(
+                    "... [{omitted} unchanged lines ({}..{}) omitted on exact duplicate read; sha256={short_sha} unchanged — reuse prior context] ...",
+                    start + 4,
+                    end - 4
+                )));
+                lines.extend(tail);
+                modified = true;
+            }
+            if notice.contains("SEQUENTIAL_SLICE")
+                && let Some(first_str) = lines.first().and_then(Value::as_str).map(str::to_owned)
+            {
+                lines[0] = json!(format!("{first_str}  /* [CCTX_OUTLINE: {notice}] */"));
+                modified = true;
+            }
+        }
+    }
+    if modified {
+        serde_json::to_string(&parsed).unwrap_or(text)
+    } else {
+        text
+    }
 }
 
 fn flush_pending_traces(
@@ -1198,7 +1258,7 @@ fn tool_call(
     {
         return Err(invalid("reserved internal trace argument").into());
     }
-    if (name == "code_status" || pending_traces.len() >= 64) && !pending_traces.is_empty() {
+    if !pending_traces.is_empty() {
         let items: Vec<Value> = pending_traces.drain(..).collect();
         arguments.insert(daemon::PREV_TRACE_ARGUMENT.into(), Value::Array(items));
     }
@@ -1248,6 +1308,11 @@ fn tool_call(
             object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
             return Ok(serde_json::to_string(&value)?);
         }
+        let text = if name == "code_read" {
+            compact_mcp_read_payload(text)
+        } else {
+            text
+        };
         return Ok(crate::inline_budget::fit_inline(name, root_text.as_deref(), text));
     }
     let mut value = daemon::request(&request)?;

@@ -959,7 +959,13 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                 bucket = "cache_load_failed"
             elif "explicit absolute Linux root" in err or "not inside a registered workspace" in err or "not explicitly registered" in err:
                 bucket = "missing_or_unregistered_root"
-            elif "READ_POLICY_DENIED" in err or "TARGET_NOT_INDEXED" in err or "only non-hidden" in err:
+            elif (
+                "READ_POLICY_DENIED" in err
+                or "TARGET_NOT_INDEXED" in err
+                or "only non-hidden" in err
+                or "max_file_bytes" in err
+                or "binary file or file larger than configured limit" in err
+            ):
                 bucket = "policy_or_hidden_target"
             elif "READ_RANGE_" in err or "radius 0.." in err or "exceeds snapshot EOF" in err or "maximum 500 lines" in err:
                 bucket = "range_or_limit_bounds"
@@ -967,7 +973,13 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                 bucket = "response_budget_exceeded"
             elif "READ_UNAVAILABLE" in err or "unavailable after automatic recovery" in err:
                 bucket = "file_unavailable"
-            elif "No matching client connected" in err or "disconnected before completing" in err:
+            elif (
+                "No matching client connected" in err
+                or "disconnected before completing" in err
+                or "skipped from another client" in err
+                or "not available on this client" in err
+                or "clientUnavailable" in err
+            ):
                 bucket = "client_disconnected"
             else:
                 bucket = "other_error"

@@ -527,6 +527,35 @@ class AdoptionAuditTests(unittest.TestCase):
             self.assertIn("tool_search_diagnostics", report)
             self.assertIn("subagent_cctx_failure_breakdown", report)
 
+    def test_skipped_from_another_client_is_classified_as_client_disconnected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sess_dir = Path(directory) / "sess-skip"
+            sess_dir.mkdir(parents=True)
+            trace = sess_dir / "events.jsonl"
+            records = [
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:01Z",
+                    "data": {
+                        "toolName": "cctxNativeRead",
+                        "toolCallId": "skip-1",
+                        "arguments": {"ranges": [{"path": "src/lib.rs", "start": 1, "end": 10}]},
+                    },
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:02Z",
+                    "data": {
+                        "toolCallId": "skip-1",
+                        "success": False,
+                        "error": {"message": "cctxNativeRead was skipped from another client", "code": "cancelled"},
+                    },
+                },
+            ]
+            trace.write_text("\n".join(map(json.dumps, records)))
+            report = MODULE.build_report([trace], 24, now=1_800_000_010)
+            self.assertEqual(report["cctx_failure_breakdown"].get("client_disconnected"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

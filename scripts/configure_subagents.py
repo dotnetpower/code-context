@@ -65,7 +65,7 @@ YAML_PROMPT_BLOCK = """\
     2. Always pass the explicit absolute `root` parameter (shown in `<environment_context>` or your task prompt). Keep `cctxNativeContext` `limit <= 64` (`radius 0..100`) and keep `cctxNativeRead` / `code_read` batches `<= 120` total lines (`<8KiB`) so responses stay inline.
     3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` files to Code Context; use `view` directly for those.
     4. If Code Context or Test Context tools are deferred or not visible in your active tool list, call `tool_search` (`tool_search_tool`) FIRST with exact names: `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status"`.
-    5. If a native `cctxNative*` or `tctxNative*` call fails with `"No matching client connected"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root <root>` / `tctx --root <root> run` CLI).
+    5. If a native `cctxNative*` or `tctxNative*` call fails with `"No matching client connected"` or `"skipped from another client"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root <root>` / `tctx --root <root> run` CLI).
     6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.
     7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph`) FIRST before `bash`, passing the explicit absolute `root`.
 """
@@ -88,7 +88,7 @@ YAML_FORMULA_PROMPT_BLOCK = """\
   - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status) > CLI (tctx --root <root> run) > bash`
   - `Guards`: always pass explicit absolute `root`; `cctxNativeContext(limit <= 64, radius: 0..100)`; `cctxNativeRead(lines <= 120, < 8KiB)`; `target in {.github/*, .vscode/*, .gitignore, /tmp/*} => view directly (!CCTX)`.
   - `Deferred`: if tools are not visible, call `tool_search` first with `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status"`.
-  - `Transitions`: `Error("No matching client connected") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+  - `Transitions`: `Error("No matching client connected" | "skipped from another client") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
 """
 
 MD_FORMULA_PROMPT_BLOCK = """

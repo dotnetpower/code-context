@@ -274,6 +274,7 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     start: number;
     end: number;
     sha: string;
+    notice?: string;
     rawLines: readonly JsonValue[];
     label: string;
   }> = [];
@@ -284,6 +285,7 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     const start = integerValue(item.start, `${label} start`, 1);
     const end = integerValue(item.end, `${label} end`, start);
     const sha = stringValue(item.sha256, `${label} sha256`);
+    const notice = typeof item.notice === 'string' && item.notice.length > 0 ? item.notice : undefined;
     const rawLines = arrayValue(item.lines, `${label} lines`);
     if (rawLines.length !== end - start + 1) {
       throw new Error(
@@ -295,7 +297,7 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
         stringValue(rawLines[lineIndex], `${label} line ${lineIndex}`);
       }
     }
-    validated.push({ path, start, end, sha, rawLines, label });
+    validated.push({ path, start, end, sha, ...(notice ? { notice } : {}), rawLines, label });
   }
   if (validated.length === 0) {
     return 'snippets=0';
@@ -349,6 +351,11 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
     previousSha = item.sha;
     output.push(header);
     used += utf8Bytes(header) + 1;
+    if (item.notice !== undefined) {
+      const noticeLine = `NOTICE ${item.notice}`;
+      output.push(noticeLine);
+      used += utf8Bytes(noticeLine) + 1;
+    }
     for (const line of keptLines) {
       output.push(line);
       used += utf8Bytes(line) + 1;

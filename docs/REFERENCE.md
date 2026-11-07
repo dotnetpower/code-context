@@ -73,13 +73,28 @@ hybrid (`hybrid`), or prose (`prose`) instructions for `.instructions.md`, MCP
 code-lookup task prompts into symbolic formula prompts with token-savings telemetry.
 
 `cctx usage` also reports per-tool failure causes (`client_disconnected`,
-`cache_miss`, `range_out_of_bounds`, ...), P95/P99 latency, offloaded outputs,
-built-in fallbacks with the CCTX tool to use instead, per-workspace adoption,
-shared-stall detection (slow calls from several sessions finishing at the same
-instant), host-dispatch delay from the native `CCTX_TRACE` timing footer,
-and optimization advisories (long sessions, spend concentration, models with no
-CCTX calls, offload and cold-cache rates). `--json` adds `insights` and the
-savings-model `assumptions`.
+`cache_miss`, `range_out_of_bounds`, `response_budget_exceeded`, `file_unavailable`, ...),
+P95/P99 latency, offloaded outputs, built-in fallbacks with the CCTX tool to use
+instead, per-workspace adoption, shared-stall detection (slow calls from several
+sessions finishing at the same instant), host-dispatch delay from the native
+`CCTX_TRACE` timing footer, and optimization advisories (`long_session`,
+`spend_concentration`, `model_without_cctx`, `low_context_share`, `offload_rate`,
+`other_tool_offload`, `cache_miss_rate`, `client_disconnected`). `--json` adds
+`insights` and the savings-model `assumptions`:
+
+```sh
+$ cctx usage --hours 2
+╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║ ⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: 2.0h)                                           ║
+╠═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ 💰 COST SAVED (@$0.001/AIC) :  +$2.42     USD   (-28.4% of baseline bill · ~2421.6 AIC saved)                           ║
+║ 💎 API LIST VALUE (@$0.01)  :  +$24.22    USD   (Frontier API list price: $2/$0.10/$10 per 1M)                          ║
+║ 🔥 TOKENS SAVED             :  ~86.02M    tok   (Payload ~851.3K + 35x Cache ~29.80M + ~244 Turns ~53.68M + BPE ~1.69M) ║
+║ 🧬 BPE FORMULA COMPRESSION  :  ██████████ 100.0%  (4/4 surfaces: ext·mcp·subagent·global · ~2100 tok/turn · +$0.93)     ║
+║ 🎯 WARM CACHE HIT RATE      :  ██████████  98.6%  (506 warm hits / 513 CCTX lookups)                                    ║
+║ 🚀 ELIGIBLE SOURCE ADOPTION :  ██████████  98.5%  (513/521 · excl. 21 /tmp & 3 pre-edit)                                ║
+╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+```
 
 Native tool results carry `started_unix_ms` and `total_ms` in the `CCTX_TRACE`
 footer. Calls slower than 5 s also log a warning and append a `CCTX_SLOW` line

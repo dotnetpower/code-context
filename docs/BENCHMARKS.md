@@ -2,9 +2,9 @@
 
 ## Result and scope
 
-The fixed mixed suite took **4.450 ms per operation without CCTX** and
-**0.293 ms with a warm CCTX cache**: **15.20x** speedup, 95% confidence interval
-**14.53–15.84x**, or **93.4% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before the optimization rounds and persistent `CCTXJ1` IPC framing).
+The fixed mixed suite took **4.246 ms per operation without CCTX** and
+**0.284 ms with a warm CCTX cache**: **14.92x** speedup, 95% confidence interval
+**14.17–15.80x**, or **93.3% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before the optimization rounds and persistent `CCTXJ1` IPC framing).
 This is a retrieval microbenchmark, **not** a claim of faster LLM generation,
 VS Code chat, model tool selection, token savings, or whole-agent completion.
 
@@ -18,14 +18,14 @@ improvements. Known reads are deliberately retained in the mixed suite.
 
 | Task | Pairs | Off mean | On mean | Speedup [95% CI] |
 |---|---:|---:|---:|---:|
-| Filename discovery | 1,920 | 4.923 ms | 0.307 ms | 16.03x [15.47, 16.60] |
-| Literal search | 2,560 | 5.885 ms | 0.289 ms | 20.35x [19.25, 21.47] |
-| Search + context | 2,560 | 5.935 ms | 0.317 ms | 18.70x [17.85, 19.47] |
-| Known read + hash | 1,920 | 0.083 ms | 0.251 ms | 0.332x [0.315, 0.350] |
-| Fixed mixed suite | 8,960 | 4.450 ms | 0.293 ms | 15.20x [14.53, 15.84] |
+| Filename discovery | 1,920 | 4.724 ms | 0.304 ms | 15.54x [14.32, 16.93] |
+| Literal search | 2,560 | 5.574 ms | 0.273 ms | 20.41x [19.38, 21.62] |
+| Search + context | 2,560 | 5.680 ms | 0.319 ms | 17.80x [17.18, 18.60] |
+| Known read + hash | 1,920 | 0.085 ms | 0.234 ms | 0.362x [0.345, 0.378] |
+| Fixed mixed suite | 8,960 | 4.246 ms | 0.284 ms | 14.92x [14.17, 15.80] |
 
-Mixed-suite p95: **8.435 ms off / 0.449 ms on**. This is a pooled descriptive
-percentile, not a confidence bound. Small known-file reads are **3.0x slower**
+Mixed-suite p95: **7.461 ms off / 0.501 ms on**. This is a pooled descriptive
+percentile, not a confidence bound. Small known-file reads are **2.8x slower**
 through IPC; direct buffered reads avoid request, policy, JSON, and socket
 overhead. CCTX is not the fastest path for every operation.
 
@@ -112,9 +112,9 @@ plus normal ripgrep fallback versus a normal off lookup. B: explicit source
 sync/load barrier measured separately; this is setup, not ordinary lookup
 latency. Daemon process startup and metadata registration are excluded.
 
-- Off lookup median: **4.626 ms**
-- Cold miss plus fallback median: **4.837 ms**
-- Subsequent explicit sync median: **29.115 ms** (down from **41.241 ms** in v0.22.0 and **98.813 ms** in v0.14 — **3.39× faster cold index build**)
+- Off lookup median: **4.491 ms**
+- Cold miss plus fallback median: **4.491 ms**
+- Subsequent explicit sync median: **28.675 ms** (down from **41.241 ms** in v0.22.0 and **98.813 ms** in v0.14 — **3.45× faster cold index build**)
 
 The off cold-control lookup runs first in each session; this small descriptive
 sample is not randomized like the warm pairs and is not assigned a confidence

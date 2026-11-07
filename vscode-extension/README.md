@@ -19,20 +19,28 @@ Publisher: **dotnetpower**. Previous VSIX users: [migration steps](docs/SETUP.md
 VS Code's native right-hand Resources panel uses Marketplace metadata.
 For VSIX-only installations, use the links above instead.
 
-## Performance
+## Performance & `cctx usage` example
+
+```sh
+$ cctx usage --hours 2        # or: cctx usage --hours 24 --json
+⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: 2.0h)
+💰 COST SAVED (@$0.001/AIC) : +$2.42 USD (-28.4% of baseline bill · ~2421.6 AIC saved)
+💎 API LIST VALUE (@$0.01)  : +$24.22 USD | 🔥 TOKENS SAVED: ~86.02M tok (244 Turns + 35x Cache + BPE)
+🎯 WARM CACHE HIT RATE      :  98.6% (506/513) | 🚀 ELIGIBLE SOURCE ADOPTION: 98.5% (513/521)
+```
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-retrieval mix averaged **15.20× faster** with a warm CCTX cache
-(95% CI **14.53–15.84×**, up from 6.83× in v0.14): **4.450 → 0.293 ms per operation**, with a **29.115 ms** cold sync median (down from 98.813 ms in v0.14).
+retrieval mix averaged **14.92× faster** with a warm CCTX cache
+(95% CI **14.17–15.80×**, up from 6.83× in v0.14): **4.246 → 0.284 ms per operation**, with a **28.675 ms** cold sync median (down from 98.813 ms in v0.14).
 Replacing separate `rg` + `view` calls with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%**, rich document (`#toc` / `#slide-N`) reads by **86.3–98.9%**, and reduces end-to-end coding agent wall time by **24.7%**.
 
 | Task | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.923 ms | 0.307 ms | 16.03× |
-| Literal search | 5.885 ms | 0.289 ms | 20.35× |
-| Search + context | 5.935 ms | 0.317 ms | 18.70× |
-| Known read + hash | **0.083 ms** | 0.251 ms | **0.33× — slower** |
-| Fixed mixed suite | 4.450 ms | 0.293 ms | 15.20× |
+| Filename discovery | 4.724 ms | 0.304 ms | 15.54× |
+| Literal search | 5.574 ms | 0.273 ms | 20.41× |
+| Search + context | 5.680 ms | 0.319 ms | 17.80× |
+| Known read + hash | **0.085 ms** | 0.234 ms | **0.36× — slower** |
+| Fixed mixed suite | 4.246 ms | 0.284 ms | 14.92× |
 
 | Token & agent acceleration suite | Baseline (`rg` + `view`) | With CCTX (`code_context` / `code_read`) | Savings / speedup |
 |---|---:|---:|---:|
@@ -40,7 +48,7 @@ Replacing separate `rg` + `view` calls with one block-clamped `code_context` cal
 | Python 6-symbol lookup tokens | 13,997 tok (100L) / 24,609 tok (200L) | **2,141 tok** (**13.16×** faster) | **-84.7% to -91.3% tokens** |
 | Rich documents (`.pptx`/`.docx`/`.md` `#toc` & `#slide-N`) | Full-document read | **Virtual `#toc` + `#slide-N-M` (5.4× faster DEFLATE)** | **-86.3% to -98.9% tokens** |
 | Copilot A/B agent turns & cost | 7.00 calls / 5.00 turns / 20.31 s | **2.67 calls / 3.67 turns / 15.30 s** | **-50.0% tok · -25.4% AIU · -24.7% time** |
-| Live status bar & `cctx usage` telemetry | Unmonitored | **Per-model tokens, 96.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
+| Live status bar & `cctx usage` telemetry | Unmonitored | **Per-model tokens, 98.6% warm hit & AIC/$USD savings** | **-10% to -39% session bill** |
 | Auto-loaded instructions & `cctx prompt` | 9,127 B / 2,048 tok prose | **BPE-aligned formula spec (`756 tok`, EN/KO `--compress`)** | **-63.1% instruction tokens** |
 
 ![Warm retrieval latency, speedup, Rust/Python token savings, and agent acceleration](resources/benchmark.png)
