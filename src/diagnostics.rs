@@ -277,7 +277,7 @@ pub fn coverage() -> Result<Value> {
         };
         match spec
             .workspace()
-            .and_then(|workspace| workspace.files_limited(&spec.policy))
+            .and_then(|workspace| workspace.files_limited_skip_oversized(&spec.policy))
         {
             Ok(inventory) => {
                 let mut files: Vec<_> = inventory
@@ -739,7 +739,96 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    usage_from_home(&state_home, hours, now, daemon_status, as_json)
+    let registered_specs = catalog::load().unwrap_or_default();
+    usage_from_home(&state_home, hours, now, daemon_status, &registered_specs, as_json)
+}
+
+fn first_target_path_str(args: &Value) -> Option<&str> {
+    if let Some(s) = args.get("path").or_else(|| args.get("filePath")).and_then(Value::as_str) {
+        return Some(s);
+    }
+    if let Some(p) = args.get("paths") {
+        if let Some(s) = p.as_str() {
+            return Some(s);
+        }
+        if let Some(arr) = p.as_array() {
+            return arr.iter().find_map(Value::as_str);
+        }
+    }
+    if let Some(arr) = args.get("ranges").and_then(Value::as_array) {
+        return arr
+            .iter()
+            .find_map(|r| r.get("path").or_else(|| r.get("filePath")).and_then(Value::as_str));
+    }
+    None
+}
+
+fn infer_call_workspace(
+    tool: &str,
+    args: &Value,
+    session_cwd: Option<&str>,
+    registered_specs: &[crate::catalog::Spec],
+    git_root_cache: &mut std::collections::BTreeMap<String, Option<String>>,
+) -> (Option<String>, Option<String>, bool) {
+    let explicit_root = args.get("root").and_then(Value::as_str);
+    let raw_target = first_target_path_str(args);
+    let probe_abs: Option<PathBuf> = if let Some(r) = explicit_root.filter(|s| s.starts_with('/')) {
+        Some(PathBuf::from(r))
+    } else if let Some(t) = raw_target.filter(|s| s.starts_with('/')) {
+        let clean = t.split('#').next().unwrap_or(t);
+        Some(PathBuf::from(clean))
+    } else {
+        session_cwd.filter(|s| s.starts_with('/')).map(PathBuf::from)
+    };
+    let Some(probe) = probe_abs else {
+        return (session_cwd.map(str::to_owned), None, false);
+    };
+    if let Some(spec) = registered_specs
+        .iter()
+        .filter(|s| probe.starts_with(&s.root))
+        .max_by_key(|s| s.root.components().count())
+    {
+        let mut oversized = false;
+        if classify_tool_group(tool) == "builtin_search_read"
+            && let Some(t) = raw_target
+        {
+            let clean = t.split('#').next().unwrap_or(t);
+            let candidate = if clean.starts_with('/') {
+                PathBuf::from(clean)
+            } else {
+                spec.root.join(clean)
+            };
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.is_file()
+                && meta.len() > spec.policy.max_file_bytes as u64
+            {
+                oversized = true;
+            }
+        }
+        return (Some(spec.root.to_string_lossy().into_owned()), None, oversized);
+    }
+    if registered_specs.is_empty() {
+        return (session_cwd.map(str::to_owned), None, false);
+    }
+    let cache_key = probe
+        .parent()
+        .unwrap_or(probe.as_path())
+        .to_string_lossy()
+        .into_owned();
+    let git_root = git_root_cache
+        .entry(cache_key)
+        .or_insert_with(|| {
+            probe
+                .ancestors()
+                .take(8)
+                .find(|anc| anc.join(".git").exists())
+                .map(|anc| anc.to_string_lossy().into_owned())
+        })
+        .clone();
+    if let Some(repo) = git_root {
+        return (Some(repo.clone()), Some(repo), false);
+    }
+    (session_cwd.map(str::to_owned), None, false)
 }
 
 fn usage_from_home(
@@ -747,6 +836,7 @@ fn usage_from_home(
     hours: f64,
     now: f64,
     daemon_status: Option<Value>,
+    registered_specs: &[crate::catalog::Spec],
     as_json: bool,
 ) -> Result<String> {
     let cutoff = now - hours * 3600.0;
@@ -811,6 +901,7 @@ fn usage_from_home(
         agent_id: String,
         seq: usize,
         cwd: Option<String>,
+        unregistered_root: Option<String>,
         tool: String,
         target: String,
         model: Option<String>,
@@ -842,6 +933,8 @@ fn usage_from_home(
     let mut calls: std::collections::BTreeMap<(String, String), CallRec> = std::collections::BTreeMap::new();
     let mut session_cwds: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut active_sessions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut git_root_cache: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
     let mut seq_counter: usize = 0;
 
     for path in &session_files {
@@ -973,20 +1066,28 @@ fn usage_from_home(
                     .or_else(|| args.get("filePath"))
                     .map(Value::to_string)
                     .unwrap_or_default();
-                let non_source_host_only = classify_tool_group(&tool) == "builtin_search_read"
-                    && [
-                        "/tmp/",
-                        "copilot-tool-output",
-                        "/.copilot",
-                        "/.github",
-                        "/.vscode",
-                        ".png",
-                        ".jpg",
-                        ".pdf",
-                        ".vsix",
-                    ]
-                    .iter()
-                    .any(|p| target.contains(p));
+                let (effective_cwd, unregistered_root, oversized_host_only) = infer_call_workspace(
+                    &tool,
+                    &args,
+                    cwd.as_deref(),
+                    registered_specs,
+                    &mut git_root_cache,
+                );
+                let non_source_host_only = oversized_host_only
+                    || (classify_tool_group(&tool) == "builtin_search_read"
+                        && [
+                            "/tmp/",
+                            "copilot-tool-output",
+                            "/.copilot",
+                            "/.github",
+                            "/.vscode",
+                            ".png",
+                            ".jpg",
+                            ".pdf",
+                            ".vsix",
+                        ]
+                        .iter()
+                        .any(|p| target.contains(p)));
                 let call_model = data
                     .get("model")
                     .and_then(Value::as_str)
@@ -999,7 +1100,8 @@ fn usage_from_home(
                 entry.session = session_id.clone();
                 entry.agent_id = agent_id;
                 entry.seq = seq_counter;
-                entry.cwd = cwd.clone();
+                entry.cwd = effective_cwd;
+                entry.unregistered_root = unregistered_root;
                 entry.tool = tool.clone();
                 entry.target = target;
                 entry.model = call_model;
@@ -1361,6 +1463,7 @@ fn usage_from_home(
             payload_tokens: c.payload_tokens,
             eligible_lookup: is_eligible_lookup(&c),
             sequential_slice: c.sequential_slice,
+            unregistered_root: c.unregistered_root.clone(),
         })
         .collect();
     let session_facts: Vec<SessionFacts> = active_sessions
@@ -1793,7 +1896,16 @@ fn usage_from_home(
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| b.3.cmp(&a.3))
     });
-    let session_rows: Vec<Vec<String>> = session_vec.into_iter().take(12).map(|item| item.4).collect();
+    let non_trivial_cnt = session_vec
+        .iter()
+        .filter(|s| !(s.2 <= 1 && s.3 == 0 && s.1 < 10.0))
+        .count();
+    let session_rows: Vec<Vec<String>> = session_vec
+        .into_iter()
+        .filter(|s| non_trivial_cnt < 6 || !(s.2 <= 1 && s.3 == 0 && s.1 < 10.0))
+        .take(12)
+        .map(|item| item.4)
+        .collect();
     lines.push(render_box_table(
         "3. TOP SESSIONS BY LLM SPEND, CACHE HIT & COST SAVINGS (Top 12)",
         &[
@@ -1959,7 +2071,7 @@ mod trace_timing_tests {
         std::fs::write(sess_dir.join("events.jsonl"), body).unwrap();
 
         let now = super::event_unix_ts(&json!({"timestamp": "2026-11-12T20:05:00Z"})).unwrap();
-        let raw = super::usage_from_home(home.path(), 24.0, now, None, true).unwrap();
+        let raw = super::usage_from_home(home.path(), 24.0, now, None, &[], true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let ts = &parsed["token_summary"];
         // c1 (1600 direct) was re-read on turn 2 (despite interleaved subagent!) and stopped at turn 3 compaction => 1600 compounded!

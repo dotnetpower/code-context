@@ -431,7 +431,7 @@ impl Workspace {
         self.files_limited_inner(policy, false)
     }
 
-    pub(crate) fn files_limited_skip_oversized(
+    pub fn files_limited_skip_oversized(
         &self,
         policy: &MemoryPolicy,
     ) -> Result<FileInventory> {

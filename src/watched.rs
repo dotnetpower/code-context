@@ -42,6 +42,8 @@ mod io_tests {
         assert_eq!(lease_multiplier(50), 2);
         assert_eq!(lease_multiplier(199), 2);
         assert_eq!(lease_multiplier(200), 4);
+        assert_eq!(lease_multiplier(499), 4);
+        assert_eq!(lease_multiplier(500), 8);
         let (_root, mut watched) = fixture();
         assert!(!watched.idle_for(Duration::from_secs(60)));
         watched.last_used = Instant::now() - Duration::from_secs(90);
@@ -505,6 +507,33 @@ mod io_tests {
             notice2.contains("L140:pub fn unread_target_fn"),
             "{notice2}"
         );
+        // Batched multi-range reads in 1 call and distant targeted jumps must NOT trigger SEQUENTIAL_SLICE.
+        let batched = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[
+                    {"path":"sliced.rs","start":1,"end":20},
+                    {"path":"sliced.rs","start":135,"end":155}
+                ]}),
+                true,
+            )
+            .unwrap();
+        assert!(
+            batched[1]
+                .get("notice")
+                .and_then(Value::as_str)
+                .is_none_or(|n| !n.contains("SEQUENTIAL_SLICE")),
+            "{batched}"
+        );
+        let jumped = watched
+            .call_with_mode(
+                "code_read",
+                json!({"ranges":[{"path":"sliced.rs","start":140,"end":160}]}),
+                true,
+            )
+            .unwrap();
+        let jump_notice = jumped[0].get("notice").and_then(Value::as_str).unwrap_or("");
+        assert!(!jump_notice.contains("SEQUENTIAL_SLICE"), "{jump_notice}");
     }
 }
 
@@ -517,7 +546,8 @@ pub(crate) fn lease_multiplier(lookups: u64) -> u32 {
     match lookups {
         0..50 => 1,
         50..200 => 2,
-        _ => 4,
+        200..500 => 4,
+        _ => 8,
     }
 }
 const ROOT_RUNTIME_HEADROOM: usize = 160 * 1024 * 1024;
@@ -566,7 +596,7 @@ pub struct Watched {
         crate::workspace::Workspace,
         crate::workspace::CandidatePolicy,
     )>,
-    file_read_streaks: BTreeMap<String, u32>,
+    file_read_streaks: BTreeMap<String, (usize, usize, u32, Instant)>,
     recent_read_history: std::collections::VecDeque<(String, String, usize, usize)>,
 }
 
@@ -3045,6 +3075,8 @@ impl Watched {
         let Some(items) = snippets_val.as_array_mut() else {
             return;
         };
+        let is_batch_call = items.len() > 1;
+        let mut seen_in_call: BTreeSet<String> = BTreeSet::new();
         for item in items.iter_mut() {
             let Some(obj) = item.as_object_mut() else {
                 continue;
@@ -3104,10 +3136,27 @@ impl Watched {
             if self.file_read_streaks.len() >= 128 && !self.file_read_streaks.contains_key(&path) {
                 self.file_read_streaks.clear();
             }
-            let streak = {
-                let entry = self.file_read_streaks.entry(path.clone()).or_insert(0);
-                *entry = entry.saturating_add(1);
-                *entry
+            let now_inst = Instant::now();
+            let first_in_call = seen_in_call.insert(path.clone());
+            let streak = if is_batch_call {
+                self.file_read_streaks.insert(path.clone(), (start, end, 1, now_inst));
+                1
+            } else if !first_in_call {
+                1
+            } else {
+                let next_streak = match self.file_read_streaks.get(&path) {
+                    Some(&(prev_s, prev_e, prev_streak, last_at))
+                        if last_at.elapsed() <= Duration::from_secs(300)
+                            && start <= prev_e.saturating_add(25)
+                            && end > prev_s =>
+                    {
+                        prev_streak.saturating_add(1)
+                    }
+                    _ => 1,
+                };
+                self.file_read_streaks
+                    .insert(path.clone(), (start, end, next_streak, now_inst));
+                next_streak
             };
             if streak >= 2
                 && end < total_lines

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.25.4
+
+- Eliminate Linux cgroup v2 `memory.high` reclaim stalls (`16s–25s` tail latency)
+  and transient warm-root purges: evict and trim userspace memory before
+  lowering kernel cgroup limits, debounce single-sample external memory dips,
+  recover immediately from `<2 GiB` emergency floors, and clear admission
+  `CACHE_LOAD_FAILED` cooldowns as soon as free RAM recovers.
+- Raise the systemd service I/O read/write guard (`SERVICE_READ_BPS`:
+  `32 MB/s -> 256 MB/s`, `SERVICE_WRITE_BPS`: `1 MB/s -> 16 MB/s`) for 8x faster
+  NVMe cold index loads, and add an 8x (2-hour) idle lease tier for busy roots
+  with `500+` lookups.
+- Fix false-positive `SEQUENTIAL_SLICE` notices on single-call multi-range
+  batches and targeted distant line jumps, skip individual oversized
+  (`> max_file_bytes`) files during `cctx plan`/`register`/`migrate`/`coverage`
+  so large JSON/data fixtures no longer block workspace registration, extend the
+  native workspace registry cache TTL (`15s -> 120s`), and add cross-repo target
+  attribution, oversized host-only filtering, and the `unregistered_workspace`
+  advisory to `cctx usage`.
+
 ## 0.25.3
 
 - Replay `cctx usage` token and AIC cost savings per `(session, agent)` stream

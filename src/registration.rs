@@ -255,7 +255,7 @@ pub const DEFAULT_SOURCE_GLOBS: &[&str] = &[
 
 pub fn plan(spec: &Spec) -> Result<Value> {
     let workspace = spec.workspace()?;
-    let inventory = workspace.files_limited(&spec.policy)?;
+    let inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
     let watches = workspace
         .watch_directories_for(inventory.files.iter().map(PathBuf::as_path), &spec.policy)?;
     Ok(json!({
@@ -322,7 +322,7 @@ pub fn migrate(
 
 fn validate_source(spec: &Spec) -> Result<()> {
     let workspace = spec.workspace()?;
-    let inventory = workspace.files_limited(&spec.policy)?;
+    let inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
     let mut source_bytes = 0usize;
     let mut lines = 0usize;
     let mut errors = Vec::new();

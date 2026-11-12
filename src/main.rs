@@ -292,7 +292,7 @@ fn run() -> Result<()> {
                 )
                 .into());
             }
-            let inventory = workspace.files_limited(&spec.policy)?;
+            let inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
             let watch_directories = workspace.watch_directories_for(
                 inventory.files.iter().map(PathBuf::as_path),
                 &spec.policy,

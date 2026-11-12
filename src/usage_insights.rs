@@ -39,6 +39,7 @@ pub struct CallFacts {
     pub payload_tokens: u64,
     pub eligible_lookup: bool,
     pub sequential_slice: bool,
+    pub unregistered_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -299,6 +300,22 @@ fn advisories(
                 message: format!(
                     "Workspace {workspace} adoption {adoption:.1}% ({}/{lookups}): check root registration, exclusions and instruction loading.",
                     stat.cctx
+                ),
+            });
+        }
+    }
+    let mut unreg_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for call in calls.iter().filter(|c| c.group == "builtin_search_read" && c.eligible_lookup) {
+        if let Some(ref root) = call.unregistered_root {
+            *unreg_counts.entry(root.as_str()).or_default() += 1;
+        }
+    }
+    for (root, count) in unreg_counts {
+        if count >= 5 {
+            out.push(Advisory {
+                code: "unregistered_workspace",
+                message: format!(
+                    "Unregistered repo {root} had {count} built-in source lookups: run `cctx --root {root} --allow-root-scope register` to index it."
                 ),
             });
         }

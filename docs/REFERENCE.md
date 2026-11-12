@@ -78,9 +78,9 @@ P95/P99 latency, offloaded outputs, built-in fallbacks with the CCTX tool to use
 instead, per-workspace adoption, shared-stall detection (slow calls from several
 sessions finishing at the same instant), host-dispatch delay from the native
 `CCTX_TRACE` timing footer, and optimization advisories (`long_session`,
-`spend_concentration`, `model_without_cctx`, `low_context_share`,
-`sequential_slicing`, `offload_rate`, `other_tool_offload`, `cache_miss_rate`,
-`client_disconnected`). Cost and token savings are trace-replayed per
+`spend_concentration`, `model_without_cctx`, `unregistered_workspace`,
+`low_context_share`, `sequential_slicing`, `offload_rate`,
+`other_tool_offload`, `cache_miss_rate`, `client_disconnected`). Cost and token savings are trace-replayed per
 `(session, agent)` stream using each turn's `copilotUsage.tokenDetails` rates,
 pre-compaction history re-reads, and warm-turn context sizes; `--json` adds
 `insights` and the savings-model `assumptions`:

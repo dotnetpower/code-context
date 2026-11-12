@@ -19,11 +19,11 @@ UMask=0077
 TasksMax=96
 LimitNOFILE=16384
 MemoryAccounting=yes
-CPUWeight=20
+CPUWeight=80
 IOAccounting=yes
-IOWeight=10
-IOReadBandwidthMax=%h 32M
-IOWriteBandwidthMax=%h 1M
+IOWeight=50
+IOReadBandwidthMax=%h 256M
+IOWriteBandwidthMax=%h 16M
 
 [Install]
 WantedBy=default.target

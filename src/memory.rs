@@ -285,23 +285,33 @@ impl Controller {
     }
 
     pub fn refresh(&mut self, worker_active: bool) -> Result<()> {
-        if self.policy.is_none() || self.last_sample.elapsed() < Duration::from_secs(5) {
+        if !self.refresh_limits()? {
             return Ok(());
+        }
+        self.sync_kernel_limits(!worker_active)
+    }
+
+    pub fn refresh_limits(&mut self) -> Result<bool> {
+        if self.policy.is_none() || self.last_sample.elapsed() < Duration::from_secs(5) {
+            return Ok(false);
         }
         self.last_sample = Instant::now();
         let next = self.sample()?;
         self.consider(next);
-        self.apply_kernel_limits(!worker_active)?;
         self.last_error = None;
-        Ok(())
+        Ok(true)
+    }
+
+    pub fn sync_kernel_limits(&self, can_shrink: bool) -> Result<()> {
+        self.apply_kernel_limits(can_shrink)
     }
 
     fn consider(&mut self, next: Limits) {
         let change = next.max.abs_diff(self.limits.max);
         let threshold = (64 * MIB).max(self.limits.max / 10);
+        let can_grow = self.limits.max < 2 * GIB || self.last_growth.elapsed() >= Duration::from_secs(30);
         if next.max < self.limits.max && change >= 16 * MIB
-            || next.max > self.limits.max && change >= threshold
-                && self.last_growth.elapsed() >= Duration::from_secs(30)
+            || next.max > self.limits.max && change >= threshold && can_grow
         {
             if next.max > self.limits.max { self.last_growth = Instant::now(); }
             self.limits = next;
@@ -452,5 +462,14 @@ mod tests {
             }
         }
         assert!(raw.page_aligned(0).is_err());
+    }
+
+    #[test]
+    fn emergency_floor_recovers_immediately_without_waiting_thirty_seconds() {
+        let mut controller = Controller::default();
+        controller.consider(Limits::fixed(RUNTIME_FLOOR));
+        assert_eq!(controller.limits.max, RUNTIME_FLOOR);
+        controller.consider(Limits::fixed(16 * GIB));
+        assert_eq!(controller.limits.max, 16 * GIB);
     }
 }

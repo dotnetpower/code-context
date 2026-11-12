@@ -33,8 +33,8 @@ const MIN_COLD_RETRY_RESERVE: usize = 128 * 1024 * 1024;
 const CACHE_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const IDLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const SERVICE_READ_BPS: u64 = 32_000_000;
-const SERVICE_WRITE_BPS: u64 = 1_000_000;
+const SERVICE_READ_BPS: u64 = 256_000_000;
+const SERVICE_WRITE_BPS: u64 = 16_000_000;
 type WireResult = std::result::Result<Value, String>;
 pub(crate) const TRACE_ARGUMENT: &str = "_cctx_trace";
 pub(crate) const PREV_TRACE_ARGUMENT: &str = "_cctx_prev_trace";
@@ -760,6 +760,7 @@ pub struct Server {
     cache_misses: u64,
     background_results: BTreeMap<u64, WireResult>,
     last_pressure_check: Option<std::time::Instant>,
+    pressure_shrink_streak: u8,
     last_idle_maintenance: Option<std::time::Instant>,
     idle_timeout: Duration,
     active_connections: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -792,6 +793,7 @@ impl Default for Server {
             cache_misses: 0,
             background_results: BTreeMap::new(),
             last_pressure_check: None,
+            pressure_shrink_streak: 0,
             last_idle_maintenance: None,
             idle_timeout: IDLE_ROOT_TIMEOUT,
             active_connections: None,
@@ -2079,18 +2081,47 @@ impl Server {
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
             self.last_pressure_check = Some(std::time::Instant::now());
-            if let Err(error) = self.memory.refresh(self.background.is_some()) {
-                self.memory.last_error = Some(error.to_string());
-                eprintln!("CCTX_MEMORY_REFRESH_FAILED {error}");
+            let prev_target = self.memory.limits.target;
+            let refreshed = match self.memory.refresh_limits() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.memory.last_error = Some(error.to_string());
+                    eprintln!("CCTX_MEMORY_REFRESH_FAILED {error}");
+                    false
+                }
+            };
+            if self.memory.limits.target > prev_target {
+                self.pressure_shrink_streak = 0;
+                self.cache_failures
+                    .retain(|_, (_, err)| !err.contains("resident admission budget exceeded"));
             }
-            while self.roots.len() > self.memory.limits.root_limit()
-                || self.roots.values().map(Watched::estimated_bytes).sum::<usize>()
-                    > self.available_cache_budget()
-            {
-                let Some(root) = self.eviction_candidate(None) else { break; };
-                self.evict(&root, "adaptive_memory_budget");
+            let total_est = self.roots.values().map(Watched::estimated_bytes).sum::<usize>();
+            let over_budget = self.roots.len() > self.memory.limits.root_limit()
+                || total_est > self.available_cache_budget();
+            if over_budget {
+                self.pressure_shrink_streak = self.pressure_shrink_streak.saturating_add(1);
+                if self.pressure_shrink_streak >= 2 || total_est > self.memory.limits.high {
+                    while self.roots.len() > self.memory.limits.root_limit()
+                        || self.roots.values().map(Watched::estimated_bytes).sum::<usize>()
+                            > self.available_cache_budget()
+                    {
+                        let Some(root) = self.eviction_candidate(None) else { break; };
+                        self.evict(&root, "adaptive_memory_budget");
+                    }
+                    release_allocator_memory();
+                }
+            } else {
+                self.pressure_shrink_streak = 0;
             }
             self.relieve_memory_pressure();
+            if refreshed {
+                let can_shrink = self.background.is_none()
+                    && self.pressure_usage_bytes() < self.memory.limits.high;
+                if let Err(error) = self.memory.sync_kernel_limits(can_shrink) {
+                    self.memory.last_error = Some(error.to_string());
+                    eprintln!("CCTX_MEMORY_REFRESH_FAILED {error}");
+                }
+            }
         }
         Ok(())
     }
@@ -3013,7 +3044,7 @@ mod tests {
 
     #[test]
     fn service_io_guard_preserves_stricter_limits_and_rejects_invalid_values() {
-        assert_eq!(service_io_guard_rule("8:48","").unwrap(),"8:48 rbps=32000000 wbps=1000000");
+        assert_eq!(service_io_guard_rule("8:48","").unwrap(),"8:48 rbps=256000000 wbps=16000000");
         let existing="8:48 rbps=16000000 wbps=500000 riops=80 wiops=40\n";
         assert_eq!(service_io_guard_rule("8:48",existing).unwrap(),"8:48 rbps=16000000 wbps=500000");
         assert!(service_io_guard_rule("8:48","8:48 rbps=invalid wbps=max").is_err());
