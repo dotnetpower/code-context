@@ -13,6 +13,8 @@ const CACHE_MISS_RATE_ALERT: f64 = 0.02;
 const MIN_MODEL_TURNS: usize = 20;
 const MIN_WORKSPACE_LOOKUPS: usize = 20;
 const LOW_ADOPTION_PERCENT: f64 = 60.0;
+const MIN_SEQUENTIAL_SLICES: usize = 10;
+const SEQUENTIAL_SLICE_SHARE_ALERT: f64 = 0.10;
 
 /// Calls slower than this are treated as stalled for stall and host-delay analysis.
 pub const SLOW_CALL_MS: f64 = 5_000.0;
@@ -36,6 +38,7 @@ pub struct CallFacts {
     pub duration_ms: Option<f64>,
     pub payload_tokens: u64,
     pub eligible_lookup: bool,
+    pub sequential_slice: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,6 +373,26 @@ fn advisories(
             ),
         });
     }
+    let read_calls = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.tool.as_str(),
+                "cctxNativeRead" | "code-context-code_read" | "code_read" | "code-context-native_codeRead"
+            )
+        })
+        .count();
+    let seq_slices = calls.iter().filter(|c| c.sequential_slice).count();
+    let read_denom = read_calls.max(seq_slices);
+    if seq_slices >= MIN_SEQUENTIAL_SLICES && ratio(seq_slices, read_denom) >= SEQUENTIAL_SLICE_SHARE_ALERT {
+        out.push(Advisory {
+            code: "sequential_slicing",
+            message: format!(
+                "{seq_slices}/{read_denom} ({:.1}%) CCTX reads triggered SEQUENTIAL_SLICE (0 avoided-turn credit): jump via #cctxNativeContext, around_line+radius, or batch multiple ranges in 1 call.",
+                100.0 * ratio(seq_slices, read_denom)
+            ),
+        });
+    }
     let context_calls = calls
         .iter()
         .filter(|c| matches!(c.tool.as_str(), "cctxNativeContext" | "code-context-code_context" | "code_context"))
@@ -677,5 +700,20 @@ mod tests {
         let text = insights.render().join("\n");
         assert!(text.contains("cctxNativeGrep") && text.contains("OPTIMIZATION ADVISORIES"));
         assert_eq!(insights.to_json()["builtin_fallbacks"][0]["replace_with"], "cctxNativeGrep");
+    }
+
+    #[test]
+    fn sequential_slicing_advisory_triggers_above_threshold() {
+        let mut sliced = call("cctxNativeRead", "native");
+        sliced.sequential_slice = true;
+        let mut calls: Vec<CallFacts> = (0..12).map(|_| sliced.clone()).collect();
+        calls.extend((0..20).map(|_| call("cctxNativeRead", "native")));
+        let insights = analyze(&calls, &[], &[], 0, 0);
+        let adv = insights
+            .advisories
+            .iter()
+            .find(|a| a.code == "sequential_slicing")
+            .expect("sequential_slicing advisory");
+        assert!(adv.message.contains("12/32 (37.5%)"), "{}", adv.message);
     }
 }

@@ -220,10 +220,149 @@ def estimate_call_tokens_saved(tool: str, arguments: dict, payload_tokens: int, 
     return 0
 
 
-def avoided_turns_for_call(tool: str, turn_compressed: bool, success: bool | None) -> float:
+def extract_token_rates(usage: dict) -> tuple[float, float, float, float]:
+    r_in, r_cr, r_cw, r_out = 200e-6, 10e-6, 0.0, 1000e-6
+    cu = usage.get("copilotUsage")
+    if isinstance(cu, dict):
+        for item in cu.get("tokenDetails") or []:
+            if not isinstance(item, dict):
+                continue
+            batch = float(item.get("batchSize") or 1_000_000)
+            cost_nano = float(item.get("costPerBatch") or 0)
+            if batch <= 0:
+                continue
+            rate = (cost_nano / 1e9) / batch
+            tt = item.get("tokenType")
+            if tt == "input":
+                r_in = rate
+            elif tt == "cache_read":
+                r_cr = rate
+            elif tt == "cache_write":
+                r_cw = rate
+            elif tt == "output":
+                r_out = rate
+    return r_in, r_cr, r_cw, r_out
+
+
+def cold_prefix_rate(cache_write_tokens: int, r_in: float, r_cw: float) -> float:
+    return r_cw if (cache_write_tokens > 0 and r_cw > 0.0) else r_in
+
+
+def avoided_turns_for_call(
+    tool: str,
+    turn_compressed: bool,
+    success: bool | None,
+    arguments: dict | None = None,
+    sequential_slice: bool = False,
+) -> float:
     if success is not True or classify(tool) not in {"native", "mcp"} or not is_lookup_tool(tool):
         return 0.0
-    return 1.0 if turn_compressed else 0.25
+    if tool.endswith(("code_context", "codeContext", "NativeContext")):
+        return 1.0
+    if tool.endswith(("code_read", "codeRead", "NativeRead")):
+        if sequential_slice:
+            return 0.0
+        args = arguments if isinstance(arguments, dict) else {}
+        ranges = args.get("ranges")
+        if isinstance(ranges, list) and len(ranges) > 1:
+            return min(3.0, 0.65 * (len(ranges) - 1) + 0.35)
+        if turn_compressed:
+            return 1.0
+        if "around_line" in args:
+            return 0.5
+        return 0.25
+    return 0.25
+
+
+def attach_trace_savings(calls: list[dict], usage_records: list[dict]) -> None:
+    streams: dict[tuple[str, str], list[dict]] = {}
+    for rec in usage_records:
+        key = (str(rec.get("channel") or ""), str(rec.get("agent_stream") or "main"))
+        streams.setdefault(key, []).append(rec)
+    stream_meta: dict[tuple[str, str], tuple[list[dict], list[int], float, float]] = {}
+    for key, tlist in streams.items():
+        tlist.sort(key=lambda r: float(r.get("timestamp") or 0.0))
+        resets = [
+            i
+            for i in range(1, len(tlist))
+            if tlist[i - 1].get("input_tokens", 0) > 60_000
+            and tlist[i].get("input_tokens", 0) < tlist[i - 1].get("input_tokens", 0) * 0.65
+        ]
+        warm = [r for r in tlist if r.get("cache_read_tokens", 0) > 0]
+        sample = warm if warm else tlist
+
+        def eff_aic(r: dict) -> float:
+            nano = int(r.get("nano_aiu") or 0)
+            if nano > 0:
+                return nano / 1e9
+            r_in, r_cr, r_cw, r_out = r.get("token_rates", (200e-6, 10e-6, 0.0, 1000e-6))
+            unc = max(0, int(r.get("input_tokens") or 0) - int(r.get("cache_read_tokens") or 0) - int(r.get("cache_write_tokens") or 0))
+            return (
+                unc * r_in
+                + int(r.get("cache_read_tokens") or 0) * r_cr
+                + int(r.get("cache_write_tokens") or 0) * r_cw
+                + int(r.get("output_tokens") or 0) * r_out
+            )
+
+        denom = max(1, len(sample))
+        mean_warm_aic = sum(eff_aic(r) for r in sample) / denom
+        mean_warm_in = sum(float(r.get("input_tokens") or 0) for r in sample) / denom
+        stream_meta[key] = (tlist, resets, mean_warm_aic, mean_warm_in)
+
+    for call in calls:
+        stok = int(call.get("estimated_tokens_saved") or 0)
+        av = avoided_turns_for_call(
+            call.get("tool", ""),
+            bool(call.get("turn_compressed")),
+            call.get("success"),
+            call.get("arguments"),
+            bool(call.get("sequential_slice")),
+        )
+        call["avoided_turns"] = av
+        if stok == 0 and av == 0.0:
+            call["compounded_tokens_saved"] = 0
+            call["payload_saved_aic"] = 0.0
+            call["turn_saved_tokens"] = 0
+            call["turn_saved_aic"] = 0.0
+            call["saved_aic"] = 0.0
+            continue
+        ch = str(call.get("channel") or "")
+        ast = str(call.get("agent_stream") or "main")
+        meta = stream_meta.get((ch, ast)) or stream_meta.get((ch, "main"))
+        if meta and meta[0]:
+            tlist, resets, mean_warm_aic, mean_warm_in = meta
+            t_ref = float(call.get("completed_at") or call.get("started_at") or 0.0)
+            pos = next((i for i, r in enumerate(tlist) if float(r.get("timestamp") or 0.0) >= t_ref), None)
+            comp_tok = 0
+            if pos is not None:
+                end_pos = next((x for x in resets if x > pos), len(tlist))
+                t0 = tlist[pos]
+                r_in, _, r_cw, _ = t0.get("token_rates", (200e-6, 10e-6, 0.0, 1000e-6))
+                p_aic = stok * cold_prefix_rate(int(t0.get("cache_write_tokens") or 0), r_in, r_cw)
+                for j in range(pos + 1, end_pos):
+                    tj = tlist[j]
+                    rj_in, rj_cr, rj_cw, _ = tj.get("token_rates", (200e-6, 10e-6, 0.0, 1000e-6))
+                    prev_in = max(1.0, float(tlist[j - 1].get("input_tokens") or 1))
+                    hf = min(1.0, max(0.0, float(tj.get("cache_read_tokens") or 0) / prev_in))
+                    rate_j = hf * rj_cr + (1.0 - hf) * cold_prefix_rate(int(tj.get("cache_write_tokens") or 0), rj_in, rj_cw)
+                    p_aic += stok * rate_j
+                    comp_tok += stok
+            else:
+                tl = tlist[-1]
+                r_in, _, r_cw, _ = tl.get("token_rates", (200e-6, 10e-6, 0.0, 1000e-6))
+                p_aic = stok * cold_prefix_rate(int(tl.get("cache_write_tokens") or 0), r_in, r_cw)
+            t_aic = av * mean_warm_aic
+            t_tok = int(round(av * mean_warm_in))
+        else:
+            comp_tok = stok * 35
+            p_aic = stok * 0.00055
+            t_aic = av * 4.20
+            t_tok = int(round(av * 220_000))
+        call["compounded_tokens_saved"] = comp_tok
+        call["payload_saved_aic"] = p_aic
+        call["turn_saved_tokens"] = t_tok
+        call["turn_saved_aic"] = t_aic
+        call["saved_aic"] = p_aic + t_aic
 
 
 def outcome_counts(calls: list[dict]) -> dict:
@@ -403,10 +542,26 @@ def session_adoption(calls: list[dict], sample_limit: int, usage_records: list[d
     used_aic = round(nano_aiu / 1e9, 4) if nano_aiu else 0.0
     direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in all_cctx)
     turn_compressed = sum(1 for call in all_cctx if call.get("success") is True and call.get("turn_compressed"))
-    avoided_turns = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in all_cctx)
-    turn_saved = int(round(avoided_turns * 220_000))
-    compounded_saved = direct_saved * 35
-    saved_aic = round((direct_saved * 0.00055) + (avoided_turns * 4.20), 4)
+    avoided_turns = sum(
+        call.get(
+            "avoided_turns",
+            avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success"), call.get("arguments"), bool(call.get("sequential_slice"))),
+        )
+        for call in all_cctx
+    )
+    turn_saved = sum(call.get("turn_saved_tokens", int(round(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) * 220_000))) for call in all_cctx)
+    compounded_saved = sum(call.get("compounded_tokens_saved", call.get("estimated_tokens_saved", 0) * 35) for call in all_cctx)
+    saved_aic = round(
+        sum(
+            call.get(
+                "saved_aic",
+                (call.get("estimated_tokens_saved", 0) * 0.00055)
+                + (avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) * 4.20),
+            )
+            for call in all_cctx
+        ),
+        4,
+    )
     eligible_lookup = [
         call for call in lookup
         if not call.get("non_source_host_only") and not call.get("pre_edit_view")
@@ -555,6 +710,8 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                             "duration_ms": float(usage.get("duration") or 0.0),
                             "ttft_ms": float(usage.get("timeToFirstTokenMs") or 0.0),
                             "nano_aiu": int(nano_aiu or 0),
+                            "agent_stream": str(agent_id) if is_subagent and agent_id else "main",
+                            "token_rates": extract_token_rates(usage),
                         })
                     continue
                 params = event.get("params", {})
@@ -625,6 +782,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     ) if is_subagent else "main"
                     call["is_subagent"] = is_subagent
                     call["agent_role"] = agent_role
+                    call["agent_stream"] = str(agent_id) if is_subagent and agent_id else "main"
                     fallback_model, fallback_display = (
                         last_model_by_agent.get(str(agent_id), (last_session_model, last_session_display))
                         if is_subagent
@@ -702,6 +860,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     call["payload_chars"] = payload_chars
                     call["payload_tokens"] = payload_tokens
                     call["offloaded"] = text_payload.startswith("Output too large to read at once")
+                    call["sequential_slice"] = "SEQUENTIAL_SLICE #" in text_payload
                     if call.get("tool") == "tool_search_tool":
                         call["tool_search_cctx_hit"] = any(
                             token in text_payload
@@ -728,6 +887,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
             call.get("payload_tokens", 0),
             call.get("success"),
         )
+    attach_trace_savings(list(calls.values()), usage_records)
     tool_counts = Counter(call["tool"] for call in calls.values())
     success_counts = Counter(
         call["tool"] for call in calls.values() if call["success"] is True
@@ -841,11 +1001,10 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
         ttfts = sorted(rec["ttft_ms"] for rec in m_records if rec["ttft_ms"] > 0)
         direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in m_cctx)
         turn_comp = sum(1 for call in m_cctx if call.get("success") is True and call.get("turn_compressed"))
-        m_avoided_turns = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in m_cctx)
-        turn_saved = int(round(m_avoided_turns * 220_000))
-        m_compounded_saved = direct_saved * 35
+        turn_saved = sum(call.get("turn_saved_tokens", 0) for call in m_cctx)
+        m_compounded_saved = sum(call.get("compounded_tokens_saved", 0) for call in m_cctx)
         used_aic = round(nano_aiu / 1e9, 4) if nano_aiu else 0.0
-        saved_aic = round((direct_saved * 0.00055) + (m_avoided_turns * 4.20), 4)
+        saved_aic = round(sum(call.get("saved_aic", 0.0) for call in m_cctx), 4)
         m_sessions = {rec["channel"] for rec in m_records} | {call["channel"] for call in m_calls}
         m_eligible_lookup = [
             call for call in m_lookup
@@ -903,11 +1062,10 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     cctx_payload = sum(call.get("payload_tokens", 0) for call in cctx_calls)
     builtin_payload = sum(call.get("payload_tokens", 0) for call in builtin_lookup_calls)
     direct_saved_all = sum(call.get("estimated_tokens_saved", 0) for call in cctx_calls)
-    compounded_saved_all = direct_saved_all * 35
+    compounded_saved_all = sum(call.get("compounded_tokens_saved", 0) for call in cctx_calls)
     turn_comp_all = sum(1 for call in cctx_calls if call.get("success") is True and call.get("turn_compressed"))
-    avoided_turns_all = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in cctx_calls)
-    turn_saved_all = int(round(avoided_turns_all * 220_000))
-    total_saved_aic = round((direct_saved_all * 0.00055) + (avoided_turns_all * 4.20), 4)
+    turn_saved_all = sum(call.get("turn_saved_tokens", 0) for call in cctx_calls)
+    total_saved_aic = round(sum(call.get("saved_aic", 0.0) for call in cctx_calls), 4)
     cctx_outcomes_all = outcome_counts(cctx_calls)
     cctx_warm_all = max(0, len(cctx_calls) - cctx_outcomes_all["expected_cache_misses"] - cctx_outcomes_all["cache_load_failures"])
     eligible_lookup_all = [
@@ -1013,11 +1171,9 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
         r_builtin = [call for call in r_lookup if classify(call["tool"]) == "builtin_search_read"]
         r_outcomes = outcome_counts(r_cctx)
         r_warm = max(0, len(r_cctx) - r_outcomes["expected_cache_misses"] - r_outcomes["cache_load_failures"])
-        r_direct_saved = sum(call.get("estimated_tokens_saved", 0) for call in r_cctx)
-        r_avoided = sum(avoided_turns_for_call(call["tool"], bool(call.get("turn_compressed")), call.get("success")) for call in r_cctx)
         r_nano = sum(rec.get("nano_aiu", 0) for rec in r_records)
         r_used_aic = round(r_nano / 1e9, 4) if r_nano else 0.0
-        r_saved_aic = round((r_direct_saved * 0.00055) + (r_avoided * 4.20), 4)
+        r_saved_aic = round(sum(call.get("saved_aic", 0.0) for call in r_cctx), 4)
         subagent_usage[role] = {
             "agent_role": role,
             "is_subagent": role != "main",

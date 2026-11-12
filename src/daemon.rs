@@ -969,17 +969,7 @@ impl Server {
             return Err(self.request_cache(root)?.into());
         }
         let compact = request.compact;
-        let root_budget = if self.roots.len() <= 1 {
-            self.available_cache_budget()
-        } else {
-            self.available_cache_budget().saturating_sub(
-                self.roots
-                    .iter()
-                    .filter(|(path, _)| **path != root)
-                    .map(|(_, entry)| entry.estimated_bytes())
-                    .sum::<usize>(),
-            )
-        };
+        let root_budget = self.active_root_budget(&root);
         let entry = self
             .roots
             .get_mut(&root)
@@ -1096,6 +1086,46 @@ impl Server {
 
     fn available_cache_budget(&self) -> usize {
         self.memory.limits.target.saturating_sub(self.background.as_ref().map_or(0, |job| job.budget))
+    }
+
+    fn active_root_budget(&mut self, root: &PathBuf) -> usize {
+        let needed_for_active = self
+            .roots
+            .get(root)
+            .map_or(0, |entry| {
+                entry
+                    .estimated_bytes()
+                    .saturating_add(entry.spec.policy.max_staged_bytes)
+            })
+            .min(self.available_cache_budget());
+        while self.roots.len() > 1
+            && self
+                .roots
+                .iter()
+                .filter(|(path, _)| *path != root)
+                .map(|(_, entry)| entry.estimated_bytes())
+                .sum::<usize>()
+                .saturating_add(needed_for_active)
+                > self.available_cache_budget()
+        {
+            if let Some(oldest) = self.eviction_candidate(Some(root)) {
+                self.evict(&oldest, "resident_budget");
+                release_allocator_memory();
+            } else {
+                break;
+            }
+        }
+        if self.roots.len() <= 1 {
+            self.available_cache_budget()
+        } else {
+            self.available_cache_budget().saturating_sub(
+                self.roots
+                    .iter()
+                    .filter(|(path, _)| *path != root)
+                    .map(|(_, entry)| entry.estimated_bytes())
+                    .sum::<usize>(),
+            )
+        }
     }
 
     fn cold_load_budget(&self, spec: &Spec, used: usize) -> usize {
@@ -3448,6 +3478,41 @@ mod tests {
         assert_eq!(
             server.evictions.back().unwrap()["reason"],
             "root_missing"
+        );
+    }
+
+    #[test]
+    fn active_root_evicts_older_sibling_before_staged_admission_squeeze() {
+        let (directory, mut server) = cached_test_roots(2);
+        let older_root = directory.path().join("root-0");
+        let active_root = directory.path().join("root-1");
+        let active_est = server.roots[&active_root].estimated_bytes();
+        server.memory.limits.target = active_est + 8 * 1024 * 1024;
+
+        std::fs::write(
+            active_root.join("source.rs"),
+            "pub fn v2_updated_after_edit() {}\n",
+        )
+        .unwrap();
+        let root_budget = server.active_root_budget(&active_root);
+        let entry = server.roots.get_mut(&active_root).unwrap();
+        let previous = entry.restrict_admission(root_budget);
+        let sync_res = entry.call_with_mode("code_sync", json!({}), false);
+        entry.restore_admission(previous);
+        sync_res.expect("active root should evict older sibling before restricting admission");
+        let read_res = entry
+            .call_with_mode(
+                "code_read",
+                json!({"ranges": [{"path": "source.rs", "start": 1, "end": 5}]}),
+                false,
+            )
+            .unwrap();
+        assert!(read_res.to_string().contains("v2_updated_after_edit"));
+        assert!(!server.roots.contains_key(&older_root));
+        assert!(server.roots.contains_key(&active_root));
+        assert_eq!(
+            server.evictions.back().unwrap()["reason"],
+            "resident_budget"
         );
     }
 }

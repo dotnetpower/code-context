@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.25.3
+
+- Replay `cctx usage` token and AIC cost savings per `(session, agent)` stream
+  using each turn's `copilotUsage.tokenDetails` rates, pre-compaction history
+  re-read horizons, and warm-turn context sizes instead of fixed `35x`,
+  `0.00055 AIC/tok`, and `4.20 AIC/turn` constants.
+- Price standing BPE formula prompt compression at each turn's actual cold/warm
+  prefix rate (preventing `35x` double-counting on zero-CCTX sessions), assign
+  zero avoided-turn credit to `SEQUENTIAL_SLICE` reads, add the
+  `sequential_slicing` optimization advisory, and sort the top-sessions table
+  by actual LLM spend.
+- Evict older idle sibling roots in the shared daemon before restricting an
+  active root's admission budget on foreground lookups so incremental updates
+  on large workspaces do not stall with `staged update exceeds resident
+  admission peak`.
+
 ## 0.25.2
 
 - Isolate oversized (`> max_file_bytes`) and binary files during initial and

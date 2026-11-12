@@ -556,6 +556,84 @@ class AdoptionAuditTests(unittest.TestCase):
             report = MODULE.build_report([trace], 24, now=1_800_000_010)
             self.assertEqual(report["cctx_failure_breakdown"].get("client_disconnected"), 1)
 
+    def test_trace_savings_respect_token_details_compaction_and_sequential_slice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sess_dir = Path(directory) / "sess-rates"
+            sess_dir.mkdir(parents=True)
+            trace = sess_dir / "events.jsonl"
+            sol_details = [
+                {"batchSize": 1_000_000, "costPerBatch": 800_000_000_000, "tokenType": "input"},
+                {"batchSize": 1_000_000, "costPerBatch": 80_000_000_000, "tokenType": "cache_read"},
+                {"batchSize": 1_000_000, "costPerBatch": 1_000_000_000_000, "tokenType": "cache_write"},
+                {"batchSize": 1_000_000, "costPerBatch": 3_000_000_000_000, "tokenType": "output"},
+            ]
+            records = [
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:01Z",
+                    "data": {"toolName": "cctxNativeContext", "toolCallId": "c1", "model": "gpt-5.6-sol", "arguments": {"pattern": "Engine"}},
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:02Z",
+                    "data": {"toolCallId": "c1", "model": "gpt-5.6-sol", "success": True, "result": {"content": "matches=1\n1: struct Engine;"}},
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:03Z",
+                    "data": {"usage": {
+                        "model": "gpt-5.6-sol",
+                        "modelDisplayName": "GPT-5.6 Sol",
+                        "inputTokens": 300_000,
+                        "cacheReadTokens": 280_000,
+                        "cacheWriteTokens": 20_000,
+                        "outputTokens": 1_000,
+                        "copilotUsage": {"totalNanoAiu": 45_400_000_000, "tokenDetails": sol_details},
+                    }},
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:04Z",
+                    "data": {"usage": {
+                        "model": "gpt-5.6-sol",
+                        "modelDisplayName": "GPT-5.6 Sol",
+                        "inputTokens": 310_000,
+                        "cacheReadTokens": 300_000,
+                        "cacheWriteTokens": 10_000,
+                        "outputTokens": 1_000,
+                        "copilotUsage": {"totalNanoAiu": 37_000_000_000, "tokenDetails": sol_details},
+                    }},
+                },
+                {
+                    "type": "session.usage_record",
+                    "timestamp": "2027-01-15T08:00:05Z",
+                    "data": {"usage": {
+                        "model": "gpt-5.6-sol",
+                        "modelDisplayName": "GPT-5.6 Sol",
+                        "inputTokens": 80_000,
+                        "cacheReadTokens": 75_000,
+                        "cacheWriteTokens": 5_000,
+                        "outputTokens": 500,
+                        "copilotUsage": {"totalNanoAiu": 12_500_000_000, "tokenDetails": sol_details},
+                    }},
+                },
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:06Z",
+                    "data": {"toolName": "cctxNativeRead", "toolCallId": "c2", "model": "gpt-5.6-sol", "arguments": {"ranges": [{"path": "a.rs", "start": 151, "end": 300}]}},
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:07Z",
+                    "data": {"toolCallId": "c2", "model": "gpt-5.6-sol", "success": True, "result": {"content": "NOTICE SEQUENTIAL_SLICE #2 (151..300 of 500)\n151: fn a() {}"}},
+                },
+            ]
+            trace.write_text("\n".join(map(json.dumps, records)))
+            report = MODULE.build_report([trace], 24, now=1_800_000_010)
+            ts = report["token_summary"]
+            self.assertEqual(ts["compounded_history_tokens_saved"], 1600)
+            self.assertGreater(ts["saved_aic"], 30.0)
+
 
 if __name__ == "__main__":
     unittest.main()

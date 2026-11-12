@@ -9,11 +9,66 @@ use std::path::{Path, PathBuf};
 
 pub const CAPABILITY_SCHEMA: u32 = 3;
 
-// Savings model assumptions; surfaced in `cctx usage --json` so they can be audited.
+// Fallback savings assumptions when a session has no `session.usage_record` events;
+// when usage records exist, `cctx usage` replays actual per-turn `copilotUsage.tokenDetails`
+// rates, pre-compaction re-read horizons, and warm-turn context sizes.
 const COMPOUND_CACHE_MULTIPLIER: u64 = 35;
 const TOKENS_PER_AVOIDED_TURN: f64 = 220_000.0;
 const AIC_PER_SAVED_TOKEN: f64 = 0.00055;
 const AIC_PER_AVOIDED_TURN: f64 = 4.20;
+
+#[derive(Clone, Copy, Debug)]
+struct TokenRates {
+    input: f64,
+    cache_read: f64,
+    cache_write: f64,
+    output: f64,
+}
+
+impl Default for TokenRates {
+    fn default() -> Self {
+        Self {
+            input: 200.0e-6,
+            cache_read: 10.0e-6,
+            cache_write: 0.0,
+            output: 1000.0e-6,
+        }
+    }
+}
+
+fn extract_token_rates(usage: &Value) -> TokenRates {
+    let mut rates = TokenRates::default();
+    if let Some(details) = usage
+        .get("copilotUsage")
+        .and_then(|cu| cu.get("tokenDetails"))
+        .and_then(Value::as_array)
+    {
+        for item in details {
+            let batch = item.get("batchSize").and_then(Value::as_f64).unwrap_or(1_000_000.0);
+            let cost_nano = item.get("costPerBatch").and_then(Value::as_f64).unwrap_or(0.0);
+            if batch <= 0.0 {
+                continue;
+            }
+            let rate = (cost_nano / 1_000_000_000.0) / batch;
+            match item.get("tokenType").and_then(Value::as_str) {
+                Some("input") => rates.input = rate,
+                Some("cache_read") => rates.cache_read = rate,
+                Some("cache_write") => rates.cache_write = rate,
+                Some("output") => rates.output = rate,
+                _ => {}
+            }
+        }
+    }
+    rates
+}
+
+fn cold_prefix_rate(cache_write_tokens: u64, rates: TokenRates) -> f64 {
+    if cache_write_tokens > 0 && rates.cache_write > 0.0 {
+        rates.cache_write
+    } else {
+        rates.input
+    }
+}
 
 pub fn executable_hash(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
@@ -412,37 +467,41 @@ fn is_lookup_tool_name(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+fn read_call_shape(args: &Value) -> (usize, bool, bool) {
+    let mut batch_ranges = 1usize;
+    let mut has_anchor = false;
+    if let Some(ranges) = args.get("ranges").and_then(Value::as_array) {
+        batch_ranges = ranges.len().max(1);
+        has_anchor = ranges.iter().any(|item| {
+            item.get("path")
+                .or_else(|| item.get("filePath"))
+                .and_then(Value::as_str)
+                .is_some_and(|p| p.contains('#'))
+        });
+    }
+    if !has_anchor {
+        has_anchor = args
+            .get("path")
+            .or_else(|| args.get("filePath"))
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.contains('#'));
+    }
+    let around_line = args.get("around_line").is_some();
+    (batch_ranges, has_anchor, around_line)
+}
+
 fn is_turn_compressed(name: &str, args: &Value) -> bool {
     if name.ends_with("code_context") || name.ends_with("codeContext") || name.ends_with("NativeContext") {
         return true;
     }
     if name.ends_with("code_read") || name.ends_with("codeRead") || name.ends_with("NativeRead") {
-        if let Some(ranges) = args.get("ranges").and_then(Value::as_array) {
-            if ranges.len() > 1 {
-                return true;
-            }
-            if ranges.iter().any(|item| {
-                item.get("path")
-                    .or_else(|| item.get("filePath"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|p| p.contains('#'))
-            }) {
-                return true;
-            }
-        }
-        if args
-            .get("path")
-            .or_else(|| args.get("filePath"))
-            .and_then(Value::as_str)
-            .is_some_and(|p| p.contains('#'))
-        {
-            return true;
-        }
+        let (batch_ranges, has_anchor, around_line) = read_call_shape(args);
+        return batch_ranges > 1 || has_anchor || around_line;
     }
     false
 }
 
-fn estimate_tokens_saved(name: &str, args: &Value, payload_tokens: u64, success: Option<bool>) -> u64 {
+fn estimate_tokens_saved(name: &str, turn_compressed: bool, payload_tokens: u64, success: Option<bool>) -> u64 {
     if success != Some(true) || !matches!(classify_tool_group(name), "native" | "mcp") || !is_lookup_tool_name(name) {
         return 0;
     }
@@ -450,9 +509,8 @@ fn estimate_tokens_saved(name: &str, args: &Value, payload_tokens: u64, success:
         return 1600_u64.max((payload_tokens as f64 * 1.85).round() as u64);
     }
     if name.ends_with("code_read") || name.ends_with("codeRead") || name.ends_with("NativeRead") {
-        let compressed = is_turn_compressed(name, args);
-        let floor = if compressed { 1400 } else { 900 };
-        let mult = if compressed { 1.75 } else { 1.10 };
+        let floor = if turn_compressed { 1400 } else { 900 };
+        let mult = if turn_compressed { 1.75 } else { 1.10 };
         return floor.max((payload_tokens as f64 * mult).round() as u64);
     }
     if [
@@ -471,15 +529,36 @@ fn estimate_tokens_saved(name: &str, args: &Value, payload_tokens: u64, success:
     0
 }
 
-fn avoided_turns_for_call(name: &str, turn_compressed: bool, success: Option<bool>) -> f64 {
+fn avoided_turns_for_call(
+    name: &str,
+    batch_ranges: usize,
+    has_anchor: bool,
+    around_line: bool,
+    sequential_slice: bool,
+    success: Option<bool>,
+) -> f64 {
     if success != Some(true) || !matches!(classify_tool_group(name), "native" | "mcp") || !is_lookup_tool_name(name) {
         return 0.0;
     }
-    if turn_compressed {
-        1.0
-    } else {
-        0.25
+    if name.ends_with("code_context") || name.ends_with("codeContext") || name.ends_with("NativeContext") {
+        return 1.0;
     }
+    if name.ends_with("code_read") || name.ends_with("codeRead") || name.ends_with("NativeRead") {
+        if sequential_slice {
+            return 0.0;
+        }
+        if batch_ranges > 1 {
+            return (0.65 * (batch_ranges - 1) as f64 + 0.35).min(3.0);
+        }
+        if has_anchor {
+            return 1.0;
+        }
+        if around_line {
+            return 0.5;
+        }
+        return 0.25;
+    }
+    0.25
 }
 
 /// Reads the `CCTX_TRACE {...}` timing footer that the native extension appends to results.
@@ -503,23 +582,27 @@ fn extract_trace_total_ms(val: &Value, depth: usize) -> Option<f64> {
     }
 }
 
-fn extract_result_chars(val: &Value, depth: usize) -> ( usize, bool ) {
+fn extract_result_chars(val: &Value, depth: usize) -> (usize, bool, bool) {
     if depth > 6 {
-        return (0, false);
+        return (0, false, false);
     }
     if let Some(s) = val.as_str() {
         let trimmed = match s.rfind("\nCCTX_TRACE {") {
             Some(idx) => &s[..idx],
             None => s,
         };
-        return (trimmed.len(), trimmed.starts_with("Output too large to read at once"));
+        return (
+            trimmed.len(),
+            trimmed.starts_with("Output too large to read at once"),
+            trimmed.contains("SEQUENTIAL_SLICE #"),
+        );
     }
     if let Some(obj) = val.as_object() {
         for key in ["content", "text", "value", "output"] {
             if let Some(child) = obj.get(key) {
-                let (chars, offloaded) = extract_result_chars(child, depth + 1);
+                let (chars, offloaded, seq_slice) = extract_result_chars(child, depth + 1);
                 if chars > 0 {
-                    return (chars, offloaded);
+                    return (chars, offloaded, seq_slice);
                 }
             }
         }
@@ -527,14 +610,16 @@ fn extract_result_chars(val: &Value, depth: usize) -> ( usize, bool ) {
     if let Some(arr) = val.as_array() {
         let mut total = 0;
         let mut any_offload = false;
+        let mut any_seq = false;
         for item in arr {
-            let (c, off) = extract_result_chars(item, depth + 1);
+            let (c, off, seq) = extract_result_chars(item, depth + 1);
             total += c;
             any_offload |= off;
+            any_seq |= seq;
         }
-        return (total, any_offload);
+        return (total, any_offload, any_seq);
     }
-    (0, false)
+    (0, false, false)
 }
 
 fn fmt_tok(val: u64) -> String {
@@ -629,7 +714,6 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs_f64();
-    let cutoff = now - hours * 3600.0;
 
     let resolved_root = catalog::resolve_root(root).ok();
     let daemon_status = if let Some(ref r) = resolved_root {
@@ -655,6 +739,17 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    usage_from_home(&state_home, hours, now, daemon_status, as_json)
+}
+
+fn usage_from_home(
+    state_home: &Path,
+    hours: f64,
+    now: f64,
+    daemon_status: Option<Value>,
+    as_json: bool,
+) -> Result<String> {
+    let cutoff = now - hours * 3600.0;
     let session_dir = state_home.join(".copilot").join("session-state");
     let mut session_files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&session_dir) {
@@ -676,21 +771,44 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
 
     #[derive(Default)]
     struct TurnRec {
+        ts: f64,
         session: String,
+        agent_id: String,
         model: String,
         display_name: String,
         effort: String,
         input_tokens: u64,
         cache_read_tokens: u64,
+        cache_write_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
         duration_ms: f64,
         nano_aiu: u64,
+        rates: TokenRates,
+        bpe_saved_aic: f64,
+    }
+
+    impl TurnRec {
+        fn effective_turn_aic(&self) -> f64 {
+            if self.nano_aiu > 0 {
+                self.nano_aiu as f64 / 1_000_000_000.0
+            } else {
+                let uncached = self
+                    .input_tokens
+                    .saturating_sub(self.cache_read_tokens)
+                    .saturating_sub(self.cache_write_tokens);
+                (uncached as f64 * self.rates.input)
+                    + (self.cache_read_tokens as f64 * self.rates.cache_read)
+                    + (self.cache_write_tokens as f64 * self.rates.cache_write)
+                    + (self.output_tokens as f64 * self.rates.output)
+            }
+        }
     }
 
     #[derive(Default, Clone)]
     struct CallRec {
         session: String,
+        agent_id: String,
         seq: usize,
         cwd: Option<String>,
         tool: String,
@@ -701,14 +819,23 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         success: Option<bool>,
         payload_tokens: u64,
         offloaded: bool,
+        sequential_slice: bool,
         cache_miss: bool,
         cache_load_failed: bool,
         error_detail: &'static str,
         trace_total_ms: Option<f64>,
+        batch_ranges: usize,
+        has_anchor: bool,
+        around_line: bool,
         turn_compressed: bool,
         non_source_host_only: bool,
         pre_edit_view: bool,
         saved_tokens: u64,
+        compounded_tokens: u64,
+        payload_saved_aic: f64,
+        avoided_turns: f64,
+        turn_saved_tokens: u64,
+        turn_saved_aic: f64,
     }
 
     let mut turns: Vec<TurnRec> = Vec::new();
@@ -728,7 +855,8 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         };
         let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
         let mut cwd: Option<String> = None;
-        let mut last_model: Option<String> = None;
+        let mut last_model_by_agent: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         let mut line = String::with_capacity(4096);
         while {
             line.clear();
@@ -737,6 +865,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             if !line.contains("\"session.usage_record\"")
                 && !line.contains("\"tool.execution_")
                 && !line.contains("\"session.start\"")
+                && !line.contains("\"subagent.started\"")
             {
                 continue;
             }
@@ -746,6 +875,11 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             let Some(event_type) = event.get("type").and_then(Value::as_str) else {
                 continue;
             };
+            let agent_id = event
+                .get("agentId")
+                .and_then(Value::as_str)
+                .unwrap_or("main")
+                .to_owned();
             if event_type == "session.start"
                 && let Some(c) = event
                     .get("data")
@@ -755,6 +889,21 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             {
                 cwd = Some(c.to_owned());
                 session_cwds.insert(session_id.clone(), c.to_owned());
+            } else if event_type == "subagent.started"
+                && let Some(m) = event
+                    .get("data")
+                    .and_then(|d| d.get("model"))
+                    .and_then(Value::as_str)
+            {
+                last_model_by_agent.insert(agent_id.clone(), m.to_owned());
+            } else if event_type == "session.usage_record"
+                && let Some(m) = event
+                    .get("data")
+                    .and_then(|d| d.get("usage"))
+                    .and_then(|u| u.get("model"))
+                    .and_then(Value::as_str)
+            {
+                last_model_by_agent.insert(agent_id.clone(), m.to_owned());
             }
             let Some(ts) = event_unix_ts(&event) else {
                 continue;
@@ -784,19 +933,24 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                         .and_then(|cu| cu.get("totalNanoAiu"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    last_model = Some(model.clone());
+                    let rates = extract_token_rates(u);
                     active_sessions.insert(session_id.clone());
                     turns.push(TurnRec {
+                        ts,
                         session: session_id.clone(),
+                        agent_id,
                         model,
                         display_name,
                         effort,
                         input_tokens: u.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
                         cache_read_tokens: u.get("cacheReadTokens").and_then(Value::as_u64).unwrap_or(0),
+                        cache_write_tokens: u.get("cacheWriteTokens").and_then(Value::as_u64).unwrap_or(0),
                         output_tokens: u.get("outputTokens").and_then(Value::as_u64).unwrap_or(0),
                         reasoning_tokens: u.get("reasoningTokens").and_then(Value::as_u64).unwrap_or(0),
                         duration_ms: u.get("duration").and_then(Value::as_f64).unwrap_or(0.0),
                         nano_aiu,
+                        rates,
+                        bpe_saved_aic: 0.0,
                     });
                 }
             } else if event_type == "tool.execution_start" {
@@ -837,16 +991,22 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| last_model.clone());
+                    .or_else(|| last_model_by_agent.get(&agent_id).cloned())
+                    .or_else(|| last_model_by_agent.get("main").cloned());
+                let (batch_ranges, has_anchor, around_line) = read_call_shape(&args);
                 seq_counter += 1;
                 let entry = calls.entry((session_id.clone(), call_id.to_owned())).or_default();
                 entry.session = session_id.clone();
+                entry.agent_id = agent_id;
                 entry.seq = seq_counter;
                 entry.cwd = cwd.clone();
                 entry.tool = tool.clone();
                 entry.target = target;
                 entry.model = call_model;
                 entry.started_at = Some(ts);
+                entry.batch_ranges = batch_ranges;
+                entry.has_anchor = has_anchor;
+                entry.around_line = around_line;
                 entry.turn_compressed = is_turn_compressed(&tool, &args);
                 entry.non_source_host_only = non_source_host_only;
             } else if event_type == "tool.execution_complete" {
@@ -861,20 +1021,25 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 if entry.session.is_empty() {
                     entry.session = session_id.clone();
                 }
+                if entry.agent_id.is_empty() {
+                    entry.agent_id = agent_id.clone();
+                }
                 if entry.model.is_none() {
                     entry.model = data
                         .get("model")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
-                        .or_else(|| last_model.clone());
+                        .or_else(|| last_model_by_agent.get(&agent_id).cloned())
+                        .or_else(|| last_model_by_agent.get("main").cloned());
                 }
                 entry.completed_at = Some(ts);
                 entry.success = data.get("success").and_then(Value::as_bool);
                 if let Some(res) = data.get("result") {
-                    let (chars, offloaded) = extract_result_chars(res, 0);
+                    let (chars, offloaded, seq_slice) = extract_result_chars(res, 0);
                     entry.trace_total_ms = extract_trace_total_ms(res, 0);
                     entry.payload_tokens = chars.div_ceil(4) as u64;
                     entry.offloaded = offloaded;
+                    entry.sequential_slice = seq_slice;
                 }
                 if entry.success == Some(false) {
                     let err_str = data
@@ -889,16 +1054,84 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         }
     }
 
+    turns.sort_by(|a, b| {
+        a.session
+            .cmp(&b.session)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+            .then_with(|| a.ts.total_cmp(&b.ts))
+    });
+
+    let bpe_status = crate::prompt_formula::inspect_bpe_surfaces(state_home);
+    let bpe_turn_tok = bpe_status.standing_tokens_saved_per_turn;
+    for t in &mut turns {
+        let prefix_rate = if t.cache_read_tokens > 0 {
+            t.rates.cache_read
+        } else {
+            cold_prefix_rate(t.cache_write_tokens, t.rates)
+        };
+        t.bpe_saved_aic = (bpe_turn_tok as f64) * prefix_rate;
+    }
+
+    struct StreamMeta {
+        idxs: Vec<usize>,
+        resets: Vec<usize>,
+        mean_warm_aic: f64,
+        mean_warm_in: f64,
+    }
+
+    let mut stream_idxs: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, t) in turns.iter().enumerate() {
+        stream_idxs
+            .entry((t.session.clone(), t.agent_id.clone()))
+            .or_default()
+            .push(idx);
+    }
+    let streams: std::collections::BTreeMap<(String, String), StreamMeta> = stream_idxs
+        .into_iter()
+        .map(|(key, idxs)| {
+            let mut resets = Vec::new();
+            for k in 1..idxs.len() {
+                let prev_in = turns[idxs[k - 1]].input_tokens;
+                let cur_in = turns[idxs[k]].input_tokens;
+                if prev_in > 60_000 && (cur_in as f64) < (prev_in as f64) * 0.65 {
+                    resets.push(k);
+                }
+            }
+            let warm: Vec<usize> = idxs
+                .iter()
+                .copied()
+                .filter(|&i| turns[i].cache_read_tokens > 0)
+                .collect();
+            let sample = if warm.is_empty() { &idxs } else { &warm };
+            let denom = sample.len().max(1) as f64;
+            let mean_warm_aic = sample.iter().map(|&i| turns[i].effective_turn_aic()).sum::<f64>() / denom;
+            let mean_warm_in = sample.iter().map(|&i| turns[i].input_tokens as f64).sum::<f64>() / denom;
+            (
+                key,
+                StreamMeta {
+                    idxs,
+                    resets,
+                    mean_warm_aic,
+                    mean_warm_in,
+                },
+            )
+        })
+        .collect();
+
     let mut valid_calls: Vec<CallRec> = calls
         .into_values()
         .filter(|c| c.started_at.is_some_and(|s| s >= cutoff))
         .map(|mut c| {
-            let synthetic_args = if c.turn_compressed {
-                json!({"ranges": [{"path": "a#toc"}, {"path": "b"}]})
-            } else {
-                json!({})
-            };
-            c.saved_tokens = estimate_tokens_saved(&c.tool, &synthetic_args, c.payload_tokens, c.success);
+            c.saved_tokens = estimate_tokens_saved(&c.tool, c.turn_compressed, c.payload_tokens, c.success);
+            c.avoided_turns = avoided_turns_for_call(
+                &c.tool,
+                c.batch_ranges.max(1),
+                c.has_anchor,
+                c.around_line,
+                c.sequential_slice,
+                c.success,
+            );
             c
         })
         .collect();
@@ -914,6 +1147,55 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             valid_calls[i].pre_edit_view = followed_by_edit;
         }
     }
+    for c in &mut valid_calls {
+        let eligible_cctx = is_lookup_tool_name(&c.tool)
+            && !c.non_source_host_only
+            && !c.pre_edit_view
+            && matches!(classify_tool_group(&c.tool), "native" | "mcp")
+            && c.success == Some(true);
+        if !eligible_cctx {
+            continue;
+        }
+        let stream_opt = streams
+            .get(&(c.session.clone(), c.agent_id.clone()))
+            .or_else(|| streams.get(&(c.session.clone(), "main".into())));
+        if let Some(stream) = stream_opt
+            && !stream.idxs.is_empty()
+        {
+            let t_ref = c.completed_at.or(c.started_at).unwrap_or(0.0);
+            if let Some(pos) = (0..stream.idxs.len()).find(|&k| turns[stream.idxs[k]].ts >= t_ref) {
+                let end_pos = stream
+                    .resets
+                    .iter()
+                    .copied()
+                    .find(|&r| r > pos)
+                    .unwrap_or(stream.idxs.len());
+                let t0 = &turns[stream.idxs[pos]];
+                c.payload_saved_aic =
+                    (c.saved_tokens as f64) * cold_prefix_rate(t0.cache_write_tokens, t0.rates);
+                for j in (pos + 1)..end_pos {
+                    let tj = &turns[stream.idxs[j]];
+                    let prev_in = turns[stream.idxs[j - 1]].input_tokens.max(1) as f64;
+                    let hit_frac = (tj.cache_read_tokens as f64 / prev_in).clamp(0.0, 1.0);
+                    let rate_j = hit_frac * tj.rates.cache_read
+                        + (1.0 - hit_frac) * cold_prefix_rate(tj.cache_write_tokens, tj.rates);
+                    c.payload_saved_aic += (c.saved_tokens as f64) * rate_j;
+                    c.compounded_tokens += c.saved_tokens;
+                }
+            } else {
+                let t_last = &turns[*stream.idxs.last().unwrap()];
+                c.payload_saved_aic =
+                    (c.saved_tokens as f64) * cold_prefix_rate(t_last.cache_write_tokens, t_last.rates);
+            }
+            c.turn_saved_aic = c.avoided_turns * stream.mean_warm_aic;
+            c.turn_saved_tokens = (c.avoided_turns * stream.mean_warm_in).round() as u64;
+        } else {
+            c.compounded_tokens = c.saved_tokens * COMPOUND_CACHE_MULTIPLIER;
+            c.payload_saved_aic = (c.saved_tokens as f64) * AIC_PER_SAVED_TOKEN;
+            c.turn_saved_aic = c.avoided_turns * AIC_PER_AVOIDED_TURN;
+            c.turn_saved_tokens = (c.avoided_turns * TOKENS_PER_AVOIDED_TURN).round() as u64;
+        }
+    }
 
     let is_eligible_lookup = |c: &&CallRec| -> bool {
         is_lookup_tool_name(&c.tool) && !c.non_source_host_only && !c.pre_edit_view
@@ -926,15 +1208,14 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         .collect();
     let non_source_cnt = valid_calls.iter().filter(|c| c.non_source_host_only).count();
     let pre_edit_cnt = valid_calls.iter().filter(|c| c.pre_edit_view).count();
+    let seq_slice_cnt = cctx_calls.iter().filter(|c| c.sequential_slice).count();
     let cctx_misses = cctx_calls.iter().filter(|c| c.cache_miss || c.cache_load_failed).count();
     let cctx_warm = cctx_calls.len().saturating_sub(cctx_misses);
     let cctx_warm_pct = (!cctx_calls.is_empty()).then(|| 100.0 * cctx_warm as f64 / cctx_calls.len() as f64);
     let cctx_select_pct = (!lookup_calls.is_empty()).then(|| 100.0 * cctx_calls.len() as f64 / lookup_calls.len() as f64);
 
-    let bpe_status = crate::prompt_formula::inspect_bpe_surfaces(&state_home);
-    let bpe_turn_tok = bpe_status.standing_tokens_saved_per_turn;
     let bpe_saved_tokens: u64 = (turns.len() as u64) * bpe_turn_tok;
-    let bpe_saved_aic: f64 = (bpe_saved_tokens as f64) * AIC_PER_SAVED_TOKEN;
+    let bpe_saved_aic: f64 = turns.iter().map(|t| t.bpe_saved_aic).sum();
     let bpe_surface_pct = (bpe_status.total_surfaces > 0)
         .then(|| 100.0 * bpe_status.active_surfaces as f64 / bpe_status.total_surfaces as f64);
 
@@ -946,17 +1227,21 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
     let total_used_aic = total_nano_aiu as f64 / 1_000_000_000.0;
     let prompt_cache_pct = (total_in > 0).then(|| 100.0 * total_cache as f64 / total_in as f64);
     let direct_saved: u64 = cctx_calls.iter().map(|c| c.saved_tokens).sum();
-    let compounded_saved: u64 = direct_saved * COMPOUND_CACHE_MULTIPLIER;
-    let avoided_turns_total: f64 = cctx_calls
-        .iter()
-        .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
-        .sum();
+    let compounded_saved: u64 = cctx_calls.iter().map(|c| c.compounded_tokens).sum();
+    let effective_reread_mult = if direct_saved > 0 {
+        compounded_saved as f64 / direct_saved as f64
+    } else if turns.is_empty() {
+        COMPOUND_CACHE_MULTIPLIER as f64
+    } else {
+        0.0
+    };
+    let avoided_turns_total: f64 = cctx_calls.iter().map(|c| c.avoided_turns).sum();
     let turn_comp_cnt = avoided_turns_total.round() as u64;
-    let turn_saved = (avoided_turns_total * TOKENS_PER_AVOIDED_TURN).round() as u64;
+    let turn_saved: u64 = cctx_calls.iter().map(|c| c.turn_saved_tokens).sum();
     let total_saved = direct_saved + compounded_saved + turn_saved + bpe_saved_tokens;
-    let total_saved_aic = (direct_saved as f64 * AIC_PER_SAVED_TOKEN)
-        + (avoided_turns_total * AIC_PER_AVOIDED_TURN)
-        + bpe_saved_aic;
+    let payload_saved_aic_total: f64 = cctx_calls.iter().map(|c| c.payload_saved_aic).sum();
+    let turn_saved_aic_total: f64 = cctx_calls.iter().map(|c| c.turn_saved_aic).sum();
+    let total_saved_aic = payload_saved_aic_total + turn_saved_aic_total + bpe_saved_aic;
     let savings_pct = if total_used_aic + total_saved_aic > 0.0 {
         100.0 * total_saved_aic / (total_used_aic + total_saved_aic)
     } else {
@@ -1006,17 +1291,15 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         let m_used_aic = m_nano_aiu as f64 / 1_000_000_000.0;
         let p_cache_pct = (in_t > 0).then(|| 100.0 * cr_t as f64 / in_t as f64);
         let m_direct_saved: u64 = m_cctx.iter().map(|c| c.saved_tokens).sum();
-        let m_avoided_turns: f64 = m_cctx
-            .iter()
-            .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
-            .sum();
+        let m_compounded_saved: u64 = m_cctx.iter().map(|c| c.compounded_tokens).sum();
+        let m_turn_saved: u64 = m_cctx.iter().map(|c| c.turn_saved_tokens).sum();
         let m_bpe_saved: u64 = (m_turns.len() as u64) * bpe_turn_tok;
-        let m_total_saved = m_direct_saved * (1 + COMPOUND_CACHE_MULTIPLIER)
-            + (m_avoided_turns * TOKENS_PER_AVOIDED_TURN).round() as u64
-            + m_bpe_saved;
-        let m_saved_aic = (m_direct_saved as f64 * AIC_PER_SAVED_TOKEN)
-            + (m_avoided_turns * AIC_PER_AVOIDED_TURN)
-            + (m_bpe_saved as f64 * AIC_PER_SAVED_TOKEN);
+        let m_total_saved = m_direct_saved + m_compounded_saved + m_turn_saved + m_bpe_saved;
+        let m_saved_aic: f64 = m_cctx
+            .iter()
+            .map(|c| c.payload_saved_aic + c.turn_saved_aic)
+            .sum::<f64>()
+            + m_turns.iter().map(|t| t.bpe_saved_aic).sum::<f64>();
         let mut durs: Vec<f64> = m_turns.iter().map(|t| t.duration_ms).filter(|d| *d > 0.0).collect();
         durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med_turn = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
@@ -1077,6 +1360,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             },
             payload_tokens: c.payload_tokens,
             eligible_lookup: is_eligible_lookup(&c),
+            sequential_slice: c.sequential_slice,
         })
         .collect();
     let session_facts: Vec<SessionFacts> = active_sessions
@@ -1132,20 +1416,28 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
                 "excluded_non_source_calls": non_source_cnt,
                 "excluded_pre_edit_views": pre_edit_cnt,
                 "direct_tokens_saved": direct_saved,
+                "compounded_history_tokens_saved": compounded_saved,
+                "effective_cache_reread_multiplier": (effective_reread_mult * 100.0).round() / 100.0,
                 "turn_compression_calls": turn_comp_cnt,
+                "sequential_slice_calls": seq_slice_cnt,
                 "estimated_turn_tokens_saved": turn_saved,
                 "bpe_formula_tokens_saved": bpe_saved_tokens,
                 "bpe_formula_saved_aic": bpe_saved_aic,
                 "bpe_formula_status": bpe_status,
                 "estimated_total_tokens_saved": total_saved,
+                "payload_saved_aic": payload_saved_aic_total,
+                "avoided_turn_saved_aic": turn_saved_aic_total,
                 "saved_aic": total_saved_aic,
+                "cost_savings_percent": savings_pct,
                 "saved_usd_0001": total_saved_aic * 0.001,
                 "saved_usd_api_001": total_saved_aic * 0.01,
             },
             "model_usage": model_entries,
             "insights": insights.to_json(),
             "assumptions": {
+                "mode": "trace_replayed_with_fallback",
                 "compound_cache_multiplier": COMPOUND_CACHE_MULTIPLIER,
+                "effective_cache_reread_multiplier": (effective_reread_mult * 100.0).round() / 100.0,
                 "tokens_per_avoided_turn": TOKENS_PER_AVOIDED_TURN,
                 "aic_per_saved_token": AIC_PER_SAVED_TOKEN,
                 "aic_per_avoided_turn": AIC_PER_AVOIDED_TURN,
@@ -1220,9 +1512,10 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             total_saved_aic * 0.01
         ),
         format!(
-            "🔥 TOKENS SAVED             :  ~{:<9} tok   (Payload ~{} + 35x Cache ~{} + ~{} Turns ~{} + BPE ~{})",
+            "🔥 TOKENS SAVED             :  ~{:<9} tok   (Payload ~{} + {:.1}x Cache ~{} + ~{} Turns ~{} + BPE ~{})",
             fmt_tok(total_saved),
             fmt_tok(direct_saved),
+            effective_reread_mult,
             fmt_tok(compounded_saved),
             turn_comp_cnt,
             fmt_tok(turn_saved),
@@ -1406,12 +1699,10 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             p_toks.iter().sum::<u64>() / p_toks.len() as u64
         };
         let offloads = g_calls.iter().filter(|c| c.offloaded).count();
-        let saved: u64 = g_calls.iter().map(|c| c.saved_tokens).sum();
-        let g_avoided: f64 = g_calls
+        let g_saved_aic: f64 = g_calls
             .iter()
-            .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
+            .map(|c| c.payload_saved_aic + c.turn_saved_aic)
             .sum();
-        let g_saved_aic = (saved as f64 * AIC_PER_SAVED_TOKEN) + (g_avoided * AIC_PER_AVOIDED_TURN);
         surface_rows.push(vec![
             label.to_string(),
             g_calls.len().to_string(),
@@ -1446,7 +1737,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
     ));
     lines.push(String::new());
 
-    let mut session_vec: Vec<(String, usize, usize, u64, Vec<String>)> = Vec::new();
+    let mut session_vec: Vec<(String, f64, usize, usize, Vec<String>)> = Vec::new();
     for s_id in &active_sessions {
         let s_turns: Vec<&TurnRec> = turns.iter().filter(|t| &t.session == s_id).collect();
         let s_calls: Vec<&CallRec> = valid_calls.iter().filter(|c| &c.session == s_id).collect();
@@ -1472,26 +1763,19 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             .unwrap_or_else(|| "-".into());
         let s_nano: u64 = s_turns.iter().map(|t| t.nano_aiu).sum();
         let s_used_aic = s_nano as f64 / 1_000_000_000.0;
-        let s_direct: u64 = s_cctx.iter().map(|c| c.saved_tokens).sum();
-        let s_avoided: f64 = s_cctx
+        let s_saved_aic: f64 = s_cctx
             .iter()
-            .map(|c| avoided_turns_for_call(&c.tool, c.turn_compressed, c.success))
-            .sum();
-        let s_bpe_saved: u64 = (s_turns.len() as u64) * bpe_turn_tok;
-        let s_saved = s_direct * (1 + COMPOUND_CACHE_MULTIPLIER)
-            + (s_avoided * TOKENS_PER_AVOIDED_TURN).round() as u64
-            + s_bpe_saved;
-        let s_saved_aic = (s_direct as f64 * AIC_PER_SAVED_TOKEN)
-            + (s_avoided * AIC_PER_AVOIDED_TURN)
-            + (s_bpe_saved as f64 * AIC_PER_SAVED_TOKEN);
+            .map(|c| c.payload_saved_aic + c.turn_saved_aic)
+            .sum::<f64>()
+            + s_turns.iter().map(|t| t.bpe_saved_aic).sum::<f64>();
         let short_id: String = s_id.chars().take(12).collect();
         let short_ws: String = ws.chars().take(20).collect();
         let short_mod: String = primary_model.chars().take(18).collect();
         session_vec.push((
             s_id.clone(),
+            s_used_aic,
             s_turns.len(),
             s_lookup.len(),
-            s_saved,
             vec![
                 short_id,
                 short_ws,
@@ -1504,7 +1788,11 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
             ],
         ));
     }
-    session_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    session_vec.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
     let session_rows: Vec<Vec<String>> = session_vec.into_iter().take(12).map(|item| item.4).collect();
     lines.push(render_box_table(
         "3. TOP SESSIONS BY LLM SPEND, CACHE HIT & COST SAVINGS (Top 12)",
@@ -1522,8 +1810,19 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         &[false, false, false, true, true, false, true, true],
     ));
     lines.extend(insights.render());
+    let eff_turn_tok = if avoided_turns_total > 0.0 {
+        turn_saved as f64 / avoided_turns_total
+    } else {
+        TOKENS_PER_AVOIDED_TURN
+    };
+    let eff_turn_aic = if avoided_turns_total > 0.0 {
+        turn_saved_aic_total / avoided_turns_total
+    } else {
+        AIC_PER_AVOIDED_TURN
+    };
     lines.push(format!(
-        "\n  Savings model: {COMPOUND_CACHE_MULTIPLIER}x cache re-read, {TOKENS_PER_AVOIDED_TURN:.0} tok/avoided turn (see `cctx usage --json` assumptions)."
+        "\n  Savings model: trace-replayed ({effective_reread_mult:.1}x avg pre-compaction re-read · ~{} tok / ~{eff_turn_aic:.1} AIC per avoided warm turn; see `cctx usage --json`).",
+        fmt_tok(eff_turn_tok.round() as u64)
     ));
     Ok(lines.join("\n"))
 }
@@ -1547,5 +1846,136 @@ mod trace_timing_tests {
         assert_eq!(extract_trace_total_ms(&json!("plain output"), 0), None);
         assert_eq!(extract_trace_total_ms(&json!("x\nCCTX_TRACE {\"trace_id\":\"t\"}"), 0), None);
         assert_eq!(extract_trace_total_ms(&json!("x\nCCTX_TRACE {broken"), 0), None);
+    }
+
+    #[test]
+    fn trace_replayed_savings_use_model_rates_compaction_and_subagent_isolation() {
+        let home = tempfile::tempdir().unwrap();
+        let sess_dir = home
+            .path()
+            .join(".copilot")
+            .join("session-state")
+            .join("sess-1");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let details_sol = json!([
+            {"batchSize": 1_000_000, "costPerBatch": 800_000_000_000_u64, "tokenType": "input"},
+            {"batchSize": 1_000_000, "costPerBatch": 80_000_000_000_u64, "tokenType": "cache_read"},
+            {"batchSize": 1_000_000, "costPerBatch": 1_000_000_000_000_u64, "tokenType": "cache_write"},
+            {"batchSize": 1_000_000, "costPerBatch": 3_000_000_000_000_u64, "tokenType": "output"}
+        ]);
+        let events = vec![
+            json!({
+                "type": "session.start",
+                "timestamp": "2026-11-12T20:00:00Z",
+                "data": {"context": {"cwd": "/path/to/project"}}
+            }),
+            json!({
+                "type": "tool.execution_start",
+                "timestamp": "2026-11-12T20:00:01Z",
+                "data": {"toolName": "cctxNativeContext", "toolCallId": "c1", "model": "gpt-5.6-sol", "arguments": {"pattern": "Planner"}}
+            }),
+            json!({
+                "type": "tool.execution_complete",
+                "timestamp": "2026-11-12T20:00:02Z",
+                "data": {"toolCallId": "c1", "model": "gpt-5.6-sol", "success": true, "result": {"content": "matches=1\n1: struct Planner;"}}
+            }),
+            json!({
+                "type": "session.usage_record",
+                "timestamp": "2026-11-12T20:00:03Z",
+                "data": {"usage": {
+                    "model": "gpt-5.6-sol",
+                    "modelDisplayName": "GPT-5.6 Sol",
+                    "reasoningEffort": "high",
+                    "inputTokens": 300_000,
+                    "cacheReadTokens": 280_000,
+                    "cacheWriteTokens": 20_000,
+                    "outputTokens": 1_000,
+                    "copilotUsage": {"totalNanoAiu": 45_400_000_000_u64, "tokenDetails": details_sol}
+                }}
+            }),
+            // Interleaved small subagent turn must NOT look like a compaction reset on main.
+            json!({
+                "type": "session.usage_record",
+                "agentId": "sub-explore",
+                "timestamp": "2026-11-12T20:00:04Z",
+                "data": {"usage": {
+                    "model": "gpt-6.1-sol",
+                    "modelDisplayName": "GPT-6.1 Sol",
+                    "reasoningEffort": "medium",
+                    "inputTokens": 10_000,
+                    "cacheReadTokens": 9_000,
+                    "cacheWriteTokens": 1_000,
+                    "outputTokens": 200,
+                    "copilotUsage": {"totalNanoAiu": 540_000_000_u64}
+                }}
+            }),
+            // Warm turn 2 on main: re-reads c1 before compaction.
+            json!({
+                "type": "session.usage_record",
+                "timestamp": "2026-11-12T20:00:05Z",
+                "data": {"usage": {
+                    "model": "gpt-5.6-sol",
+                    "modelDisplayName": "GPT-5.6 Sol",
+                    "reasoningEffort": "high",
+                    "inputTokens": 310_000,
+                    "cacheReadTokens": 300_000,
+                    "cacheWriteTokens": 10_000,
+                    "outputTokens": 1_000,
+                    "copilotUsage": {"totalNanoAiu": 37_000_000_000_u64, "tokenDetails": details_sol}
+                }}
+            }),
+            // Compaction reset on main (310k -> 80k): stops further compounding of c1!
+            json!({
+                "type": "session.usage_record",
+                "timestamp": "2026-11-12T20:00:06Z",
+                "data": {"usage": {
+                    "model": "gpt-5.6-sol",
+                    "modelDisplayName": "GPT-5.6 Sol",
+                    "reasoningEffort": "high",
+                    "inputTokens": 80_000,
+                    "cacheReadTokens": 75_000,
+                    "cacheWriteTokens": 5_000,
+                    "outputTokens": 500,
+                    "copilotUsage": {"totalNanoAiu": 12_500_000_000_u64, "tokenDetails": details_sol}
+                }}
+            }),
+            // Sequential slice read must receive 0 avoided-turn credit.
+            json!({
+                "type": "tool.execution_start",
+                "timestamp": "2026-11-12T20:00:07Z",
+                "data": {"toolName": "cctxNativeRead", "toolCallId": "c2", "model": "gpt-5.6-sol", "arguments": {"ranges": [{"path": "a.rs", "start": 151, "end": 300}]}}
+            }),
+            json!({
+                "type": "tool.execution_complete",
+                "timestamp": "2026-11-12T20:00:08Z",
+                "data": {"toolCallId": "c2", "model": "gpt-5.6-sol", "success": true, "result": {"content": "NOTICE SEQUENTIAL_SLICE #2 (151..300 of 500)\n151: fn x() {}"}}
+            }),
+        ];
+        let body = events
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(sess_dir.join("events.jsonl"), body).unwrap();
+
+        let now = super::event_unix_ts(&json!({"timestamp": "2026-11-12T20:05:00Z"})).unwrap();
+        let raw = super::usage_from_home(home.path(), 24.0, now, None, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ts = &parsed["token_summary"];
+        // c1 (1600 direct) was re-read on turn 2 (despite interleaved subagent!) and stopped at turn 3 compaction => 1600 compounded!
+        assert_eq!(ts["compounded_history_tokens_saved"].as_u64(), Some(1600));
+        assert_eq!(ts["sequential_slice_calls"].as_u64(), Some(1));
+        // Only c1 gets 1.0 avoided turn; c2 (SEQUENTIAL_SLICE) gets 0.0 => rounded turn_compression_calls == 1.
+        assert_eq!(ts["turn_compression_calls"].as_u64(), Some(1));
+        // Avoided turn AIC uses GPT-5.6 Sol's warm turn mean ((45.4 + 37.0 + 12.5)/3 = 31.63 AIC), far above legacy hardcoded 4.20 AIC.
+        assert!(ts["avoided_turn_saved_aic"].as_f64().unwrap() > 30.0);
+        // GPT-6.1 Sol subagent had 0 CCTX calls: its saved_aic is strictly single-turn BPE prefix (~0.02 AIC), not 35x inflated.
+        let sub_entry = parsed["model_usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["model"] == "gpt-6.1-sol")
+            .unwrap();
+        assert!(sub_entry["saved_aic"].as_f64().unwrap() < 1.0);
     }
 }
