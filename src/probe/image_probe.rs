@@ -153,8 +153,8 @@ fn inspect_png(label: &str, data: &[u8], header_only: bool) -> Result<ImageInfo>
         let payload = &data[payload_start..payload_end];
         match chunk_type {
             b"PLTE" => {
-                for rgb in payload.chunks_exact(3) {
-                    palette.push([rgb[0], rgb[1], rgb[2]]);
+                for &rgb in payload.as_chunks::<3>().0 {
+                    palette.push(rgb);
                 }
             }
             b"tRNS" => {
@@ -281,7 +281,7 @@ fn compute_png_exposure(
         }
 
         if (color_type, bit_depth) == (6, 8) {
-            for px in cur_row.chunks_exact(4) {
+            for px in cur_row.as_chunks::<4>().0 {
                 if px[3] == 0 {
                     transparent_pixels += 1;
                     continue;
@@ -293,7 +293,7 @@ fn compute_png_exposure(
                 lum_sum += lum as f64;
             }
         } else if (color_type, bit_depth) == (2, 8) {
-            for px in cur_row.chunks_exact(3) {
+            for px in cur_row.as_chunks::<3>().0 {
                 let lum =
                     (((54u32 * px[0] as u32) + (183u32 * px[1] as u32) + (19u32 * px[2] as u32)) >> 8)
                         as u8;
