@@ -387,6 +387,45 @@ export class DaemonClient {
     if (this.socket !== socket || chunk.byteLength === 0) {
       return;
     }
+    if (
+      this.receiveBuffer.byteLength === 0 &&
+      this.receiveChunks.length === 0 &&
+      chunk.byteLength >= 4
+    ) {
+      const length = chunk.readUInt32BE(0);
+      if (length > MAX_FRAME_BYTES) {
+        this.disconnect(new Error('Code Context daemon response exceeds 2 MiB.'));
+        return;
+      }
+      if (chunk.byteLength === length + 4) {
+        const pending = this.takePending();
+        if (!pending) {
+          this.disconnect(new Error('Code Context daemon sent an unsolicited response.'));
+          return;
+        }
+        try {
+          const response = JSON.parse(chunk.toString('utf8', 4, length + 4)) as {
+            result?: JsonValue;
+            error?: string;
+          };
+          if (typeof response.error === 'string') {
+            pending.reject(
+              response.error.startsWith('CACHE_MISS ')
+                ? new CacheMissError(response.error)
+                : new DaemonResponseError(response.error),
+            );
+          } else if (response.result !== undefined) {
+            pending.resolve(response.result);
+          } else {
+            pending.reject(new Error('Code Context daemon response has no result.'));
+          }
+        } catch (error: unknown) {
+          pending.reject(asError(error));
+          this.disconnect(asError(error));
+        }
+        return;
+      }
+    }
     if (this.receiveBuffer.byteLength > 0) {
       this.receiveChunks.push(this.receiveBuffer);
       this.receiveBytes += this.receiveBuffer.byteLength;

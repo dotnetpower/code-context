@@ -325,6 +325,28 @@ pub struct Request {
     pub compact: bool,
 }
 
+#[derive(Debug)]
+enum WirePayload {
+    Json(Value),
+    RawJson(Box<serde_json::value::RawValue>),
+}
+
+impl Serialize for WirePayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Json(value) => value.serialize(serializer),
+            Self::RawJson(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+type WirePayloadResult = std::result::Result<WirePayload, String>;
+
+enum LoopEvent {
+    Request(Envelope),
+    BackgroundWake,
+}
+
 struct Envelope {
     request: Request,
     protocol: Protocol,
@@ -337,7 +359,7 @@ struct Envelope {
 }
 
 struct TimedReply {
-    result: WireResult,
+    result: WirePayloadResult,
     sample: RequestTiming,
 }
 
@@ -564,7 +586,23 @@ impl Client {
 
     pub(crate) fn call_raw(&mut self, request: &Request) -> Result<Vec<u8>> {
         self.call_into_read_buf(request)?;
-        Ok(self.read_buf.clone())
+        let out = self.read_buf.clone();
+        if self.read_buf.capacity() > 256 * 1024 {
+            self.read_buf.shrink_to(16 * 1024);
+        }
+        Ok(out)
+    }
+
+    fn call_into_result_frame(&mut self, request: &Request, frame: &mut Vec<u8>) -> Result<()> {
+        self.call_into_read_buf(request)?;
+        frame.reserve(self.read_buf.len() + 11);
+        frame.extend_from_slice(b"{\"result\":");
+        frame.extend_from_slice(&self.read_buf);
+        frame.push(b'}');
+        if self.read_buf.capacity() > 256 * 1024 {
+            self.read_buf.shrink_to(16 * 1024);
+        }
+        Ok(())
     }
 
     pub fn call(&mut self, request: &Request) -> Result<Value> {
@@ -660,20 +698,21 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
         let request: Request = serde_json::from_slice(&read_buf)?;
         frame.clear();
         frame.extend_from_slice(&[0_u8; 4]);
-        let call_outcome = match client.call_raw(&request) {
-            Ok(payload) => Ok(payload),
+        let call_outcome = match client.call_into_result_frame(&request, &mut frame) {
+            Ok(()) => Ok(()),
             Err(error) if is_application_error(error.as_ref()) => Err(error),
             Err(_transport_error) => {
+                frame.truncate(4);
                 if let Ok(reconnected) = Client::connect() {
                     client = reconnected;
-                    client.call_raw(&request)
+                    client.call_into_result_frame(&request, &mut frame)
                 } else {
                     #[cfg(windows)]
                     if std::env::var_os("CCTX_NO_AUTO_START").is_none() {
                         let _ = start_windows_daemon();
                         if let Ok(reconnected) = Client::connect() {
                             client = reconnected;
-                            client.call_raw(&request)
+                            client.call_into_result_frame(&request, &mut frame)
                         } else {
                             Err(_transport_error)
                         }
@@ -688,13 +727,9 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
             }
         };
         match call_outcome {
-            Ok(payload) => {
-                frame.reserve(payload.len() + 11);
-                frame.extend_from_slice(b"{\"result\":");
-                frame.extend_from_slice(&payload);
-                frame.push(b'}');
-            }
+            Ok(()) => {}
             Err(error) if is_application_error(error.as_ref()) => {
+                frame.truncate(4);
                 serde_json::to_writer(&mut frame, &json!({"error":error.to_string()}))?;
             }
             Err(error) => return Err(error),
@@ -767,6 +802,7 @@ pub struct Server {
     protocol_calls: BTreeMap<String, u64>,
     protocol_failures: BTreeMap<String, u64>,
     runtime: Option<RuntimeIdentity>,
+    wake_tx: Option<std::sync::mpsc::SyncSender<LoopEvent>>,
 }
 
 impl Default for Server {
@@ -800,18 +836,26 @@ impl Default for Server {
             protocol_calls: BTreeMap::new(),
             protocol_failures: BTreeMap::new(),
             runtime: None,
+            wake_tx: None,
         }
     }
 }
 
 impl Server {
     pub fn call(&mut self, request: Request) -> Result<Value> {
+        match self.call_wire(request)? {
+            WirePayload::Json(value) => Ok(value),
+            WirePayload::RawJson(raw) => Ok(serde_json::from_str(raw.get())?),
+        }
+    }
+
+    fn call_wire(&mut self, request: Request) -> Result<WirePayload> {
         if request.name == "code_trace" {
             if request.root.is_some() {
                 return Err(invalid("code_trace takes no root").into());
             }
             self.record_client_timing(request.arguments)?;
-            return Ok(json!({"recorded":true}));
+            return Ok(WirePayload::Json(json!({"recorded":true})));
         }
         self.refresh_registry()?;
         if self.evict_idle_roots() {
@@ -819,7 +863,7 @@ impl Server {
         }
         match request.name.as_str() {
             "ping" => {
-                return Ok(
+                return Ok(WirePayload::Json(
                     json!({"ready":true,"pid":std::process::id(),"loaded_roots":self.roots.len(),
                     "capabilities":crate::diagnostics::capabilities()?,
                     "prewarm_failures":0,
@@ -828,7 +872,7 @@ impl Server {
                     "protocol_failures":self.protocol_failures,
                     "active_connections":self.active_connections.as_ref().map_or(0, |value|
                         value.load(std::sync::atomic::Ordering::Acquire))}),
-                );
+                ));
             }
             "code_workspaces" => {
                 if request.compact && self.registry.len() > 8 {
@@ -869,9 +913,9 @@ impl Server {
                             }
                         })
                         .collect();
-                    return Ok(Value::Array(compacted));
+                    return Ok(WirePayload::Json(Value::Array(compacted)));
                 }
-                return Ok(serde_json::to_value(&self.registry)?);
+                return Ok(WirePayload::Json(serde_json::to_value(&self.registry)?));
             }
             "code_status" => {
                 if request.arguments != json!({}) {
@@ -899,9 +943,9 @@ impl Server {
                 };
                 self.add_status_metrics(&mut value, &effective)?;
                 return if request.compact {
-                    Ok(Self::compact_result(&request.name, value))
+                    Ok(WirePayload::Json(Self::compact_result(&request.name, value)))
                 } else {
-                    Ok(json!({"root":root,"data":value}))
+                    Ok(WirePayload::Json(json!({"root":root,"data":value})))
                 };
             }
             _ => {}
@@ -923,53 +967,71 @@ impl Server {
         let requested_root = request
             .root
             .ok_or_else(|| invalid("root is required; use code_workspaces"))?;
-        let canonical = if matches!(
+        let is_fast_lookup = matches!(
             request.name.as_str(),
             "code_files" | "code_grep" | "code_context" | "code_read"
-        ) && self.roots.contains_key(&requested_root)
-            && self
-                .registry
-                .iter()
-                .any(|spec| spec.root == requested_root && !spec.allow_worktrees)
+        );
+        // O(1) warm-root fast path when registry stamp is verified unchanged on disk.
+        let fast_warm_root = if is_fast_lookup
+            && self.registry_stamp.is_some()
+            && let Some(existing) = self.roots.get(&requested_root)
+            && existing.spec.managed_parent.is_none()
+            && (!existing.spec.allow_worktrees
+                || std::fs::symlink_metadata(&requested_root)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()))
         {
-            requested_root
+            self.cache_hits = self.cache_hits.saturating_add(1);
+            Some(requested_root.clone())
         } else {
-            catalog::canonicalize(&requested_root)?
+            None
         };
-        let spec = if matches!(
-            request.name.as_str(),
-            "code_files" | "code_grep" | "code_context" | "code_read"
-        ) {
-            match self.requested_registration(&canonical)? {
-                Some(spec)
-                    if self
-                        .roots
-                        .get(&spec.root)
-                        .is_some_and(|entry| entry.spec == spec) =>
-                {
-                    self.cache_hits = self.cache_hits.saturating_add(1);
-                    spec
+        let root = if let Some(warm_root) = fast_warm_root {
+            warm_root
+        } else {
+            let canonical = if is_fast_lookup
+                && self.roots.contains_key(&requested_root)
+                && self
+                    .registry
+                    .iter()
+                    .any(|spec| spec.root == requested_root && !spec.allow_worktrees)
+            {
+                requested_root
+            } else {
+                catalog::canonicalize(&requested_root)?
+            };
+            let spec = if is_fast_lookup {
+                match self.requested_registration(&canonical)? {
+                    Some(spec)
+                        if self
+                            .roots
+                            .get(&spec.root)
+                            .is_some_and(|entry| entry.spec == spec) =>
+                    {
+                        self.cache_hits = self.cache_hits.saturating_add(1);
+                        spec
+                    }
+                    other => {
+                        let target = other.map_or(canonical, |spec| spec.root);
+                        return Err(self.request_cache(target)?.into());
+                    }
                 }
-                other => {
-                    let target = other.map_or(canonical, |spec| spec.root);
-                    return Err(self.request_cache(target)?.into());
-                }
+            } else {
+                self.source_spec_canonical(&canonical)?
+            };
+            let root = spec.root.clone();
+            if self
+                .roots
+                .get(&root)
+                .is_some_and(|entry| entry.spec != spec)
+            {
+                self.evict(&root, "registration_changed");
+                release_allocator_memory();
             }
-        } else {
-            self.source_spec_canonical(&canonical)?
+            if !self.roots.contains_key(&root) {
+                return Err(self.request_cache(root)?.into());
+            }
+            root
         };
-        let root = spec.root.clone();
-        if self
-            .roots
-            .get(&root)
-            .is_some_and(|entry| entry.spec != spec)
-        {
-            self.evict(&root, "registration_changed");
-            release_allocator_memory();
-        }
-        if !self.roots.contains_key(&root) {
-            return Err(self.request_cache(root)?.into());
-        }
         let compact = request.compact;
         let root_budget = self.active_root_budget(&root);
         let entry = self
@@ -977,26 +1039,47 @@ impl Server {
             .get_mut(&root)
             .ok_or_else(|| invalid("missing registered root"))?;
         let previous = entry.restrict_admission(root_budget);
-        let mut outcome = entry.call_with_mode(&request.name, request.arguments.clone(), compact);
-        for _ in 0..3 {
-            if let Err(ref error) = outcome
-                && matches!(
-                    request.name.as_str(),
-                    "code_files" | "code_grep" | "code_context"
-                )
-                && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
-            {
-                outcome = entry.call_with_mode(&request.name, request.arguments.clone(), compact);
-            } else {
-                break;
+        let mut arguments = request.arguments;
+        let wire_outcome: Result<WirePayload> = if is_fast_lookup {
+            let can_retry_stale = matches!(
+                request.name.as_str(),
+                "code_files" | "code_grep" | "code_context"
+            );
+            let env_root = (!compact).then_some(root.as_path());
+            let mut raw_outcome =
+                entry.call_raw_json(&request.name, &mut arguments, compact, env_root);
+            if can_retry_stale {
+                for _ in 0..3 {
+                    if let Err(ref error) = raw_outcome
+                        && entry.recover_stale_search(&error.to_string()).unwrap_or(false)
+                    {
+                        raw_outcome =
+                            entry.call_raw_json(&request.name, &mut arguments, compact, env_root);
+                    } else {
+                        break;
+                    }
+                }
             }
-        }
+            raw_outcome.map(|opt| WirePayload::RawJson(opt.expect("fast lookup returns raw json")))
+        } else {
+            entry
+                .call_with_mode(&request.name, arguments, compact)
+                .map(|result| {
+                    if compact {
+                        WirePayload::Json(Self::compact_result(&request.name, result))
+                    } else {
+                        WirePayload::Json(json!({"root":&root,"data":result}))
+                    }
+                })
+        };
         entry.restore_admission(previous);
-        let result = outcome?;
+        let payload = wire_outcome?;
         if let Some(watched) = self.roots.get(&root) {
             let estimated = watched.estimated_bytes();
             match self.root_size_hints.get_mut(&root) {
-                Some((saved_spec, bytes)) if *saved_spec == watched.spec => {
+                Some((saved_spec, bytes))
+                    if self.registry_stamp.is_some() || *saved_spec == watched.spec =>
+                {
                     *bytes = estimated;
                 }
                 _ => {
@@ -1020,11 +1103,7 @@ impl Server {
                 break;
             }
         }
-        if compact {
-            Ok(Self::compact_result(&request.name, result))
-        } else {
-            Ok(json!({"root":root,"data":result}))
-        }
+        Ok(payload)
     }
 
     fn add_status_metrics(&self, value: &mut Value, spec: &Spec) -> Result<()> {
@@ -1403,6 +1482,7 @@ impl Server {
             return;
         }
         let requested = job.requested.clone();
+        let wake_tx = self.wake_tx.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("cctx-root-prepare".into())
@@ -1418,6 +1498,9 @@ impl Server {
                     crate::registration::effective_spec(spec, &registry)
                 })();
                 let _ = sender.send(result);
+                if let Some(wake) = wake_tx {
+                    let _ = wake.try_send(LoopEvent::BackgroundWake);
+                }
             });
         match spawned {
             Ok(_) => {
@@ -1561,6 +1644,7 @@ impl Server {
         release_allocator_memory();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_spec = spec.clone();
+        let wake_tx = self.wake_tx.clone();
         std::thread::Builder::new()
             .name("cctx-root-work".into())
             .stack_size(WORKER_STACK_BYTES)
@@ -1591,6 +1675,9 @@ impl Server {
                     Ok((watched, outcome))
                 });
                 let _ = sender.send(result);
+                if let Some(wake) = wake_tx {
+                    let _ = wake.try_send(LoopEvent::BackgroundWake);
+                }
             })?;
         self.background = Some(BackgroundRoot {
             spec,
@@ -1995,15 +2082,11 @@ impl Server {
     }
 
     fn refresh_registry(&mut self) -> Result<()> {
-        let path = match &self.registry_path {
-            Some(path) => path.clone(),
-            None => {
-                let path = catalog::state_dir()?.join("workspaces.json");
-                self.registry_path = Some(path.clone());
-                path
-            }
-        };
-        let stamp = match std::fs::metadata(&path) {
+        if self.registry_path.is_none() {
+            self.registry_path = Some(catalog::state_dir()?.join("workspaces.json"));
+        }
+        let path = self.registry_path.as_deref().expect("registry path set");
+        let stamp = match std::fs::metadata(path) {
             Ok(metadata) => {
                 #[cfg(unix)]
                 let ino = metadata.ino();
@@ -2033,6 +2116,23 @@ impl Server {
             }
             self.registry = registry;
             self.registry_stamp = stamp;
+            let stale_loaded: Vec<PathBuf> = self
+                .roots
+                .iter()
+                .filter_map(|(root, watched)| {
+                    match self.requested_registration(root) {
+                        Ok(Some(effective)) if effective == watched.spec => None,
+                        _ => Some(root.clone()),
+                    }
+                })
+                .collect();
+            let had_stale = !stale_loaded.is_empty();
+            for stale_root in stale_loaded {
+                self.evict(&stale_root, "registration_changed");
+            }
+            if had_stale {
+                release_allocator_memory();
+            }
             self.root_size_hints.retain(|root, (spec, _)| {
                 self.registry
                     .iter()
@@ -2336,14 +2436,14 @@ struct TraceMeta<'a> {
 
 #[derive(Serialize)]
 struct TracedRef<'a> {
-    value: &'a Value,
+    value: &'a WirePayload,
     _cctx_trace: TraceMeta<'a>,
 }
 
 fn respond_protocol(
     stream: &mut RpcStream,
     protocol: Protocol,
-    result: &WireResult,
+    result: &WirePayloadResult,
 ) -> Result<(f64, f64)> {
     let mut frame = Vec::with_capacity(512);
     respond_protocol_buf(stream, protocol, result, None, &mut frame)
@@ -2352,7 +2452,7 @@ fn respond_protocol(
 fn respond_protocol_buf(
     stream: &mut RpcStream,
     protocol: Protocol,
-    result: &WireResult,
+    result: &WirePayloadResult,
     trace: Option<TraceMeta<'_>>,
     frame: &mut Vec<u8>,
 ) -> Result<(f64, f64)> {
@@ -2367,6 +2467,8 @@ fn respond_protocol_buf(
                     frame.extend_from_slice(&[0_u8; 8]);
                     if let Some(_cctx_trace) = trace {
                         serde_json::to_writer(&mut *frame, &TracedRef { value, _cctx_trace })?;
+                    } else if let WirePayload::RawJson(raw) = value {
+                        frame.extend_from_slice(raw.get().as_bytes());
                     } else {
                         serde_json::to_writer(&mut *frame, value)?;
                     }
@@ -2410,10 +2512,16 @@ fn respond_protocol_buf(
                                 result: TracedRef { value, _cctx_trace },
                             },
                         )?;
+                    } else if let WirePayload::RawJson(raw) = value {
+                        let raw_bytes = raw.get().as_bytes();
+                        frame.reserve(raw_bytes.len() + 11);
+                        frame.extend_from_slice(b"{\"result\":");
+                        frame.extend_from_slice(raw_bytes);
+                        frame.push(b'}');
                     } else {
                         #[derive(Serialize)]
                         struct FramedOk<'a> {
-                            result: &'a Value,
+                            result: &'a WirePayload,
                         }
                         serde_json::to_writer(&mut *frame, &FramedOk { result: value })?;
                     }
@@ -2438,12 +2546,28 @@ fn respond_protocol_buf(
             match result {
                 Ok(value) => {
                     if let Some(_cctx_trace) = trace {
+                        #[derive(Serialize)]
+                        struct LineTracedOk<'a> {
+                            result: TracedRef<'a>,
+                        }
                         serde_json::to_writer(
                             &mut *frame,
-                            &json!({"result": TracedRef { value, _cctx_trace }}),
+                            &LineTracedOk {
+                                result: TracedRef { value, _cctx_trace },
+                            },
                         )?;
+                    } else if let WirePayload::RawJson(raw) = value {
+                        let raw_bytes = raw.get().as_bytes();
+                        frame.reserve(raw_bytes.len() + 12);
+                        frame.extend_from_slice(b"{\"result\":");
+                        frame.extend_from_slice(raw_bytes);
+                        frame.push(b'}');
                     } else {
-                        serde_json::to_writer(&mut *frame, &json!({"result":value}))?;
+                        #[derive(Serialize)]
+                        struct LineOk<'a> {
+                            result: &'a WirePayload,
+                        }
+                        serde_json::to_writer(&mut *frame, &LineOk { result: value })?;
                     }
                 }
                 Err(error) => {
@@ -2469,7 +2593,7 @@ fn respond_protocol_buf(
 
 fn handle_connection(
     mut stream: RpcStream,
-    tx: std::sync::mpsc::SyncSender<Envelope>,
+    tx: std::sync::mpsc::SyncSender<LoopEvent>,
     active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     timing_tx: std::sync::mpsc::SyncSender<RequestTiming>,
     #[cfg(windows)] expected_secret: std::sync::Arc<String>,
@@ -2596,7 +2720,7 @@ fn handle_connection(
             },
         };
         if tx
-            .try_send(Envelope {
+            .try_send(LoopEvent::Request(Envelope {
                 request,
                 protocol,
                 reply: reply_tx.clone(),
@@ -2609,7 +2733,7 @@ fn handle_connection(
                         std::sync::atomic::AtomicU64::new(1);
                     NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 },
-            })
+            }))
             .is_err()
         {
             let _ = respond_protocol(
@@ -2711,13 +2835,14 @@ pub fn serve() -> Result<()> {
         (listener, secret)
     };
     eprintln!("code-context daemon ready at {}", socket.display());
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Envelope>(128);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<LoopEvent>(256);
     let (timing_tx, timing_rx) = std::sync::mpsc::sync_channel::<RequestTiming>(128);
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut server = Server {
         memory,
         active_connections: Some(active.clone()),
-        runtime:Some(RuntimeIdentity::capture(&dir,&socket,&lock)?),
+        runtime: Some(RuntimeIdentity::capture(&dir, &socket, &lock)?),
+        wake_tx: Some(tx.clone()),
         ..Server::default()
     };
     let acceptor = std::thread::Builder::new()
@@ -2775,7 +2900,7 @@ pub fn serve() -> Result<()> {
             .background_results
             .retain(|id, _| deferred.iter().any(|envelope| envelope.id == *id));
         match rx.recv_timeout(server.poll_interval(!deferred.is_empty())) {
-            Ok(envelope) => {
+            Ok(LoopEvent::Request(envelope)) => {
                 let is_trace = envelope.request.name == "code_trace";
                 server.record_call(envelope.protocol, &envelope.request.name);
                 dispatch_envelope(&mut server, &mut deferred, envelope);
@@ -2790,6 +2915,10 @@ pub fn serve() -> Result<()> {
                     server.last_idle_maintenance = Some(Instant::now());
                     server.maintain_idle_roots_inner(true)?;
                 }
+            }
+            Ok(LoopEvent::BackgroundWake) => {
+                server.poll_background();
+                server.drive_lazy_loads();
             }
 
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -2851,9 +2980,9 @@ fn dispatch_envelope(
         }
         Err(error) => Err(error.to_string()),
         Ok(true) => match server.background_results.remove(&envelope.id) {
-            Some(result) => result,
+            Some(result) => result.map(WirePayload::Json),
             None => server
-                .call(envelope.request)
+                .call_wire(envelope.request)
                 .map_err(|error| error.to_string()),
         },
     };

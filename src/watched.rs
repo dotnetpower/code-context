@@ -1500,6 +1500,601 @@ impl Watched {
         self.call_with_mode(name, arguments, false)
     }
 
+    fn freshness_ref<'a>(&self, returned_file_check: &'a str, regex_hint: bool) -> FreshnessRef<'a> {
+        const BASE_NOTICE: &str = "Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence.";
+        const REGEX_NOTICE: &str = "Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence. (Pattern contains regex syntax with regex=false; set regex=true if a regular expression was intended.)";
+        FreshnessRef {
+            basis: "watcher_snapshot",
+            generation: self.resident.stats.generation,
+            returned_file_check,
+            full_disk_verified: false,
+            notice: if regex_hint { REGEX_NOTICE } else { BASE_NOTICE },
+        }
+    }
+
+    pub(crate) fn call_raw_json(
+        &mut self,
+        name: &str,
+        arguments: &mut Value,
+        compact: bool,
+        envelope_root: Option<&Path>,
+    ) -> Result<Option<Box<serde_json::value::RawValue>>> {
+        if !matches!(name, "code_files" | "code_grep" | "code_context" | "code_read") {
+            return Ok(None);
+        }
+        self.last_used = Instant::now();
+        self.source_lookups = self.source_lookups.saturating_add(1);
+        self.synchronize_or_block(false)?;
+        self.normalize_root_prefixed_arguments(arguments);
+        match name {
+            "code_files" => {
+                let mut request: crate::files::FileQuery =
+                    serde::Deserialize::deserialize(&*arguments)?;
+                if compact {
+                    request.limit = request.limit.clamp(1, 1000);
+                }
+                self.filter_multi_search_paths(&mut request.paths);
+                self.check_explicit_search_targets(&request.paths, Some(&request.glob))?;
+                let result = if self.resident.ids_are_path_sorted {
+                    crate::files::find(
+                        self.resident.documents.iter().map(|d| d.path.as_ref()),
+                        &request,
+                    )?
+                } else {
+                    crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?
+                };
+                self.check_search_paths(result.paths.iter().map(String::as_str))?;
+                #[derive(serde::Serialize)]
+                struct WireFiles<'a> {
+                    paths: &'a [String],
+                    total_matches: usize,
+                    truncated: bool,
+                    freshness: FreshnessRef<'a>,
+                }
+                let payload = WireFiles {
+                    paths: &result.paths,
+                    total_matches: result.total_matches,
+                    truncated: result.truncated,
+                    freshness: self.freshness_ref("metadata", false),
+                };
+                Ok(Some(serialize_wire_json(
+                    &payload,
+                    envelope_root,
+                    256 + result.paths.len() * 48,
+                )?))
+            }
+            "code_grep" => {
+                let mut query: Query = serde::Deserialize::deserialize(&*arguments)?;
+                if compact {
+                    query.limit = query.limit.clamp(1, 1000);
+                    if let Some(m) = query.max_matches_per_file {
+                        query.max_matches_per_file = Some(m.clamp(1, 64));
+                    }
+                }
+                self.filter_multi_search_paths(&mut query.paths);
+                self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
+                let mut budget_narrowed = false;
+                let result = match search_fast_arc(&self.resident, &query, &mut self.query_cache) {
+                    Ok(res) => res,
+                    Err(err) if compact && crate::context::is_response_budget(err.as_ref()) => {
+                        budget_narrowed = true;
+                        let mut narrowed = query.clone();
+                        narrowed.limit = narrowed.limit.min(40);
+                        narrowed.max_matches_per_file =
+                            Some(narrowed.max_matches_per_file.unwrap_or(2).min(2));
+                        search_fast_arc(&self.resident, &narrowed, &mut self.query_cache)?
+                    }
+                    Err(err) => return Err(err),
+                };
+                self.check_search_paths(result.matches.iter().map(|hit| hit.path.as_str()))?;
+                let regex_hint = result.total_matches == 0
+                    && looks_like_unintended_literal_regex(&query.pattern, query.regex);
+                let freshness = self.freshness_ref("metadata", regex_hint);
+                if compact {
+                    #[derive(serde::Serialize)]
+                    struct WireCompactGrepHit<'a> {
+                        path: &'a str,
+                        line: usize,
+                        text: std::borrow::Cow<'a, str>,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct WireCompactGrep<'a> {
+                        matches: Vec<WireCompactGrepHit<'a>>,
+                        total_matches: usize,
+                        truncated: bool,
+                        freshness: FreshnessRef<'a>,
+                    }
+                    let matches = result
+                        .matches
+                        .iter()
+                        .map(|hit| {
+                            let text = if hit.text.len() > 512 {
+                                let end = hit.text.floor_char_boundary(512);
+                                std::borrow::Cow::Owned(format!("{}...", &hit.text[..end]))
+                            } else {
+                                std::borrow::Cow::Borrowed(hit.text.as_str())
+                            };
+                            WireCompactGrepHit {
+                                path: hit.path.as_str(),
+                                line: hit.line,
+                                text,
+                            }
+                        })
+                        .collect();
+                    let payload = WireCompactGrep {
+                        matches,
+                        total_matches: result.total_matches,
+                        truncated: result.truncated || budget_narrowed,
+                        freshness,
+                    };
+                    return Ok(Some(serialize_wire_json(
+                        &payload,
+                        envelope_root,
+                        384 + result.matches.len() * 128,
+                    )?));
+                }
+                #[derive(serde::Serialize)]
+                struct WireFullGrep<'a> {
+                    matches: &'a [crate::search::Hit],
+                    total_matches: usize,
+                    truncated: bool,
+                    consistency: &'a str,
+                    freshness: FreshnessRef<'a>,
+                }
+                let payload = WireFullGrep {
+                    matches: &result.matches,
+                    total_matches: result.total_matches,
+                    truncated: result.truncated,
+                    consistency: &result.consistency,
+                    freshness,
+                };
+                Ok(Some(serialize_wire_json(
+                    &payload,
+                    envelope_root,
+                    384 + result.matches.len() * 128,
+                )?))
+            }
+            "code_context" => {
+                if !arguments.is_object() {
+                    return Err(invalid("arguments must be an object").into());
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ContextWireArgs {
+                    pattern: String,
+                    #[serde(default)]
+                    regex: bool,
+                    #[serde(default)]
+                    ignore_case: bool,
+                    #[serde(default)]
+                    paths: Vec<String>,
+                    #[serde(default)]
+                    glob: Option<String>,
+                    limit: Option<usize>,
+                    max_matches_per_file: Option<usize>,
+                    radius: Option<usize>,
+                }
+                let parsed: ContextWireArgs = serde::Deserialize::deserialize(&*arguments)?;
+                let mut radius = parsed.radius.unwrap_or(3);
+                let (limit, max_matches_per_file) = match parsed.limit {
+                    Some(explicit_limit) => (explicit_limit, parsed.max_matches_per_file),
+                    None => (20, Some(parsed.max_matches_per_file.unwrap_or(5))),
+                };
+                let mut query = Query {
+                    pattern: parsed.pattern,
+                    regex: parsed.regex,
+                    ignore_case: parsed.ignore_case,
+                    paths: parsed.paths,
+                    glob: parsed.glob,
+                    limit,
+                    max_matches_per_file,
+                };
+                if compact {
+                    radius = radius.min(100);
+                    query.limit = query.limit.clamp(1, 64);
+                    if let Some(m) = query.max_matches_per_file {
+                        query.max_matches_per_file = Some(m.clamp(1, 64));
+                    }
+                } else if radius > 100 || query.limit > 64 {
+                    return Err(invalid("radius 0..100, context limit 1..64 required; use code_read for larger ranges").into());
+                }
+                self.filter_multi_search_paths(&mut query.paths);
+                self.check_explicit_search_targets(&query.paths, query.glob.as_deref())?;
+                let regex_hint_needed = !query.regex
+                    && looks_like_unintended_literal_regex(&query.pattern, query.regex);
+                let result = if let Some(cached) = self.query_cache.get_context(
+                    self.resident.stats.generation,
+                    &query,
+                    radius,
+                ) {
+                    cached
+                } else {
+                    let build_context = |this: &mut Self,
+                                         q: &Query,
+                                         r: usize|
+                     -> Result<Arc<crate::context::ContextResult>> {
+                        let search_arc = search_fast_arc(&this.resident, q, &mut this.query_cache)?;
+                        let search_owned =
+                            Arc::try_unwrap(search_arc).unwrap_or_else(|shared| (*shared).clone());
+                        Ok(Arc::new(assemble_trusted(search_owned, r, |ranges| {
+                            this.resident.read_many(ranges)
+                        })?))
+                    };
+                    match build_context(self, &query, radius) {
+                        Ok(res) => {
+                            self.query_cache.put_context(
+                                self.resident.stats.generation,
+                                query,
+                                radius,
+                                res.clone(),
+                            );
+                            res
+                        }
+                        Err(err) if compact && crate::context::is_response_budget(err.as_ref()) => {
+                            let mut narrowed = query.clone();
+                            narrowed.limit = narrowed.limit.min(10);
+                            narrowed.max_matches_per_file =
+                                Some(narrowed.max_matches_per_file.unwrap_or(2).min(2));
+                            let narrowed_radius = radius.min(4);
+                            build_context(self, &narrowed, narrowed_radius)?
+                        }
+                        Err(err) => return Err(err),
+                    }
+                };
+                let ws = self.workspace()?;
+                if let Some(path) =
+                    self.stale_snippet_path_with_workspace(ws.as_ref(), &result.snippets)?
+                {
+                    return Err(self.stale_search_error(&path).into());
+                }
+                drop(ws);
+                let regex_hint = result.search.total_matches == 0 && regex_hint_needed;
+                let freshness = self.freshness_ref("sha256", regex_hint);
+                if compact {
+                    #[derive(serde::Serialize)]
+                    struct WireCompactHit<'a> {
+                        path: &'a str,
+                        line: usize,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct WireCompactSearch<'a> {
+                        matches: Vec<WireCompactHit<'a>>,
+                        total_matches: usize,
+                        truncated: bool,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct WireCompactContext<'a> {
+                        search: WireCompactSearch<'a>,
+                        snippets: &'a [Snippet],
+                        freshness: FreshnessRef<'a>,
+                    }
+                    let matches = result
+                        .search
+                        .matches
+                        .iter()
+                        .map(|hit| WireCompactHit {
+                            path: hit.path.as_str(),
+                            line: hit.line,
+                        })
+                        .collect();
+                    let payload = WireCompactContext {
+                        search: WireCompactSearch {
+                            matches,
+                            total_matches: result.search.total_matches,
+                            truncated: result.search.truncated,
+                        },
+                        snippets: &result.snippets,
+                        freshness,
+                    };
+                    return Ok(Some(serialize_wire_json(
+                        &payload,
+                        envelope_root,
+                        512 + result.snippets.len() * 512,
+                    )?));
+                }
+                #[derive(serde::Serialize)]
+                struct WireFullContext<'a> {
+                    search: &'a crate::search::SearchResult,
+                    snippets: &'a [Snippet],
+                    freshness: FreshnessRef<'a>,
+                }
+                let payload = WireFullContext {
+                    search: &result.search,
+                    snippets: &result.snippets,
+                    freshness,
+                };
+                Ok(Some(serialize_wire_json(
+                    &payload,
+                    envelope_root,
+                    512 + result.snippets.len() * 512,
+                )?))
+            }
+            "code_read" => {
+                if let Some(fast) =
+                    self.try_serialize_borrowed_read(arguments, compact, envelope_root)
+                {
+                    return fast.map(Some);
+                }
+                if arguments.get("page").and_then(Value::as_bool) == Some(true) {
+                    let request: ReadRequest = serde::Deserialize::deserialize(&*arguments)?;
+                    let val = self.read_page(&request, compact)?;
+                    return Ok(Some(serialize_wire_json(&val, envelope_root, 1024)?));
+                }
+                let request: ReadRequest = serde::Deserialize::deserialize(&*arguments)?;
+                if !compact {
+                    let snippets = self.read_verified_with_recovery(&request)?;
+                    return Ok(Some(serialize_wire_json(
+                        &snippets,
+                        envelope_root,
+                        256 + snippets.len() * 512,
+                    )?));
+                }
+                // Compact mode may attach EOF/OVERLAP/PARTIAL/SEQUENTIAL_SLICE notices or clamp OOB ranges.
+                match self.read_verified_with_recovery(&request) {
+                    Ok(snippets) => {
+                        let notices = self.compute_read_snippet_notices(&snippets, None);
+                        #[derive(serde::Serialize)]
+                        struct AnnotatedSnippetRef<'a> {
+                            path: &'a str,
+                            start: usize,
+                            end: usize,
+                            sha256: &'a str,
+                            lines: &'a [String],
+                            #[serde(skip_serializing_if = "Option::is_none")]
+                            notice: Option<&'a str>,
+                        }
+                        let annotated: Vec<AnnotatedSnippetRef<'_>> = snippets
+                            .iter()
+                            .zip(notices.iter())
+                            .map(|(s, n)| AnnotatedSnippetRef {
+                                path: &s.path,
+                                start: s.start,
+                                end: s.end,
+                                sha256: &s.sha256,
+                                lines: &s.lines,
+                                notice: n.as_deref(),
+                            })
+                            .collect();
+                        Ok(Some(serialize_wire_json(
+                            &annotated,
+                            envelope_root,
+                            256 + annotated.len() * 512,
+                        )?))
+                    }
+                    Err(err) => {
+                        let fallback_args = arguments.clone();
+                        // Undo duplicate lookup increment before delegating rare compact error recovery
+                        self.source_lookups = self.source_lookups.saturating_sub(1);
+                        match self.call_with_mode("code_read", fallback_args, true) {
+                            Ok(val) => Ok(Some(serialize_wire_json(&val, envelope_root, 512)?)),
+                            Err(_) => Err(err),
+                        }
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn try_serialize_borrowed_read(
+        &mut self,
+        arguments: &Value,
+        compact: bool,
+        envelope_root: Option<&Path>,
+    ) -> Option<Result<Box<serde_json::value::RawValue>>> {
+        let obj = arguments.as_object()?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "ranges" | "split_ranges" | "page") {
+                return None;
+            }
+        }
+        if let Some(page_val) = obj.get("page")
+            && page_val.as_bool() != Some(false)
+        {
+            return None;
+        }
+        if let Some(split_val) = obj.get("split_ranges")
+            && !split_val.is_boolean()
+        {
+            return None;
+        }
+        let ranges_arr = obj.get("ranges")?.as_array()?;
+        if ranges_arr.is_empty() || ranges_arr.len() > 64 {
+            return None;
+        }
+        let (saved_spec, workspace, _) = self.read_policy.as_ref()?;
+        if saved_spec != &self.spec {
+            return None;
+        }
+
+        let mut planned: Vec<(usize, usize, usize)> = Vec::with_capacity(ranges_arr.len());
+        let mut unique_docs: Vec<usize> = Vec::with_capacity(ranges_arr.len());
+        for item in ranges_arr {
+            let r_obj = item.as_object()?;
+            if r_obj.len() != 3 {
+                return None;
+            }
+            let path_str = r_obj.get("path")?.as_str()?;
+            let start = usize::try_from(r_obj.get("start")?.as_u64()?).ok()?;
+            let end = usize::try_from(r_obj.get("end")?.as_u64()?).ok()?;
+            if start == 0 || end < start {
+                return None;
+            }
+            let &doc_id = self.resident.paths.get(path_str)?;
+            let doc = &self.resident.documents[doc_id];
+            let doc_lines = doc.starts.len();
+            if start > doc_lines {
+                return None;
+            }
+            let clamped_end = end.min(doc_lines);
+            if clamped_end - start >= 500 {
+                return None;
+            }
+            planned.push((doc_id, start, clamped_end));
+            if !unique_docs.contains(&doc_id) {
+                unique_docs.push(doc_id);
+            }
+        }
+
+        let max_file_bytes = self.spec.policy.max_file_bytes as u64;
+        let mut checked_dirs: std::collections::HashSet<&Path> =
+            std::collections::HashSet::with_capacity(unique_docs.len() * 2);
+        let mut abs_buf = PathBuf::with_capacity(workspace.root.as_os_str().len() + 128);
+
+        for &doc_id in &unique_docs {
+            let doc = &self.resident.documents[doc_id];
+            let rel_str = doc.path.as_ref();
+            let expected_stamp = self.stamps.get(rel_str)?;
+            let rel_path = Path::new(rel_str);
+            if let Some(parent) = rel_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                for ancestor in parent.ancestors() {
+                    if ancestor.as_os_str().is_empty() || !checked_dirs.insert(ancestor) {
+                        break;
+                    }
+                    abs_buf.clear();
+                    abs_buf.push(&workspace.root);
+                    abs_buf.push(ancestor);
+                    let dir_meta = match std::fs::symlink_metadata(&abs_buf) {
+                        Ok(meta) => meta,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+                        Err(err) => return Some(Err(err.into())),
+                    };
+                    if dir_meta.file_type().is_symlink() {
+                        return Some(Err(
+                            invalid("symlinks are unsupported in this local experiment").into()
+                        ));
+                    }
+                }
+            }
+            abs_buf.clear();
+            abs_buf.push(&workspace.root);
+            abs_buf.push(rel_path);
+            let meta = match std::fs::symlink_metadata(&abs_buf) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(err) => return Some(Err(err.into())),
+            };
+            if meta.file_type().is_symlink() {
+                return Some(Err(
+                    invalid("symlinks are unsupported in this local experiment").into(),
+                ));
+            }
+            if meta.len() > max_file_bytes || meta.len() != expected_stamp.length {
+                return None;
+            }
+            if !crate::document::is_container_or_rich_document(rel_path)
+                && meta.len() as usize != doc.text.len()
+                && meta.len() % 2 != 0
+            {
+                return None;
+            }
+            if !(meta.len() > 64 || crate::document::is_binary_container_document(rel_path)) {
+                return None;
+            }
+            let Ok(current_stamp) = crate::incremental::stamp_from_metadata(&meta) else {
+                return None;
+            };
+            if &current_stamp != expected_stamp {
+                return None;
+            }
+        }
+
+        // Check response budget without allocating per-line Strings.
+        let mut total_bound = 64usize;
+        let mut est_wire_bytes = 256usize;
+        for &(doc_id, start, clamped_end) in &planned {
+            let doc = &self.resident.documents[doc_id];
+            let mut lines_bound = 0usize;
+            for line_idx in (start - 1)..clamped_end {
+                let line = doc.line(line_idx);
+                lines_bound += 2 + crate::context::string_bound(line);
+                est_wire_bytes += line.len() + 4;
+            }
+            total_bound += 192
+                + crate::context::string_bound(&doc.path)
+                + crate::context::string_bound(&doc.sha256_hex)
+                + lines_bound;
+            est_wire_bytes += 128;
+            if total_bound > crate::workspace::MAX_RESPONSE {
+                return None;
+            }
+        }
+
+        self.io_profile.read_policy_cache_hits += 1;
+
+        #[derive(serde::Serialize)]
+        struct BorrowedSnippet<'a> {
+            path: &'a str,
+            start: usize,
+            end: usize,
+            sha256: &'a str,
+            lines: Vec<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            notice: Option<&'a str>,
+        }
+
+        if !compact {
+            let borrowed: Vec<BorrowedSnippet<'_>> = planned
+                .iter()
+                .map(|&(doc_id, start, clamped_end)| {
+                    let doc = &self.resident.documents[doc_id];
+                    let mut lines = Vec::with_capacity(clamped_end - start + 1);
+                    for line_idx in (start - 1)..clamped_end {
+                        lines.push(doc.line(line_idx));
+                    }
+                    BorrowedSnippet {
+                        path: &doc.path,
+                        start,
+                        end: clamped_end,
+                        sha256: &doc.sha256_hex,
+                        lines,
+                        notice: None,
+                    }
+                })
+                .collect();
+            return Some(serialize_wire_json(&borrowed, envelope_root, est_wire_bytes));
+        }
+
+        let is_batch_call = planned.len() > 1;
+        let mut seen_in_call: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(planned.len());
+        let mut notices: Vec<Option<String>> = Vec::with_capacity(planned.len());
+        for &(doc_id, start, clamped_end) in &planned {
+            let first_in_call = seen_in_call.insert(doc_id);
+            let path_rc = self.resident.documents[doc_id].path.clone();
+            let sha_rc = self.resident.documents[doc_id].sha256_hex.clone();
+            notices.push(self.compute_single_snippet_notice(
+                &path_rc,
+                &sha_rc,
+                (start, clamped_end),
+                (is_batch_call, first_in_call),
+                None,
+            ));
+        }
+        let borrowed: Vec<BorrowedSnippet<'_>> = planned
+            .iter()
+            .zip(notices.iter())
+            .map(|(&(doc_id, start, clamped_end), notice)| {
+                let doc = &self.resident.documents[doc_id];
+                let mut lines = Vec::with_capacity(clamped_end - start + 1);
+                for line_idx in (start - 1)..clamped_end {
+                    lines.push(doc.line(line_idx));
+                }
+                BorrowedSnippet {
+                    path: &doc.path,
+                    start,
+                    end: clamped_end,
+                    sha256: &doc.sha256_hex,
+                    lines,
+                    notice: notice.as_deref(),
+                }
+            })
+            .collect();
+        Some(serialize_wire_json(&borrowed, envelope_root, est_wire_bytes))
+    }
+
     pub fn call_with_mode(&mut self, name: &str, mut arguments: Value, compact: bool) -> Result<Value> {
         self.last_used = Instant::now();
         if matches!(name, "code_files" | "code_grep" | "code_read" | "code_context") {
@@ -1515,8 +2110,14 @@ impl Watched {
                 }
                 self.filter_multi_search_paths(&mut request.paths);
                 self.check_explicit_search_targets(&request.paths, Some(&request.glob))?;
-                let result =
-                    crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?;
+                let result = if self.resident.ids_are_path_sorted {
+                    crate::files::find(
+                        self.resident.documents.iter().map(|d| d.path.as_ref()),
+                        &request,
+                    )?
+                } else {
+                    crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?
+                };
                 self.check_search_paths(result.paths.iter().map(String::as_str))?;
                 if compact {
                     #[derive(serde::Serialize)]
@@ -2192,9 +2793,12 @@ impl Watched {
     }
 
     fn check_search_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
-        let mut checked = BTreeSet::new();
-        let mut checked_dirs: BTreeSet<&'a Path> = BTreeSet::new();
+        let mut checked: std::collections::HashSet<&'a str> =
+            std::collections::HashSet::with_capacity(16);
+        let mut checked_dirs: std::collections::HashSet<&'a Path> =
+            std::collections::HashSet::with_capacity(16);
         let mut last_path: Option<&'a str> = None;
+        let mut abs_buf = PathBuf::with_capacity(self.spec.root.as_os_str().len() + 128);
         for path in paths {
             if last_path == Some(path) || !checked.insert(path) {
                 continue;
@@ -2212,7 +2816,10 @@ impl Watched {
                     if ancestor.as_os_str().is_empty() || !checked_dirs.insert(ancestor) {
                         break;
                     }
-                    let dir_meta = match std::fs::symlink_metadata(self.spec.root.join(ancestor)) {
+                    abs_buf.clear();
+                    abs_buf.push(&self.spec.root);
+                    abs_buf.push(ancestor);
+                    let dir_meta = match std::fs::symlink_metadata(&abs_buf) {
                         Ok(meta) => meta,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             return Err(self.stale_search_error(path).into());
@@ -2226,8 +2833,10 @@ impl Watched {
                     }
                 }
             }
-            let absolute = self.spec.root.join(rel_path);
-            let meta = match std::fs::symlink_metadata(&absolute) {
+            abs_buf.clear();
+            abs_buf.push(&self.spec.root);
+            abs_buf.push(rel_path);
+            let meta = match std::fs::symlink_metadata(&abs_buf) {
                 Ok(meta) => meta,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(self.stale_search_error(path).into());
@@ -2629,7 +3238,8 @@ impl Watched {
         snippets: &[Snippet],
     ) -> Result<Option<String>> {
         let mut unique: Vec<&Snippet> = Vec::with_capacity(snippets.len());
-        let mut seen = BTreeSet::new();
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(snippets.len());
         for snippet in snippets {
             if snippet.sha256 == "READ_UNAVAILABLE" {
                 continue;
@@ -2644,8 +3254,19 @@ impl Watched {
                 unique.push(snippet);
             }
         }
-        let mut checked_dirs: BTreeSet<&Path> = BTreeSet::new();
-        for snippet in &unique {
+        if unique.is_empty() {
+            return Ok(None);
+        }
+        let resident = &self.resident;
+        let stamps = &self.stamps;
+        let max_file_bytes = self.spec.policy.max_file_bytes;
+        let mut checked_dirs: std::collections::HashSet<&Path> =
+            std::collections::HashSet::with_capacity(unique.len() * 2);
+        let mut abs_buf = PathBuf::with_capacity(workspace.root.as_os_str().len() + 128);
+        let mut needs_hash: Vec<(&Snippet, Option<&crate::resident::Document>, u64)> = Vec::new();
+        let mut total_hash_bytes = 0usize;
+
+        for &snippet in &unique {
             let rel_path = Path::new(&snippet.path);
             if let Some(parent) = rel_path.parent()
                 && !parent.as_os_str().is_empty()
@@ -2654,7 +3275,10 @@ impl Watched {
                     if ancestor.as_os_str().is_empty() || !checked_dirs.insert(ancestor) {
                         break;
                     }
-                    let dir_meta = match std::fs::symlink_metadata(workspace.root.join(ancestor)) {
+                    abs_buf.clear();
+                    abs_buf.push(&workspace.root);
+                    abs_buf.push(ancestor);
+                    let dir_meta = match std::fs::symlink_metadata(&abs_buf) {
                         Ok(meta) => meta,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             return Ok(Some(snippet.path.clone()));
@@ -2668,16 +3292,14 @@ impl Watched {
                     }
                 }
             }
-        }
-        let resident = &self.resident;
-        let stamps = &self.stamps;
-        let max_file_bytes = self.spec.policy.max_file_bytes;
-        let verify_with_buf = |snippet: &Snippet, buf: &mut Vec<u8>| -> Result<bool> {
-            let rel_path = Path::new(&snippet.path);
-            let absolute = workspace.root.join(rel_path);
-            let meta = match std::fs::symlink_metadata(&absolute) {
+            abs_buf.clear();
+            abs_buf.push(&workspace.root);
+            abs_buf.push(rel_path);
+            let meta = match std::fs::symlink_metadata(&abs_buf) {
                 Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Some(snippet.path.clone()));
+                }
                 Err(error) => return Err(error.into()),
             };
             if meta.file_type().is_symlink() {
@@ -2700,23 +3322,38 @@ impl Watched {
                     .get(&snippet.path)
                     .is_some_and(|s| s.length != meta.len())
                 {
-                    return Ok(true);
+                    return Ok(Some(snippet.path.clone()));
                 }
                 if !crate::document::is_container_or_rich_document(rel_path)
                     && meta.len() as usize != doc.text.len()
                     && !matches!(meta.len() % 2, 0)
                 {
-                    return Ok(true);
+                    return Ok(Some(snippet.path.clone()));
                 }
                 if (meta.len() > 64 || crate::document::is_binary_container_document(rel_path))
                     && let Ok(current_stamp) = crate::incremental::stamp_from_metadata(&meta)
                     && stamps.get(&snippet.path) == Some(&current_stamp)
                 {
-                    return Ok(false);
+                    continue;
                 }
             }
+            total_hash_bytes = total_hash_bytes.saturating_add(meta.len() as usize);
+            needs_hash.push((snippet, known_doc, meta.len()));
+        }
+
+        if needs_hash.is_empty() {
+            return Ok(None);
+        }
+
+        let hash_file_with_buf = |snippet: &Snippet,
+                                  known_doc: Option<&crate::resident::Document>,
+                                  expected_len: u64,
+                                  buf: &mut Vec<u8>|
+         -> Result<bool> {
+            let rel_path = Path::new(&snippet.path);
+            let absolute = workspace.root.join(rel_path);
             buf.clear();
-            let needed = (meta.len() as usize).min(max_file_bytes).saturating_add(1);
+            let needed = (expected_len as usize).min(max_file_bytes).saturating_add(1);
             if buf.capacity() < needed {
                 buf.reserve(needed - buf.len());
             }
@@ -2754,11 +3391,12 @@ impl Watched {
             }
             Ok(crate::resident::digest_hex(&digest) != snippet.sha256)
         };
-        if unique.len() >= 4 {
-            let workers = unique.len().min(4);
-            let chunk_size = unique.len().div_ceil(workers);
+
+        if needs_hash.len() >= 4 && total_hash_bytes >= 64 * 1024 {
+            let workers = needs_hash.len().min(4);
+            let chunk_size = needs_hash.len().div_ceil(workers);
             let outcomes = std::thread::scope(|scope| {
-                let handles: Vec<_> = unique
+                let handles: Vec<_> = needs_hash
                     .chunks(chunk_size)
                     .map(|chunk| {
                         std::thread::Builder::new()
@@ -2767,8 +3405,11 @@ impl Watched {
                             .spawn_scoped(scope, move || {
                                 let mut buf = Vec::new();
                                 let mut results = Vec::with_capacity(chunk.len());
-                                for &snippet in chunk {
-                                    results.push((snippet.path.as_str(), verify_with_buf(snippet, &mut buf)?));
+                                for &(snippet, known_doc, len) in chunk {
+                                    results.push((
+                                        snippet.path.as_str(),
+                                        hash_file_with_buf(snippet, known_doc, len, &mut buf)?,
+                                    ));
                                 }
                                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(results)
                             })
@@ -2793,8 +3434,8 @@ impl Watched {
             return Ok(None);
         }
         let mut buf = Vec::new();
-        for snippet in unique {
-            if verify_with_buf(snippet, &mut buf)? {
+        for (snippet, known_doc, len) in needs_hash {
+            if hash_file_with_buf(snippet, known_doc, len, &mut buf)? {
                 return Ok(Some(snippet.path.clone()));
             }
         }
@@ -3074,6 +3715,134 @@ impl Watched {
         Ok(())
     }
 
+    fn compute_single_snippet_notice(
+        &mut self,
+        path: &str,
+        sha256: &str,
+        bounds: (usize, usize),
+        flags: (bool, bool),
+        clamped_req: Option<(usize, usize, usize)>,
+    ) -> Option<String> {
+        let (start, end) = bounds;
+        let (is_batch_call, first_in_call) = flags;
+        if sha256 == "READ_UNAVAILABLE" {
+            return None;
+        }
+        let doc = self
+            .resident
+            .paths
+            .get(path)
+            .map(|&id| &self.resident.documents[id]);
+        let total_lines = doc.map_or(end, |d| d.starts.len());
+        let mut notes = Vec::new();
+        if let Some((req_s, req_e, tot)) = clamped_req {
+            notes.push(format!(
+                "EOF_CLAMPED: requested {req_s}..{req_e} exceeds total_lines={tot}; returned valid_tail {start}..{end} (EOF)"
+            ));
+        } else if end >= total_lines && total_lines > 1 {
+            notes.push(format!(
+                "EOF: total_lines={total_lines} (no lines beyond {total_lines})"
+            ));
+        }
+        let mut overlap_found = None;
+        for (p, h, pst, pen) in &self.recent_read_history {
+            if p == path && h == sha256 {
+                let ov_s = start.max(*pst);
+                let ov_e = end.min(*pen);
+                if ov_e >= ov_s && (ov_e - ov_s + 1) >= 20 {
+                    overlap_found = Some((ov_s, ov_e, *pst, *pen));
+                    break;
+                }
+            }
+        }
+        if let Some((ov_s, ov_e, pst, pen)) = overlap_found {
+            notes.push(format!(
+                "OVERLAP_READ: lines {ov_s}..{ov_e} already read in {pst}..{pen} (sha256 unchanged); reuse context"
+            ));
+        }
+        if self.recent_read_history.len() >= 64 {
+            self.recent_read_history.pop_front();
+        }
+        self.recent_read_history
+            .push_back((path.to_owned(), sha256.to_owned(), start, end));
+
+        if self.file_read_streaks.len() >= 128 && !self.file_read_streaks.contains_key(path) {
+            self.file_read_streaks.clear();
+        }
+        let now_inst = Instant::now();
+        let streak = if is_batch_call {
+            self.file_read_streaks
+                .insert(path.to_owned(), (start, end, 1, now_inst));
+            1
+        } else if !first_in_call {
+            1
+        } else {
+            let next_streak = match self.file_read_streaks.get(path) {
+                Some(&(prev_s, prev_e, prev_streak, last_at))
+                    if last_at.elapsed() <= Duration::from_secs(300)
+                        && start <= prev_e.saturating_add(25)
+                        && end > prev_s =>
+                {
+                    prev_streak.saturating_add(1)
+                }
+                _ => 1,
+            };
+            self.file_read_streaks
+                .insert(path.to_owned(), (start, end, next_streak, now_inst));
+            next_streak
+        };
+        if streak >= 2
+            && end < total_lines
+            && total_lines > 120
+            && let Some(doc) = doc
+        {
+            let outline = extract_unread_outline(doc, end, 10);
+            if !outline.is_empty() {
+                notes.push(format!(
+                    "SEQUENTIAL_SLICE #{streak} ({start}..{end} of {total_lines}): unread_outline=[{}] — use code_context(paths=[\"{path}\"], pattern=\"...\") or jump to line",
+                    outline.join(", ")
+                ));
+            }
+        } else if streak == 1
+            && !is_batch_call
+            && start <= 5
+            && end < total_lines
+            && total_lines > 120
+            && let Some(doc) = doc
+        {
+            let outline = extract_unread_outline(doc, end, 8);
+            if !outline.is_empty() {
+                notes.push(format!(
+                    "PARTIAL_READ ({start}..{end} of {total_lines}): unread_outline=[{}] — jump via around_line/ranges or code_context(paths=[\"{path}\"], pattern=\"...\") instead of sequential slicing",
+                    outline.join(", ")
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join(" | "))
+    }
+
+    fn compute_read_snippet_notices(
+        &mut self,
+        snippets: &[Snippet],
+        clamped_req: Option<(usize, usize, usize)>,
+    ) -> Vec<Option<String>> {
+        let is_batch_call = snippets.len() > 1;
+        let mut seen_in_call: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(snippets.len());
+        let mut out = Vec::with_capacity(snippets.len());
+        for s in snippets {
+            let first_in_call = seen_in_call.insert(s.path.as_str());
+            out.push(self.compute_single_snippet_notice(
+                &s.path,
+                &s.sha256,
+                (s.start, s.end),
+                (is_batch_call, first_in_call),
+                clamped_req,
+            ));
+        }
+        out
+    }
+
     fn annotate_read_snippets_value(
         &mut self,
         snippets_val: &mut Value,
@@ -3094,109 +3863,52 @@ impl Watched {
             let Some(sha256) = obj.get("sha256").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
-            if sha256 == "READ_UNAVAILABLE" {
-                continue;
-            }
             let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = obj
                 .get("end")
                 .and_then(Value::as_u64)
                 .unwrap_or(start as u64) as usize;
-            let doc = self
-                .resident
-                .paths
-                .get(path.as_str())
-                .map(|&id| &self.resident.documents[id]);
-            let total_lines = doc.map_or(end, |d| d.starts.len());
-            let mut notes = Vec::new();
-            if let Some((req_s, req_e, tot)) = clamped_req {
-                notes.push(format!(
-                    "EOF_CLAMPED: requested {req_s}..{req_e} exceeds total_lines={tot}; returned valid_tail {start}..{end} (EOF)"
-                ));
-            } else if end >= total_lines && total_lines > 1 {
-                notes.push(format!(
-                    "EOF: total_lines={total_lines} (no lines beyond {total_lines})"
-                ));
-            }
-            let mut overlap_found = None;
-            for (p, h, pst, pen) in &self.recent_read_history {
-                if p == &path && h == &sha256 {
-                    let ov_s = start.max(*pst);
-                    let ov_e = end.min(*pen);
-                    if ov_e >= ov_s && (ov_e - ov_s + 1) >= 20 {
-                        overlap_found = Some((ov_s, ov_e, *pst, *pen));
-                        break;
-                    }
-                }
-            }
-            if let Some((ov_s, ov_e, pst, pen)) = overlap_found {
-                notes.push(format!(
-                    "OVERLAP_READ: lines {ov_s}..{ov_e} already read in {pst}..{pen} (sha256 unchanged); reuse context"
-                ));
-            }
-            if self.recent_read_history.len() >= 64 {
-                self.recent_read_history.pop_front();
-            }
-            self.recent_read_history
-                .push_back((path.clone(), sha256, start, end));
-
-            if self.file_read_streaks.len() >= 128 && !self.file_read_streaks.contains_key(&path) {
-                self.file_read_streaks.clear();
-            }
-            let now_inst = Instant::now();
             let first_in_call = seen_in_call.insert(path.clone());
-            let streak = if is_batch_call {
-                self.file_read_streaks.insert(path.clone(), (start, end, 1, now_inst));
-                1
-            } else if !first_in_call {
-                1
-            } else {
-                let next_streak = match self.file_read_streaks.get(&path) {
-                    Some(&(prev_s, prev_e, prev_streak, last_at))
-                        if last_at.elapsed() <= Duration::from_secs(300)
-                            && start <= prev_e.saturating_add(25)
-                            && end > prev_s =>
-                    {
-                        prev_streak.saturating_add(1)
-                    }
-                    _ => 1,
-                };
-                self.file_read_streaks
-                    .insert(path.clone(), (start, end, next_streak, now_inst));
-                next_streak
-            };
-            if streak >= 2
-                && end < total_lines
-                && total_lines > 120
-                && let Some(doc) = doc
-            {
-                let outline = extract_unread_outline(doc, end, 10);
-                if !outline.is_empty() {
-                    notes.push(format!(
-                        "SEQUENTIAL_SLICE #{streak} ({start}..{end} of {total_lines}): unread_outline=[{}] — use code_context(paths=[\"{path}\"], pattern=\"...\") or jump to line",
-                        outline.join(", ")
-                    ));
-                }
-            } else if streak == 1
-                && !is_batch_call
-                && start <= 5
-                && end < total_lines
-                && total_lines > 120
-                && let Some(doc) = doc
-            {
-                let outline = extract_unread_outline(doc, end, 8);
-                if !outline.is_empty() {
-                    notes.push(format!(
-                        "PARTIAL_READ ({start}..{end} of {total_lines}): unread_outline=[{}] — jump via around_line/ranges or code_context(paths=[\"{path}\"], pattern=\"...\") instead of sequential slicing",
-                        outline.join(", ")
-                    ));
-                }
-            }
-            if !notes.is_empty() {
-                obj.insert("notice".into(), Value::String(notes.join(" | ")));
+            if let Some(joined) = self.compute_single_snippet_notice(
+                &path,
+                &sha256,
+                (start, end),
+                (is_batch_call, first_in_call),
+                clamped_req,
+            ) {
+                obj.insert("notice".into(), Value::String(joined));
             }
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct FreshnessRef<'a> {
+    basis: &'static str,
+    generation: u64,
+    returned_file_check: &'a str,
+    full_disk_verified: bool,
+    notice: &'static str,
+}
+
+fn serialize_wire_json<T: serde::Serialize>(
+    data: &T,
+    envelope_root: Option<&Path>,
+    capacity: usize,
+) -> Result<Box<serde_json::value::RawValue>> {
+    let mut buf = Vec::with_capacity(capacity);
+    if let Some(root) = envelope_root {
+        #[derive(serde::Serialize)]
+        struct RootEnvelope<'a, D: serde::Serialize + ?Sized> {
+            root: &'a Path,
+            data: &'a D,
+        }
+        serde_json::to_writer(&mut buf, &RootEnvelope { root, data })?;
+    } else {
+        serde_json::to_writer(&mut buf, data)?;
+    }
+    let json_str = String::from_utf8(buf)?;
+    Ok(serde_json::value::RawValue::from_string(json_str)?)
 }
 
 fn extract_unread_outline(

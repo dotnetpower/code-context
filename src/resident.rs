@@ -427,61 +427,168 @@ impl Resident {
         let mut line_count = 0usize;
         let mut doc_owned_bytes = 0usize;
         let mut digest = Sha256::new();
-        for path in paths {
-            let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
-            let bytes = match workspace.read_known_with_limit_cached(
-                path,
-                policy.max_file_bytes,
-                &mut checked_dirs,
-            ) {
-                Ok(bytes) => bytes,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
-                        || error.to_string().contains(
-                            "file larger than configured max_file_bytes is unsupported",
-                        ) =>
-                {
-                    continue;
+        let can_parallel_load = paths.len() >= 16
+            && inventory.metadata_source_bytes >= 64 * 1024
+            && source_floor.saturating_add(
+                usize::try_from(inventory.metadata_source_bytes).unwrap_or(usize::MAX),
+            ) <= max_owned_bytes;
+        if can_parallel_load {
+            let mut verified_paths: Vec<(&Path, &str)> = Vec::with_capacity(paths.len());
+            for path in &paths {
+                let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
+                safe_relative(path)?;
+                match workspace.check_parent_symlinks_cached(path, &mut checked_dirs) {
+                    Ok(()) => verified_paths.push((path.as_path(), name)),
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
-            };
-            let text = String::from_utf8(bytes)?;
-            source_bytes += text.len();
-            if source_bytes > policy.max_source_bytes {
-                return Err(invalid("resident source budget exceeds configured limit").into());
             }
-            let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
-            digest.update((name.len() as u64).to_le_bytes());
-            digest.update(name.as_bytes());
-            digest.update((text.len() as u64).to_le_bytes());
-            digest.update(sha256);
-            let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
-            let starts = build_line_starts(&text)?;
-            line_count = line_count.saturating_add(starts.len());
-            if line_count > policy.max_total_lines {
-                return Err(invalid("resident line count exceeds configured limit").into());
+            let max_file_bytes = policy.max_file_bytes;
+            let workers = verified_paths.len().clamp(1, 4);
+            let chunk_size = verified_paths.len().div_ceil(workers).max(1);
+            let loaded_chunks = std::thread::scope(|scope| {
+                let handles: Vec<_> = verified_paths
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        std::thread::Builder::new()
+                            .name("cctx-load".into())
+                            .stack_size(crate::policy::WORKER_STACK_BYTES)
+                            .spawn_scoped(scope, move || {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for &(path, name) in chunk {
+                                    let bytes = match workspace
+                                        .read_known_nofollow_after_dir_check(path, max_file_bytes)
+                                    {
+                                        Ok(bytes) => bytes,
+                                        Err(error)
+                                            if error
+                                                .downcast_ref::<std::io::Error>()
+                                                .is_some_and(|io_err| {
+                                                    io_err.kind() == std::io::ErrorKind::NotFound
+                                                })
+                                                || error.to_string().contains(
+                                                    "file larger than configured max_file_bytes is unsupported",
+                                                ) =>
+                                        {
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                    let text = String::from_utf8(bytes)?;
+                                    let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                                    let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
+                                    let starts = build_line_starts(&text)?;
+                                    out.push(Document {
+                                        path: Arc::from(name),
+                                        text,
+                                        starts,
+                                        sha256,
+                                        sha256_hex,
+                                    });
+                                }
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(out)
+                            })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .map_err(|_| invalid("document loader worker panicked").into())
+                            .and_then(|r| r)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for doc in loaded_chunks.into_iter().flatten() {
+                source_bytes += doc.text.len();
+                if source_bytes > policy.max_source_bytes {
+                    return Err(invalid("resident source budget exceeds configured limit").into());
+                }
+                line_count = line_count.saturating_add(doc.starts.len());
+                if line_count > policy.max_total_lines {
+                    return Err(invalid("resident line count exceeds configured limit").into());
+                }
+                digest.update((doc.path.len() as u64).to_le_bytes());
+                digest.update(doc.path.as_bytes());
+                digest.update((doc.text.len() as u64).to_le_bytes());
+                digest.update(doc.sha256);
+                doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
+                documents.push(doc);
+                let floor = source_bytes
+                    .saturating_add(inventory.total_path_bytes.saturating_mul(2))
+                    .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
+                    .saturating_add(documents.len().saturating_mul(128));
+                if floor > max_owned_bytes {
+                    return Err(ResidentAdmissionError::new(
+                        "resident admission budget exceeded while loading files",
+                        floor,
+                    )
+                    .into());
+                }
             }
-            let doc = Document {
-                path: Arc::from(name),
-                text,
-                starts,
-                sha256,
-                sha256_hex,
-            };
-            doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
-            documents.push(doc);
-            let floor = source_bytes
-                .saturating_add(inventory.total_path_bytes.saturating_mul(2))
-                .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
-                .saturating_add(documents.len().saturating_mul(128));
-            if floor > max_owned_bytes {
-                return Err(ResidentAdmissionError::new(
-                    "resident admission budget exceeded while loading files",
-                    floor,
-                )
-                .into());
+        } else {
+            for path in paths {
+                let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
+                let bytes = match workspace.read_known_with_limit_cached(
+                    path,
+                    policy.max_file_bytes,
+                    &mut checked_dirs,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                            || error.to_string().contains(
+                                "file larger than configured max_file_bytes is unsupported",
+                            ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let text = String::from_utf8(bytes)?;
+                source_bytes += text.len();
+                if source_bytes > policy.max_source_bytes {
+                    return Err(invalid("resident source budget exceeds configured limit").into());
+                }
+                let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                digest.update((name.len() as u64).to_le_bytes());
+                digest.update(name.as_bytes());
+                digest.update((text.len() as u64).to_le_bytes());
+                digest.update(sha256);
+                let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
+                let starts = build_line_starts(&text)?;
+                line_count = line_count.saturating_add(starts.len());
+                if line_count > policy.max_total_lines {
+                    return Err(invalid("resident line count exceeds configured limit").into());
+                }
+                let doc = Document {
+                    path: Arc::from(name),
+                    text,
+                    starts,
+                    sha256,
+                    sha256_hex,
+                };
+                doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
+                documents.push(doc);
+                let floor = source_bytes
+                    .saturating_add(inventory.total_path_bytes.saturating_mul(2))
+                    .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
+                    .saturating_add(documents.len().saturating_mul(128));
+                if floor > max_owned_bytes {
+                    return Err(ResidentAdmissionError::new(
+                        "resident admission budget exceeded while loading files",
+                        floor,
+                    )
+                    .into());
+                }
             }
         }
         drop(allowed);

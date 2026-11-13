@@ -633,6 +633,91 @@ impl Workspace {
         self.read_verified_file_bytes(path, &metadata, max_file_bytes)
     }
 
+    pub(crate) fn check_parent_symlinks_cached(
+        &self,
+        path: &Path,
+        checked_dirs: &mut HashSet<PathBuf>,
+    ) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            for ancestor in parent.ancestors() {
+                if ancestor.as_os_str().is_empty() || checked_dirs.contains(ancestor) {
+                    break;
+                }
+                let meta = std::fs::symlink_metadata(self.root.join(ancestor))?;
+                if meta.file_type().is_symlink() {
+                    return Err(invalid("symlinks are unsupported in this local experiment").into());
+                }
+                checked_dirs.insert(ancestor.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_known_nofollow_after_dir_check(
+        &self,
+        path: &Path,
+        max_file_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let absolute = self.root.join(path);
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&absolute)
+            {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(invalid("symlinks are unsupported in this local experiment").into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid("symlinks are unsupported in this local experiment").into());
+            }
+            if metadata.len() > max_file_bytes as u64 {
+                return Err(invalid(format!(
+                    "file larger than configured max_file_bytes is unsupported: {}",
+                    path.display()
+                ))
+                .into());
+            }
+            let capacity = (metadata.len() as usize).min(max_file_bytes).saturating_add(1);
+            let mut bytes = Vec::with_capacity(capacity);
+            file.take(max_file_bytes as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > max_file_bytes {
+                return Err(invalid(format!(
+                    "file larger than configured max_file_bytes is unsupported: {}",
+                    path.display()
+                ))
+                .into());
+            }
+            if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)? {
+                return Ok(extracted.into_bytes());
+            }
+            if memchr::memchr(0, &bytes).is_some() {
+                return Err(invalid(format!(
+                    "binary file or file larger than configured limit is unsupported: {}",
+                    path.display()
+                ))
+                .into());
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(self.root.join(path))?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid("symlinks are unsupported in this local experiment").into());
+            }
+            self.read_verified_file_bytes(path, &metadata, max_file_bytes)
+        }
+    }
+
     pub(crate) fn read_known_with_limit_cached(
         &self,
         path: &Path,
@@ -640,8 +725,8 @@ impl Workspace {
         checked_dirs: &mut HashSet<PathBuf>,
     ) -> Result<Vec<u8>> {
         safe_relative(path)?;
-        let metadata = reject_symlinks_metadata_cached(&self.root, path, checked_dirs)?;
-        self.read_verified_file_bytes(path, &metadata, max_file_bytes)
+        self.check_parent_symlinks_cached(path, checked_dirs)?;
+        self.read_known_nofollow_after_dir_check(path, max_file_bytes)
     }
 
     fn read_verified_file_bytes(

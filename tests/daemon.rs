@@ -918,3 +918,87 @@ fn source_plan_update_preserves_existing_registration_settings() {
     assert_eq!(plan["prewarm"], true);
     assert_eq!(plan["policy"]["max_files"], 123);
 }
+
+#[test]
+fn framed_raw_json_fast_path_preserves_borrowed_read_notices_and_live_edit_recovery() {
+    use std::io::Read;
+    let fixture = Fixture::new();
+    let initial_body = (1..=25)
+        .map(|idx| format!("pub fn item_{idx}() -> usize {{ {idx} }}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(initial_body.len() > 64);
+    std::fs::write(fixture.root.join("src/big.rs"), &initial_body).unwrap();
+    fixture
+        .rpc("code_sync", Some(&fixture.root), json!({}))
+        .unwrap();
+
+    let mut stream = UnixStream::connect(fixture.home.join("daemon.sock")).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(b"CCTXJ1\n").unwrap();
+
+    let mut framed_call = |name: &str, arguments: Value, compact: bool| -> Value {
+        let req = serde_json::to_vec(&json!({
+            "root": fixture.root,
+            "name": name,
+            "arguments": arguments,
+            "compact": compact,
+        }))
+        .unwrap();
+        stream
+            .write_all(&u32::try_from(req.len()).unwrap().to_be_bytes())
+            .unwrap();
+        stream.write_all(&req).unwrap();
+        let mut len = [0_u8; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    };
+
+    let range_args = json!({"ranges": [{"path": "src/big.rs", "start": 1, "end": 25}]});
+    let first = framed_call("code_read", range_args.clone(), true);
+    assert_eq!(first["result"][0]["lines"][0], "pub fn item_1() -> usize { 1 }");
+    assert!(first["result"][0]["notice"].as_str().unwrap().contains("EOF"));
+
+    // Second call exercises the borrowed zero-allocation read fast path + OVERLAP_READ notice.
+    let second = framed_call("code_read", range_args.clone(), true);
+    assert_eq!(second["result"][0]["lines"][24], "pub fn item_25() -> usize { 25 }");
+    assert!(
+        second["result"][0]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("OVERLAP_READ")
+    );
+
+    // Non-compact envelope wraps {"root", "data"} without notices.
+    let full = framed_call("code_read", range_args.clone(), false);
+    assert_eq!(full["result"]["root"], json!(fixture.root));
+    assert!(full["result"]["data"][0].get("notice").is_none());
+    assert_eq!(full["result"]["data"][0]["lines"].as_array().unwrap().len(), 25);
+
+    // Unknown fields still fail strict schema validation.
+    let bad = framed_call(
+        "code_read",
+        json!({"ranges": [{"path": "src/big.rs", "start": 1, "end": 2}], "bogus": true}),
+        true,
+    );
+    assert!(bad["error"].as_str().is_some(), "{bad}");
+
+    // Immediate live edit on disk falls back to recovery and returns updated content & sha256.
+    let updated_body = initial_body.replace("pub fn item_1() -> usize { 1 }", "pub fn item_1() -> usize { 999 }");
+    std::fs::write(fixture.root.join("src/big.rs"), &updated_body).unwrap();
+    let after_edit = framed_call("code_read", range_args, true);
+    assert_eq!(
+        after_edit["result"][0]["lines"][0],
+        "pub fn item_1() -> usize { 999 }"
+    );
+    assert_ne!(after_edit["result"][0]["sha256"], second["result"][0]["sha256"]);
+
+    // ContextWireArgs default limit/max_matches_per_file path over FramedJson.
+    let ctx = framed_call("code_context", json!({"pattern": "item_1() -> usize { 999 }"}), true);
+    assert_eq!(ctx["result"]["search"]["total_matches"], 1);
+}
