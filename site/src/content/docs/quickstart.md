@@ -67,22 +67,45 @@ cctx --root /path/to/project prompt --style formula --target instructions
 
 ## 5. Inspect live token & cost savings (`cctx usage`)
 
-Monitor real multi-session telemetry—warm cache hit rate, eligible tool adoption, BPE formula compression coverage, and estimated AI Credit (AIC) / USD savings—directly from your terminal or the VS Code status bar:
+Monitor real multi-session telemetry—modeled AI Credit (`@ $0.001/AIC`) spend with versus without `cctx`, avoided tokens across turns/cache/BPE, warm cache hit rate, per-model breakdown, and actionable optimization advisories—directly from your terminal or the VS Code status bar:
 
 ```sh
 cctx usage --hours 24
+# Full 4-driver cost anatomy & session advisories:
+cctx usage --hours 24 --details
 # Machine-readable JSON output:
 cctx usage --hours 24 --json
 ```
 
-Example terminal summary:
+Example `24h` multi-session summary (`159` sessions · `7,578` turns):
 
 ```text
-⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: 2.0h)
-💰 COST SAVED (@$0.001/AIC) : +$2.42 USD (-28.4% of baseline bill · ~2421.6 AIC saved)
-💎 API LIST VALUE (@$0.01)  : +$24.22 USD | 🔥 TOKENS SAVED: ~86.02M tok (244 Turns + 35x Cache + BPE)
-🧬 BPE FORMULA COMPRESSION  : 100.0% (4/4 surfaces: ext·mcp·subagent·global · ~2100 tok/turn)
-🎯 WARM CACHE HIT RATE      :  98.6% (506/513) | 🚀 ELIGIBLE SOURCE ADOPTION: 98.5% (513/521)
+⚡ CCTX USAGE · Last 24 hours
+
+💰 $48.88 saved · 26.6% less (estimated)
+   Without cctx ~$183.78 → With cctx $134.90
+   USD equivalent @ $0.001/AIC; not a bill.
+
+EFFICIENCY
+  Tokens avoided ~1.58B
+  Warm hits 95.5% · Source adoption 90.3%
+
+💡 OPTIMIZATION ADVISORIES
+  No optimization issues detected.
+
+MODELS · USD equivalent
+┌───────────────────────┬─────────┬───────────┐
+│ Model                 │    Used │ Est.saved │
+├───────────────────────┼─────────┼───────────┤
+│ Claude Opus (high)    │  $78.40 │    $29.10 │
+│ GPT-6.1 (medium)      │  $41.25 │    $14.85 │
+│ Claude Sonnet (med)   │  $15.25 │     $4.93 │
+│ Total                 │ $134.90 │    $48.88 │
+└───────────────────────┴─────────┴───────────┘
+
+Full report: cctx usage --hours 24 --details
 ```
+
+Running `--details` decomposes **why** net dollar spend drops—showing that **54.0%** (`851.8M tok`) comes from **avoided LLM round-trip turns** and **44.5%** (`701.8M tok`, `98.7×`) comes from **avoided prompt-cache re-reads**, rather than single-output byte trimming (`0.5%`). See [Benchmarks & Net LLM Cost Analysis](../benchmarks/#5-net-llm-cost-analysis-24h-production-trace-replay) for the full cost equation.
 
 Continue to [Native VS Code & MCP Tools](../tools/) for full parameter schemas and rich document anchor syntax.

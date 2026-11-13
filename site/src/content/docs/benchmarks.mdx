@@ -101,7 +101,23 @@ Measured with `scripts/agent_ab.py` on a 6,000-file Rust workspace across identi
 
 ---
 
-## 5. Reproduce on your own machine
+## 5. Net LLM cost analysis (`24h` production trace replay)
+
+Shrinking a single tool output by 99% via large MCP tool catalogs or `PreToolUse` hook denials often **increases** total session billing because model output tokens and extra uncached turns cost **10× to 100× more** than cached history reads.
+
+Replaying **159 live multi-model coding sessions (`7,578` turns, `2.86B` total tokens, `95.5%` warm cache hit rate, `90.3%` eligible source adoption)** via `cctx usage --hours 24 --details` models **`$48.88 USD` (`-26.6%`) lower spend** (`~$183.78 → $134.90` @ `$0.001/AIC`; `~$488.82` @ `$0.01` API list reference):
+
+| Savings Driver (`cctx usage --hours 24 --details`) | Tokens Avoided | Share | Why It Lowers the Actual Bill |
+|---|---:|---:|---|
+| **1. Avoided LLM round-trip turns** (`~2,290` turns) | **851.76M tok** | **54.0%** | Combining search + block-clamped read in 1 turn eliminates extra model invocations, reasoning/output tokens, and full-history re-submissions. |
+| **2. Compounded prompt-cache re-reads** (`98.7×` mult.) | **701.82M tok** | **44.5%** | Keeping noisy lines out on turn *k* avoids re-reading those tokens across turns *k+1 … T* before compaction. |
+| **3. Standing BPE formula compression** (`4/4` surfaces) | **16.09M tok** | **1.0%** | Saves `~2,123 tok` on **every** turn (`0` extra MCP schemas for `pctx` & `journal`). |
+| **4. First-turn tool payload byte delta** | **7.11M tok** | **0.5%** | Immediate single-call byte trimming alone is `<0.5%` of total session token exposure. |
+| **Total modeled 24h impact** | **~1.58B tok** | **100.0%** | **`~$183.78 → $134.90` (`-$48.88 USD` / `-26.6%` @ `$0.001/AIC`)** |
+
+---
+
+## 6. Reproduce on your own machine
 
 ```sh
 git clone https://github.com/dotnetpower/code-context.git
