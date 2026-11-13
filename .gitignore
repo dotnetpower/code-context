@@ -10,6 +10,13 @@ __pycache__/
 /vscode-extension/out/
 /vscode-extension/dist/
 /vscode-extension/.eslintcache
+/site/node_modules/
+/site/dist/
+/site/.astro/
+/site/public/benchmarks/
+/site/public/llms.txt
+/site/public/og-cover.png
+/site/public/c7d4e9a1b2f84c6093e5a7d21f0b8e4c.txt
 .env
 .env.*
 !.env.example

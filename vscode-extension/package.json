@@ -155,7 +155,7 @@
         "name": "code-context-native_codeFiles",
         "toolReferenceName": "cctxNativeFiles",
         "displayName": "Code Context: Find Files",
-        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for filename/path glob discovery, NOT content. Pass explicit root in WSL/multi-root sessions. This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_files.",
+        "modelDescription": "Preferred native tool: filename/path glob (!content). Pass root when known. CACHE_MISS returns immediately -> 1 host read; fallback: backend MCP code_files.",
         "userDescription": "Find indexed filenames and paths without searching file contents.",
         "tags": [
           "files",
@@ -178,13 +178,13 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known (required in Windows/WSL Agent Sessions with multiple roots)."
+              "description": "Explicit absolute root."
             },
             "glob": {
               "type": "string",
               "minLength": 1,
               "maxLength": 1024,
-              "description": "Filename or relative-path glob, e.g. *Tools.ts, *.{ts,tsx}, **/*.test.tsx, src/**/*.rs, or bare stem."
+              "description": "Path/name glob (e.g. *.rs, src/**/*.ts) or stem."
             },
             "paths": {
               "type": "array",
@@ -192,7 +192,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional non-hidden relative path prefixes within root."
+              "description": "Relative path prefixes."
             },
             "limit": {
               "type": "integer",
@@ -224,7 +224,7 @@
         ],
         "toolReferenceName": "cctxNativeGrep",
         "displayName": "Code Context: Search",
-        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for saved-source exact/regex search. Pass explicit root when known and set max_matches_per_file to stay inline (<8KiB). This native cache: CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_grep.",
+        "modelDescription": "Preferred native tool: saved-source literal/regex search. Pass root & max_matches_per_file (<8KiB). CACHE_MISS returns immediately -> 1 host search; fallback: backend MCP code_grep.",
         "userDescription": "Search indexed workspace source with the native Rust code-context tool.",
         "canBeReferencedInPrompt": true,
         "icon": "$(search)",
@@ -234,17 +234,16 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
+              "description": "Explicit absolute root."
             },
             "pattern": {
               "type": "string",
               "minLength": 1,
-              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation (a|b)."
+              "description": "Literal default, not semantic or keyword search. Set regex=true for a|b."
             },
             "regex": {
               "type": "boolean",
-              "default": false,
-              "description": "Enable regex syntax."
+              "default": false
             },
             "ignore_case": {
               "type": "boolean",
@@ -260,7 +259,7 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 64,
-              "description": "Optional per-file match cap; prioritizes symbol definitions."
+              "description": "Per-file cap."
             },
             "paths": {
               "type": "array",
@@ -268,11 +267,10 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional non-hidden relative path prefixes within root."
+              "description": "Relative path prefixes."
             },
             "glob": {
-              "type": "string",
-              "description": "Optional filename/path glob."
+              "type": "string"
             }
           },
           "required": [
@@ -297,7 +295,7 @@
         ],
         "toolReferenceName": "cctxNativeContext",
         "displayName": "Code Context: Search with Context",
-        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for symbol/literal/regex lookup with nearby saved source in one native call. Pass explicit root when known; radius 0..100, limit 1..64. CACHE_MISS returns immediately; continue with permitted host search/read. If foreground dispatch is unavailable, prefer backend MCP code_context.",
+        "modelDescription": "NATIVE FIRST: symbol/literal + surrounding source in 1 native call (radius 0..100, limit 1..64). CACHE_MISS returns immediately -> 1 host read; fallback: backend MCP code_context.",
         "userDescription": "Search indexed source and return versioned surrounding context.",
         "canBeReferencedInPrompt": true,
         "icon": "$(book)",
@@ -307,17 +305,16 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
+              "description": "Explicit absolute root."
             },
             "pattern": {
               "type": "string",
               "minLength": 1,
-              "description": "Literal substring by default, not semantic or keyword search. Set regex=true for alternation (a|b)."
+              "description": "Literal default, not semantic or keyword search. Set regex=true for a|b."
             },
             "regex": {
               "type": "boolean",
-              "default": false,
-              "description": "Enable regex syntax."
+              "default": false
             },
             "ignore_case": {
               "type": "boolean",
@@ -334,7 +331,7 @@
               "minimum": 1,
               "maximum": 64,
               "default": 4,
-              "description": "Optional per-file match cap; prioritizes symbol definitions."
+              "description": "Per-file cap."
             },
             "radius": {
               "type": "integer",
@@ -348,11 +345,10 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional non-hidden relative path prefixes within root."
+              "description": "Relative path prefixes."
             },
             "glob": {
-              "type": "string",
-              "description": "Optional filename/path glob."
+              "type": "string"
             }
           },
           "required": [
@@ -377,7 +373,7 @@
         ],
         "toolReferenceName": "cctxNativeRead",
         "displayName": "Code Context: Read Ranges",
-        "modelDescription": "PREFERRED NATIVE TOOL: Use FIRST for known saved-source ranges in a native batch read. Pass explicit root when known and keep total lines <=150 per call (<8KiB) so output stays inline. CACHE_MISS returns immediately; continue with permitted host read. If foreground dispatch is unavailable, prefer backend MCP code_read.",
+        "modelDescription": "Preferred native tool: batch saved-source ranges (<=150 lines, <8KiB). Pass root when known. CACHE_MISS returns immediately -> 1 host read; fallback: backend MCP code_read.",
         "userDescription": "Read multiple indexed source ranges with live hash verification.",
         "canBeReferencedInPrompt": true,
         "icon": "$(file-code)",
@@ -387,66 +383,58 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Always pass the explicit absolute project/worktree root when known."
+              "description": "Explicit absolute root."
             },
             "page": {
               "type": "boolean",
               "default": false,
-              "description": "Paginate large reads (<256KiB) returning snippets, complete, and next_ranges."
+              "description": "Paginate >150L via next_ranges."
             },
             "split_ranges": {
               "type": "boolean",
-              "default": true,
-              "description": "Split broad reads into <=500-line segments (max 64 segments, 256KiB)."
+              "default": true
             },
             "path": {
               "type": "string",
-              "description": "Optional single workspace-relative path (supports path:line:col, path#Lstart-Lend, path.md#slug, and @/ aliases) when reading one range."
+              "description": "Single relative path (supports :line, #Lstart-Lend, .md#slug, @/)."
             },
             "start": {
               "type": "integer",
-              "minimum": 1,
-              "description": "Optional 1-based inclusive start line for single-file reads."
+              "minimum": 1
             },
             "end": {
               "type": "integer",
-              "minimum": 1,
-              "description": "Optional 1-based inclusive end line for single-file reads."
+              "minimum": 1
             },
             "around_line": {
               "type": "integer",
-              "minimum": 1,
-              "description": "Optional 1-based center line for reading a symmetric window around a diagnostic or symbol."
+              "minimum": 1
             },
             "radius": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 200,
-              "description": "Optional line radius around around_line (default 20)."
+              "maximum": 200
             },
             "ranges": {
               "type": "array",
               "minItems": 1,
               "maxItems": 64,
-              "description": "1-based inclusive line ranges for non-hidden workspace-relative paths. Keep total lines <=150 per call (<8KiB) to avoid host output offloading.",
+              "description": "1-based inclusive ranges (<=150 total lines; no .github/.vscode).",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                   "path": {
                     "type": "string",
-                    "minLength": 1,
-                    "description": "Non-hidden workspace-relative file path (supports path:line:col, path#Lstart-Lend, and @/ aliases; do not pass .github/.vscode dotfiles)."
+                    "minLength": 1
                   },
                   "start": {
                     "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based inclusive start line."
+                    "minimum": 1
                   },
                   "end": {
                     "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based inclusive end line."
+                    "minimum": 1
                   }
                 },
                 "required": [
@@ -470,7 +458,7 @@
         ],
         "toolReferenceName": "cctxNativeStatus",
         "displayName": "Code Context: Status",
-        "modelDescription": "Show native code-context index state, coverage, memory and protocol counters without loading, refreshing or hashing source. An unloaded index is normal until the first source lookup.",
+        "modelDescription": "Show native index state, coverage & memory without loading source.",
         "userDescription": "Show native index and daemon status.",
         "canBeReferencedInPrompt": true,
         "icon": "$(pulse)",
@@ -480,7 +468,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Explicit absolute root."
             }
           }
         }
@@ -494,7 +482,7 @@
         ],
         "toolReferenceName": "cctxNativeSync",
         "displayName": "Code Context: Sync",
-        "modelDescription": "Run the preferred native explicit full-source synchronization barrier before exhaustive absence claims or after edits. Rechecks ignore/profile policy and updates only changed postings.",
+        "modelDescription": "Explicit native full-source sync barrier for exhaustive absence claims only.",
         "userDescription": "Synchronize the native source index with saved files.",
         "canBeReferencedInPrompt": true,
         "icon": "$(sync)",
@@ -504,7 +492,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional registered root. Windows Agent Sessions: pass the actual absolute Linux project/worktree root."
+              "description": "Explicit absolute root."
             }
           }
         }
@@ -517,7 +505,7 @@
         ],
         "toolReferenceName": "cctxNativeWorkspaces",
         "displayName": "Code Context: Registered Workspaces",
-        "modelDescription": "List explicitly registered native code-context roots, scopes, globs, exclusion settings, and memory policies. Use only when automatic current-workspace root resolution is ambiguous.",
+        "modelDescription": "List registered native roots, scopes & globs.",
         "userDescription": "List registered native code-context workspaces.",
         "canBeReferencedInPrompt": true,
         "icon": "$(root-folder)",

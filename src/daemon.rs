@@ -218,9 +218,8 @@ pub(crate) fn new_trace_id() -> String {
             .finish()
     });
     format!(
-        "{:x}-{:x}-{:x}",
-        std::process::id(),
-        nonce,
+        "{:x}_{:x}",
+        nonce & 0xffffff,
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
 }
@@ -1231,9 +1230,9 @@ impl Server {
         if used == 0 {
             self.memory.limits.target
         } else {
-            self.memory.limits.target
-                .saturating_sub(used)
-                .saturating_sub(128 * 1024 * 1024)
+            let remaining = self.memory.limits.target.saturating_sub(used);
+            let cushion = (128 * 1024 * 1024).min(remaining / 2);
+            remaining.saturating_sub(cushion)
         }
     }
 
@@ -1613,12 +1612,18 @@ impl Server {
         }
         let existing = requester.and_then(|_| self.roots.remove(&spec.root));
         let owner = existing.as_ref().and(requester);
-        let used = self
+        while !self.roots.is_empty() && self.roots.len() >= self.memory.limits.root_limit() {
+            let oldest = self
+                .eviction_candidate(None)
+                .ok_or_else(|| invalid("missing eviction candidate"))?;
+            self.evict(&oldest, "background_admission");
+        }
+        let mut used = self
             .roots
             .values()
             .map(Watched::estimated_bytes)
             .sum::<usize>();
-        let budget = if let Some(watched) = &existing {
+        let mut budget = if let Some(watched) = &existing {
             watched
                 .estimated_bytes()
                 .saturating_add(spec.policy.max_staged_bytes)
@@ -1627,19 +1632,26 @@ impl Server {
             self.cold_load_budget(&spec, used)
         };
         while !self.roots.is_empty()
-            && (self.roots.len() >= self.memory.limits.root_limit()
-                || self
-                    .roots
-                    .values()
-                    .map(Watched::estimated_bytes)
-                    .sum::<usize>()
-                    .saturating_add(budget)
-                    > self.memory.limits.target)
+            && self
+                .roots
+                .values()
+                .map(Watched::estimated_bytes)
+                .sum::<usize>()
+                .saturating_add(budget)
+                > self.memory.limits.target
         {
             let oldest = self
                 .eviction_candidate(None)
                 .ok_or_else(|| invalid("missing eviction candidate"))?;
             self.evict(&oldest, "background_admission");
+            if existing.is_none() {
+                used = self
+                    .roots
+                    .values()
+                    .map(Watched::estimated_bytes)
+                    .sum::<usize>();
+                budget = self.cold_load_budget(&spec, used);
+            }
         }
         release_allocator_memory();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -3673,6 +3685,24 @@ mod tests {
         assert_eq!(
             server.evictions.back().unwrap()["reason"],
             "resident_budget"
+        );
+    }
+
+    #[test]
+    fn low_target_root_switch_evicts_before_computing_cold_budget() {
+        let (directory, mut server) = cached_test_roots(1);
+        server.memory.limits = crate::memory::Limits::fixed(64 * 1024 * 1024);
+        assert_eq!(server.memory.limits.root_limit(), 1);
+        let incoming = directory.path().join("incoming-root");
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("source.rs"), "pub fn incoming() {}\n").unwrap();
+        let spec = test_spec(incoming);
+        server.start_root_job(spec, None, 0).unwrap();
+        let reserved = server.background.as_ref().unwrap().budget;
+        assert_eq!(
+            reserved,
+            server.memory.limits.target,
+            "cold_load_budget must see used==0 after root_limit eviction instead of starving to 0"
         );
     }
 }

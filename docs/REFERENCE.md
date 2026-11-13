@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 The installer builds a locked release and installs:
 
-- `~/.local/bin/cctx`
+- `~/.local/bin/cctx` (plus `~/.local/bin/pctx -> cctx` multi-call symlink for declarative probes)
 - `~/.config/systemd/user/code-context.service`
 - private state in `~/.local/state/code-context/`
 
@@ -65,7 +65,17 @@ cctx --backend shared --root /path/to/project status
 cctx usage --hours 24
 cctx --root /path/to/project prompt --style formula --target instructions
 cctx --root /path/to/project prompt --compress "Which function calculates retry delay, and what caps the result?" --json
+pctx http "https://openapi.example.org/{svc}?Type=json&pSize=2" --var svc=CityPark,ParkingPlace
+pctx json /path/to/collection.json --bbox 125.5,33.1,131.0,38.6 --count-by properties.category
+pctx table /path/to/dataset.parquet --bbox 125.5,33.1,131.0,38.6
+pctx image /path/to/render.png --expect 1440x480
+pctx batch -c "git log -n 200 --stat" -c "docker logs app" -q "timeout" -q "retry"
+pctx log @s1 -q "fatal"
+cctx --root /path/to/project journal record --kind decision --pin -s "Keep <8KiB inline cap"
+cctx --root /path/to/project journal resume -q "inline cap"
 ```
+
+`pctx` (`cctx probe {http|json|table|image|log|batch|journal}`) replaces ad-hoc `python3 -c`, `curl`, `jq`, and `sqlite3` inspection scripts with zero-schema-tax Rust primitives: concurrent `{var}` matrix HTTP probing with automatic query/env secret redaction, streaming JSON/JSONL/GeoJSON/STAC/`/tmp` offload schema & `--bbox` filtering, pure-Rust Parquet Thrift footer + read-only SQLite + CSV inspection, PNG scanline Rec.709 luminance/exposure + JPEG/WebP/GIF/SVG verification, spooled unstructured log & multi-command batch retrieval (`pctx batch` / `pctx log @sN` with fence/stacktrace-aware chunking and Okapi BM25 + Trigram RRF), and a per-workspace compaction continuity journal (`cctx journal` / `pctx journal`) that restores a secret-scrubbed `<=2 KiB` `<cctx_journal_state>` block + BM25 prompt recall across context compactions via fail-open, zero-`PreToolUse`-deny hooks (`cctx journal hook-config`), bounded strictly inside `<8 KiB`.
 
 `cctx prompt` renders BPE-aligned symbolic formula (`formula`), contract-compatible
 hybrid (`hybrid`), or prose (`prose`) instructions for `.instructions.md`, MCP
@@ -83,21 +93,58 @@ sessions finishing at the same instant), host-dispatch delay from the native
 `other_tool_offload`, `cache_miss_rate`, `client_disconnected`). Cost and token savings are trace-replayed per
 `(session, agent)` stream using each turn's `copilotUsage.tokenDetails` rates,
 pre-compaction history re-reads, and warm-turn context sizes; `--json` adds
-`insights` and the savings-model `assumptions`:
+`insights` and the savings-model `assumptions`. The terminal view leads with
+estimated savings and a without/with comparison at `$0.001/AIC`; these are USD
+equivalents, not verified billing reductions. Alternative `$0.01/AIC` valuations
+are labeled as reference values, not additional savings.
+
+The default view shows savings, efficiency, up to three prioritized advisory
+groups, and a compact model cost table. Repeated recommendations are grouped;
+additional findings are counted with a `--details` hint. The three highest-spend
+models are shown individually, with remaining models aggregated as `Other`;
+the total always includes every model.
+
+The table wraps model names within the available width and switches to compact
+stacked rows when even the minimal columns cannot fit. Output fits the detected
+terminal width (`COLUMNS`, or 80 columns, when detection is unavailable).
+Only the title, savings and advisory heading use an emoji. Savings are green,
+headings cyan, and `OPTIMIZATION ADVISORIES` yellow. Colors are disabled for
+piped/file output, `TERM=dumb`, or when `NO_COLOR` is set.
 
 ```sh
 $ cctx usage --hours 2
-╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║ ⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: 2.0h)                                           ║
-╠═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
-║ 💰 COST SAVED (@$0.001/AIC) :  +$2.42     USD   (-28.4% of baseline bill · ~2421.6 AIC saved)                           ║
-║ 💎 API LIST VALUE (@$0.01)  :  +$24.22    USD   (Frontier API list price: $2/$0.10/$10 per 1M)                          ║
-║ 🔥 TOKENS SAVED             :  ~86.02M    tok   (Payload ~851.3K + 35x Cache ~29.80M + ~244 Turns ~53.68M + BPE ~1.69M) ║
-║ 🧬 BPE FORMULA COMPRESSION  :  ██████████ 100.0%  (4/4 surfaces: ext·mcp·subagent·global · ~2100 tok/turn · +$0.93)     ║
-║ 🎯 WARM CACHE HIT RATE      :  ██████████  98.6%  (506 warm hits / 513 CCTX lookups)                                    ║
-║ 🚀 ELIGIBLE SOURCE ADOPTION :  ██████████  98.5%  (513/521 · excl. 21 /tmp & 3 pre-edit)                                ║
-╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+⚡ CCTX USAGE · Last 2 hours
+
+💰 $4.77 saved · 15.4% less (estimated)
+   Without cctx ~$30.90 → With cctx $26.13
+   USD equivalent @ $0.001/AIC; not a bill.
+
+EFFICIENCY
+  Tokens avoided ~173.21M
+  Warm hits 93.6% · Source adoption 86.2%
+
+💡 OPTIMIZATION ADVISORIES
+  1. Reduce cold-cache costs; compact long sessions and avoid idle gaps.
+  Full evidence: --details
+
+MODELS · USD equivalent
+┌────────────────┬────────┬───────────┐
+│ Model          │   Used │ Est.saved │
+├────────────────┼────────┼───────────┤
+│ Model A (high) │ $25.00 │     $4.50 │
+│ Model B (high) │  $1.13 │     $0.27 │
+├────────────────┼────────┼───────────┤
+│ Total          │ $26.13 │     $4.77 │
+└────────────────┴────────┴───────────┘
+
+Full report: cctx usage --hours 2 --details
 ```
+
+`cctx usage --hours 2 --details` preserves the full token-savings breakdown,
+LLM usage, reference valuation, model/surface/session cards, tool reliability,
+built-in fallbacks, workspace adoption, every advisory and the savings assumptions.
+Full details use wrapping cards with unabridged model, tool and workspace names.
+`--json` always returns the complete structured report, with or without `--details`.
 
 Native tool results carry `started_unix_ms` and `total_ms` in the `CCTX_TRACE`
 footer. Calls slower than 5 s also log a warning and append a `CCTX_SLOW` line

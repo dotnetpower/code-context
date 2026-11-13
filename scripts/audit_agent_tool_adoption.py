@@ -140,7 +140,7 @@ def result_usefulness(value, depth: int = 0) -> bool | None:
                 header = re.match(r"^(?:matches|files)=(\d+)\s+truncated=(?:true|false)", preview)
                 if header:
                     return int(header[1]) > 0
-                if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{64})?\n", preview):
+                if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{12,64})?\n", preview):
                     return True
                 if preview.startswith(("{", "[")) and '"total_matches":0' not in preview and '"snippets":[]' not in preview:
                     return True
@@ -153,7 +153,7 @@ def result_usefulness(value, depth: int = 0) -> bool | None:
                 return int(header[1]) > 0
             if cleaned == "snippets=0":
                 return False
-            if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{64})?\n", cleaned):
+            if re.search(r"(?:^|\n)--- .+:\d+-\d+(?: sha256=[0-9a-f]{12,64})?\n", cleaned):
                 return True
             if cleaned.startswith("page=true complete="):
                 return "--- " in cleaned

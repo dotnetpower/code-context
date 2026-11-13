@@ -608,6 +608,14 @@ pub struct Watched {
 }
 
 impl Watched {
+    fn effective_headroom(total_budget: usize) -> usize {
+        if total_budget >= 512 * 1024 * 1024 {
+            ROOT_RUNTIME_HEADROOM
+        } else {
+            (total_budget / 4).min(ROOT_RUNTIME_HEADROOM)
+        }
+    }
+
     pub(crate) fn budget_for_resident(required_bytes: usize) -> usize {
         required_bytes.saturating_add(ROOT_RUNTIME_HEADROOM)
     }
@@ -729,7 +737,7 @@ impl Watched {
             true,
             1,
             spec.policy.clone(),
-            max_owned_bytes.saturating_sub(ROOT_RUNTIME_HEADROOM),
+            max_owned_bytes.saturating_sub(Self::effective_headroom(max_owned_bytes)),
             inventory,
         )?;
         stamps.retain(|path, _| resident.paths.contains_key(path.as_str()));
@@ -789,7 +797,7 @@ impl Watched {
     pub(crate) fn restrict_admission(&mut self, total_budget: usize) -> usize {
         let previous = self.resident.max_owned_bytes;
         self.resident.max_owned_bytes =
-            previous.min(total_budget.saturating_sub(ROOT_RUNTIME_HEADROOM));
+            previous.min(total_budget.saturating_sub(Self::effective_headroom(total_budget)));
         previous
     }
 
@@ -803,8 +811,14 @@ impl Watched {
             .stats
             .path_bytes
             .saturating_add(self.stamps.len().saturating_mul(std::mem::size_of::<Stamp>() + 64));
+        let cap_headroom =
+            if self.resident.max_owned_bytes >= 512 * 1024 * 1024 - ROOT_RUNTIME_HEADROOM {
+                ROOT_RUNTIME_HEADROOM
+            } else {
+                (self.resident.max_owned_bytes / 3).min(ROOT_RUNTIME_HEADROOM)
+            };
         self.resident.stats.estimated_owned_bytes.saturating_add(
-            ROOT_RUNTIME_HEADROOM.max(
+            cap_headroom.max(
                 stamp_bytes
                     .saturating_add(self.watched_dir_bytes)
                     .saturating_add(self.query_cache.estimated_bytes()),

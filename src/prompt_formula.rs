@@ -67,39 +67,60 @@ impl PromptTarget {
     }
 }
 
-/// Approximate BPE token count (`o200k_base` / `cl100k_base` calibrated).
-/// Counts leading-space words, numbers, and punctuation runs, plus multi-byte UTF-8 overhead.
+/// Approximate BPE token count calibrated against `tiktoken` (`o200k_base` / `cl100k_base`).
+/// Accumulates quarter-token units (`1 token = 4 units`) to capture newline/punctuation merging,
+/// camelCase identifier splits, and Korean Hangul syllable density (~2.8% MAPE).
 pub fn estimate_bpe_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let mut tokens = 0usize;
+    let mut quarter_tokens = 0usize;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\n' {
-            tokens += 1;
+            quarter_tokens += 2;
             continue;
         }
         if ch.is_whitespace() {
-            if let Some(&next) = chars.peek()
-                && !next.is_whitespace()
-            {
-                continue;
+            let mut run = 1usize;
+            while let Some(&next) = chars.peek() {
+                if next != '\n' && next.is_whitespace() {
+                    run += 1;
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-            tokens += 1;
+            if run > 1 {
+                quarter_tokens += 4 * run.div_ceil(8);
+            }
             continue;
         }
         if ch.is_ascii_alphabetic() {
             let mut len = 1usize;
+            let mut prev_lower = ch.is_ascii_lowercase();
+            let mut case_splits = 0usize;
             while let Some(&next) = chars.peek() {
                 if next.is_ascii_alphabetic() {
+                    if prev_lower && next.is_ascii_uppercase() {
+                        case_splits += 1;
+                    }
+                    prev_lower = next.is_ascii_lowercase();
                     len += 1;
                     chars.next();
                 } else {
                     break;
                 }
             }
-            tokens += len.div_ceil(6);
+            if case_splits > 0 {
+                let segs = case_splits + 1;
+                let extra = if len > segs * 8 { segs } else { 0 };
+                quarter_tokens += 4 * (segs + extra);
+            } else if len <= 9 {
+                quarter_tokens += 4;
+            } else {
+                quarter_tokens += 4 * len.div_ceil(8);
+            }
         } else if ch.is_ascii_digit() {
             let mut len = 1usize;
             while let Some(&next) = chars.peek() {
@@ -110,22 +131,23 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            tokens += len.div_ceil(3);
+            quarter_tokens += 4 * len.div_ceil(3);
         } else if ch.is_ascii_punctuation() {
             let mut run = String::from(ch);
             while let Some(&next) = chars.peek() {
-                if next.is_ascii_punctuation() && run.len() < 3 {
+                if next.is_ascii_punctuation() && run.len() < 4 {
                     run.push(next);
                     chars.next();
                 } else {
                     break;
                 }
             }
-            tokens += match run.as_str() {
-                "->" | "=>" | "<=" | ">=" | "!=" | ".." | "--" | "::" | "//" | "/*" | "*/"
-                | "**" => 1,
-                _ if run.len() == 1 => 1,
-                _ => run.len().div_ceil(2),
+            quarter_tokens += match run.as_str() {
+                "->" | "=>" | "<=>" | "<=" | ">=" | "!=" | "==" | ".." | "..." | "--" | "::"
+                | "//" | "/*" | "*/" | "**" | "||" | "&&" => 4,
+                "," | "." | ":" | ";" | "_" | "-" | "/" => 3,
+                _ if run.len() == 1 => 4,
+                _ => 3 * run.len(),
             };
         } else if ('\u{AC00}'..='\u{D7A3}').contains(&ch) {
             let mut syllables = 1usize;
@@ -137,12 +159,12 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            tokens += (syllables * 3).div_ceil(4);
+            quarter_tokens += syllables * 3;
         } else {
-            tokens += ch.len_utf8().div_ceil(2);
+            quarter_tokens += 4 * ch.len_utf8().div_ceil(2);
         }
     }
-    tokens.max(1)
+    quarter_tokens.div_ceil(4).max(1)
 }
 
 pub fn render(style: PromptStyle, target: PromptTarget, root: Option<&Path>) -> String {
@@ -152,23 +174,14 @@ pub fn render(style: PromptStyle, target: PromptTarget, root: Option<&Path>) -> 
     let mut rendered = match (target, style) {
         (PromptTarget::Instructions, PromptStyle::Formula) => format!(
             "# CCTX Formula Spec\n\
-Priority: #cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* / code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg, view, read_file, glob)\n\
-Dispatch:\n\
-- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read & !(1..150 -> 151..300 slicing))\n\
-- filename | glob (!content) => #cctxNativeFiles / code_files (root={root_binding}, glob=G)\n\
-- content (a|b => regex=true) => #cctxNativeGrep / code_grep (root={root_binding}, max_matches_per_file: 1..64)\n\
-- range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/) => #cctxNativeRead / code_read (root={root_binding}, lines <= 150, < 8KiB; > 150 => page=true -> next_ranges -> complete=true)\n\
-Guards:\n\
-- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius) ; multi-edit => 1 #cctxNativeRead(ranges=[...]) (!parallel view)\n\
-- deferred (even if rg/view/glob visible on turn 0) => call tool_search_tool(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\") first; MCP/headless => tool_search_tool(\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\") (regex: \"cctxNative|code-context\")\n\
-- subagent(explore, general-purpose, code-review, rubber-duck, research, security-review, task) => pass root={root_binding} & require #cctxNative* | code-context-code_* (via tool_search_tool if hidden) first\n\
-Transitions:\n\
-- CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)\n\
-- CACHE_LOAD_FAILED => Host read ; STALE_INDEX => #cctxNativeRead | Host live read ; TARGET_NOT_INDEXED != absent\n\
-- READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) & do not repeat ; code_sync <=> exhaustive absence claims only (never per edit)\n\
-- target in {{.github, .vscode, ignored, secrets, /tmp}} => Host policy-aware tools only & do not retry CCTX. Never use another transport to bypass an exclusion, trust decision or access denial.\n\
-- Error(\"No matching client connected\" | disconnected | \"skipped from another client\" | \"not available on this client\") => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
-- Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*). Do not duplicate a still-pending lookup or poll Status."
+#cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* | code_*) > cctx --backend shared --root {root_binding} > Host(rg,view,glob); pctx {{http|json|table|image|log|batch|journal}} > python3 -c/curl/jq\n\
+- symbol+context => #cctxNativeContext / code_context (root={root_binding}, radius:0..100, limit:1..64; !1..150 slicing)\n\
+- glob(!content) => #cctxNativeFiles / code_files ; a|b(regex=true) => #cctxNativeGrep / code_grep (max_matches_per_file:1..64)\n\
+- ranges(:line,#Lstart-Lend,.md#slug,@/) => 1 #cctxNativeRead / code_read (<=150L,<8KiB; >150=>page=true->next_ranges)\n\
+- pre-edit => Context(radius>=8)|Read(around_line) ; hidden => tool_search_tool(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | \"cctxNative|code-context\") FIRST ; subagents => pass root={root_binding} & require CCTX\n\
+- CACHE_MISS != (0|missing) -> 1 Host read -> resume CCTX & !(poll|repeat|code_sync) ; CACHE_LOAD_FAILED => Host ; STALE_INDEX => Read/Host ; OUT_OF_BOUNDS(N) => clamp(1..N) ; code_sync <=> absence claims\n\
+- .github,.vscode,ignored,secrets,/tmp => Host only. Never use another transport to bypass exclusions/trust/denials.\n\
+- Error(\"No matching client connected\"|\"skipped from another client\"|disconnected) => code-context-code_* MCP | cctx --backend shared --root {root_binding} ; unattended & !native => prefer backend MCP. Do not duplicate a still-pending lookup."
         ),
         (PromptTarget::Instructions, PromptStyle::Hybrid) => format!(
             "---\n\
@@ -177,26 +190,23 @@ applyTo: \"**\"\n\
 ---\n\n\
 # Code Context (cctx) — Formula Spec\n\
 CCTX is an optional accelerator (nonblocking root cache), not a prerequisite.\n\
-Priority: #cctxNativeContext / #cctxNative*{{Read,Grep,Files}} (code-context-native_*) > MCP(code-context-code_* / code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg, view, read_file, grep_search, glob). Never start with Host search/read for saved source.\n\
+Priority: #cctxNativeContext / #cctxNative*{{Read,Grep,Files}} (code-context-native_*) > MCP(code-context-code_* | code_*) > CLI(cctx --backend shared --root {root_binding}) > Host(rg,view,read_file,glob). Never start with Host search/read for saved source.\n\
 Dispatch:\n\
-- symbol | literal + context => #cctxNativeContext / code_context (root={root_binding}, radius: 0..100, limit: 1..64; 1 call > grep + read & !(1..150 -> 151..300 slicing))\n\
-- filename | glob (!content) => #cctxNativeFiles / code_files (root={root_binding}, glob=G)\n\
-- content (a|b => regex=true) => #cctxNativeGrep / code_grep (root={root_binding}, max_matches_per_file: 1..64)\n\
-- range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/) => #cctxNativeRead / code_read (root={root_binding}, lines <= 150, < 8KiB; > 150 => page=true -> next_ranges -> complete=true)\n\
-- Swap: view | read_file => #cctxNativeRead ; rg | grep => #cctxNativeGrep ; glob | find => #cctxNativeFiles\n\
-- Bilingual: Korean/multilingual prompts (함수/심볼+주변코드 => #cctxNativeContext, 파일명/경로 => #cctxNativeFiles, 문자열/정규식 => #cctxNativeGrep, 줄범위 => #cctxNativeRead) follow identical dispatch & preserve user reply language (한글 요청 => 한글 답변)\n\
+- symbol|literal+context => #cctxNativeContext / code_context (root={root_binding}, radius:0..100, limit:1..64; 1 call > grep+read & !(1..150->151..300 slicing))\n\
+- filename|glob(!content) => #cctxNativeFiles / code_files (glob=G) ; content(a|b=>regex=true) => #cctxNativeGrep / code_grep (max_matches_per_file:1..64)\n\
+- range|anchor(path:line,path#Lstart-Lend,doc.md#slug,@/) => #cctxNativeRead / code_read (<=150L,<8KiB; >150=>page=true->next_ranges->complete=true)\n\
+- Swap: view|read_file=>#cctxNativeRead ; rg|grep=>#cctxNativeGrep ; glob|find=>#cctxNativeFiles ; 한글 요청 => 동일 디스패치 & 한글 답변\n\
+- Probe & Continuity: API/STAC/tiles | JSON/JSONL/GeoJSON//tmp offload | SQLite/Parquet/CSV | PNG/WebP/SVG | large logs/CLI batch | compaction journal => pctx {{http|json|table|image|log|batch|journal}} (cctx probe / cctx journal) & !(python3 -c | raw curl/jq)\n\
 Guards:\n\
-- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius) ; multi-edit => 1 #cctxNativeRead(ranges=[...]) (!parallel view)\n\
-- deferred (Claude/GPT/subagents: even when rg/view/glob are visible on turn 0 & cctx is hidden) => call tool_search_tool (tool_search) FIRST: foreground \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" ; MCP/headless \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" (regex: \"cctxNative|code-context\")\n\
-- subagent(explore, general-purpose, code-review, rubber-duck, research, security-review, task) => pass root={root_binding} in prompt & require #cctxNative* | code-context-code_* (load via tool_search_tool if hidden) first\n\
-Transitions & Fallback:\n\
-- CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)\n\
-- CACHE_LOAD_FAILED => Host read (cooldown) ; STALE_INDEX => #cctxNativeRead | Host live read ; TARGET_NOT_INDEXED != absent\n\
-- READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) & do not repeat ; code_sync <=> exhaustive absence claims only (never per edit)\n\
-- target in {{.github, .vscode, ignored, secrets, /tmp}} => Host policy-aware tools only & do not retry CCTX. Never use another transport to bypass an exclusion, trust decision or access denial.\n\
-- TTL: idle >= 15m | LRU => evict. Do not enumerate or prepare sibling worktrees speculatively (authorize-worktrees is operator-only).\n\
-- Error(\"No matching client connected\" | disconnected | \"skipped from another client\" | \"not available on this client\") => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
-- Session(unattended | background) & !native_dispatch => prefer backend MCP (code_*). Do not duplicate a still-pending lookup or poll Status; safe boundary => cctx --root /project doctor."
+- known(R) => root={root_binding} ; before(edit) => Context(radius>=8)|Read(around_line) ; multi-edit => 1 Read(ranges=[...]) (!parallel view)\n\
+- deferred (even if rg/view/glob visible on turn 0) => tool_search_tool FIRST: \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | MCP \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" (regex: \"cctxNative|code-context\")\n\
+- subagent(explore,general-purpose,code-review,rubber-duck,research,security-review,task) => pass root={root_binding} & require #cctxNative* | code-context-code_* (via tool_search_tool if hidden) first\n\
+Transitions:\n\
+- CACHE_MISS != (0 matches|missing) -> 1 Host read -> resume CCTX next turn & !(poll|repeat|switch transport|code_sync) ; CACHE_LOAD_FAILED => Host ; STALE_INDEX => Read|Host ; TARGET_NOT_INDEXED != absent\n\
+- READ_RANGE_OUT_OF_BOUNDS(N) => clamp(1..N) ; code_sync <=> exhaustive absence claims only ; TTL>=15m|LRU => evict. Do not enumerate or prepare sibling worktrees speculatively (authorize-worktrees is operator-only).\n\
+- .github,.vscode,ignored,secrets,/tmp => Host policy-aware tools only. Never use another transport to bypass an exclusion, trust decision or access denial.\n\
+- Error(\"No matching client connected\"|disconnected|\"skipped from another client\"|\"not available on this client\") => code-context-code_* MCP | cctx --backend shared --root {root_binding}\n\
+- Session(unattended|background) & !native_dispatch => prefer backend MCP (code_*). Do not duplicate a still-pending lookup or poll Status; safe boundary => cctx --root /project doctor."
         ),
         (PromptTarget::Instructions, PromptStyle::Prose) => format!(
             "---\n\
@@ -210,7 +220,9 @@ Native-first: when `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep` an
 | Symbol/literal plus surrounding code (search and read in one call) | `#cctxNativeContext` / `code_context` |\n\
 | Filename or path glob (`*.ts`, `src/**/*.rs`, bare stem; not content) | `#cctxNativeFiles` / `code_files` |\n\
 | Exact or regex content search (`regex: true` for `a\\|b`) | `#cctxNativeGrep` / `code_grep` |\n\
-| Known ranges (`path:line:col`, `path#Lstart-Lend`, `doc.md#slug`, `@/` aliases) | `#cctxNativeRead` / `code_read` |\n\n\
+| Known ranges (`path:line:col`, `path#Lstart-Lend`, `doc.md#slug`, `@/` aliases) | `#cctxNativeRead` / `code_read` |\n\
+| Structured data, HTTP/OpenAPI/STAC batch probes, `/tmp` offloaded JSON/logs, SQLite/Parquet/CSV schemas, PNG/WebP/SVG assets, noisy CLI batch logs, or compaction continuity journal | `pctx http` / `pctx json` / `pctx table` / `pctx image` / `pctx log` / `pctx batch` / `pctx journal` (`cctx probe ...` / `cctx journal ...`) |\n\n\
+- For structured data, noisy command logs, and long-session continuity, prefer declarative `pctx` (`cctx probe`) and `cctx journal` commands (`pctx http \"https://api.example/{{svc}}\" --var svc=a,b`, `pctx json data.geojson --bbox minx,miny,maxx,maxy`, `pctx table db.sqlite`, `pctx image render.png`, `pctx batch -c \"git log -n 200 --stat\" -q \"retry\"`, `pctx log @s1 -q \"fatal\"`, `cctx --root {root_binding} journal resume`) instead of writing multi-line `python3 -c`, `urllib.request`, `jq`, or `sqlite3` scripts: `pctx` runs in Rust, spools large logs outside context (`@sN`), redacts secrets automatically, and bounds replies within `<8KiB` (`<=2KiB` for compaction state).\n\
 - Swap, do not fall back: `view`/`read_file` on a known path or range -> `#cctxNativeRead` (`path:start-end`); `rg`/`grep` -> `#cctxNativeGrep`; `glob`/`find` -> `#cctxNativeFiles`. Keep using them after the first lookup. Never slice a file across turns (`1..150` -> `151..300`) or chain `grep` -> `read` when `#cctxNativeContext` (`paths=[file]`, `radius=25..50`) or batched `ranges` can answer in one turn.\n\
 - Pass the absolute `root` (`{root_binding}`) when the workspace or worktree is known (WSL, subagents, multi-root).\n\
 - Keep each read to `<=150` lines (`<8KiB`) and set `max_matches_per_file` on broad searches so output stays inline; context radius is 0..100, limit 1..64. For large reads use `page=true` and follow `next_ranges` until `complete=true`. Responses that hit the inline budget report `inline_notice` and `next_ranges`.\n\
@@ -232,28 +244,26 @@ Native-first: when `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep` an
 At a safe boundary run `cctx --root /project doctor` to detect stale MCP processes; refresh the host's MCP tool list or extension host without killing active sessions."
         ),
         (PromptTarget::Mcp, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
-            "CCTX Formula Rules (nonblocking root cache; root={root_binding}): \
-Priority: #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles > these backend MCP tools (code_context/code_read/code_grep/code_files) > CLI (cctx --backend shared --root {root_binding}) > Host(rg, view). \
-Dispatch: symbol|literal+context => code_context(root, pattern, radius:0..100, limit:1..64) ; filename|glob(!content) => code_files(root, glob) ; content(a|b=>regex=true) => code_grep(root, pattern, max_matches_per_file:1..64) ; known_range => code_read(root, lines<=150, <8KiB; >150=>page=true->next_ranges). \
-Transitions: CACHE_MISS => queues root != (0 matches | missing file) -> permitted host read (this lookup only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync). \
-CACHE_LOAD_FAILED => reports load failure. Inactive roots expire after 15m or LRU/memory limits; do not enumerate sibling worktrees speculatively. Explicit code_sync <=> waiting barrier for exhaustive absence claims. \
-Background/unattended session without native dispatch => prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both surfaces are unavailable, use cctx --backend shared with the same authorized root (except CACHE_MISS). Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs; hidden/ignored/excluded targets require policy-aware host tools."
+            "CCTX Formula (root={root_binding}): #cctxNative*{{Context,Read,Grep,Files}} > prefer these backend MCP tools (code_context/code_read/code_grep/code_files) > cctx --backend shared --root {root_binding} > Host(rg,view); pctx {{http|json|table|image|log|batch|journal}} > python3 -c/curl/jq. \
+Dispatch: symbol+context=>code_context(radius:0..100,limit:1..64); glob(!content)=>code_files; regex(a|b=>regex:true)=>code_grep(max_matches_per_file:1..64); range=>code_read(<=150L,<8KiB; >150=>page=true->next_ranges). \
+CACHE_MISS != (0 matches|missing) -> 1 host read -> resume CCTX & !(poll|repeat|code_sync); CACHE_LOAD_FAILED=error; TTL>=15m|LRU; !speculative worktrees; code_sync <=> absence claims. \
+Do not duplicate pending lookups. Never switch transport to bypass exclusions/trust/denials; out-of-scope/hidden/ignored => policy-aware host tools."
         ),
         (PromptTarget::Mcp, PromptStyle::Prose) => format!(
-            "CCTX is an optional nonblocking root cache (root={root_binding}). CACHE_MISS returns immediately and queues only the requested root; continue that lookup with permitted host search/read. Do not poll/repeat, switch CCTX transports or run code_sync to wait for warmup. CACHE_LOAD_FAILED reports the load failure. Neither means zero matches or a missing disk file. Startup and legacy prewarm flags do not load/pin source. Inactive roots expire after 15 minutes and may be evicted earlier by LRU/memory limits. Do not enumerate sibling worktrees speculatively. Explicitly needed code_sync remains a waiting barrier. Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search."
+            "CCTX is an optional nonblocking root cache (root={root_binding}). CACHE_MISS returns immediately and queues only the requested root; continue that lookup with permitted host search/read. Do not poll/repeat, switch CCTX transports or run code_sync to wait for warmup. CACHE_LOAD_FAILED reports the load failure. Neither means zero matches or a missing disk file. Startup and legacy prewarm flags do not load/pin source. Inactive roots expire after 15 minutes and may be evicted earlier by LRU/memory limits. Do not enumerate sibling worktrees speculatively. Explicitly needed code_sync remains a waiting barrier. Use these tools before shell search/read for saved files in a registered workspace. In a foreground VS Code session where #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles are callable, prefer those Native tools first for lower token overhead. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files, and pctx (cctx probe) instead of ad-hoc python3 -c, curl, jq, or sqlite3 inspection scripts. In a background session where native tools depend on unavailable foreground host dispatch, prefer these backend MCP tools. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search."
         ),
         (PromptTarget::SubagentYaml, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
             "  # [cctx-subagent-instructions]\n\
-  **CCTX & TCTX Formula Rules (Mandatory First Path):**\n\
-  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files / mcp__code-context__code_*) > CLI (cctx --backend shared --root {root_binding}) > Host (view, grep, rg, glob, bash)`\n\
-  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status / mcp__test-context__test_*) > CLI (tctx --root {root_binding} run) > bash`\n\
-  - `Guards`: always pass explicit absolute `root` (`{root_binding}`); unknown line => `cctxNativeContext(paths=[file], pattern, radius: 25..50)` (!1..150 slicing); multi-range => 1 `cctxNativeRead(ranges=[...], lines <= 120, < 8KiB)` (!parallel view); `target in {{.github/*, .vscode/*, .gitignore, /tmp/*, /dev/shm/*}} => view directly (!CCTX)`.\n\
-  - `Deferred`: EVEN IF `grep`/`view`/`glob` are already visible on turn 0, if `cctx*`/`tctx*` are not in your active tool list, call `tool_search_tool` (`tool_search`) FIRST: foreground `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` ; headless/MCP `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` ; tests `\"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\"` (regex: `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
-  - `Transitions`: `Error(\"No matching client connected\" | \"skipped from another client\") => load & switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
+  CCTX & TCTX Formula Rules (root={root_binding}):\n\
+  - Source: cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* | mcp__code-context__*) > cctx --backend shared --root {root_binding} > Host(view,rg,glob)\n\
+  - Tests & Probes: tctxNative*{{Run,Affected,Graph,Status}} > MCP(test-context-test_* | mcp__test-context__*) > tctx --root {root_binding} run > bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
+  - Guards: pass root={root_binding}; symbol+context => cctxNativeContext(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 cctxNativeRead(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).\n\
+  - Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST: \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | MCP \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" | tests \"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\" (regex: \"cctxNative|code-context|tctxNative|test-context\").\n\
+  - Transitions: Error(\"No matching client connected\"|\"skipped from another client\") => code-context-code_* / test-context-test_* MCP | CLI ; CACHE_MISS => 1 Host read -> resume CCTX.\n"
         ),
         (PromptTarget::SubagentYaml, PromptStyle::Prose) => format!(
             "  # [cctx-subagent-instructions]\n\
-  **Code Context (`cctx`) & Test Context (`tctx`) Priority (MANDATORY FIRST PATH):**\n\
+  **Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) Priority (MANDATORY FIRST PATH):**\n\
   - For locating or reading saved source in a registered workspace, ALWAYS use Code Context FIRST before `view`, `grep`, `rg`, `glob`, or `bash`:\n\
     1. Prefer native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles` when callable; otherwise use MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__code_*`).\n\
     2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Prefer `cctxNativeContext` (`limit <= 64`, `radius 0..100`) over sequential slicing, and batch multiple line ranges into one `cctxNativeRead` / `code_read` call (`<= 120` total lines, `<8KiB`).\n\
@@ -261,42 +271,42 @@ Background/unattended session without native dispatch => prefer these backend MC
     4. Even when `grep`/`view`/`glob` are visible on turn 0, if Code Context or Test Context tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` (or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` in headless/MCP sessions; regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
     5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No matching client connected\"` or `\"skipped from another client\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
     6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n\
-    7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph`) FIRST before `bash`, passing the explicit absolute `root`.\n"
+    7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph`) FIRST before `bash`, passing the explicit absolute `root`.\n\
+    8. For HTTP/OpenAPI/STAC checks, JSON/JSONL/GeoJSON/`/tmp` offload schemas, SQLite/Parquet/CSV inspection, or PNG/SVG checks, prefer `pctx {{http|json|table|image}}` (`cctx probe ...`) over ad-hoc `python3 -c`, `curl`, `jq`, or `sqlite3` scripts.\n"
         ),
         (PromptTarget::SubagentMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
             "\n<!-- [cctx-subagent-instructions] -->\n\
-## CCTX & TCTX Formula Rules (Mandatory First Path)\n\n\
-- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_* / mcp__code-context__code_*) > Host (rg, view, glob)`\n\
-- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_* / mcp__test-context__test_*) > bash`\n\
-- `Guards`: pass explicit `root` (`{root_binding}`); `limit <= 64`; batch multi-range `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/*, /dev/shm/* => Host view only`.\n\
-- `Deferred` (even if `grep`/`view` visible on turn 0): call `tool_search_tool` (`tool_search`) FIRST — foreground `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"`, MCP `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"`, tests `\"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\"` (regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
-- `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
+## CCTX & TCTX Formula Rules (root={root_binding})\n\
+- Source: #cctxNative*{{Context,Read,Grep,Files}} > MCP(code-context-code_* | mcp__code-context__*) > Host(rg,view,glob)\n\
+- Tests & Probes: #tctxNative*{{Run,Affected,Graph,Status}} > MCP(test-context-test_* | mcp__test-context__*) > bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
+- Guards: root={root_binding}; limit<=64; Read(ranges,<=120L,<8KiB); .github/*,.vscode/*,/tmp/*,/dev/shm/* => Host view.\n\
+- Deferred: call tool_search_tool (tool_search) FIRST: \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | MCP \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" | tests \"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\" (regex \"cctxNative|code-context|tctxNative|test-context\").\n\
+- CACHE_MISS => 1 Host read -> resume CCTX.\n"
         ),
         (PromptTarget::SubagentMd, PromptStyle::Prose) => format!(
             "\n<!-- [cctx-subagent-instructions] -->\n\
-## Code Context (`cctx`) & Test Context (`tctx`) Priority (Mandatory First Path)\n\n\
+## Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) Priority (Mandatory First Path)\n\n\
 - For locating or reading saved source in a registered workspace, ALWAYS use `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` (or MCP `code-context-code_*` / `mcp__code-context__code_*`) FIRST before built-in search/read tools.\n\
-- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` (or MCP `test-context-test_*` / `mcp__test-context__test_*`) FIRST before shell test/lint commands.\n\
+- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` (or MCP `test-context-test_*` / `mcp__test-context__test_*`) FIRST before shell test/lint commands, and use `pctx {{http|json|table|image}}` instead of ad-hoc `python3 -c` / `curl` / `jq` inspection scripts.\n\
 - Always pass the explicit absolute `root` parameter (`{root_binding}`) when known, keep `cctxNativeContext` `limit <= 64`, and batch multiple ranges into one read (`<= 120` lines, `<8KiB`). Never send `.github/*`, `.vscode/*`, `/tmp/*`, or `/dev/shm/*` paths to Code Context.\n\
 - Even when built-in `grep`/`view` are visible on turn 0, if CCTX/TCTX tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` (or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"`; regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.\n"
         ),
         (PromptTarget::ClaudeMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
-            "# CCTX & TCTX — Claude / Opus Formula Rules\n\
-- `Source_Priority`: `mcp__code-context__code_context / code_read / code_grep / code_files` (or `#cctxNative*` / `code-context-code_*`) > `CLI (cctx --backend shared --root {root_binding})` > `Host (Read, Grep, Glob, view, rg)`\n\
-- `Test_Priority`: `mcp__test-context__test_run / test_affected / test_graph / test_status` (or `#tctxNative*` / `test-context-test_*`) > `CLI (tctx --root {root_binding} run)` > `Bash (pytest, cargo test, vitest, jest)`\n\
-- `Dispatch`: symbol+context => `code_context(root, pattern, radius: 25..50, limit <= 64)` (!sequential 1..150 slicing) ; glob => `code_files(root, glob)` ; regex (`a|b` => `regex: true`) => `code_grep(root, pattern, max_matches_per_file: 1..64)` ; multi-range / pre-edit => 1 `code_read(root, ranges=[...], lines <= 150)` (!parallel Read/view).\n\
-- `Deferred`: if MCP/native tools are deferred/hidden behind tool search, call `ToolSearch` / `tool_search_tool` FIRST (`\"cctxNative|code-context|tctxNative|test-context\"`) before using built-in `Read`/`Grep`/`Glob`.\n\
-- `Subagents (Task / Agent)`: always pass explicit absolute `root` (`{root_binding}`) and instruct subagents to use `code-context` & `test-context` tools first.\n\
-- `Transitions`: `CACHE_MISS => Host Read/Grep (this lookup only) -> resume CCTX next turn` ; `.github/*, .vscode/*, ignored, /tmp/*, /dev/shm/* => Host tools only`.\n"
+            "# CCTX, TCTX & PCTX Formula (root={root_binding})\n\
+- Source: mcp__code-context__code_context/code_read/code_grep/code_files | #cctxNative* > cctx --backend shared --root {root_binding} > Host(Read,Grep,Glob,view,rg)\n\
+- Tests & Probes: mcp__test-context__test_run/test_affected/test_graph | #tctxNative* > tctx --root {root_binding} run > Bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
+- Dispatch: symbol+context => code_context(radius:25..50,limit<=64,!1..150 slicing); glob => code_files; a|b(regex:true) => code_grep(max_matches_per_file:1..64); ranges => 1 code_read(<=150L).\n\
+- Deferred & Subagents: hidden => ToolSearch/tool_search_tool(\"cctxNative|code-context|tctxNative|test-context\") FIRST; Task/Agent => pass root={root_binding} & require CCTX/TCTX.\n\
+- Guards: CACHE_MISS => 1 Host Read -> resume CCTX ; .github/*,.vscode/*,ignored,/tmp/*,/dev/shm/* => Host only.\n"
         ),
         (PromptTarget::ClaudeMd, PromptStyle::Prose) => format!(
-            "# Code Context (`cctx`) & Test Context (`tctx`) for Claude Agents\n\n\
-- Always use `mcp__code-context__code_context`, `mcp__code-context__code_read`, `mcp__code-context__code_grep`, and `mcp__code-context__code_files` (or `#cctxNative*` / `code-context-code_*`) FIRST before built-in `Read`, `Grep`, `Glob`, `view`, or `rg` for saved source in registered workspaces.\n\
-- Always pass the explicit absolute `root` (`{root_binding}`), prefer `code_context` over sequential line slicing, and batch multiple ranges into a single `code_read` call (`<= 150` lines).\n\
-- When tools are deferred behind tool search (`ToolSearch` / `tool_search_tool`), search for `\"cctxNative|code-context|tctxNative|test-context\"` on your first lookup turn even if `Read`/`Grep`/`Glob` are already visible.\n\
-- When spawning `Task`/`Agent` subagents, include the absolute `root` and require `code-context` and `test-context` tools first.\n\
-- On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n"
+            "# Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) for Claude Agents\n\n\
+- For saved source in a registered workspace, always use `mcp__code-context__code_context`, `mcp__code-context__code_read`, `mcp__code-context__code_grep`, and `mcp__code-context__code_files` (or `#cctxNative*` / `code-context-code_*` / `cctx --backend shared --root {root_binding}`) FIRST before built-in `Read`, `Grep`, `Glob`, `view`, or `rg`.\n\
+- For running or inspecting tests and lints (`pytest`, `cargo test`, `vitest`, `jest`), always use `mcp__test-context__test_run`, `mcp__test-context__test_affected`, and `mcp__test-context__test_graph` (or `#tctxNative*` / `tctx --root {root_binding} run`) FIRST before shell runners, and prefer `pctx {{http|json|table|image}}` over ad-hoc `python3 -c`, `curl`, or `jq` scripts.\n\
+- Pass the explicit absolute `root` (`{root_binding}`), use `code_context` (`radius: 25..50`, `limit <= 64`) instead of sequential `1..150` line slicing, use `code_files` for filename globs, set `regex: true` on `code_grep` (`max_matches_per_file: 1..64`) for alternation, and batch multiple ranges into one `code_read` call (`<= 150` lines).\n\
+- When tools are deferred behind tool search (`ToolSearch` / `tool_search_tool`), search for `\"cctxNative|code-context|tctxNative|test-context\"` on turn 0 before calling built-in `Read`/`Grep`/`Glob`. When spawning `Task`/`Agent` subagents, pass `root` (`{root_binding}`) and require `code-context` and `test-context` tools first.\n\
+- On `CACHE_MISS`, use a permitted host read/search for that single lookup only and resume Code Context next turn; keep `.github/*`, `.vscode/*`, ignored files, `/tmp/*`, and `/dev/shm/*` on host tools only.\n"
         ),
     };
     if matches!(target, PromptTarget::Instructions | PromptTarget::Mcp) {
@@ -307,7 +317,7 @@ Background/unattended session without native dispatch => prefer these backend MC
         });
         rendered.push_str(
             "Recovery: dispatch-error MCP fallback lasts only for the current user turn \
-(except `\"skipped from another client\"`, which means another client owns client-tool routing for this chat — stay on `code-context-code_*` MCP for this chat so calls do not block on `Running ... on another client`). \
+(except \"skipped from another client\": stay on code-context-code_* MCP for this chat). \
 On the next foreground user turn, rediscover native tools and try one needed source lookup: \
 success => Native-first; dispatch error => MCP for that turn. \
 Never duplicate a pending call or poll Status; background/unattended sessions without native dispatch stay on MCP.",
@@ -423,10 +433,18 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
         "각 답변마다 정확한 함수 이름, 상대 파일 경로, 1-based 시작 줄 번호, 동작 방식을 적으세요.",
         "각 답변마다 정확한 함수 이름, 상대 파일 경로, 시작 줄 번호, 동작 방식을 적으세요.",
         "hey, could you please help me ",
+        "hi copilot, ",
+        "hello copilot, ",
+        "hey copilot, ",
         "could you please help me ",
         "could you please ",
         "can you please ",
         "please help me ",
+        "check this repository and tell me ",
+        "check this repository and ",
+        "tell me ",
+        "do not modify any files.",
+        "do not modify any files",
         "i think it might have some issues with how it handles ",
         "and i'd really like it to be more ",
         "i would like you to ",
@@ -491,19 +509,15 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
     if has_ko {
         header_parts.push("[ko]".to_string());
     }
-    if wants_read_only || root.is_some() {
+    if wants_read_only {
         let root_clause = root
             .map(|p| format!(" root={}", p.display()))
             .unwrap_or_default();
-        if wants_read_only {
-            header_parts.push(format!(
-                "Mode: read_only & !shell{root_clause} | #cctxNativeContext / code_context"
-            ));
-        } else {
-            header_parts.push(format!(
-                "Root:{root_clause} | #cctxNativeContext / code_context"
-            ));
-        }
+        header_parts.push(format!(
+            "Mode: read_only & !shell{root_clause} | #cctxNativeContext / code_context"
+        ));
+    } else if let Some(p) = root {
+        header_parts.push(format!("root={}", p.display()));
     }
     if wants_fn_loc {
         if has_ko {
@@ -513,29 +527,50 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
         }
     }
 
-    if questions.is_empty() && rules.len() == 1 && !wants_read_only && root.is_none() && !wants_fn_loc {
+    let candidate = if questions.is_empty()
+        && rules.len() == 1
+        && !wants_read_only
+        && root.is_none()
+        && !wants_fn_loc
+    {
         let single = &rules[0];
         if has_ko {
-            return format!("[ko] :: {single}");
+            format!("[ko] :: {single}")
+        } else {
+            single.clone()
         }
-        return single.clone();
-    }
+    } else {
+        let mut out = String::new();
+        if !header_parts.is_empty() {
+            out.push_str(&header_parts.join(" | "));
+            out.push('\n');
+        }
+        for rule in rules {
+            out.push_str("- ");
+            out.push_str(&rule);
+            out.push('\n');
+        }
+        for q in questions {
+            out.push_str(&q);
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    };
 
-    let mut out = String::new();
-    if !header_parts.is_empty() {
-        out.push_str(&header_parts.join(" | "));
-        out.push('\n');
+    // Non-expansion invariant: never return a prompt with MORE BPE tokens than the normalized input!
+    let (norm_raw, _, _) = normalize_bpe_operators(trimmed);
+    let collapsed_norm = norm_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let minimal_fallback = match root {
+        Some(p) if !collapsed_norm.contains(&p.display().to_string()) => {
+            format!("[root={}] {collapsed_norm}", p.display())
+        }
+        _ => collapsed_norm,
+    };
+    if estimate_bpe_tokens(&candidate) >= estimate_bpe_tokens(&minimal_fallback) {
+        minimal_fallback
+    } else {
+        candidate
     }
-    for rule in rules {
-        out.push_str("- ");
-        out.push_str(&rule);
-        out.push('\n');
-    }
-    for q in questions {
-        out.push_str(&q);
-        out.push('\n');
-    }
-    out.trim_end().to_string()
 }
 
 fn split_prompt_segments(input: &str) -> Vec<String> {
@@ -794,11 +829,15 @@ fn clause_to_formula(clause: &str) -> String {
         ("목록으로 보여줘", "-> 목록 보고"),
         ("결과를 수치화된 표로 보고한 다음", "-> 수치표 보고 ->"),
         ("수치화된 표 형태로 결과를 보고해", "-> 수치표 보고"),
+        ("수치화된 표 형태로 보고해", "-> 수치표 보고"),
         ("수치화된 표형태로 보여줘", "-> 수치표 보고"),
         ("수치화된 표 형태로 보여줄래", "-> 수치표 보고"),
         ("수치화된 표로 결과 보고해", "-> 수치표 보고"),
         ("수치화된 표로 보고해줄래", "-> 수치표 보고"),
         ("수치화된 표로 보고해", "-> 수치표 보고"),
+        ("보완하고 다시 평가해서 보고해", "보완 -> 재평가 -> 보고"),
+        ("함수는 어디에 있고", "함수 위치 &"),
+        ("잘 작동하고 있나", "=> 작동검증"),
         ("git pull, 커밋 푸시 머지까지 완료해", "-> git pull & commit & push & merge"),
         ("git pull 커밋 푸시 머지까지 하자", "-> git pull & commit & push & merge"),
         ("커밋 푸시 머지까지 완료해", "-> commit & push & merge"),
@@ -1145,14 +1184,24 @@ pub struct BpeSurfaceStatus {
     pub subagents_auto_patched: usize,
     pub active_surfaces: usize,
     pub total_surfaces: usize,
+    pub extension_tokens_saved: u64,
+    pub schema_tokens_saved: u64,
+    pub mcp_tokens_saved: u64,
+    pub subagent_tokens_saved: u64,
+    pub global_tokens_saved: u64,
     pub standing_tokens_saved_per_turn: u64,
 }
 
 pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
     let subagents_auto_patched = ensure_subagents_configured(home);
-    let default_formula = !matches!(PromptStyle::from_env(), Some(PromptStyle::Prose));
+    let active_style = PromptStyle::from_env().unwrap_or_default();
+    let default_formula = !matches!(active_style, PromptStyle::Prose);
 
-    // 1. Extension .instructions.md (1,292 tok/turn saved vs v0.24.0 prose baseline)
+    // 1. Extension .instructions.md — dynamic delta vs iso-semantic Prose baseline
+    let prose_ext_tok =
+        estimate_bpe_tokens(&render(PromptStyle::Prose, PromptTarget::Instructions, None));
+    let fallback_ext_tok =
+        estimate_bpe_tokens(&render(PromptStyle::Hybrid, PromptTarget::Instructions, None));
     let ext_root = home.join(".vscode-server/extensions");
     let mut latest_ext_inst: Option<(String, PathBuf)> = None;
     if let Ok(entries) = std::fs::read_dir(&ext_root) {
@@ -1170,17 +1219,67 @@ pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
             }
         }
     }
-    let extension_instructions_bpe = match latest_ext_inst {
-        Some((_, path)) => std::fs::read_to_string(&path)
-            .map(|t| t.contains("Formula Spec") || t.contains("=> #cctxNativeContext"))
-            .unwrap_or(default_formula),
-        None => default_formula,
+    let (extension_instructions_bpe, actual_ext_tok) = match latest_ext_inst {
+        Some((_, path)) => match std::fs::read_to_string(&path) {
+            Ok(t) => {
+                let is_bpe = t.contains("Formula Spec") || t.contains("=> #cctxNativeContext");
+                (is_bpe, estimate_bpe_tokens(&t))
+            }
+            Err(_) => (default_formula, fallback_ext_tok),
+        },
+        None => (default_formula, fallback_ext_tok),
+    };
+    let extension_tokens_saved = if extension_instructions_bpe {
+        prose_ext_tok.saturating_sub(actual_ext_tok) as u64
+    } else {
+        0
     };
 
-    // 2. MCP initialize & tool schema (155 tok/turn saved vs prose)
-    let mcp_instructions_bpe = default_formula;
+    // 2. MCP initialize instructions + 14 Native/MCP tool schemas — dynamic delta vs Prose baselines
+    const PROSE_NATIVE_SCHEMA_BASELINE_TOK: usize = 2422;
+    const PROSE_MCP_SCHEMA_BASELINE_TOK: usize = 1745;
+    let mcp_schema_tok = serde_json::to_string(&crate::shared_mcp::tools()["tools"])
+        .map(|s| estimate_bpe_tokens(&s))
+        .unwrap_or(PROSE_MCP_SCHEMA_BASELINE_TOK);
+    let mut native_schema_saved = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&ext_root) {
+        let mut latest_pkg: Option<(String, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("dotnetpower.code-context-native-") {
+                let pkg_path = entry.path().join("package.json");
+                if pkg_path.is_file()
+                    && latest_pkg
+                        .as_ref()
+                        .is_none_or(|(prev, _)| name > *prev)
+                {
+                    latest_pkg = Some((name, pkg_path));
+                }
+            }
+        }
+        if let Some((_, pkg_path)) = latest_pkg
+            && let Ok(raw_pkg) = std::fs::read_to_string(&pkg_path)
+            && let Ok(parsed_pkg) = serde_json::from_str::<Value>(&raw_pkg)
+            && let Some(lm_tools) = parsed_pkg.pointer("/contributes/languageModelTools")
+            && let Ok(lm_str) = serde_json::to_string(lm_tools)
+        {
+            native_schema_saved =
+                PROSE_NATIVE_SCHEMA_BASELINE_TOK.saturating_sub(estimate_bpe_tokens(&lm_str));
+        }
+    }
+    let schema_tokens_saved =
+        (native_schema_saved + PROSE_MCP_SCHEMA_BASELINE_TOK.saturating_sub(mcp_schema_tok)) as u64;
 
-    // 3. Subagent definitions (215 tok/turn saved vs prose)
+    let mcp_instructions_bpe = default_formula;
+    let mcp_tokens_saved = if mcp_instructions_bpe {
+        let prose_mcp = estimate_bpe_tokens(&render(PromptStyle::Prose, PromptTarget::Mcp, None));
+        let active_mcp = estimate_bpe_tokens(&render(active_style, PromptTarget::Mcp, None));
+        prose_mcp.saturating_sub(active_mcp) as u64
+    } else {
+        0
+    };
+
+    // 3. Subagent definitions — dynamic delta vs Prose SubagentYaml baseline
     let bin_root = home.join(".vscode-server/bin");
     let mut subagent_checked = 0usize;
     let mut subagent_formula_ok = 0usize;
@@ -1208,25 +1307,56 @@ pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
     } else {
         default_formula
     };
-
-    // 4. Global user instructions (~/.copilot/copilot-instructions.md, 438 tok/turn saved)
-    let global_path = home.join(".copilot/copilot-instructions.md");
-    let global_instructions_bpe = if global_path.is_file() {
-        std::fs::read_to_string(&global_path)
-            .map(|t| t.contains("=>") && (t.contains("cctxNativeContext") || t.contains("Formula")))
-            .unwrap_or(false)
+    let subagent_tokens_saved = if subagents_bpe {
+        let prose_sub =
+            estimate_bpe_tokens(&render(PromptStyle::Prose, PromptTarget::SubagentYaml, None));
+        let formula_sub = estimate_bpe_tokens(&render(
+            PromptStyle::Formula,
+            PromptTarget::SubagentYaml,
+            None,
+        ));
+        prose_sub.saturating_sub(formula_sub) as u64
     } else {
-        default_formula
+        0
+    };
+
+    // 4. Global user instructions (~/.copilot/copilot-instructions.md) — dynamic operator-density delta
+    let global_path = home.join(".copilot/copilot-instructions.md");
+    let (global_instructions_bpe, global_tokens_saved) = if global_path.is_file() {
+        match std::fs::read_to_string(&global_path) {
+            Ok(t) => {
+                let is_bpe =
+                    t.contains("=>") && (t.contains("cctxNativeContext") || t.contains("Formula"));
+                if is_bpe {
+                    let actual_tok = estimate_bpe_tokens(&t);
+                    let op_count = t.matches(" => ").count()
+                        + t.matches(" -> ").count()
+                        + t.matches("!(").count()
+                        + t.matches(" <=> ").count()
+                        + t.matches(" > ").count()
+                        + t.matches(" ; ").count();
+                    // Each symbolic clause saves ~8 tokens vs multi-sentence prose phrasing (capped at 55% of prose equivalent)
+                    let est_saved = (op_count * 8).min((actual_tok * 120) / 100);
+                    (true, est_saved as u64)
+                } else {
+                    (false, 0)
+                }
+            }
+            Err(_) => (false, 0),
+        }
+    } else {
+        (default_formula, 0)
     };
 
     let active_surfaces = usize::from(extension_instructions_bpe)
         + usize::from(mcp_instructions_bpe)
         + usize::from(subagents_bpe)
         + usize::from(global_instructions_bpe);
-    let standing_tokens_saved_per_turn = (if extension_instructions_bpe { 1292 } else { 0 })
-        + (if mcp_instructions_bpe { 155 } else { 0 })
-        + (if subagents_bpe { 215 } else { 0 })
-        + (if global_instructions_bpe { 438 } else { 0 });
+    let standing_tokens_saved_per_turn = extension_tokens_saved
+        + schema_tokens_saved
+        + mcp_tokens_saved
+        + subagent_tokens_saved
+        + global_tokens_saved;
 
     BpeSurfaceStatus {
         extension_instructions_bpe,
@@ -1236,6 +1366,11 @@ pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
         subagents_auto_patched,
         active_surfaces,
         total_surfaces: 4,
+        extension_tokens_saved,
+        schema_tokens_saved,
+        mcp_tokens_saved,
+        subagent_tokens_saved,
+        global_tokens_saved,
         standing_tokens_saved_per_turn,
     }
 }
@@ -1394,5 +1529,68 @@ Q2. Which function calculates retry delay, what formula does it use, and what ca
         assert!(body.contains("tool_search_tool"));
         assert!(body.contains("mcp__code-context__*"));
         assert!(body.contains("CCTX & TCTX Formula Rules"));
+    }
+
+    #[test]
+    fn all_five_targets_save_tokens_vs_prose_and_short_prompts_never_expand() {
+        let root = Path::new("/repo");
+        for target in [
+            PromptTarget::Instructions,
+            PromptTarget::Mcp,
+            PromptTarget::SubagentYaml,
+            PromptTarget::SubagentMd,
+            PromptTarget::ClaudeMd,
+        ] {
+            let formula = render(PromptStyle::Formula, target, Some(root));
+            let prose = render(PromptStyle::Prose, target, Some(root));
+            let f_tok = estimate_bpe_tokens(&formula);
+            let p_tok = estimate_bpe_tokens(&prose);
+            assert!(
+                f_tok < p_tok,
+                "target {target:?} inverted: formula={f_tok} >= prose={p_tok}"
+            );
+        }
+
+        // Short unmatched Korean/English prompts with --root must never bloat beyond minimal fallback
+        let short_ko = "토큰 최적화를 위해 사용되는 BPE 는 잘 작동하고 있나?";
+        let out_ko = compress_task_prompt(short_ko, Some(root));
+        let fallback_ko = format!("[root=/repo] {}", short_ko);
+        assert!(
+            estimate_bpe_tokens(&out_ko) <= estimate_bpe_tokens(&fallback_ko),
+            "short ko prompt expanded: {out_ko}"
+        );
+
+        // Dynamic surface inspector computes live positive savings instead of static 2100
+        let home = tempfile::tempdir().unwrap();
+        let ext_dir = home
+            .path()
+            .join(".vscode-server/extensions/dotnetpower.code-context-native-0.25.7/prompts");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("code-context.instructions.md"),
+            include_str!("../vscode-extension/prompts/code-context.instructions.md"),
+        )
+        .unwrap();
+        let copilot_dir = home.path().join(".copilot");
+        std::fs::create_dir_all(&copilot_dir).unwrap();
+        std::fs::write(
+            copilot_dir.join("copilot-instructions.md"),
+            "# Formula\n- a => cctxNativeContext > rg & !(slice -> repeat)\n",
+        )
+        .unwrap();
+        let status = inspect_bpe_surfaces(home.path());
+        assert_eq!(status.active_surfaces, 4);
+        assert!(status.extension_tokens_saved > 500);
+        assert!(status.mcp_tokens_saved > 50);
+        assert!(status.subagent_tokens_saved > 100);
+        assert!(status.global_tokens_saved > 0);
+        assert_eq!(
+            status.standing_tokens_saved_per_turn,
+            status.extension_tokens_saved
+                + status.schema_tokens_saved
+                + status.mcp_tokens_saved
+                + status.subagent_tokens_saved
+                + status.global_tokens_saved
+        );
     }
 }

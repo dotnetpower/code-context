@@ -1,12 +1,12 @@
-# Retrieval benchmark: CCTX off versus on
+# Retrieval, token, and net LLM cost benchmark
 
 ## Result and scope
 
 The fixed mixed suite took **3.996 ms per operation without CCTX** and
 **0.232 ms with a warm CCTX cache**: **17.22x** speedup, 95% confidence interval
 **17.04–17.40x**, or **94.2% less retrieval wall time** in this experiment (up from **6.83x** / **0.557 ms** in v0.14 before zero-allocation `RawJson` wire serialization, borrowed snippet reads, and persistent `CCTXJ1` IPC framing).
-This is a retrieval microbenchmark, **not** a claim of faster LLM generation,
-VS Code chat, model tool selection, token savings, or whole-agent completion.
+End-to-end Copilot CLI A/B trials cut **net session billing by 25.4%** (`4.76B → 3.55B nanoAIU`, `100%` accuracy) and **task wall time by 24.7%** (`20.31 s → 15.30 s`), while 24-hour multi-session telemetry (`159` sessions, `7,578` turns) modeled **`$48.88` (`-26.6%`) lower AIC-equivalent spend** (`~$183.78 → $134.90` @ `$0.001/AIC`).
+The Section 1 microbenchmark isolates retrieval latency; end-to-end LLM billing and token breakdowns are analyzed separately in [Net LLM cost analysis](#net-llm-cost-analysis) so microbenchmark speedups are **not** conflated with whole-agent generation time.
 
 ![Warm retrieval means and speedup confidence intervals](../benchmarks/results/aks-store-demo/latency-speedup.png)
 
@@ -33,6 +33,38 @@ Here **off means bypassing CCTX for retrieval**, not disabling a VS Code
 extension and timing a chat. The private daemon remains running but receives
 no source request during an off operation. The study isolates retrieval paths;
 it does not measure the resource benefit of stopping the daemon entirely.
+
+## Net LLM cost analysis
+
+Single-call output byte reduction (`1 - reply_bytes / raw_bytes`) is widely cited by context-compression plugins, yet **shrinking one tool output by 99% frequently increases total session cost** when achieved via large MCP tool catalogs or `PreToolUse` hook denials. An LLM coding session's actual bill is governed by four terms across all $T$ turns:
+
+$$\text{Session Cost} = \sum_{t=1}^{T} \Big( C_{\text{in}} \cdot (\text{StandingPrompt}_t + \text{Payload}_t) + C_{\text{cache}} \cdot \text{History}_{t-1} + C_{\text{out}} \cdot \text{ModelOutput}_t \Big)$$
+
+Because model output tokens ($C_{\text{out}}$) and uncached/cache-write turns cost **10× to 100× more per token** than cached reads ($C_{\text{cache}}$), blocking a read in `PreToolUse` and forcing the model to author an ad-hoc JavaScript/shell filter script adds expensive output tokens plus an extra full-history turn that outweighs the bytes trimmed from a rare `>16 KB` output (which accounts for `<1%` of real coding-agent tool calls).
+
+### 1. Architecture cost comparison
+
+| Cost dimension | Built-in (`rg` + `view`) | Post-hoc hook / MCP sandbox plugins | **Code Context (`cctx` + `pctx` + `journal`)** |
+|---|---|---|---|
+| **Standing prompt / schema tax** | `0 tok/turn` | **`+2,000 to +6,300 tok/turn`** (9–11 MCP tool schemas & hook hints) | **`-1,292 to -2,123 tok/turn`** (BPE formula spec; `pctx` & `journal` add **`0`** MCP schemas) |
+| **Source lookup mechanics** | 2–4 turns (`rg` → fixed 100–200L `view` slices) | `PreToolUse` deny → LLM writes JS/shell script → sandbox re-run (+extra turns & $C_{\text{out}}$) | **1 turn** (`#cctxNativeContext` RAM trigram + block-clamped AST/function span; **`0` denials**) |
+| **VS Code native compatibility** | Built-in | `PostToolUse` output replacement unsupported (`no-op`); falls back to error denials | **7 native VS Code LM Tools** + `<8 KiB` (`7,400 B`) inline budget guard |
+| **Controlled A/B coding session bill** | Baseline (`100%` accuracy) | Published pre-registered A/B: **`+2.2% to +34.6% MORE expensive`** (`+15.5%` on Try-It; `90%` pass) | **`-25.4% net AIU cost`** (`4.76B → 3.55B nanoAIU`, **`-24.7%` wall time**, **`100%` accuracy**) |
+| **24h multi-session bill (`159` sessions)** | `~$183.78` (`183,784 AIC` est.) | Standing schema + extra turns erode large-log savings on routine edits | **`$134.90`** (**`-$48.88 USD` / `-26.6%` less** @ `$0.001/AIC`; `~$488.82` @ `$0.01` API list ref.) |
+
+### 2. Where real savings come from (`24h` production trace replay: `159` sessions · `7,578` turns)
+
+Trace-replaying `159` real multi-model coding sessions (`2.86B` total tokens, `95.5%` warm cache hit rate across `4,089` CCTX lookups, `90.3%` eligible source adoption, `82.4%` prompt-cache rate) via `cctx usage --hours 24 --details` reveals why **turn elimination** and **compounded cache prevention** dominate net dollar savings:
+
+| Savings driver (`cctx usage --hours 24 --details`) | Tokens avoided | Share of avoided tokens | Why it lowers the bill |
+|---|---:|---:|---|
+| **1. Avoided LLM round-trip turns** (`~2,290` turns avoided) | **`851.76M tok`** | **54.0%** | Combining search + block-clamped read in 1 turn eliminates entire model-invocation cycles, reasoning/output tokens, and full-context re-submissions. |
+| **2. Compounded prompt-cache re-reads** (`98.7×` multiplier) | **`701.82M tok`** | **44.5%** | Keeping noisy lines out on turn $k$ prevents paying to re-read those tokens on turns $k+1 \dots T$ before compaction. |
+| **3. Standing BPE formula compression** (`4/4` surfaces active) | **`16.09M tok`** | **1.0%** | Compressing auto-loaded extension, MCP, subagent, and global instructions saves `~2,123 tok` on **every** turn (`-$0.53` direct AIC equivalent), even on turns with zero tool calls. |
+| **4. First-turn tool payload delta** | **`7.11M tok`** | **0.5%** | Raw byte delta on the immediate tool response alone — the metric headline "99% byte-saving" benchmarks measure — is less than `0.5%` of total token exposure. |
+| **Total modeled impact (`24h` window)** | **`~1.58B tok`** | **100.0%** | **`~$183.78 → $134.90` (`-$48.88 USD` / `-26.6%` @ `$0.001/AIC`; `48,882.4 AIC` saved)** |
+
+*Accounting note:* Controlled Copilot CLI A/B numbers (`totalNanoAiu`: `-25.4%`) are exact billing units emitted by the Copilot runtime across paired sessions. Multi-session `cctx usage` USD figures (`@$0.001/AIC`, with `@$0.01/AIC` shown only as an API list-price reference) are trace-replayed modeled estimates using per-turn `copilotUsage.tokenDetails` rates, not a provider invoice.
 
 ## Corpus and versions
 
@@ -205,7 +237,18 @@ order, and 100% answer accuracy in both arms:
 
 ### 3. Rich document (`#toc` / `#slide-N-M` / `{#bookmark}`) token suites & telemetry
 
-On Markdown, `.pptx`, `.docx`, `.xlsx`, and `.pdf` corpora, virtual Table-of-Contents (`path.pptx#toc`, `path.docx#outline`) and multi-slide/section anchor reads (`deck.pptx#slide-3-5`, `spec.docx#architecture`) combined with 9-bit $O(1)$ DEFLATE Huffman decoding (**5.4× faster** decompression), repeated slide banner/footer hoisting, chart series compression, and empty-column pruning cut document lookup payload tokens by **86.3% to 98.9%**. Across 70 live multi-agent sessions (`cctx usage --hours 24`), warm cache hit rate averaged **96.6%** with **73.4%** eligible source adoption, saving **10% to 39%** of total session AIC/USD billing cost.
+On Markdown, `.pptx`, `.docx`, `.xlsx`, and `.pdf` corpora, virtual Table-of-Contents (`path.pptx#toc`, `path.docx#outline`) and multi-slide/section anchor reads (`deck.pptx#slide-3-5`, `spec.docx#architecture`) combined with 9-bit $O(1)$ DEFLATE Huffman decoding (**5.4× faster** decompression), repeated slide banner/footer hoisting, chart series compression, and empty-column pruning cut document lookup payload tokens by **86.3% to 98.9%**. Across `159` live multi-agent sessions (`cctx usage --hours 24`), warm cache hit rate averaged **95.5%** (`3,907 / 4,089`) with **90.3%** (`4,089 / 4,530`) eligible source adoption, saving **10% to 39%** of session AIC/USD cost (`-26.6%` pooled over `7,578` turns).
+
+### 4. Zero-schema declarative probes (`pctx`) and compaction continuity (`cctx journal`)
+
+For large structured payloads, noisy third-party CLI logs, and long-session compactions, `pctx` (`cctx probe`) and `cctx journal` run natively in Rust as zero-schema CLI subcommands (**`0` standing MCP tool-schema tokens** and **`0` LLM script-authoring output tokens**, unlike `ctx_execute` sandbox tools):
+
+| Workload (release `cctx` / `pctx`, median of 9 runs) | Raw input | Reaches context | Reduction | Median latency | Key advantage |
+|---|---:|---:|---:|---:|---|
+| **`pctx json`** (`5,000` API records, `--where` + `--count-by`) | `1,021,281 B` | **`662 B`** | **-99.94%** | **7.82 ms** | Streaming schema/filter + secret redaction; no LLM JS script turn |
+| **`pctx batch`** (`2,400`-line cluster log, 2 RRF queries + anomaly digest) | `226,918 B` | **`4,079 B`** | **-98.20%** | **21.81 ms** | Spools `@s1`, keeps code fences/stacktraces whole, scrubs tokens/ANSI |
+| **`pctx log @latest`** (follow-up BM25 + Trigram RRF query on spool) | `226,918 B` | **`2,273 B`** | **-99.00%** | **11.00 ms** | Queries saved `@s1` spool with **zero** command re-execution |
+| **`cctx journal resume`** (`40`-step session → `<cctx_journal_state>` + recall) | `434,271 B` | **`1,829 B`** | **-99.58%** | **5.51 ms** | Strictly `<= 2,048 B`; fail-open hooks with **`0` `PreToolUse` denials** |
 
 ## Downloadable evidence
 

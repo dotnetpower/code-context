@@ -1,0 +1,23 @@
+{
+  "name": "code-context-site",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Code Context (cctx) official website & documentation — Astro Starlight + Dual-Layer Motion Stage for GitHub Pages.",
+  "scripts": {
+    "predev": "node scripts/gen-og-image.mjs",
+    "dev": "astro dev",
+    "start": "astro dev",
+    "gen-og": "node scripts/gen-og-image.mjs",
+    "build": "NODE_ENV=production node scripts/gen-og-image.mjs && NODE_ENV=production astro build && NODE_ENV=production node scripts/build-seo-geo.mjs",
+    "build:seo": "NODE_ENV=production node scripts/build-seo-geo.mjs",
+    "check:seo": "NODE_ENV=production node scripts/check-seo-geo.mjs",
+    "preview": "NODE_ENV=production astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.36.0",
+    "astro": "^5.14.0",
+    "sharp": "^0.34.0"
+  }
+}

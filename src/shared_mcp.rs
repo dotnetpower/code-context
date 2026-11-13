@@ -17,53 +17,48 @@ fn build_tools() -> Value {
         .as_array_mut()
         .expect("static tool schema is an array");
     for tool in items.iter_mut() {
-        tool["inputSchema"]["properties"]["root"] = json!({"type":"string","description":"Optional absolute registered project/worktree root. Pass explicitly when known; if omitted, resolves from the current workspace."});
+        tool["inputSchema"]["properties"]["root"] =
+            json!({"type":"string","description":"Explicit absolute root."});
         if tool["name"] != "code_read" && tool["name"] != "code_files" {
-            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Optional non-hidden relative path prefixes within root."});
-            tool["inputSchema"]["properties"]["glob"] = json!({"type":"string","description":"Optional filename/path glob."});
-            tool["inputSchema"]["properties"]["max_matches_per_file"] = json!({"type":"integer","minimum":1,"maximum":64,"description":"Optional per-file match cap; prioritizes symbol definitions."});
+            tool["inputSchema"]["properties"]["paths"] = json!({"type":"array","maxItems":64,"items":{"type":"string"},"description":"Relative path prefixes."});
+            tool["inputSchema"]["properties"]["glob"] = json!({"type":"string"});
+            tool["inputSchema"]["properties"]["max_matches_per_file"] = json!({"type":"integer","minimum":1,"maximum":64,"description":"Per-file cap."});
         }
         if tool["name"] == "code_read" {
             tool["inputSchema"]["properties"]["page"] = json!({"type":"boolean","default":false,
-                "description":"Paginate large reads (<256KiB) returning snippets, complete, and next_ranges."});
-            tool["inputSchema"]["properties"]["split_ranges"] = json!({
-                "type":"boolean","default":true,
-                "description":"Split broad ranges into <=500-line segments (max 64 segments, 256KiB)."
-            });
+                "description":"Paginate >150L via next_ranges."});
+            tool["inputSchema"]["properties"]["split_ranges"] =
+                json!({"type":"boolean","default":true});
         }
         let prefix = match tool["name"].as_str() {
-            Some("code_files") => {
-                "Use FIRST for filename/path glob discovery, NOT content."
-            }
+            Some("code_files") => "Use FIRST for filename/path glob (!content).",
             Some("code_grep") => {
-                "Use FIRST for saved-source search (or prefer code_context when you also need surrounding lines). Literal by default; Set regex=true for alternation (a|b)."
+                "Use FIRST for saved-source search. Set regex=true for a|b."
             }
             Some("code_context") => {
-                "Use FIRST for a symbol plus nearby saved source in ONE call (replaces code_grep + code_read and avoids 1..150 -> 151..300 slicing). Literal by default; Set regex=true for alternation (a|b)."
+                "Use FIRST for symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
             }
-            _ => {
-                "Use FIRST for known saved-source ranges (keep <=150 lines per call to stay inline; prefer code_context first to locate symbols instead of sequential 1..150 -> 151..300 slicing) with live SHA-256 verification."
-            }
+            _ => "Use FIRST for batched ranges (<=150L, <8KiB).",
         };
         tool["description"] = json!(format!(
-            "{prefix} CACHE_MISS returns immediately and schedules only this root; continue with permitted host search/read. These backend MCP tools avoid native extension-host dispatch in background sessions. Do not duplicate a pending native call or run code_sync to wait."
+            "{prefix} CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch. Do not duplicate a pending native call."
         ));
     }
     for (name, description) in [
         (
             "code_status",
-            "Show index state (including unloaded), cache queue/misses/load errors, coverage and memory without loading, reconciling or hashing source. Ordinary cold lookups return CACHE_MISS immediately and schedule only that root; no startup prewarm.",
+            "Show index state, cache misses & memory without loading source.",
         ),
         (
             "code_sync",
-            "Explicit full-source synchronization barrier: recheck ignore policy, hash permitted source, update changed files; use before exhaustive absence claims or after edits.",
+            "Explicit full-source sync barrier for exhaustive absence claims only.",
         ),
     ] {
         items.push(json!({"name":name,"description":description,
-            "inputSchema":{"type":"object","properties":{"root":{"type":"string","description":"Optional absolute registered root; omit for current workspace."}},"additionalProperties":false},
+            "inputSchema":{"type":"object","properties":{"root":{"type":"string","description":"Explicit absolute root."}},"additionalProperties":false},
             "annotations":{"readOnlyHint":name=="code_status","destructiveHint":false,"openWorldHint":false}}));
     }
-    items.push(json!({"name":"code_workspaces","description":"List explicitly registered source roots and permitted scopes/globs. Use the current workspace root for all searches.",
+    items.push(json!({"name":"code_workspaces","description":"List registered roots, scopes & globs.",
         "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
@@ -74,56 +69,62 @@ pub fn dispatch(request: Value) -> Option<Value> {
     dispatch_with_root(request, None, None, &mut pending_traces)
 }
 
-fn compact_mcp_read_payload(text: String) -> String {
-    if !text.contains("\"notice\":") {
+fn compact_mcp_snippet_payload(_name: &str, text: String) -> String {
+    if !text.contains("\"sha256\":") && !text.contains("\"notice\":") {
         return text;
     }
     let Ok(mut parsed) = serde_json::from_str::<Value>(&text) else {
         return text;
     };
+    let mut modified = false;
     let snippets_opt = if parsed.is_array() {
         parsed.as_array_mut()
     } else {
         parsed.get_mut("snippets").and_then(Value::as_array_mut)
     };
-    let Some(snippets) = snippets_opt else {
-        return text;
-    };
-    let mut modified = false;
-    for item in snippets.iter_mut() {
-        let Some(obj) = item.as_object_mut() else {
-            continue;
-        };
-        let Some(notice) = obj.get("notice").and_then(Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1);
-        let end = obj.get("end").and_then(Value::as_u64).unwrap_or(start);
-        let sha = obj
-            .get("sha256")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let exact_overlap_tag = format!("OVERLAP_READ: lines {start}..{end} already read");
-        if let Some(lines) = obj.get_mut("lines").and_then(Value::as_array_mut) {
-            if notice.contains(&exact_overlap_tag) && lines.len() >= 30 {
-                let omitted = lines.len() - 8;
-                let tail: Vec<Value> = lines.split_off(lines.len() - 4);
-                lines.truncate(4);
-                let short_sha = &sha[..12.min(sha.len())];
-                lines.push(json!(format!(
-                    "... [{omitted} unchanged lines ({}..{}) omitted on exact duplicate read; sha256={short_sha} unchanged — reuse prior context] ...",
-                    start + 4,
-                    end - 4
-                )));
-                lines.extend(tail);
+    if let Some(snippets) = snippets_opt {
+        for item in snippets.iter_mut() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let full_sha = obj
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let short_sha = if full_sha.len() == 64 {
+                let s = full_sha[..12].to_string();
+                obj.insert("sha256".into(), json!(s));
                 modified = true;
-            }
-            if notice.contains("SEQUENTIAL_SLICE")
-                && let Some(first_str) = lines.first().and_then(Value::as_str).map(str::to_owned)
-            {
-                lines[0] = json!(format!("{first_str}  /* [CCTX_OUTLINE: {notice}] */"));
-                modified = true;
+                s
+            } else {
+                full_sha
+            };
+            let Some(notice) = obj.get("notice").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1);
+            let end = obj.get("end").and_then(Value::as_u64).unwrap_or(start);
+            let exact_overlap_tag = format!("OVERLAP_READ: lines {start}..{end} already read");
+            if let Some(lines) = obj.get_mut("lines").and_then(Value::as_array_mut) {
+                if notice.contains(&exact_overlap_tag) && lines.len() >= 30 {
+                    let omitted = lines.len() - 8;
+                    let tail: Vec<Value> = lines.split_off(lines.len() - 4);
+                    lines.truncate(4);
+                    lines.push(json!(format!(
+                        "... [{omitted} unchanged lines ({}..{}) omitted on exact duplicate read; sha256={short_sha} unchanged — reuse prior context] ...",
+                        start + 4,
+                        end - 4
+                    )));
+                    lines.extend(tail);
+                    modified = true;
+                }
+                if notice.contains("SEQUENTIAL_SLICE")
+                    && let Some(first_str) = lines.first().and_then(Value::as_str).map(str::to_owned)
+                {
+                    lines[0] = json!(format!("{first_str}  /* [CCTX_OUTLINE: {notice}] */"));
+                    modified = true;
+                }
             }
         }
     }
@@ -1308,8 +1309,8 @@ fn tool_call(
             object.insert("mcp_client".into(), crate::diagnostics::capabilities()?);
             return Ok(serde_json::to_string(&value)?);
         }
-        let text = if name == "code_read" {
-            compact_mcp_read_payload(text)
+        let text = if matches!(name, "code_read" | "code_context") {
+            compact_mcp_snippet_payload(name, text)
         } else {
             text
         };

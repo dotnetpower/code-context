@@ -250,19 +250,23 @@ function formatContext(value: JsonValue): string {
   const searchRec = recordValue(searchVal, 'search result');
   const total = integerValue(searchRec.total_matches, 'total_matches');
   const search = formatSearch(searchVal, context.freshness === undefined, 2_400);
-  const notice = context.freshness === undefined ? '' : `\n${formatFreshness(context.freshness, total === 0)}`;
+  const freshLine = context.freshness === undefined ? undefined : formatFreshness(context.freshness, total === 0);
+  const notice = freshLine === undefined ? '' : `\n${freshLine}`;
   const snippetBudget = Math.max(1_500, MAX_INLINE_CHARS - utf8Bytes(search) - utf8Bytes(notice) - 2);
   const snippets = formatSnippets(requiredValue(context, 'snippets', 'context result'), snippetBudget);
   return `${search}${notice}\n\n${snippets}`;
 }
 
-function formatFreshness(value: JsonValue, includeNotice = true): string {
+function formatFreshness(value: JsonValue, zeroMatches = false): string | undefined {
   const freshness = recordValue(value, 'search freshness');
   const basis = stringValue(freshness.basis, 'freshness basis');
   const check = stringValue(freshness.returned_file_check, 'returned_file_check');
   const verified = booleanValue(freshness.full_disk_verified, 'full_disk_verified');
   const notice = stringValue(freshness.notice, 'freshness notice');
-  return includeNotice
+  if (!zeroMatches && basis === 'watcher_snapshot' && !verified) {
+    return undefined;
+  }
+  return zeroMatches
     ? `NOTICE freshness=${basis} returned_file_check=${check} full_disk_verified=${verified}: ${notice}`
     : `NOTICE freshness=${basis} returned_file_check=${check} full_disk_verified=${verified}`;
 }
@@ -344,9 +348,10 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
       keptLines.push(formatLine(item.rawLines[0] as string, item.start));
     }
     const actualEnd = item.start + keptLines.length - 1;
+    const displaySha = item.sha.length === 64 ? item.sha.slice(0, 12) : item.sha;
     const header = sameFileHeader
       ? `--- ${item.path}:${item.start}-${actualEnd}`
-      : `--- ${item.path}:${item.start}-${actualEnd} sha256=${item.sha}`;
+      : `--- ${item.path}:${item.start}-${actualEnd} sha256=${displaySha}`;
     previousPath = item.path;
     previousSha = item.sha;
     output.push(header);
@@ -356,7 +361,16 @@ function formatSnippets(value: JsonValue, maxChars = MAX_INLINE_CHARS): string {
       output.push(noticeLine);
       used += utf8Bytes(noticeLine) + 1;
     }
-    for (const line of keptLines) {
+    const exactOverlapTag = `OVERLAP_READ: lines ${item.start}..${actualEnd} already read`;
+    const renderedLines =
+      item.notice?.includes(exactOverlapTag) && keptLines.length >= 30
+        ? [
+            ...keptLines.slice(0, 4),
+            `... [${keptLines.length - 8} unchanged lines (${item.start + 4}..${actualEnd - 4}) omitted on exact duplicate read; sha256=${displaySha} unchanged — reuse context] ...`,
+            ...keptLines.slice(keptLines.length - 4),
+          ]
+        : keptLines;
+    for (const line of renderedLines) {
       output.push(line);
       used += utf8Bytes(line) + 1;
     }

@@ -399,33 +399,41 @@ def render(report, output, extension_image=None):
     tokens_ax.set_axisbelow(True)
 
     agent_metrics = (
-        "vs Headroom latency\n(5.67ms → 0.17ms, 32.8×)",
-        "vs Headroom tokens\n(23.6k → 1.2k, 20.0×)",
-        "Copilot A/B tool calls\n(7.0 → 2.7 calls)",
-        "Copilot A/B payload tok\n(6.4k → 3.2k tok)",
-        "Copilot A/B wall time\n(20.3s → 15.3s, -25% AIU)",
+        "24h live bill (159 sess)\n($183.8 → $134.9, -$48.9)",
+        "Copilot A/B net cost\n(4.76B → 3.55B nanoAIU)",
+        "Copilot A/B wall time\n(20.31s → 15.30s, 100% acc)",
+        "Copilot A/B tool calls\n(7.00 → 2.67 calls/task)",
+        "Standing BPE prompt\n(2,048 → 756 tok/turn)",
+        "pctx & journal inline\n(1.68 MB → 6.6 KB, 0 schema)",
     )
     builtin_norm = [100.0] * len(agent_metrics)
-    cctx_norm = [0.173 / 5.670 * 100, 1176 / 23557 * 100, 2.67 / 7.00 * 100, 3177 / 6360 * 100, 15.30 / 20.31 * 100]
+    cctx_norm = [
+        134.90 / 183.78 * 100,
+        3.55 / 4.76 * 100,
+        15.30 / 20.31 * 100,
+        2.67 / 7.00 * 100,
+        756 / 2048 * 100,
+        6570 / 1682470 * 100,
+    ]
     y_pos = list(range(len(agent_metrics)))
-    agent_ax.barh([y - 0.17 for y in y_pos], builtin_norm, height=0.32, color=colors[0], label="Baseline (Headroom / Built-in)")
-    cctx_bars = agent_ax.barh([y + 0.17 for y in y_pos], cctx_norm, height=0.32, color=colors[2], label="CCTX current")
+    agent_ax.barh([y - 0.17 for y in y_pos], builtin_norm, height=0.32, color=colors[0], label="Baseline (Without CCTX / Raw)")
+    cctx_bars = agent_ax.barh([y + 0.17 for y in y_pos], cctx_norm, height=0.32, color=colors[2], label="With CCTX + pctx")
     for bar, val in zip(cctx_bars, cctx_norm):
         agent_ax.annotate(f"-{100.0 - val:.1f}%", (val, bar.get_y() + bar.get_height() / 2),
                           xytext=(5, -3), textcoords="offset points", fontsize=8.5, fontweight="bold", color="#065F46")
     agent_ax.set(
         yticks=y_pos, yticklabels=agent_metrics,
-        xlabel="Relative latency / tokens / cost (% of baseline, lower is better)",
-        title="D  Headroom & Copilot A/B agent acceleration",
-        xlim=(0, 118), ylim=(-0.6, 5.15),
+        xlabel="Relative bill / wall time / tokens (% of baseline, lower is better)",
+        title="D  Net LLM session cost, BPE, probes & agent A/B",
+        xlim=(0, 118), ylim=(-0.6, 5.95),
     )
     agent_ax.invert_yaxis()
-    agent_ax.legend(frameon=False, loc="lower right", ncol=2, fontsize=8.2)
+    agent_ax.legend(frameon=False, loc="lower right", ncol=2, fontsize=8.0)
     agent_ax.grid(axis="x", alpha=0.22)
     agent_ax.set_axisbelow(True)
 
     figure.suptitle(
-        f"Code Context (CCTX) · Warm Retrieval ({report['summary']['all']['speedup']['ratio']:.2f}× Speedup) & Token Acceleration",
+        f"Code Context (CCTX) · {report['summary']['all']['speedup']['ratio']:.2f}× Warm Retrieval & -25.4% to -26.6% Net LLM Cost",
         fontsize=13, fontweight="bold",
     )
     output.mkdir(parents=True, exist_ok=True)

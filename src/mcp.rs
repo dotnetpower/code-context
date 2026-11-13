@@ -11,9 +11,8 @@ pub const MAX_MESSAGE: usize = 1024 * 1024;
 pub fn tools() -> Value {
     let search_properties = json!({
         "pattern": {"type":"string", "minLength":1,
-            "description":"Literal substring by default, not semantic or keyword search. Set regex=true for alternation such as a|b or other regex syntax."},
-        "regex": {"type":"boolean", "default":false,
-            "description":"Enable regular expressions explicitly; otherwise |, parentheses and other operators are literal characters."},
+            "description":"Literal default, not semantic or keyword search. Set regex=true for a|b."},
+        "regex": {"type":"boolean", "default":false},
         "ignore_case": {"type":"boolean", "default":false},
         "limit": {"type":"integer", "minimum":1, "maximum":1000, "default":200}
     });
@@ -23,9 +22,9 @@ pub fn tools() -> Value {
     json!({"tools":[
         {
             "name":"code_files",
-            "description":"Find files by filename or relative-path glob, NOT by file contents. Use before content search when locating a file. Returns sorted permitted paths, total_matches and truncated. Respects registered scopes, globs, ignores and exclusions.",
+            "description":"Find files by filename/path glob (!content).",
             "inputSchema":{"type":"object","properties":{
-                "glob":{"type":"string","minLength":1,"maxLength":1024,"description":"Filename/path glob, e.g. *Tools.ts, **/README.md or *.json."},
+                "glob":{"type":"string","minLength":1,"maxLength":1024,"description":"Path/name glob (e.g. *.rs, src/**/*.ts)."},
                 "paths":{"type":"array","maxItems":64,"items":{"type":"string"}},
                 "limit":{"type":"integer","minimum":1,"maximum":1000,"default":200}
             },"required":["glob"],"additionalProperties":false},
@@ -33,19 +32,19 @@ pub fn tools() -> Value {
         },
         {
             "name":"code_grep",
-            "description":"Search current saved source files in the configured root/scopes/globs. Like rg: literal by default, optional regex and case-insensitive search. Returns path, 1-based line, original text, total and truncation. No index, hidden files, symlinks or arbitrary paths.",
+            "description":"Search saved source lines (literal default; regex=true for regex).",
             "inputSchema":{"type":"object","properties":search_properties,"required":["pattern"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         },
         {
             "name":"code_read",
-            "description":"Read multiple known source-file ranges in one call. Paths relative to configured root, inclusive 1-based ranges (max 500 lines each). Returns original lines and whole-file SHA-256; rejects out-of-scope and ignored files.",
+            "description":"Read batched 1-based inclusive source ranges (<=150 lines).",
             "inputSchema":{"type":"object","properties":{"ranges":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"path":{"type":"string"},"start":{"type":"integer","minimum":1},"end":{"type":"integer","minimum":1}},"required":["path","start","end"],"additionalProperties":false}}},"required":["ranges"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         },
         {
             "name":"code_context",
-            "description":"Find a symbol or literal/regex and read matching source lines with surrounding context in ONE call instead of search then file reads. Merges overlapping ranges. Does not resolve call graphs or infer related tests. Saved files only; hashes must be revalidated before editing.",
+            "description":"Search symbol/literal + surrounding source in 1 call.",
             "inputSchema":{"type":"object","properties":context_properties,"required":["pattern"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         }

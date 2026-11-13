@@ -1,6 +1,6 @@
 //! Failure, offload, built-in fallback and cost-guard analysis for `cctx usage`.
 
-use crate::diagnostics::render_box_table;
+use crate::diagnostics::usage_display::{Style, UsageDisplay};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -68,6 +68,32 @@ pub struct ModelFacts {
 pub struct Advisory {
     pub code: &'static str,
     pub message: String,
+}
+
+impl Advisory {
+    pub(crate) fn compact_hint(&self) -> (u8, &str) {
+        match self.code {
+            "native_stall" => (0, "Shared stall detected; check cctx doctor and machine load."),
+            "client_disconnected" => (1, "Native client disconnected; use MCP/CLI until restored."),
+            "cold_cache_spike" => (2, "Reduce cold-cache costs; compact long sessions and avoid idle gaps."),
+            "host_dispatch_delay" => (3, "Host dispatch is slow; check the extension host or use MCP."),
+            "unregistered_workspace" => (4, "Register missing workspaces before source lookups."),
+            "cache_miss_rate" => (5, "Frequent cache misses; check root admission and memory limits."),
+            "low_adoption_workspace" | "model_without_cctx" => {
+                (6, "Prefer cctx for source lookups; check loaded instructions.")
+            }
+            "sequential_slicing" => (7, "Avoid sequential reads; request relevant ranges in one call."),
+            "low_context_share" => (8, "Use cctxNativeContext to combine source search and reading."),
+            "offload_rate" | "other_tool_offload" => {
+                (9, "Reduce output offloads; narrow queries and response sizes.")
+            }
+            "long_session" => (10, "Compact long sessions to reduce repeated context costs."),
+            "spend_concentration" => (11, "Review the highest-spend session for repeated work."),
+            "reasoning_share" => (12, "Review reasoning effort for routine tasks."),
+            "model_efficiency" => (13, "Review per-model efficiency and warm-cache costs in --details."),
+            _ => (14, &self.message),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -551,6 +577,7 @@ impl Insights {
 
     pub fn render(&self) -> Vec<String> {
         let mut out = Vec::new();
+        let display = UsageDisplay::terminal();
         let ms = |v: Option<f64>| v.map_or_else(|| "-".into(), |m| format!("{m:.0}ms"));
 
         let mut tool_rows: Vec<(&String, &ToolStat)> = self.tools.iter().collect();
@@ -567,7 +594,7 @@ impl Insights {
                     .collect::<Vec<_>>()
                     .join(", ");
                 vec![
-                    short(tool, 34),
+                    tool.clone(),
                     s.calls.to_string(),
                     s.failures.to_string(),
                     if cause_text.is_empty() { "-".into() } else { cause_text },
@@ -580,11 +607,10 @@ impl Insights {
             })
             .collect();
         out.push(String::new());
-        out.push(render_box_table(
+        out.push(display.cards(
             "4. CCTX TOOL RELIABILITY, FAILURE CAUSES & TAIL LATENCY",
             &["Tool", "Calls", "Fail", "Top Causes", "Offload", "Median", "P95", "P99", "Avg Payload"],
             &rows,
-            &[false, true, true, false, true, true, true, true, true],
         ));
 
         let mut fb: Vec<(&String, &FallbackStat)> = self.fallbacks.iter().collect();
@@ -593,7 +619,7 @@ impl Insights {
             .into_iter()
             .map(|(tool, s)| {
                 vec![
-                    short(tool, 28),
+                    tool.clone(),
                     s.calls.to_string(),
                     format!("{} tok", if s.calls == 0 { 0 } else { s.payload_tokens / s.calls as u64 }),
                     cctx_replacement(tool).into(),
@@ -601,11 +627,10 @@ impl Insights {
             })
             .collect();
         out.push(String::new());
-        out.push(render_box_table(
+        out.push(display.cards(
             "5. BUILT-IN FALLBACKS TO REPLACE (eligible source lookups only)",
             &["Built-in Tool", "Calls", "Avg Payload", "Use Instead"],
             &rows,
-            &[false, true, true, false],
         ));
 
         let mut ws: Vec<(&String, &WorkspaceStat)> = self.workspaces.iter().filter(|(_, s)| s.builtin > 0).collect();
@@ -615,7 +640,7 @@ impl Insights {
             .take(8)
             .map(|(workspace, s)| {
                 vec![
-                    short(workspace, 24),
+                    workspace.clone(),
                     s.cctx.to_string(),
                     s.builtin.to_string(),
                     format!("{:.1}%", 100.0 * ratio(s.cctx, s.cctx + s.builtin)),
@@ -623,20 +648,21 @@ impl Insights {
             })
             .collect();
         out.push(String::new());
-        out.push(render_box_table(
+        out.push(display.cards(
             "6. WORKSPACES WITH THE MOST BUILT-IN FALLBACKS (Top 8)",
             &["Workspace", "CCTX", "Built-in", "Adoption"],
             &rows,
-            &[false, true, true, true],
         ));
 
         out.push(String::new());
-        out.push("  7. OPTIMIZATION ADVISORIES".into());
+        out.push(display.section("7. OPTIMIZATION ADVISORIES", Style::Advisory));
         if self.advisories.is_empty() {
-            out.push("  • none — no long sessions, offload spikes or adoption gaps detected".into());
+            out.push(display.text("No long sessions, offload spikes or adoption gaps detected.", Style::Muted));
         }
-        for advisory in &self.advisories {
-            out.push(format!("  • [{}] {}", advisory.code, advisory.message));
+        for (index, advisory) in self.advisories.iter().enumerate() {
+            out.push(String::new());
+            out.push(display.text(&format!("{:02} / {}", index + 1, advisory.code), Style::Advisory));
+            out.push(display.text(&format!("  {}", advisory.message), Style::Normal));
         }
         out
     }

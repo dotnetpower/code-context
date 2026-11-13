@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use code_context::context::{ContextRequest, ReadRange};
 use code_context::engine::{Backend, Engine};
+use code_context::journal::JournalCommand;
 use code_context::policy::MemoryPolicy;
+use code_context::probe::ProbeCommand;
 use code_context::prompt_formula::{PromptStyle, PromptTarget};
 use code_context::search::Search;
 use code_context::workspace::Workspace;
@@ -49,6 +51,17 @@ struct Args {
     command: Action,
 }
 
+#[derive(Parser)]
+#[command(
+    name = "pctx",
+    version,
+    about = "Declarative Rust data, HTTP API, SQLite/Parquet, and image prober for AI coding agents"
+)]
+struct PctxArgs {
+    #[command(subcommand)]
+    command: ProbeCommand,
+}
+
 #[derive(Subcommand)]
 enum Action {
     Daemon,
@@ -63,11 +76,22 @@ enum Action {
     Status,
     Doctor,
     Coverage,
+    Probe {
+        #[command(subcommand)]
+        command: Box<ProbeCommand>,
+    },
+    Journal {
+        #[command(subcommand)]
+        command: Box<JournalCommand>,
+    },
     Usage {
         #[arg(long, default_value_t = 24.0)]
         hours: f64,
         #[arg(long)]
         json: bool,
+        /// Show all statistics and advisory evidence instead of the compact summary.
+        #[arg(long)]
+        details: bool,
     },
     Prompt {
         #[arg(long, value_enum, default_value_t = PromptStyle::Formula)]
@@ -157,7 +181,29 @@ enum Action {
     },
 }
 
+fn invoked_as_pctx() -> bool {
+    std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        })
+        .is_some_and(|stem| matches!(stem.as_str(), "pctx" | "cctx-probe"))
+}
+
+fn write_probe_output(cmd: &ProbeCommand) -> Result<()> {
+    let output = code_context::probe::run_probe(cmd)?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(output.as_bytes())?;
+    stdout.write_all(b"\n").map_err(Into::into)
+}
+
 fn run() -> Result<()> {
+    if invoked_as_pctx() {
+        let pctx = PctxArgs::parse();
+        return write_probe_output(&pctx.command);
+    }
     let args = Args::parse();
     match &args.command {
         Action::Daemon => return daemon::serve(),
@@ -165,8 +211,15 @@ fn run() -> Result<()> {
         Action::NativeBridge => return daemon::native_bridge(io::stdin().lock(), io::stdout().lock()),
         Action::Doctor => return print(&code_context::diagnostics::doctor(&args.root)?),
         Action::Coverage => return print(&code_context::diagnostics::coverage()?),
-        Action::Usage { hours, json } => {
-            let output = code_context::diagnostics::usage(&args.root, *hours, *json)?;
+        Action::Probe { command } => return write_probe_output(command),
+        Action::Journal { command } => {
+            let output = code_context::journal::run(&args.root, command)?;
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(output.as_bytes())?;
+            return stdout.write_all(b"\n").map_err(Into::into);
+        }
+        Action::Usage { hours, json, details } => {
+            let output = code_context::diagnostics::usage(&args.root, *hours, *json, *details)?;
             let mut stdout = io::stdout().lock();
             stdout.write_all(output.as_bytes())?;
             return stdout.write_all(b"\n").map_err(Into::into);
@@ -504,8 +557,9 @@ fn print(value: &serde_json::Value) -> Result<()> {
 }
 
 fn main() {
+    let prog = if invoked_as_pctx() { "pctx" } else { "cctx" };
     if let Err(error) = run() {
-        eprintln!("cctx: {error}");
+        eprintln!("{prog}: {error}");
         std::process::exit(2);
     }
 }

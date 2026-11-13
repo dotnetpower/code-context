@@ -292,3 +292,28 @@ void test('oversized tool outputs are bounded to stay under 8KiB inline host lim
   );
   assert.match(multibyteReadOut, /inline budget reached \(<8KiB\); next_ranges=/);
 });
+
+void test('non-empty searches suppress watcher_snapshot boilerplate, shorten 64-char sha256, and elide duplicate overlap reads', () => {
+  const fullSha = 'abcdef0123456789'.repeat(4);
+  const ctxOut = formatToolResult('code_context', {
+    search: { total_matches: 1, truncated: false, matches: [{ path: 'src/a.rs', line: 1 }] },
+    snippets: [{ path: 'src/a.rs', start: 1, end: 1, sha256: fullSha, lines: ['fn a() {}'] }],
+    freshness,
+  });
+  assert.doesNotMatch(ctxOut, /NOTICE freshness=watcher_snapshot/);
+  assert.match(ctxOut, /--- src\/a\.rs:1-1 sha256=abcdef012345\n/);
+
+  const dupLines = Array.from({ length: 40 }, (_, i) => `line_${i + 1}`);
+  const dupOut = formatToolResult('code_read', [
+    {
+      path: 'src/dup.rs',
+      start: 1,
+      end: 40,
+      sha256: fullSha,
+      notice: 'OVERLAP_READ: lines 1..40 already read in 1..40 (sha256 unchanged); reuse context',
+      lines: dupLines,
+    },
+  ]);
+  assert.match(dupOut, /32 unchanged lines \(5\.\.36\) omitted on exact duplicate read/);
+  assert.doesNotMatch(dupOut, /\n20: line_20\n/);
+});

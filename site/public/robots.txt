@@ -1,0 +1,77 @@
+# robots.txt for Code Context (cctx) official documentation & showcase
+# https://dotnetpower.github.io/code-context/
+# Public English documentation — all search engines and generative AI answer
+# engines (GEO / AEO) are welcome to crawl and cite published pages.
+#
+# Structured LLM index: https://dotnetpower.github.io/code-context/llms.txt
+# Full LLM corpus:      https://dotnetpower.github.io/code-context/llms-full.txt
+# Markdown sitemap:     https://dotnetpower.github.io/code-context/sitemap.md
+# RSS 2.0 feed:         https://dotnetpower.github.io/code-context/rss.xml
+
+User-agent: *
+Allow: /
+
+# Search & retrieval crawlers:
+User-agent: Googlebot
+Allow: /
+
+User-agent: bingbot
+Allow: /
+
+User-agent: Yeti
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: Claude-SearchBot
+Allow: /
+
+User-agent: Claude-User
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+# Generative AI & research crawlers:
+User-agent: GPTBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+User-agent: CCBot
+Allow: /
+
+User-agent: cohere-ai
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+
+User-agent: Amazonbot
+Allow: /
+
+Sitemap: https://dotnetpower.github.io/code-context/sitemap-index.xml
+Sitemap: https://dotnetpower.github.io/code-context/sitemap.xml

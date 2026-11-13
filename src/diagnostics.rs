@@ -7,6 +7,9 @@ use std::io::{BufRead, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod usage_display;
+use usage_display::{Style, UsageDisplay, UsageSummary};
+
 pub const CAPABILITY_SCHEMA: u32 = 3;
 
 // Fallback savings assumptions when a session has no `session.usage_record` events;
@@ -679,59 +682,7 @@ fn fmt_bar(pct: Option<f64>, width: usize) -> String {
     )
 }
 
-pub(crate) fn render_box_table(title: &str, headers: &[&str], rows: &[Vec<String>], right_align: &[bool]) -> String {
-    let fallback = vec![
-        std::iter::once("(none)".to_string())
-            .chain((1..headers.len()).map(|_| "-".to_string()))
-            .collect::<Vec<_>>(),
-    ];
-    let active_rows = if rows.is_empty() { &fallback } else { rows };
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|col| {
-            let h_len = headers[col].chars().count();
-            let r_max = active_rows
-                .iter()
-                .map(|r| r.get(col).map_or(0, |s| s.chars().count()))
-                .max()
-                .unwrap_or(0);
-            h_len.max(r_max)
-        })
-        .collect();
-    let pad = |text: &str, width: usize, right: bool| -> String {
-        let count = text.chars().count();
-        let pad_len = width.saturating_sub(count);
-        if right {
-            format!("{}{}", " ".repeat(pad_len), text)
-        } else {
-            format!("{}{}", text, " ".repeat(pad_len))
-        }
-    };
-    let join_border = |left: &str, mid: &str, right: &str| -> String {
-        let segs: Vec<String> = widths.iter().map(|w| "─".repeat(*w + 2)).collect();
-        format!("{left}{}{right}", segs.join(mid))
-    };
-    let mut out = Vec::with_capacity(active_rows.len() + 5);
-    out.push(format!("  {title}"));
-    out.push(join_border("┌", "┬", "┐"));
-    let head_cells: Vec<String> = (0..headers.len())
-        .map(|i| pad(headers[i], widths[i], *right_align.get(i).unwrap_or(&false)))
-        .collect();
-    out.push(format!("│ {} │", head_cells.join(" │ ")));
-    out.push(join_border("├", "┼", "┤"));
-    for row in active_rows {
-        let cells: Vec<String> = (0..headers.len())
-            .map(|i| {
-                let text = row.get(i).map_or("-", String::as_str);
-                pad(text, widths[i], *right_align.get(i).unwrap_or(&false))
-            })
-            .collect();
-        out.push(format!("│ {} │", cells.join(" │ ")));
-    }
-    out.push(join_border("└", "┴", "┘"));
-    out.join("\n")
-}
-
-pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
+pub fn usage(root: &Path, hours: f64, as_json: bool, details: bool) -> Result<String> {
     if !hours.is_finite() || hours <= 0.0 {
         return Err(invalid("hours must be greater than zero").into());
     }
@@ -764,7 +715,7 @@ pub fn usage(root: &Path, hours: f64, as_json: bool) -> Result<String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let registered_specs = catalog::load().unwrap_or_default();
-    usage_from_home(&state_home, hours, now, daemon_status, &registered_specs, as_json)
+    usage_from_home(&state_home, hours, now, daemon_status, &registered_specs, as_json, details)
 }
 
 fn first_target_path_str(args: &Value) -> Option<&str> {
@@ -932,6 +883,7 @@ fn usage_from_home(
     daemon_status: Option<Value>,
     registered_specs: &[crate::catalog::Spec],
     as_json: bool,
+    details: bool,
 ) -> Result<String> {
     let cutoff = now - hours * 3600.0;
     let session_dir = state_home.join(".copilot").join("session-state");
@@ -1950,6 +1902,19 @@ fn usage_from_home(
         return serde_json::to_string_pretty(&payload).map_err(Into::into);
     }
 
+    if !details {
+        return Ok(UsageDisplay::terminal().summary(&UsageSummary {
+            hours,
+            used_aic: total_used_aic,
+            saved_aic: total_saved_aic,
+            tokens_saved: total_saved,
+            warm_pct: cctx_warm_pct,
+            adoption_pct: cctx_select_pct,
+            models: &model_entries,
+            advisories: &insights.advisories,
+        }));
+    }
+
     let mut daemon_line = String::from("  • Shared Daemon   : offline");
     if let Some(ref d) = daemon_status {
         let state = d.get("index_state").and_then(Value::as_str).unwrap_or("online");
@@ -1990,106 +1955,52 @@ fn usage_from_home(
         );
     }
 
-    let visual_width = |s: &str| -> usize {
-        s.chars()
-            .map(|c| {
-                if matches!(c, '⚡' | '💰' | '💎' | '🔥' | '🎯' | '🚀') || (c as u32) >= 0x1F300 {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum()
-    };
-    let title_row = format!(
-        "⚡ CODE CONTEXT (cctx) — MODEL, TOKEN & COST SAVINGS DASHBOARD (Window: {hours:.1}h)"
-    );
-    let hero_rows = [
-        format!(
-            "💰 COST SAVED (@$0.001/AIC) :  +${:<8.2} USD   (-{savings_pct:.1}% of baseline bill · ~{total_saved_aic:.1} AIC saved)",
-            total_saved_aic * 0.001
-        ),
-        format!(
-            "💎 API LIST VALUE (@$0.01)  :  +${:<8.2} USD   (Frontier API list price: $2/$0.10/$10 per 1M)",
-            total_saved_aic * 0.01
-        ),
-        format!(
-            "🔥 TOKENS SAVED             :  ~{:<9} tok   (Payload ~{} + {:.1}x Cache ~{} + ~{} Turns ~{} + BPE ~{})",
-            fmt_tok(total_saved),
-            fmt_tok(direct_saved),
-            effective_reread_mult,
-            fmt_tok(compounded_saved),
-            turn_comp_cnt,
-            fmt_tok(turn_saved),
-            fmt_tok(bpe_saved_tokens)
-        ),
-        format!(
-            "🧬 BPE FORMULA COMPRESSION  :  {}  ({}/{} surfaces: ext·mcp·subagent·global · ~{} tok/turn · +${:.2})",
-            fmt_bar(bpe_surface_pct, 10),
-            bpe_status.active_surfaces,
-            bpe_status.total_surfaces,
-            bpe_turn_tok,
-            bpe_saved_aic * 0.001
-        ),
-        format!(
-            "🎯 WARM CACHE HIT RATE      :  {}  ({} warm hits / {} CCTX lookups)",
-            fmt_bar(cctx_warm_pct, 10),
-            cctx_warm,
-            cctx_calls.len()
-        ),
-        format!(
-            "🚀 ELIGIBLE SOURCE ADOPTION :  {}  ({}/{} · excl. {} /tmp & {} pre-edit)",
-            fmt_bar(cctx_select_pct, 10),
-            cctx_calls.len(),
-            lookup_calls.len(),
-            non_source_cnt,
-            pre_edit_cnt
-        ),
+    let display = UsageDisplay::terminal();
+    let mut lines = vec![
+        display.text(&format!("CCTX USAGE / Last {hours} hours"), Style::Title),
+        String::new(),
+        display.section("ESTIMATED SAVINGS", Style::Title),
+        display.text(&format!("${:.2} USD saved", total_saved_aic * 0.001), Style::Savings),
+        display.text(&format!("{savings_pct:.1}% less than estimated baseline"), Style::Savings),
+        String::new(),
+        display.field("Without cctx (est.)", &format!("${:.2}", (total_used_aic + total_saved_aic) * 0.001), Style::Normal),
+        display.field("With cctx", &format!("${:.2}", total_used_aic * 0.001), Style::Normal),
+        String::new(),
+        display.text("USD equivalents @ $0.001/AIC.", Style::Muted),
+        display.text("Savings are modeled estimates, not verified billing reductions.", Style::Muted),
+        String::new(),
+        display.section("EFFICIENCY", Style::Title),
+        display.field("Tokens avoided (est.)", &fmt_tok(total_saved), Style::Normal),
+        display.field("Warm cache hits", &fmt_pct(cctx_warm_pct), Style::Normal),
+        display.text(&format!("  {cctx_warm} / {} CCTX lookups", cctx_calls.len()), Style::Muted),
+        display.field("Source adoption", &fmt_pct(cctx_select_pct), Style::Normal),
+        display.text(&format!("  {} / {} eligible; excludes {non_source_cnt} /tmp and {pre_edit_cnt} pre-edit calls", cctx_calls.len(), lookup_calls.len()), Style::Muted),
+        display.field("Formula coverage", &fmt_pct(bpe_surface_pct), Style::Normal),
+        display.text(&format!("  {}/{} surfaces: ext, mcp, subagent, global; ~{bpe_turn_tok} tokens/turn", bpe_status.active_surfaces, bpe_status.total_surfaces), Style::Muted),
+        String::new(),
+        display.section("SAVINGS BREAKDOWN / Estimated tokens", Style::Title),
+        display.field("Smaller payloads", &fmt_tok(direct_saved), Style::Normal),
+        display.field("Cache re-reads", &fmt_tok(compounded_saved), Style::Normal),
+        display.text(&format!("  {effective_reread_mult:.1}x cache multiplier"), Style::Muted),
+        display.field("Avoided turns", &fmt_tok(turn_saved), Style::Normal),
+        display.text(&format!("  ~{turn_comp_cnt} turns avoided"), Style::Muted),
+        display.field("Formula compression", &fmt_tok(bpe_saved_tokens), Style::Normal),
+        display.text(&format!("  ${:.2} estimated savings (included above)", bpe_saved_aic * 0.001), Style::Muted),
+        String::new(),
+        display.section("LLM USAGE", Style::Title),
+        display.field("Sessions / turns", &format!("{} / {}", active_sessions.len(), turns.len()), Style::Normal),
+        display.field("Total tokens", &fmt_tok(total_in + total_out + total_rsn), Style::Normal),
+        display.field("Input tokens", &fmt_tok(total_in), Style::Normal),
+        display.field("Prompt cache rate", &fmt_pct(prompt_cache_pct), Style::Normal),
+        display.field("Output / reasoning", &format!("{} / {}", fmt_tok(total_out), fmt_tok(total_rsn)), Style::Normal),
+        display.text(&format!("Usage: {total_used_aic:.1} AIC; estimated savings: {total_saved_aic:.1} AIC"), Style::Muted),
+        display.text(daemon_line.trim(), Style::Muted),
+        String::new(),
+        display.section("REFERENCE ONLY / Alternative valuation", Style::Title),
+        display.field("At $0.01/AIC", &format!("${:.2} saved equivalent", total_saved_aic * 0.01), Style::Muted),
+        display.text(&format!("Used equivalent: ${:.2}. Not additional savings.", total_used_aic * 0.01), Style::Muted),
+        String::new(),
     ];
-    let meta_rows = [
-        format!(
-            "• Total LLM Spend : ${:.2} (@$0.001/AIC · {:.1} AIC)  |  ${:.2} (API List @$0.01/AIC)",
-            total_used_aic * 0.001,
-            total_used_aic,
-            total_used_aic * 0.01
-        ),
-        format!(
-            "• Total LLM Tokens: {} across {} sessions / {} turns (In {} · Cache {} · Out {} · Rsn {})",
-            fmt_tok(total_in + total_out + total_rsn),
-            active_sessions.len(),
-            turns.len(),
-            fmt_tok(total_in),
-            fmt_pct(prompt_cache_pct),
-            fmt_tok(total_out),
-            fmt_tok(total_rsn)
-        ),
-        daemon_line.trim_start().to_string(),
-    ];
-    let box_width = std::iter::once(&title_row)
-        .chain(hero_rows.iter())
-        .chain(meta_rows.iter())
-        .map(|s| visual_width(s))
-        .max()
-        .unwrap_or(92)
-        .max(92);
-    let frame_row = |content: &str| -> String {
-        let pad = box_width.saturating_sub(visual_width(content));
-        format!("║ {}{} ║", content, " ".repeat(pad))
-    };
-    let top_border = format!("╔{}╗", "═".repeat(box_width + 2));
-    let mid_border = format!("╠{}╣", "═".repeat(box_width + 2));
-    let bot_border = format!("╚{}╝", "═".repeat(box_width + 2));
-
-    let mut lines = vec![top_border, frame_row(&title_row), mid_border.clone()];
-    for row in &hero_rows {
-        lines.push(frame_row(row));
-    }
-    lines.push(mid_border);
-    for row in &meta_rows {
-        lines.push(frame_row(row));
-    }
-    lines.push(bot_border);
-    lines.push(String::new());
 
     let mut model_rows: Vec<Vec<String>> = model_entries
         .iter()
@@ -2120,7 +2031,8 @@ fn usage_from_home(
                 ),
                 fmt_pct(m["cctx_adoption_percent"].as_f64()),
                 format!("${:.2} ({u_aic:.1} AIC)", u_aic * 0.001),
-                format!("+${:.2} / API +${:.2} (~{s_aic:.1} AIC)", s_aic * 0.001, s_aic * 0.01),
+                format!("${:.2} (~{s_aic:.1} AIC)", s_aic * 0.001),
+                format!("${:.2}", s_aic * 0.01),
             ]
         })
         .collect();
@@ -2132,9 +2044,10 @@ fn usage_from_home(
         format!("{} ({})", cctx_calls.len(), fmt_pct(cctx_warm_pct)),
         fmt_pct(cctx_select_pct),
         format!("${:.2} ({total_used_aic:.1} AIC)", total_used_aic * 0.001),
-        format!("+${:.2} / API +${:.2} (~{total_saved_aic:.1} AIC)", total_saved_aic * 0.001, total_saved_aic * 0.01),
+        format!("${:.2} (~{total_saved_aic:.1} AIC)", total_saved_aic * 0.001),
+        format!("${:.2}", total_saved_aic * 0.01),
     ]);
-    lines.push(render_box_table(
+    lines.push(display.cards(
         "1. LLM MODEL USAGE, CACHE HIT & COST SAVINGS",
         &[
             "Model (Effort)",
@@ -2143,11 +2056,11 @@ fn usage_from_home(
             "Out+Rsn Tok",
             "CCTX (Warm%)",
             "Src Adopt",
-            "LLM Spend (@$0.001)",
-            "COST SAVED (@$0.001 / API @$0.01)",
+            "Used equivalent",
+            "Est. savings",
+            "Reference @$0.01/AIC",
         ],
         &model_rows,
-        &[false, true, true, true, true, true, true, true],
     ));
     lines.push(String::new());
 
@@ -2215,13 +2128,18 @@ fn usage_from_home(
             format!("{avg_tok} tok"),
             offloads.to_string(),
             if matches!(key, "native" | "mcp") {
-                format!("+${:.2} / API +${:.2} (~{g_saved_aic:.1} AIC)", g_saved_aic * 0.001, g_saved_aic * 0.01)
+                format!("${:.2} (~{g_saved_aic:.1} AIC)", g_saved_aic * 0.001)
+            } else {
+                "-".into()
+            },
+            if matches!(key, "native" | "mcp") {
+                format!("${:.2}", g_saved_aic * 0.01)
             } else {
                 "-".into()
             },
         ]);
     }
-    lines.push(render_box_table(
+    lines.push(display.cards(
         "2. TOOL SURFACE PERFORMANCE, ELIGIBILITY & COST SAVINGS",
         &[
             "Surface",
@@ -2232,10 +2150,10 @@ fn usage_from_home(
             "P95",
             "Avg Payload",
             ">8KiB Offload",
-            "COST SAVED (@$0.001 / API @$0.01)",
+            "Est. savings",
+            "Reference @$0.01/AIC",
         ],
         &surface_rows,
-        &[false, true, true, true, true, true, true, true, true],
     ));
     lines.push(String::new());
 
@@ -2271,8 +2189,6 @@ fn usage_from_home(
             .sum::<f64>()
             + s_turns.iter().map(|t| t.bpe_saved_aic).sum::<f64>();
         let short_id: String = s_id.chars().take(12).collect();
-        let short_ws: String = ws.chars().take(20).collect();
-        let short_mod: String = primary_model.chars().take(18).collect();
         session_vec.push((
             s_id.clone(),
             s_used_aic,
@@ -2280,13 +2196,14 @@ fn usage_from_home(
             s_lookup.len(),
             vec![
                 short_id,
-                short_ws,
-                short_mod,
+                ws,
+                primary_model,
                 s_turns.len().to_string(),
                 format!("${:.2} ({s_used_aic:.1} AIC)", s_used_aic * 0.001),
                 fmt_bar(s_warm_pct, 8),
                 format!("{} ({}/{})", fmt_pct(s_adopt_pct), s_cctx.len(), s_lookup.len()),
-                format!("+${:.2} / API +${:.2} (~{s_saved_aic:.1} AIC)", s_saved_aic * 0.001, s_saved_aic * 0.01),
+                format!("${:.2} (~{s_saved_aic:.1} AIC)", s_saved_aic * 0.001),
+                format!("${:.2}", s_saved_aic * 0.01),
             ],
         ));
     }
@@ -2305,20 +2222,20 @@ fn usage_from_home(
         .take(12)
         .map(|item| item.4)
         .collect();
-    lines.push(render_box_table(
+    lines.push(display.cards(
         "3. TOP SESSIONS BY LLM SPEND, CACHE HIT & COST SAVINGS (Top 12)",
         &[
             "Session",
             "Workspace",
             "Primary Model",
             "Turns",
-            "LLM Spend (@$0.001)",
+            "Used equivalent",
             "Warm Hit Rate",
             "Src Adopt (CCTX/Elig)",
-            "COST SAVED (@$0.001 / API @$0.01)",
+            "Est. savings",
+            "Reference @$0.01/AIC",
         ],
         &session_rows,
-        &[false, false, false, true, true, false, true, true],
     ));
     lines.extend(insights.render());
     let eff_turn_tok = if avoided_turns_total > 0.0 {
@@ -2331,10 +2248,10 @@ fn usage_from_home(
     } else {
         AIC_PER_AVOIDED_TURN
     };
-    lines.push(format!(
+    lines.push(display.text(&format!(
         "\n  Savings model: trace-replayed ({effective_reread_mult:.1}x avg pre-compaction re-read · ~{} tok / ~{eff_turn_aic:.1} AIC per avoided warm turn; see `cctx usage --json`).",
         fmt_tok(eff_turn_tok.round() as u64)
-    ));
+    ), Style::Muted));
     Ok(lines.join("\n"))
 }
 
@@ -2470,7 +2387,7 @@ mod trace_timing_tests {
         std::fs::write(sess_dir.join("events.jsonl"), body).unwrap();
 
         let now = super::event_unix_ts(&json!({"timestamp": "2026-11-12T20:05:00Z"})).unwrap();
-        let raw = super::usage_from_home(home.path(), 24.0, now, None, &[], true).unwrap();
+        let raw = super::usage_from_home(home.path(), 24.0, now, None, &[], true, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let ts = &parsed["token_summary"];
         // c1 (1600 direct) was re-read on turn 2 (despite interleaved subagent!) and stopped at turn 3 compaction => 1600 compounded!
@@ -2488,6 +2405,22 @@ mod trace_timing_tests {
             .find(|m| m["model"] == "gpt-6.1-sol")
             .unwrap();
         assert!(sub_entry["saved_aic"].as_f64().unwrap() < 1.0);
+
+        let text = super::usage_from_home(home.path(), 24.0, now, None, &[], false, true).unwrap();
+        assert!(text.contains("ESTIMATED SAVINGS"));
+        assert!(text.contains(&format!("${:.2} USD saved", ts["saved_usd_0001"].as_f64().unwrap())));
+        assert!(text.contains("Without cctx (est.)"));
+        assert!(text.contains("With cctx"));
+        assert!(text.contains("not verified billing reductions"));
+        assert!(text.contains("OPTIMIZATION ADVISORIES"));
+        assert!(text.contains("REFERENCE ONLY"));
+        let compact = super::usage_from_home(home.path(), 24.0, now, None, &[], false, false).unwrap();
+        assert!(compact.contains("OPTIMIZATION ADVISORIES"));
+        assert!(compact.contains("--details"));
+        assert!(!compact.contains("TOOL SURFACE PERFORMANCE"));
+        assert!(text.contains("TOOL SURFACE PERFORMANCE"));
+        let detailed_json = super::usage_from_home(home.path(), 24.0, now, None, &[], true, true).unwrap();
+        assert_eq!(parsed, serde_json::from_str::<serde_json::Value>(&detailed_json).unwrap());
     }
 
     #[test]
@@ -2589,7 +2522,7 @@ mod trace_timing_tests {
         .unwrap();
 
         let now = super::event_unix_ts(&json!({"timestamp": "2026-11-13T05:10:00Z"})).unwrap();
-        let raw = super::usage_from_home(home.path(), 1.0, now, None, &[], true).unwrap();
+        let raw = super::usage_from_home(home.path(), 1.0, now, None, &[], true, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let models = parsed["model_usage"].as_array().unwrap();
         let carbon = models.iter().find(|m| m["model"] == "gemini-4-carbon").unwrap();

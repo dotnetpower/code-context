@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e2b58"/>
+      <stop offset="55%" stop-color="#141e3c"/>
+      <stop offset="100%" stop-color="#0b1325"/>
+    </linearGradient>
+    <linearGradient id="clamp" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#54ead2"/>
+      <stop offset="100%" stop-color="#748ffc"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="none" stroke="#364fc7" stroke-opacity="0.55" stroke-width="1.5"/>
+  <!-- Top-left & bottom-right block-clamping brackets -->
+  <path d="M23 15H15v8M41 15h8v8M15 41v8h8M49 41v8h-8" fill="none" stroke="url(#clamp)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Clamped signal lines -->
+  <rect x="22" y="25" width="20" height="4" rx="2" fill="#54ead2"/>
+  <rect x="22" y="33" width="14" height="4" rx="2" fill="#dbe4ff"/>
+  <circle cx="41" cy="35" r="2.6" fill="#748ffc"/>
+</svg>

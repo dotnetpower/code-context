@@ -327,6 +327,26 @@ impl<'a> BitReader<'a> {
 
     #[inline]
     fn ensure_bits(&mut self, needed: u8) {
+        if self.bit_count >= needed {
+            return;
+        }
+        if self.bit_count <= 56
+            && let Some(slice) = self.data.get(self.byte_pos..self.byte_pos + 8)
+            && let Ok(bytes) = <[u8; 8]>::try_from(slice)
+        {
+            let advance = ((64 - u32::from(self.bit_count)) / 8) as usize;
+            let valid_bits = (advance * 8) as u32;
+            let word = u64::from_le_bytes(bytes);
+            let masked = if valid_bits == 64 {
+                word
+            } else {
+                word & ((1u64 << valid_bits) - 1)
+            };
+            self.bit_buf |= masked << self.bit_count;
+            self.byte_pos += advance;
+            self.bit_count += (advance * 8) as u8;
+            return;
+        }
         while self.bit_count < needed && self.byte_pos < self.data.len() {
             self.bit_buf |= u64::from(self.data[self.byte_pos]) << self.bit_count;
             self.byte_pos += 1;
@@ -388,7 +408,7 @@ struct HuffmanTree {
     counts: [u16; 16],
     symbols: Vec<u16>,
     max_bits: u8,
-    fast_table: [u16; 512],
+    fast_table: [u16; 2048],
 }
 
 impl HuffmanTree {
@@ -415,7 +435,7 @@ impl HuffmanTree {
             next_code[bits] = code;
         }
         let mut symbols = vec![0u16; usize::from(total)];
-        let mut fast_table = [0u16; 512];
+        let mut fast_table = [0u16; 2048];
         for (sym, &len) in lengths.iter().enumerate() {
             if len > 0 {
                 let len_usize = usize::from(len);
@@ -424,12 +444,12 @@ impl HuffmanTree {
                 symbols[idx] = sym as u16;
                 let c = next_code[len_usize];
                 next_code[len_usize] = c.wrapping_add(1);
-                if len <= 9 && sym < 1024 {
+                if len <= 11 && sym < 1024 {
                     let rev = c.reverse_bits() >> (16 - len);
                     let entry = ((u16::from(len)) << 10) | (sym as u16);
                     let step = 1usize << len;
                     let mut slot = usize::from(rev);
-                    while slot < 512 {
+                    while slot < 2048 {
                         fast_table[slot] = entry;
                         slot += step;
                     }
@@ -467,7 +487,7 @@ impl HuffmanTree {
     #[inline]
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         reader.ensure_bits(15);
-        let fast = self.fast_table[(reader.bit_buf & 0x1ff) as usize];
+        let fast = self.fast_table[(reader.bit_buf & 0x7ff) as usize];
         if fast != 0 {
             let len = (fast >> 10) as u8;
             if reader.bit_count >= len {
@@ -655,9 +675,13 @@ fn decode_huffman_block(
                 } else if distance >= length {
                     out.extend_from_within(start..start + length);
                 } else {
-                    for i in 0..length {
-                        let b = out[start + i];
-                        out.push(b);
+                    out.reserve(length);
+                    let mut copied = 0usize;
+                    while copied < length {
+                        let avail = out.len() - start;
+                        let chunk = (length - copied).min(avail);
+                        out.extend_from_within(start..start + chunk);
+                        copied += chunk;
                     }
                 }
             }

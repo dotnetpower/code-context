@@ -24,6 +24,7 @@
 
 ## Documentation
 
+- [Official Website & Interactive Docs](https://dotnetpower.github.io/code-context/): Full English guides, Markdown mirrors, and single-fetch LLM corpus (`https://dotnetpower.github.io/code-context/llms-full.txt`).
 - [Overview & Quickstart](README.md): Installation on Linux, native Windows (`cctx.exe`), WSL, and SSH, plus summary benchmark tables.
 - [Backend & CLI/MCP Reference](docs/REFERENCE.md): Complete CLI flags, MCP configuration, native tools contract, adaptive memory/cgroup controls, and privacy model.
 - [Benchmarks & Token Efficiency Report](docs/BENCHMARKS.md): Methodology, paired-session confidence intervals, Rust/Python token savings suites, and Copilot A/B agent trials.

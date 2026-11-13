@@ -1,0 +1,1172 @@
+:root {
+  --sl-color-accent-low: #e6eefc;
+  --sl-color-accent: #3b5bdb;
+  --sl-color-accent-high: #1e2e6e;
+  --sl-color-white: #131826;
+  --sl-color-gray-1: #232a3d;
+  --sl-color-gray-2: #464f68;
+  --sl-color-gray-3: #6c7590;
+  --sl-color-gray-4: #b0b7cd;
+  --sl-color-gray-5: #dfe3ef;
+  --sl-color-gray-6: #f3f6fc;
+  --sl-color-black: #ffffff;
+  --sl-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --sl-font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+  /* Motion Landing tokens (agent-tokenomics editorial surface + aimotion cinema stage) */
+  --cctx-surface-hero: linear-gradient(135deg, #f8faff 0%, #f1f5ff 52%, #eefbf8 100%);
+  --cctx-surface-card: #ffffff;
+  --cctx-border-soft: color-mix(in srgb, #3b5bdb 18%, #dfe3ef);
+  --cctx-cyan: #12b886;
+  --cctx-cyan-bright: #54ead2;
+  --cctx-indigo: #3b5bdb;
+  --cctx-indigo-bright: #748ffc;
+  --cctx-amber: #f59f00;
+  --cctx-rose: #fa5252;
+  --cctx-stage-bg: #090e1a;
+  --cctx-stage-panel: #0e1628;
+  --cctx-stage-border: #233354;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #1d2654;
+  --sl-color-accent: #748ffc;
+  --sl-color-accent-high: #eef2ff;
+  --sl-color-white: #f6f8ff;
+  --sl-color-gray-1: #e4e8f5;
+  --sl-color-gray-2: #bdc4da;
+  --sl-color-gray-3: #8c94b0;
+  --sl-color-gray-4: #505872;
+  --sl-color-gray-5: #293048;
+  --sl-color-gray-6: #171c2d;
+  --sl-color-black: #0b0e18;
+
+  --cctx-surface-hero: linear-gradient(135deg, #101526 0%, #121a33 54%, #0e2029 100%);
+  --cctx-surface-card: #121728;
+  --cctx-border-soft: color-mix(in srgb, #748ffc 24%, #26304a);
+  --cctx-cyan: #38d9a9;
+}
+
+header.header {
+  border-bottom-color: color-mix(in srgb, var(--sl-color-gray-5) 78%, transparent);
+  backdrop-filter: blur(18px);
+  background: color-mix(in srgb, var(--sl-color-black) 86%, transparent);
+}
+
+/* Documentation table & figure polish */
+.sl-markdown-content table {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.7rem;
+  overflow: hidden;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.sl-markdown-content th {
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  font-weight: 700;
+  font-size: 0.79rem;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--sl-color-gray-4);
+}
+
+.sl-markdown-content th,
+.sl-markdown-content td {
+  padding: 0.52rem 0.68rem;
+  vertical-align: top;
+  border-bottom: 1px solid color-mix(in srgb, var(--sl-color-gray-5) 75%, transparent);
+}
+
+.sl-markdown-content tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--sl-color-gray-6) 45%, transparent);
+}
+
+.sl-markdown-content tbody tr:hover td {
+  background: color-mix(in srgb, var(--sl-color-accent-low) 45%, transparent);
+}
+
+.sl-markdown-content table:has(th:nth-child(5)),
+.sl-markdown-content table:has(th:nth-child(5)) td {
+  font-size: 0.76rem !important;
+  line-height: 1.4 !important;
+}
+
+.sl-markdown-content img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.85rem;
+  box-shadow: 0 18px 48px rgb(12 18 38 / 12%);
+}
+
+@media (min-width: 72rem) {
+  :root {
+    --sl-sidebar-width: 17.5rem;
+    --sl-right-sidebar-width: 15.5rem;
+    --sl-content-width: 68rem;
+  }
+}
+
+/* ==========================================================================
+   Splash Motion Landing Override & Dual-Layer Adaptive Stage
+   ========================================================================== */
+html:has(.cctx-landing) main .hero {
+  display: none;
+}
+
+html:has(.cctx-landing) main > .content-panel {
+  padding-block: 1rem 3.5rem;
+  border-top: 0;
+}
+
+html:has(.cctx-landing) main > .content-panel > .sl-container {
+  max-width: 85rem;
+  margin-inline: auto;
+}
+
+.cctx-landing {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(3rem, 5.5vw, 5.25rem);
+  padding-top: 0.35rem;
+  overflow-wrap: break-word;
+}
+
+/* Eyebrow pills & section headers */
+.cctx-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: fit-content;
+  padding: 0.34rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--sl-color-accent) 32%, var(--sl-color-gray-5));
+  background: color-mix(in srgb, var(--sl-color-accent-low) 68%, var(--sl-color-black));
+  font: 700 0.72rem/1.2 var(--sl-font-mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--sl-color-accent);
+}
+
+.cctx-eyebrow-dot {
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 50%;
+  background: var(--cctx-cyan);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--cctx-cyan) 26%, transparent);
+}
+
+.cctx-section-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  max-width: 54rem;
+}
+
+.cctx-section-title {
+  margin: 0;
+  font-size: clamp(1.65rem, 3vw, 2.45rem);
+  line-height: 1.14;
+  letter-spacing: -0.028em;
+  font-weight: 800;
+  color: var(--sl-color-white);
+}
+
+.cctx-section-desc {
+  margin: 0;
+  font-size: clamp(0.98rem, 1.35vw, 1.1rem);
+  line-height: 1.62;
+  color: var(--sl-color-gray-2);
+}
+
+/* ==========================================================================
+   ACT 1: Hero — Editorial Copy + 60fps Cinema Stage (16:9 Split <-> 9:16 Reel)
+   ========================================================================== */
+.cctx-hero-shell {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 0.94fr) minmax(0, 1.16fr);
+  align-items: center;
+  gap: clamp(1.5rem, 3.2vw, 2.8rem);
+  padding: clamp(1.35rem, 3.4vw, 2.75rem);
+  border-radius: 1.75rem;
+  border: 1px solid var(--cctx-border-soft);
+  background: var(--cctx-surface-hero);
+  box-shadow:
+    0 24px 70px rgb(17 25 54 / 9%),
+    inset 0 1px 0 rgb(255 255 255 / 60%);
+  overflow: hidden;
+}
+
+:root[data-theme="dark"] .cctx-hero-shell {
+  box-shadow:
+    0 28px 80px rgb(0 0 0 / 42%),
+    inset 0 1px 0 rgb(255 255 255 / 6%);
+}
+
+.cctx-hero-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1.05rem;
+  z-index: 2;
+}
+
+.cctx-hero-title {
+  margin: 0;
+  font-size: clamp(2.15rem, 4.1vw, 3.45rem);
+  line-height: 1.05;
+  letter-spacing: -0.036em;
+  font-weight: 850;
+  color: var(--sl-color-white);
+}
+
+.cctx-hero-kicker {
+  display: block;
+  margin-bottom: 0.45rem;
+  font: 700 0.86rem/1.3 var(--sl-font);
+  letter-spacing: -0.01em;
+  color: var(--sl-color-accent);
+}
+
+.cctx-gradient-phrase {
+  background: linear-gradient(96deg, var(--cctx-indigo) 0%, #2b8a9e 54%, var(--cctx-cyan) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+:root[data-theme="dark"] .cctx-gradient-phrase {
+  background: linear-gradient(96deg, #91a7ff 0%, #66d9e8 52%, #54ead2 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.cctx-hero-lead {
+  margin: 0;
+  font-size: clamp(0.96rem, 1.25vw, 1.06rem);
+  line-height: 1.62;
+  color: var(--sl-color-gray-2);
+}
+
+/* Live narrative beat indicator synced with frame(t) */
+.cctx-beat-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.cctx-beat-pill {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.14rem;
+  padding: 0.52rem 0.68rem;
+  border-radius: 0.72rem;
+  border: 1px solid color-mix(in srgb, var(--sl-color-gray-4) 45%, transparent);
+  background: color-mix(in srgb, var(--sl-color-black) 78%, transparent);
+  color: var(--sl-color-gray-2);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+}
+
+.cctx-beat-pill:hover {
+  border-color: var(--sl-color-accent);
+  transform: translateY(-1px);
+}
+
+.cctx-beat-pill[data-active="true"] {
+  border-color: var(--sl-color-accent);
+  background: color-mix(in srgb, var(--sl-color-accent-low) 78%, var(--sl-color-black));
+  color: var(--sl-color-white);
+  box-shadow: 0 8px 22px rgb(59 91 219 / 12%);
+}
+
+.cctx-beat-num {
+  font: 700 0.66rem/1.1 var(--sl-font-mono);
+  letter-spacing: 0.06em;
+  color: var(--sl-color-accent);
+}
+
+.cctx-beat-label {
+  font: 700 0.78rem/1.25 var(--sl-font);
+}
+
+/* Instant copyable command bar in Hero */
+.cctx-quick-cmd {
+  display: flex;
+  flex-direction: column;
+  gap: 0.42rem;
+  padding: 0.68rem 0.78rem;
+  border-radius: 0.9rem;
+  background: #0d1424;
+  border: 1px solid #263859;
+  color: #e6eefc;
+}
+
+.cctx-quick-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.cctx-quick-tab-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.cctx-os-tab {
+  appearance: none;
+  border: 1px solid #2a3d62;
+  background: #131d33;
+  color: #9bb0d3;
+  border-radius: 0.48rem;
+  padding: 0.22rem 0.54rem;
+  font: 600 0.7rem/1.2 var(--sl-font-mono);
+  cursor: pointer;
+}
+
+.cctx-os-tab[aria-selected="true"] {
+  background: #233863;
+  border-color: #54ead2;
+  color: #ffffff;
+}
+
+.cctx-copy-btn {
+  appearance: none;
+  border: 1px solid #2f4b6c;
+  background: #16283f;
+  color: #8ce9db;
+  border-radius: 0.48rem;
+  padding: 0.24rem 0.6rem;
+  font: 700 0.7rem/1.2 var(--sl-font-mono);
+  cursor: pointer;
+}
+
+.cctx-copy-btn:hover {
+  background: #1f3959;
+  border-color: #54ead2;
+}
+
+.cctx-quick-code {
+  margin: 0;
+  font: 500 0.76rem/1.45 var(--sl-font-mono);
+  color: #dbe7ff;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.cctx-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.cctx-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.42rem;
+  padding: 0.64rem 1.08rem;
+  border-radius: 0.72rem;
+  font: 700 0.86rem/1.2 var(--sl-font);
+  text-decoration: none !important;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.cctx-btn:hover {
+  transform: translateY(-1px);
+}
+
+.cctx-btn-primary {
+  background: linear-gradient(135deg, #3b5bdb 0%, #2b4bc8 100%);
+  color: #ffffff !important;
+  border: 1px solid #364fc7;
+  box-shadow: 0 10px 24px rgb(59 91 219 / 28%);
+}
+
+.cctx-btn-secondary {
+  background: var(--cctx-surface-card);
+  color: var(--sl-color-white) !important;
+  border: 1px solid var(--sl-color-gray-4);
+}
+
+/* ==========================================================================
+   Right Column: Dedicated Fixed-Aspect Cinema Stage (Zero Layout Shift!)
+   ========================================================================== */
+.cctx-cinema {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: 1.25rem;
+  background: var(--cctx-stage-bg);
+  border: 1px solid var(--cctx-stage-border);
+  box-shadow:
+    0 26px 65px rgb(5 10 24 / 42%),
+    0 0 0 1px rgb(84 234 210 / 12%);
+  overflow: hidden;
+  color: #e6eefc;
+  z-index: 2;
+}
+
+.cctx-cinema-hud {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.62rem 0.9rem;
+  background: rgb(10 16 30 / 94%);
+  border-bottom: 1px solid rgb(51 74 114 / 55%);
+}
+
+.cctx-stage-screen {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10.4;
+  background: #070c18;
+  overflow: hidden;
+}
+
+.cctx-cinema-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.cctx-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.cctx-hud-left,
+.cctx-hud-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.cctx-win-dots {
+  display: inline-flex;
+  gap: 0.32rem;
+}
+
+.cctx-win-dots i {
+  width: 0.56rem;
+  height: 0.56rem;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.cctx-win-dots i:nth-child(1) { background: #ff6b6b; }
+.cctx-win-dots i:nth-child(2) { background: #fcc419; }
+.cctx-win-dots i:nth-child(3) { background: #51cf66; }
+
+.cctx-stage-badge {
+  padding: 0.16rem 0.52rem;
+  border-radius: 999px;
+  background: rgb(84 234 210 / 14%);
+  border: 1px solid rgb(84 234 210 / 40%);
+  font: 700 0.67rem/1.2 var(--sl-font-mono);
+  letter-spacing: 0.05em;
+  color: #54ead2;
+}
+
+.cctx-stage-badge[data-phase="flood"] {
+  background: rgb(250 82 82 / 16%);
+  border-color: rgb(250 82 82 / 48%);
+  color: #ffa8a8;
+}
+
+.cctx-stage-badge[data-phase="clamp"] {
+  background: rgb(116 143 252 / 18%);
+  border-color: rgb(116 143 252 / 52%);
+  color: #bac8ff;
+}
+
+.cctx-timecode {
+  font: 700 0.74rem/1.2 var(--sl-font-mono);
+  color: #ffd43b;
+  background: rgb(255 212 59 / 10%);
+  border: 1px solid rgb(255 212 59 / 28%);
+  padding: 0.16rem 0.48rem;
+  border-radius: 0.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cctx-mode-switch {
+  display: inline-flex;
+  border-radius: 0.5rem;
+  border: 1px solid #2b3f66;
+  overflow: hidden;
+  background: #0d1629;
+}
+
+.cctx-mode-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #93a8cc;
+  padding: 0.22rem 0.52rem;
+  font: 700 0.67rem/1.2 var(--sl-font-mono);
+  cursor: pointer;
+}
+
+.cctx-mode-btn[aria-pressed="true"] {
+  background: #243b67;
+  color: #54ead2;
+}
+
+/* Stage Body */
+.cctx-cinema-body {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.85rem 0.95rem;
+}
+
+.cctx-agent-prompt-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  padding: 0.5rem 0.72rem;
+  border-radius: 0.65rem;
+  background: rgb(18 29 52 / 86%);
+  border: 1px solid rgb(66 93 145 / 45%);
+  font: 500 0.74rem/1.35 var(--sl-font-mono);
+}
+
+.cctx-prompt-call {
+  color: #dbe7ff;
+}
+
+.cctx-prompt-call strong {
+  color: #54ead2;
+}
+
+.cctx-prompt-sha {
+  font-size: 0.68rem;
+  color: #8ce9db;
+  opacity: calc(0.35 + 0.65 * var(--clamp-p));
+}
+
+/* Code Lens Viewport */
+.cctx-code-viewport {
+  position: relative;
+  border-radius: 0.75rem;
+  background: rgb(7 12 23 / 88%);
+  border: 1px solid rgb(44 65 104 / 68%);
+  padding: 0.55rem 0.7rem;
+  font: 500 0.73rem/1.46 var(--sl-font-mono);
+  overflow: hidden;
+}
+
+.cctx-noise-block {
+  color: #6b7d9e;
+  opacity: var(--noise-alpha);
+  max-height: calc((1 - var(--clamp-p)) * 4.4rem + 1.35rem);
+  overflow: hidden;
+  filter: blur(calc(var(--clamp-p) * 1.1px));
+  transition: opacity 0.08s linear;
+}
+
+.cctx-noise-line {
+  display: flex;
+  gap: 0.6rem;
+  white-space: nowrap;
+}
+
+.cctx-clamped-target {
+  position: relative;
+  margin-block: 0.3rem;
+  padding: 0.52rem 0.65rem;
+  border-radius: 0.55rem;
+  background: linear-gradient(90deg, rgb(20 49 66 / calc(0.24 + 0.58 * var(--clamp-p))) 0%, rgb(19 34 64 / calc(0.2 + 0.52 * var(--clamp-p))) 100%);
+  border-left: 3px solid color-mix(in srgb, #54ead2 calc(var(--clamp-p) * 100%), #fa5252);
+  box-shadow: 0 0 28px rgb(84 234 210 / calc(var(--clamp-p) * 14%));
+}
+
+.cctx-clamp-tag {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.28rem;
+  font-size: 0.67rem;
+  font-weight: 700;
+  color: #54ead2;
+}
+
+.cctx-code-line {
+  display: flex;
+  gap: 0.6rem;
+  white-space: pre;
+  overflow-x: auto;
+  color: #eef4ff;
+}
+
+.cctx-ln {
+  color: #597096;
+  user-select: none;
+  min-width: 1.9rem;
+  text-align: right;
+}
+
+.cctx-kw { color: #91a7ff; font-weight: 600; }
+.cctx-fn { color: #54ead2; font-weight: 700; }
+.cctx-ty { color: #ffd43b; }
+.cctx-cm { color: #748cab; }
+
+/* Live Telemetry Strip inside Cinema */
+.cctx-telemetry-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.cctx-tele-card {
+  padding: 0.48rem 0.62rem;
+  border-radius: 0.6rem;
+  background: rgb(14 23 43 / 90%);
+  border: 1px solid rgb(49 71 112 / 60%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.cctx-tele-label {
+  font: 700 0.63rem/1.2 var(--sl-font-mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #8aa0c4;
+}
+
+.cctx-tele-val {
+  font: 800 0.94rem/1.2 var(--sl-font-mono);
+  color: #ffffff;
+  font-variant-numeric: tabular-nums;
+}
+
+.cctx-tele-delta {
+  font: 700 0.68rem/1.2 var(--sl-font-mono);
+  color: #54ead2;
+}
+
+.cctx-tele-delta[data-bad="true"] {
+  color: #ffa8a8;
+}
+
+/* Interactive Scrubber Bar (inspired by cokacmotion / yt-338s) */
+.cctx-scrubber-bar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.9rem;
+  background: rgb(8 13 24 / 94%);
+  border-top: 1px solid rgb(46 68 106 / 60%);
+}
+
+.cctx-scrub-play {
+  appearance: none;
+  border: 1px solid #35507f;
+  background: #162644;
+  color: #ffffff;
+  border-radius: 0.45rem;
+  padding: 0.25rem 0.58rem;
+  font: 700 0.7rem/1.2 var(--sl-font-mono);
+  cursor: pointer;
+  min-width: 4.1rem;
+}
+
+.cctx-scrub-play:hover {
+  border-color: #54ead2;
+}
+
+.cctx-scrub-range {
+  flex: 1;
+  accent-color: #54ead2;
+  height: 0.36rem;
+  cursor: pointer;
+}
+
+.cctx-scrub-hint {
+  font: 600 0.67rem/1.2 var(--sl-font-mono);
+  color: #889ec2;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   ACT 2: Scroll-Driven Shared Rust Daemon Choreography
+   ========================================================================== */
+.cctx-engine-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.cctx-engine-stage {
+  position: relative;
+  border-radius: 1.4rem;
+  padding: clamp(1.1rem, 2.5vw, 1.85rem);
+  background: #0a101e;
+  border: 1px solid #243659;
+  box-shadow: 0 22px 55px rgb(7 12 28 / 24%);
+  color: #e8f0ff;
+  overflow: hidden;
+}
+
+.cctx-engine-canvas {
+  display: block;
+  width: 100%;
+  height: 220px;
+  border-radius: 0.9rem;
+  background: radial-gradient(circle at 50% 45%, #13203d 0%, #090f1d 75%);
+  border: 1px solid #1f3152;
+}
+
+.cctx-engine-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  margin-bottom: 0.9rem;
+}
+
+.cctx-engine-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.95rem;
+}
+
+.cctx-engine-node {
+  padding: 0.85rem 0.95rem;
+  border-radius: 0.85rem;
+  background: #101a30;
+  border: 1px solid #25385c;
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
+}
+
+.cctx-engine-node:hover,
+.cctx-engine-node[data-active="true"] {
+  border-color: #54ead2;
+  background: #152544;
+  transform: translateY(-2px);
+}
+
+.cctx-engine-node-num {
+  font: 700 0.68rem/1.2 var(--sl-font-mono);
+  color: #54ead2;
+}
+
+.cctx-engine-node h3 {
+  margin: 0.25rem 0 0.32rem;
+  font-size: 0.92rem;
+  font-weight: 750;
+  color: #ffffff;
+}
+
+.cctx-engine-node p {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.48;
+  color: #a9bbd9;
+}
+
+/* ==========================================================================
+   ACT 3: 3-Up Live Motion Micro-Stages (Rich Docs, pctx Probes, Journal & Usage)
+   ========================================================================== */
+.cctx-micro-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.15rem;
+}
+
+.cctx-micro-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem;
+  border-radius: 1.25rem;
+  background: var(--cctx-surface-card);
+  border: 1px solid var(--cctx-border-soft);
+  box-shadow: 0 14px 36px rgb(15 23 48 / 6%);
+}
+
+.cctx-micro-top {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.cctx-micro-kicker {
+  font: 700 0.7rem/1.2 var(--sl-font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sl-color-accent);
+}
+
+.cctx-micro-card h3 {
+  margin: 0;
+  font-size: 1.14rem;
+  line-height: 1.26;
+  font-weight: 800;
+  color: var(--sl-color-white);
+}
+
+.cctx-micro-card p {
+  margin: 0;
+  font-size: 0.88rem;
+  line-height: 1.56;
+  color: var(--sl-color-gray-2);
+}
+
+.cctx-micro-screen {
+  border-radius: 0.85rem;
+  padding: 0.8rem 0.85rem;
+  background: #0b1222;
+  border: 1px solid #24375b;
+  font: 500 0.73rem/1.48 var(--sl-font-mono);
+  color: #dce8ff;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.cctx-meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+}
+
+.cctx-meter-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.68rem;
+  color: #9cb2d6;
+}
+
+.cctx-meter-track {
+  height: 0.44rem;
+  border-radius: 999px;
+  background: #182540;
+  overflow: hidden;
+}
+
+.cctx-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #748ffc 0%, #54ead2 100%);
+  transform-origin: left center;
+}
+
+.cctx-meter-fill.is-raw {
+  background: linear-gradient(90deg, #fa5252 0%, #f59f00 100%);
+}
+
+/* ==========================================================================
+   ACT 4: Verified Benchmarks, Seven-Tool Matrix, Install & Crawlable FAQ
+   ========================================================================== */
+.cctx-bench-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+  gap: 1.35rem;
+  align-items: start;
+}
+
+.cctx-card-panel {
+  padding: clamp(1.1rem, 2.2vw, 1.55rem);
+  border-radius: 1.25rem;
+  background: var(--cctx-surface-card);
+  border: 1px solid var(--cctx-border-soft);
+  box-shadow: 0 14px 36px rgb(15 23 48 / 6%);
+}
+
+.cctx-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.cctx-stat-box {
+  padding: 0.85rem 0.95rem;
+  border-radius: 0.9rem;
+  background: var(--sl-color-gray-6);
+  border: 1px solid var(--sl-color-gray-5);
+}
+
+.cctx-stat-num {
+  display: block;
+  font: 850 clamp(1.35rem, 2.3vw, 1.8rem)/1.12 var(--sl-font-mono);
+  color: var(--sl-color-accent);
+}
+
+.cctx-stat-caption {
+  display: block;
+  margin-top: 0.24rem;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--sl-color-gray-2);
+}
+
+.cctx-honest-note {
+  margin-top: 0.9rem;
+  padding: 0.78rem 0.95rem;
+  border-radius: 0.8rem;
+  border-left: 3px solid var(--cctx-amber);
+  background: color-mix(in srgb, var(--cctx-amber) 10%, var(--sl-color-gray-6));
+  font-size: 0.82rem;
+  line-height: 1.52;
+  color: var(--sl-color-gray-1);
+}
+
+.cctx-table-wrap {
+  overflow-x: auto;
+  border-radius: 0.85rem;
+  border: 1px solid var(--sl-color-gray-5);
+}
+
+.cctx-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.cctx-data-table th {
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  font-weight: 700;
+  text-align: left;
+  padding: 0.58rem 0.72rem;
+  border-bottom: 1px solid var(--sl-color-gray-4);
+}
+
+.cctx-data-table td {
+  padding: 0.54rem 0.72rem;
+  border-bottom: 1px solid var(--sl-color-gray-5);
+  color: var(--sl-color-gray-1);
+}
+
+.cctx-data-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.cctx-faq-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+}
+
+.cctx-faq-item {
+  border-radius: 0.95rem;
+  border: 1px solid var(--sl-color-gray-5);
+  background: var(--cctx-surface-card);
+  padding: 0.95rem 1.1rem;
+}
+
+.cctx-faq-item summary {
+  font-weight: 750;
+  font-size: 0.95rem;
+  color: var(--sl-color-white);
+  cursor: pointer;
+  list-style-position: outside;
+}
+
+.cctx-faq-item p {
+  margin: 0.62rem 0 0;
+  font-size: 0.86rem;
+  line-height: 1.58;
+  color: var(--sl-color-gray-2);
+}
+
+/* ==========================================================================
+   Responsive Recomposition:
+   - Tablet (<= 1080px): Stacked Widescreen Cinema
+   - Mobile (< 700px): 9:16 Vertical Motion Reel (Zero shrunk desktop chrome!)
+   ========================================================================== */
+@media (max-width: 67.5rem) {
+  .cctx-hero-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cctx-bench-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cctx-micro-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cctx-engine-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 44rem) {
+  .cctx-hero-shell {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 0.95rem;
+    gap: 0.85rem;
+    border-radius: 1.25rem;
+  }
+
+  /* Unwrap .cctx-hero-copy on mobile so the 9:16 Cinema Reel sits immediately below the headline! */
+  .cctx-hero-copy {
+    display: contents;
+  }
+
+  .cctx-cinema,
+  .cctx-quick-cmd,
+  .cctx-hero-actions,
+  .cctx-beat-strip {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .cctx-hero-copy > .cctx-eyebrow {
+    order: 1;
+    font-size: 0.64rem;
+    padding: 0.28rem 0.62rem;
+  }
+
+  .cctx-hero-title {
+    order: 2;
+    font-size: clamp(1.68rem, 7.2vw, 2.08rem);
+  }
+
+  /* Place the live Motion Reel ABOVE THE FOLD right after the title */
+  .cctx-cinema {
+    order: 3;
+    border-radius: 1.05rem;
+  }
+
+  .cctx-stage-screen {
+    aspect-ratio: 4 / 4.75;
+  }
+
+  .cctx-hero-actions {
+    order: 4;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.48rem;
+  }
+
+  .cctx-btn {
+    padding: 0.58rem 0.65rem;
+    font-size: 0.78rem;
+  }
+
+  .cctx-quick-cmd {
+    order: 5;
+  }
+
+  .cctx-beat-strip {
+    order: 6;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.32rem;
+  }
+
+  .cctx-hero-lead {
+    order: 7;
+    font-size: 0.88rem;
+    line-height: 1.52;
+  }
+
+  .cctx-beat-pill {
+    padding: 0.42rem 0.48rem;
+  }
+
+  .cctx-beat-label {
+    font-size: 0.7rem;
+  }
+
+  .cctx-cinema-hud {
+    padding: 0.52rem 0.68rem;
+  }
+
+  .cctx-win-dots {
+    display: none;
+  }
+
+  .cctx-cinema-body {
+    padding: 0.68rem;
+    gap: 0.58rem;
+  }
+
+  .cctx-code-viewport {
+    font-size: 0.68rem;
+    padding: 0.48rem 0.52rem;
+  }
+
+  .cctx-noise-line.is-extra-mobile-hide {
+    display: none;
+  }
+
+  .cctx-telemetry-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.35rem;
+  }
+
+  .cctx-tele-card {
+    padding: 0.42rem 0.46rem;
+  }
+
+  .cctx-tele-val {
+    font-size: 0.8rem;
+  }
+
+  .cctx-scrub-hint {
+    display: none;
+  }
+
+  .cctx-engine-canvas {
+    height: 290px;
+  }
+
+  .cctx-engine-steps,
+  .cctx-faq-grid,
+  .cctx-stat-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cctx-btn,
+  .cctx-beat-pill,
+  .cctx-engine-node {
+    transition: none !important;
+  }
+}

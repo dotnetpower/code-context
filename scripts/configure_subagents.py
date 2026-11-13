@@ -86,23 +86,22 @@ MD_PROMPT_BLOCK = """
 
 YAML_FORMULA_PROMPT_BLOCK = """\
   # [cctx-subagent-instructions]
-  **CCTX & TCTX Formula Rules (Mandatory First Path):**
-  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files / mcp__code-context__code_*) > CLI (cctx --backend shared --root <root>) > Host (view, grep, rg, glob, bash)`
-  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status / mcp__test-context__test_*) > CLI (tctx --root <root> run) > bash`
-  - `Guards`: always pass explicit absolute `root`; unknown line => `cctxNativeContext(paths=[file], pattern, radius: 25..50)` (!1..150 slicing); multi-range => 1 `cctxNativeRead(ranges=[...], lines <= 120, < 8KiB)` (!parallel view); `target in {.github/*, .vscode/*, .gitignore, /tmp/*, /dev/shm/*} => view directly (!CCTX)`.
-  - `Deferred`: EVEN IF `grep`/`view`/`glob` are already visible on turn 0, if `cctx*`/`tctx*` are hidden, call `tool_search_tool` (`tool_search`) FIRST: foreground `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"` ; headless/MCP `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` ; tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"` (regex: `"cctxNative|code-context|tctxNative|test-context"`).
-  - `Transitions`: `Error("No matching client connected" | "skipped from another client") => load & switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+  CCTX & TCTX Formula Rules:
+  - Source: cctxNative*{Context,Read,Grep,Files} > MCP(code-context-code_* | mcp__code-context__*) > cctx --backend shared --root <root> > Host(view,rg,glob)
+  - Tests & Probes: tctxNative*{Run,Affected,Graph,Status} > MCP(test-context-test_* | mcp__test-context__*) > tctx --root <root> run > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
+  - Guards: pass explicit root; symbol+context => cctxNativeContext(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 cctxNativeRead(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).
+  - Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST: "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" | MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" | tests "tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected" (regex: "cctxNative|code-context|tctxNative|test-context").
+  - Transitions: Error("No matching client connected"|"skipped from another client") => code-context-code_* / test-context-test_* MCP | CLI ; CACHE_MISS => 1 Host read -> resume CCTX.
 """
 
 MD_FORMULA_PROMPT_BLOCK = """
 <!-- [cctx-subagent-instructions] -->
-## CCTX & TCTX Formula Rules (Mandatory First Path)
-
-- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_* / mcp__code-context__code_*) > Host (rg, view, glob)`
-- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_* / mcp__test-context__test_*) > bash`
-- `Guards`: pass explicit `root`; `limit <= 64`; batch multi-range `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/*, /dev/shm/* => Host view only`.
-- `Deferred` (even if `grep`/`view` visible on turn 0): call `tool_search_tool` (`tool_search`) FIRST — foreground `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"`, MCP `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"`, tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"` (regex `"cctxNative|code-context|tctxNative|test-context"`).
-- `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+## CCTX & TCTX Formula Rules
+- Source: #cctxNative*{Context,Read,Grep,Files} > MCP(code-context-code_* | mcp__code-context__*) > Host(rg,view,glob)
+- Tests & Probes: #tctxNative*{Run,Affected,Graph,Status} > MCP(test-context-test_* | mcp__test-context__*) > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
+- Guards: pass root; limit<=64; Read(ranges,<=120L,<8KiB); .github/*,.vscode/*,/tmp/*,/dev/shm/* => Host view.
+- Deferred: call tool_search_tool (tool_search) FIRST: "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" | MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" | tests "tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected" (regex "cctxNative|code-context|tctxNative|test-context").
+- CACHE_MISS => 1 Host read -> resume CCTX.
 """
 
 

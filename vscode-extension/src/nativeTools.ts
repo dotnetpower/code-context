@@ -1,5 +1,5 @@
 import { posix, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
 import * as vscode from 'vscode';
 
@@ -159,7 +159,7 @@ export class NativeToolBridge implements vscode.Disposable {
     ensureTrustedWorkspace();
     const started = performance.now();
     const startedUnixMs = Date.now();
-    const traceId = randomUUID();
+    const traceId = randomBytes(6).toString('base64url');
     let root: string | null = null;
     try {
       const explicit = normalizeExplicitRootInput(

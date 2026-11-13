@@ -5,6 +5,7 @@ cargo build --locked --release
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
 install -m 0755 target/release/cctx "$HOME/.local/bin/cctx.next"
 mv "$HOME/.local/bin/cctx.next" "$HOME/.local/bin/cctx"
+ln -sfn cctx "$HOME/.local/bin/pctx"
 install -m 0644 deploy/code-context.service "$HOME/.config/systemd/user/code-context.service"
 systemctl --user daemon-reload
 systemctl --user enable code-context.service

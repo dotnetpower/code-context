@@ -1,0 +1,474 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
+const docUrl = (slug: string) => `${base}${slug.replace(/^\/+/, "")}`;
+const benchSvgUrl = `${base}benchmarks/latency-speedup.svg`;
+---
+
+<div class="cctx-landing not-content">
+  <!-- ACT 1: Editorial Hero + Deterministic frame(t) Cinema Stage -->
+  <section class="cctx-hero-shell" aria-labelledby="_top">
+    <div class="cctx-hero-copy">
+      <span class="cctx-eyebrow">
+        <i class="cctx-eyebrow-dot" aria-hidden="true"></i>
+        LOCAL RUST CONTEXT ENGINE · NATIVE VS CODE TOOLS &amp; MCP
+      </span>
+
+      <h1 id="_top" data-page-title="" class="cctx-hero-title">
+        <span class="cctx-hero-kicker">Code Context (cctx) for AI Coding Agents</span>
+        Find the signal.<br />
+        <span class="cctx-gradient-phrase">Clamp the noise in 0.23 ms.</span>
+      </h1>
+
+      <p class="cctx-hero-lead">
+        Stop feeding coding agents 200-line <code>grep</code> dumps. <strong>Code Context (cctx)</strong> pairs
+        native VS Code Language Model Tools (<code>#cctxNativeContext</code>) and an MCP server over one shared
+        Rust trigram index—cutting lookup tokens by <strong>73.2–91.3%</strong>, accelerating warm retrieval
+        <strong>17.22×</strong>, and finishing end-to-end coding tasks <strong>24.7% faster</strong> on Linux,
+        native Windows (<code>cctx.exe</code>), WSL, and SSH.
+      </p>
+
+      <div class="cctx-beat-strip" role="group" aria-label="Jump to motion film act">
+        <button type="button" class="cctx-beat-pill" data-beat-seek="1.4" data-active="false">
+          <span class="cctx-beat-num">SCENE 01 &middot; 0.0s</span>
+          <span class="cctx-beat-label">200-Line Grep Flood</span>
+        </button>
+        <button type="button" class="cctx-beat-pill" data-beat-seek="4.3" data-active="false">
+          <span class="cctx-beat-num">SCENE 02 &middot; 2.8s</span>
+          <span class="cctx-beat-label">Trigram Optical Wipe</span>
+        </button>
+        <button type="button" class="cctx-beat-pill" data-beat-seek="6.6" data-active="true">
+          <span class="cctx-beat-num">SCENE 03 &middot; 5.4s</span>
+          <span class="cctx-beat-label">AST Clamp &amp; 0.23 ms</span>
+        </button>
+      </div>
+
+      <div class="cctx-quick-cmd" aria-label="Quick install commands">
+        <div class="cctx-quick-tabs">
+          <div class="cctx-quick-tab-group" role="tablist" aria-label="Platform install command">
+            <button type="button" class="cctx-os-tab" role="tab" aria-selected="true" data-os-tab="linux">
+              Linux / WSL / SSH
+            </button>
+            <button type="button" class="cctx-os-tab" role="tab" aria-selected="false" data-os-tab="windows">
+              Native Windows
+            </button>
+            <button type="button" class="cctx-os-tab" role="tab" aria-selected="false" data-os-tab="vscode">
+              VS Code CLI
+            </button>
+            <button type="button" class="cctx-os-tab" role="tab" aria-selected="false" data-os-tab="mcp">
+              MCP Server
+            </button>
+          </div>
+          <button type="button" class="cctx-copy-btn" id="cctx-quick-copy">Copy</button>
+        </div>
+        <pre class="cctx-quick-code"><code id="cctx-quick-code">git clone https://github.com/dotnetpower/code-context.git &amp;&amp; cd code-context &amp;&amp; bash scripts/install.sh</code></pre>
+      </div>
+
+      <div class="cctx-hero-actions">
+        <a class="cctx-btn cctx-btn-primary" href={docUrl("installation/")}>
+          Install in 60s &rarr;
+        </a>
+        <a class="cctx-btn cctx-btn-secondary" href="https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native" target="_blank" rel="noopener noreferrer">
+          VS Code Marketplace &#8599;
+        </a>
+        <a class="cctx-btn cctx-btn-secondary" href={docUrl("tools/")}>
+          7 Native &amp; MCP Tools &rarr;
+        </a>
+        <a class="cctx-btn cctx-btn-secondary" href={docUrl("benchmarks/")}>
+          Verified Benchmarks &rarr;
+        </a>
+      </div>
+    </div>
+
+    <!-- Live Deterministic frame(t) Cinema Stage (100% Canvas-Rendered, Zero Layout Jitter) -->
+    <figure class="cctx-cinema" id="cctx-cinema" style="margin:0" aria-label="Interactive motion film comparing multi-turn rg + view against block-clamped Code Context">
+      <div class="cctx-cinema-hud">
+        <div class="cctx-hud-left">
+          <span class="cctx-win-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="cctx-stage-badge" id="cctx-phase-badge" data-phase="hit">
+            SCENE 03 &middot; AST CLAMP LOCKED
+          </span>
+        </div>
+        <div class="cctx-hud-right">
+          <span class="cctx-timecode" id="cctx-timecode">t = 06.80s</span>
+          <div class="cctx-mode-switch" role="group" aria-label="Stage comparison mode">
+            <button type="button" class="cctx-mode-btn" data-stage-mode="film" aria-pressed="true">Film</button>
+            <button type="button" class="cctx-mode-btn" data-stage-mode="before" aria-pressed="false">Without cctx</button>
+            <button type="button" class="cctx-mode-btn" data-stage-mode="after" aria-pressed="false">With cctx</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="cctx-stage-screen" id="cctx-stage-screen">
+        <canvas id="cctx-hero-canvas" class="cctx-cinema-canvas" aria-hidden="true"></canvas>
+        <figcaption class="cctx-sr-only">
+          Comparison of traditional multi-turn ripgrep plus 200-line view windows (25,133 tokens, 20 tool calls,
+          3.996 ms mean retrieval) versus a single Code Context #cctxNativeContext call on plan_query in
+          src/planner.rs:142-146 (4,031 tokens, -84.0% payload reduction, 6 calls, 0.232 ms warm retrieval, SHA-256 verified under 8 KiB).
+        </figcaption>
+      </div>
+
+      <div class="cctx-scrubber-bar">
+        <button type="button" class="cctx-scrub-play" id="cctx-scrub-play">Pause &#10074;&#10074;</button>
+        <input
+          id="cctx-scrub-range"
+          class="cctx-scrub-range"
+          type="range"
+          min="0"
+          max="10"
+          step="0.01"
+          value="6.80"
+          aria-label="Scrub motion timeline in seconds"
+        />
+        <span class="cctx-scrub-hint">Drag wipe &middot; 10.0s</span>
+      </div>
+    </figure>
+  </section>
+
+  <!-- ACT 2: Scroll-Driven Shared Rust Daemon Choreography -->
+  <section class="cctx-engine-section" id="cctx-engine-section" aria-labelledby="engine-heading">
+    <div class="cctx-section-head">
+      <span class="cctx-eyebrow">
+        <i class="cctx-eyebrow-dot" aria-hidden="true"></i>
+        ONE SHARED RUST DAEMON &middot; ZERO STARTUP STALLS
+      </span>
+      <h2 id="engine-heading" class="cctx-section-title">
+        One resident index powers both VS Code Native Tools and MCP.
+      </h2>
+      <p class="cctx-section-desc">
+        Scroll or toggle between <strong>Warm Hit</strong> and <strong>Cold <code>CACHE_MISS</code></strong>.
+        Code Context never blocks an agent on index warmup: cold workspaces return immediately so host tools
+        proceed without delay while bounded background indexing finishes in ~19.7 ms.
+      </p>
+    </div>
+
+    <div class="cctx-engine-stage">
+      <div class="cctx-engine-controls">
+        <span style="font:700 0.75rem/1.2 var(--sl-font-mono);color:#8ce9db;">
+          PIPELINE CHOREOGRAPHY &middot; CLICK ANY STAGE OR TOGGLE CACHE STATE
+        </span>
+        <div class="cctx-mode-switch" role="group" aria-label="Daemon cache state">
+          <button type="button" class="cctx-mode-btn" data-cache-mode="warm" aria-pressed="true">
+            Warm Hit (0.232 ms)
+          </button>
+          <button type="button" class="cctx-mode-btn" data-cache-mode="cold" aria-pressed="false">
+            Cold CACHE_MISS (0 ms stall)
+          </button>
+        </div>
+      </div>
+
+      <canvas id="cctx-engine-canvas" class="cctx-engine-canvas" aria-hidden="true"></canvas>
+
+      <div class="cctx-engine-steps">
+        <article class="cctx-engine-node" data-engine-step="0" data-active="true">
+          <span class="cctx-engine-node-num">STAGE 01</span>
+          <h3>Native &amp; MCP Ingress</h3>
+          <p>
+            Foreground VS Code agents call <code>#cctxNativeContext</code>; CLI and subagents call
+            <code>code_context</code> over <code>cctx shared-mcp</code>. Both hit the same socket/loopback RPC.
+          </p>
+        </article>
+        <article class="cctx-engine-node" data-engine-step="1" data-active="false">
+          <span class="cctx-engine-node-num">STAGE 02</span>
+          <h3>Trigram + HIR Planner</h3>
+          <p>
+            ASCII/UTF-8 case-folded trigram postings narrow regex and literal candidates in microseconds before
+            touching line buffers, prioritizing symbol definitions.
+          </p>
+        </article>
+        <article class="cctx-engine-node" data-engine-step="2" data-active="false">
+          <span class="cctx-engine-node-num">STAGE 03</span>
+          <h3>Polyglot Block Clamper</h3>
+          <p>
+            Expands matches to clean Rust, Python, TS/React, Go, SQL, and Markdown/Office boundaries under a strict
+            <code>&lt;8 KiB</code> inline guard with SHA-256 verification.
+          </p>
+        </article>
+        <article class="cctx-engine-node" data-engine-step="3" data-active="false">
+          <span class="cctx-engine-node-num">STAGE 04</span>
+          <h3>Watcher &amp; Adaptive Memory</h3>
+          <p>
+            Incremental filesystem watchers reconcile edits live while the memory controller respects Linux cgroup v2
+            headroom, Windows physical RAM reports, and 15m TTL eviction.
+          </p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ACT 3: 3-Up Live Motion Micro-Stages -->
+  <section aria-labelledby="beyond-search-heading" style="display:flex;flex-direction:column;gap:1.5rem;">
+    <div class="cctx-section-head">
+      <span class="cctx-eyebrow">
+        <i class="cctx-eyebrow-dot" aria-hidden="true"></i>
+        BEYOND SOURCE GREP &middot; FULL CONTEXT HYGIENE SUITE
+      </span>
+      <h2 id="beyond-search-heading" class="cctx-section-title">
+        Rich document anchors, zero-schema probes, and compaction journals.
+      </h2>
+      <p class="cctx-section-desc">
+        Every high-volume token leak in real agent sessions—Office decks, 1 MB JSON responses, multi-command build
+        logs, and context compactions—is handled natively in Rust with <strong>0 standing MCP schema bloat</strong>.
+      </p>
+    </div>
+
+    <div class="cctx-micro-grid">
+      <article class="cctx-micro-card">
+        <div class="cctx-micro-top">
+          <span class="cctx-micro-kicker">01 &middot; Virtual #toc &amp; #slide-N-M</span>
+          <h3>Rich Document Slicing (-86.3% to -98.9%)</h3>
+          <p>
+            Inspect <code>.pptx</code>, <code>.docx</code>, <code>.xlsx</code>, <code>.pdf</code>, <code>.epub</code>,
+            Jupyter notebooks, and Markdown by virtual table-of-contents or slide/section anchors—backed by 5.4&times;
+            faster 9-bit O(1) DEFLATE decoding.
+          </p>
+        </div>
+        <div class="cctx-micro-screen">
+          <div><span style="color:#54ead2">#cctxNativeRead</span> <code>architecture.pptx#toc</code></div>
+          <div><span style="color:#91a7ff">&rarr;</span> <code>architecture.pptx#slide-3-5</code></div>
+          <div class="cctx-meter-row">
+            <div class="cctx-meter-head"><span>Full deck dump</span><span>100.0%</span></div>
+            <div class="cctx-meter-track"><div class="cctx-meter-fill is-raw" style="width:100%"></div></div>
+          </div>
+          <div class="cctx-meter-row">
+            <div class="cctx-meter-head"><span>#toc + #slide-3-5</span><span style="color:#54ead2">1.1% &ndash; 13.7%</span></div>
+            <div class="cctx-meter-track"><div class="cctx-meter-fill" style="width:9%"></div></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="cctx-micro-card">
+        <div class="cctx-micro-top">
+          <span class="cctx-micro-kicker">02 &middot; pctx &#123;http|json|table|image|log|batch&#125;</span>
+          <h3>Zero-Schema Probes &amp; BM25+RRF Log Spools</h3>
+          <p>
+            Replace fragile ad-hoc <code>python3 -c</code>, <code>jq</code>, and <code>sqlite3</code> one-liners.
+            Filter 1 MB JSON payloads to 662 B in 7.82 ms and query spooled batch logs (<code>@s1</code>) without
+            re-running commands.
+          </p>
+        </div>
+        <div class="cctx-micro-screen">
+          <div><code>$ pctx json api.json --where status=500 --count-by route</code></div>
+          <div><code>$ pctx log @latest "panic|deadlock"</code> <span style="color:#748cab"># 0 re-exec</span></div>
+          <div class="cctx-meter-row">
+            <div class="cctx-meter-head"><span>Raw JSON (1,021,281 B)</span><span>7.82 ms</span></div>
+            <div class="cctx-meter-track"><div class="cctx-meter-fill is-raw" style="width:100%"></div></div>
+          </div>
+          <div class="cctx-meter-row">
+            <div class="cctx-meter-head"><span>Redacted digest (662 B)</span><span style="color:#54ead2">-99.94%</span></div>
+            <div class="cctx-meter-track"><div class="cctx-meter-fill" style="width:3%"></div></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="cctx-micro-card">
+        <div class="cctx-micro-top">
+          <span class="cctx-micro-kicker">03 &middot; cctx journal &amp; cctx usage</span>
+          <h3>&lt;=2 KiB Continuity &amp; Live Cost Telemetry</h3>
+          <p>
+            Preserve architectural decisions across compactions in strictly <code>&lt;= 2,048 B</code> with fail-open
+            hooks (<code>0</code> <code>PreToolUse</code> denials), and track live AIC/USD savings in VS Code or
+            <code>cctx usage --hours 24</code>.
+          </p>
+        </div>
+        <div class="cctx-micro-screen">
+          <div><code>$ cctx usage --hours 24</code></div>
+          <div style="color:#54ead2">&#9889; Warm Hit: 98.6% &middot; BPE Formula: -63.1%</div>
+          <div style="color:#ffd43b">&#128176; Net Session Bill: -10% to -39% AIC/USD</div>
+          <div class="cctx-meter-row">
+            <div class="cctx-meter-head"><span>40-step journal resume (1,829 B)</span><span style="color:#54ead2">-99.58%</span></div>
+            <div class="cctx-meter-track"><div class="cctx-meter-fill" style="width:6%"></div></div>
+          </div>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ACT 4: Verified Benchmarks, Honest Scope & 7-Tool Matrix -->
+  <section aria-labelledby="benchmarks-heading" style="display:flex;flex-direction:column;gap:1.5rem;">
+    <div class="cctx-section-head">
+      <span class="cctx-eyebrow">
+        <i class="cctx-eyebrow-dot" aria-hidden="true"></i>
+        8,960 CORRECTNESS-CHECKED PAIRS &middot; REPRODUCIBLE EVIDENCE
+      </span>
+      <h2 id="benchmarks-heading" class="cctx-section-title">
+        Measured retrieval speedups, token reductions, and honest limits.
+      </h2>
+      <p class="cctx-section-desc">
+        Evaluated across 8 daemon sessions &times; 40 rounds &times; 28 tasks on
+        <a href="https://github.com/dotnetpower/aks-store-demo" target="_blank" rel="noopener noreferrer">AKS Store Demo</a>,
+        506-file Python and 6,000-file Rust suites, and controlled end-to-end Copilot CLI A/B trials.
+      </p>
+    </div>
+
+    <div class="cctx-bench-layout">
+      <div class="cctx-card-panel">
+        <img
+          src={benchSvgUrl}
+          alt="Measured retrieval latency, paired-session speedup confidence intervals, Rust and Python lookup token savings, and Copilot A/B task completion speedup"
+          width="1100"
+          height="680"
+          loading="lazy"
+          style="width:100%;height:auto;border-radius:0.75rem;border:1px solid var(--sl-color-gray-5);"
+        />
+        <div class="cctx-honest-note">
+          <strong>Transparent engineering boundaries:</strong> Small known-file reads are
+          <strong>0.43&times; (2.4&times; slower: 0.081 ms &rarr; 0.190 ms)</strong> over daemon IPC than direct
+          buffered reads because IPC adds socket and JSON framing overhead. A cold <code>CACHE_MISS</code> plus host
+          fallback had a <strong>4.409 ms</strong> median—no cold-cache speedup is claimed. See the
+          <a href={docUrl("benchmarks/")}>full methodology, confidence intervals, and reproduction commands</a>.
+        </div>
+      </div>
+
+      <div class="cctx-card-panel">
+        <div class="cctx-stat-grid">
+          <div class="cctx-stat-box">
+            <span class="cctx-stat-num">17.22&times;</span>
+            <span class="cctx-stat-caption">Mixed retrieval speedup (95% CI 17.04&ndash;17.40&times;, 3.996 &rarr; 0.232 ms)</span>
+          </div>
+          <div class="cctx-stat-box">
+            <span class="cctx-stat-num">-73% to -91%</span>
+            <span class="cctx-stat-caption">Rust &amp; Python 6-symbol lookup payload token reduction</span>
+          </div>
+          <div class="cctx-stat-box">
+            <span class="cctx-stat-num">-24.7%</span>
+            <span class="cctx-stat-caption">Faster Copilot A/B task wall time (20.31 s &rarr; 15.30 s, 100% accuracy)</span>
+          </div>
+          <div class="cctx-stat-box">
+            <span class="cctx-stat-num">-25.4%</span>
+            <span class="cctx-stat-caption">Lower net session AIU billing cost (-61.9% tool calls)</span>
+          </div>
+        </div>
+
+        <div class="cctx-table-wrap">
+          <table class="cctx-data-table">
+            <thead>
+              <tr>
+                <th>Benchmark Workload</th>
+                <th>Baseline</th>
+                <th>With cctx</th>
+                <th>Impact</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Literal search (AKS Store Demo)</td>
+                <td>5.234 ms</td>
+                <td><strong>0.230 ms</strong></td>
+                <td><strong>22.77&times; faster</strong></td>
+              </tr>
+              <tr>
+                <td>Search + context</td>
+                <td>5.343 ms</td>
+                <td><strong>0.250 ms</strong></td>
+                <td><strong>21.39&times; faster</strong></td>
+              </tr>
+              <tr>
+                <td>Filename discovery</td>
+                <td>4.466 ms</td>
+                <td><strong>0.254 ms</strong></td>
+                <td><strong>17.57&times; faster</strong></td>
+              </tr>
+              <tr>
+                <td>Known small read + SHA-256</td>
+                <td><strong>0.081 ms</strong></td>
+                <td>0.190 ms</td>
+                <td>0.43&times; (IPC overhead)</td>
+              </tr>
+              <tr>
+                <td>Rust 6-symbol lookup tokens</td>
+                <td>15,028 &ndash; 25,133 tok</td>
+                <td><strong>4,031 tok</strong></td>
+                <td><strong>-73.2% to -84.0%</strong></td>
+              </tr>
+              <tr>
+                <td>Python 6-symbol lookup tokens</td>
+                <td>13,997 &ndash; 24,609 tok</td>
+                <td><strong>2,141 tok</strong></td>
+                <td><strong>-84.7% to -91.3%</strong></td>
+              </tr>
+              <tr>
+                <td>BPE formula instructions</td>
+                <td>2,048 tok</td>
+                <td><strong>756 tok</strong></td>
+                <td><strong>-63.1% per turn</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Crawlable English FAQ for SEO / GEO / AEO -->
+  <section aria-labelledby="faq-heading" style="display:flex;flex-direction:column;gap:1.25rem;">
+    <div class="cctx-section-head">
+      <span class="cctx-eyebrow">
+        <i class="cctx-eyebrow-dot" aria-hidden="true"></i>
+        FREQUENTLY ASKED QUESTIONS &middot; TECHNICAL EVALUATION
+      </span>
+      <h2 id="faq-heading" class="cctx-section-title">
+        Common questions from engineers &amp; agent builders
+      </h2>
+    </div>
+
+    <div class="cctx-faq-grid">
+      <details class="cctx-faq-item" open>
+        <summary>How is Code Context (cctx) different from ripgrep or vector embeddings?</summary>
+        <p>
+          <code>ripgrep</code> spawns a fresh scan per call and returns raw lines without block boundaries, forcing
+          agents into multi-turn <code>rg</code> + <code>view</code> loops. Vector RAG requires cloud or GPU embedding
+          indexes that drift on edits and blur exact identifiers. <code>cctx</code> keeps an exact, deterministic
+          in-memory trigram posting index in Rust with live file-watcher updates and polyglot AST block clamping—100%
+          local and SHA-256 verified.
+        </p>
+      </details>
+
+      <details class="cctx-faq-item" open>
+        <summary>Does cctx upload source code or require an external API key?</summary>
+        <p>
+          Never. Indexing, trigram queries, document extraction, probes (<code>pctx</code>), and continuity journals
+          run entirely on your local machine over Unix domain sockets (Linux/WSL/SSH) or authenticated loopback RPC
+          (native Windows <code>cctx.exe</code>). Ignored paths, secrets, <code>.github</code>, and
+          <code>.vscode</code> boundaries are enforced automatically.
+        </p>
+      </details>
+
+      <details class="cctx-faq-item">
+        <summary>Should I use the VS Code Native Extension or the MCP server?</summary>
+        <p>
+          In VS Code 1.140+, install <code>dotnetpower.code-context-native</code> from the Marketplace for foreground
+          native tool dispatch and automatic BPE-aligned agent instructions, and optionally configure
+          <code>cctx shared-mcp</code> for background subagents or MCP-only clients (Claude Code, Cursor, CLI agents).
+          Both surfaces share the exact same resident Rust daemon and cache.
+        </p>
+      </details>
+
+      <details class="cctx-faq-item">
+        <summary>Does it work on native Windows without WSL?</summary>
+        <p>
+          Yes. Build or copy <code>cctx.exe</code> to <code>%USERPROFILE%\.local\bin\cctx.exe</code>. The VS Code
+          extension automatically starts <code>cctx.exe daemon</code> in the background on first use and falls back to
+          VS Code&rsquo;s bundled <code>rg.exe</code> if ripgrep is not on <code>PATH</code>. WSL and Windows Agent
+          Sessions are also first-class supported.
+        </p>
+      </details>
+    </div>
+
+    <p style="margin:0;font-size:0.88rem;color:var(--sl-color-gray-2);">
+      Looking for broader LLM &amp; Copilot token-cost playbooks and zero-code request profiling? Explore our companion
+      guide <a href="https://dotnetpower.github.io/agent-tokenomics/" target="_blank" rel="noopener noreferrer"><strong>agent-tokenomics &amp; tokprof &nearr;</strong></a>
+      or browse the machine-readable <a href={docUrl("llms.txt")}><code>llms.txt</code></a> and
+      <a href={docUrl("llms-full.txt")}><code>llms-full.txt</code></a> indexes.
+    </p>
+  </section>
+</div>
+
+<script>
+  import { initCctxMotion } from "../scripts/motionStage";
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => initCctxMotion(), { once: true });
+  } else {
+    initCctxMotion();
+  }
+</script>
