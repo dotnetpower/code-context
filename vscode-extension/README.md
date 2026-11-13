@@ -30,17 +30,17 @@ $ cctx usage --hours 2        # or: cctx usage --hours 24 --json
 ```
 
 On [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo), the fixed
-retrieval mix averaged **14.92× faster** with a warm CCTX cache
-(95% CI **14.17–15.80×**, up from 6.83× in v0.14): **4.246 → 0.284 ms per operation**, with a **28.675 ms** cold sync median (down from 98.813 ms in v0.14).
+retrieval mix averaged **17.22× faster** with a warm CCTX cache
+(95% CI **17.04–17.40×**, up from 6.83× in v0.14): **3.996 → 0.232 ms per operation**, with a **19.735 ms** cold sync median (down from 98.813 ms in v0.14 — **5.01× faster**).
 Replacing separate `rg` + `view` calls with one block-clamped `code_context` call cuts **lookup payload tokens by 73.2–91.3%**, rich document (`#toc` / `#slide-N`) reads by **86.3–98.9%**, and reduces end-to-end coding agent wall time by **24.7%**.
 
 | Task | CCTX off | CCTX on, warm | Off / on |
 |---|---:|---:|---:|
-| Filename discovery | 4.724 ms | 0.304 ms | 15.54× |
-| Literal search | 5.574 ms | 0.273 ms | 20.41× |
-| Search + context | 5.680 ms | 0.319 ms | 17.80× |
-| Known read + hash | **0.085 ms** | 0.234 ms | **0.36× — slower** |
-| Fixed mixed suite | 4.246 ms | 0.284 ms | 14.92× |
+| Filename discovery | 4.466 ms | 0.254 ms | 17.57× |
+| Literal search | 5.234 ms | 0.230 ms | 22.77× |
+| Search + context | 5.343 ms | 0.250 ms | 21.39× |
+| Known read + hash | **0.081 ms** | 0.190 ms | **0.43× — slower** |
+| Fixed mixed suite | 3.996 ms | 0.232 ms | 17.22× |
 
 | Token & agent acceleration suite | Baseline (`rg` + `view`) | With CCTX (`code_context` / `code_read`) | Savings / speedup |
 |---|---:|---:|---:|

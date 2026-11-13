@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.25.7
+
+- Accelerate warm daemon IPC and resident lookups (`14.92x -> 17.22x` on the
+  8,960-pair AKS Store Demo mixed retrieval suite, `0.284 ms -> 0.232 ms` mean,
+  `0.501 ms -> 0.355 ms` p95): serialize `code_files`, `code_grep`,
+  `code_context`, and `code_read` directly to `WirePayload::RawJson` frames
+  without intermediate `serde_json::Value` trees or defensive argument cloning,
+  add a zero-allocation borrowed snippet fast path for warm `code_read` calls
+  (`0.234 ms -> 0.190 ms`), fast-path O(1) warm-root dispatch, and decode
+  single-chunk IPC frames directly in `daemonClient.ts`.
+- Cut cold source index sync latency by 31% (`28.675 ms -> 19.735 ms` median,
+  `5.01x` faster than v0.14): parallelize `Resident::load_with_inventory` across
+  scoped `O_NOFOLLOW` + `fstat` workers, wake the daemon event loop immediately
+  on background root preparation/load completion instead of polling every 5 ms,
+  reuse path buffers in `check_search_paths`, and skip 4-thread scope spawns
+  when single-thread `lstat` stamps match.
+
 ## 0.25.6
 
 - Harden cross-model and subagent Code Context adoption across Gemini, Claude
