@@ -230,6 +230,10 @@ async function showStatus(
     }
   } catch (error: unknown) {
     if (error instanceof RootResolutionError) {
+      if (bridge.usesWslBridge) {
+        await showFailure(error, output);
+        return;
+      }
       if (await registerCurrentWorkspace(bridge, output)) {
         await runStartupProbe(bridge, statusBar, output);
       }

@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { existsSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve, sep, posix } from 'node:path';
 
@@ -53,8 +54,135 @@ export class RootResolutionError extends Error {
   }
 }
 
-export function wslCandidateToLinuxPath(candidate: string): string | undefined {
+export function decodeAgentHostAuthority(authority: string): string {
+  if (
+    authority.length > 4 &&
+    authority.slice(0, 4).toLowerCase() === 'hex-' &&
+    authority.length % 2 === 0 &&
+    /^[0-9a-f]+$/iu.test(authority.slice(4))
+  ) {
+    return Buffer.from(authority.slice(4), 'hex').toString('utf8');
+  }
+  try {
+    return decodeURIComponent(authority);
+  } catch {
+    return authority;
+  }
+}
+
+function parseAgentHostQueryMetadata(
+  query: string,
+): { scheme?: string; path?: string } | undefined {
+  const rawQuery = query.startsWith('?') ? query.slice(1) : query;
+  if (rawQuery.length === 0) {
+    return undefined;
+  }
+  let encoded = new URLSearchParams(rawQuery).get('_ah');
+  if (encoded === null) {
+    try {
+      encoded = new URLSearchParams(decodeURIComponent(rawQuery)).get('_ah');
+    } catch {
+      encoded = null;
+    }
+  }
+  if (!encoded) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const record = parsed as Record<string, unknown>;
+    const metadata: { scheme?: string; path?: string } = {};
+    if (typeof record.scheme === 'string') {
+      metadata.scheme = record.scheme;
+    }
+    if (typeof record.path === 'string') {
+      metadata.path = record.path;
+    }
+    return metadata;
+  } catch {
+    return undefined;
+  }
+}
+
+export function agentHostPartsToPath(
+  authority: string,
+  path: string,
+  query = '',
+  usesWslBridge?: boolean,
+  wslDistribution = '',
+): string | undefined {
+  const metadata = parseAgentHostQueryMetadata(query);
+  const innerScheme = metadata?.scheme ?? 'file';
+  if (innerScheme !== 'file' && innerScheme !== 'vscode-remote') {
+    return undefined;
+  }
+  const address = decodeAgentHostAuthority(authority);
+  if (usesWslBridge === true) {
+    if (!address.toLowerCase().startsWith('wsl:')) {
+      return undefined;
+    }
+    const distro = wslDistribution.trim();
+    if (distro.length > 0 && address.slice(4).toLowerCase() !== distro.toLowerCase()) {
+      return undefined;
+    }
+  } else if (usesWslBridge === false && address !== 'local') {
+    return undefined;
+  }
+  let resolvedPath =
+    typeof metadata?.path === 'string' && metadata.path.length > 0 ? metadata.path : path;
+  if (/^\/[a-zA-Z]:\//u.test(resolvedPath)) {
+    resolvedPath = resolvedPath.slice(1);
+  }
+  return resolvedPath.length > 0 ? resolvedPath : undefined;
+}
+
+function parseAgentHostUriString(
+  raw: string,
+  usesWslBridge?: boolean,
+  wslDistribution = '',
+): { path: string; hash: string } | undefined {
+  if (!/^vscode-agent-host:\/\//iu.test(raw)) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(raw);
+    let decodedPathname: string;
+    try {
+      decodedPathname = decodeURIComponent(parsed.pathname);
+    } catch {
+      decodedPathname = parsed.pathname;
+    }
+    const resolved = agentHostPartsToPath(
+      parsed.host,
+      decodedPathname,
+      parsed.search,
+      usesWslBridge,
+      wslDistribution,
+    );
+    if (!resolved) {
+      return undefined;
+    }
+    return { path: resolved, hash: parsed.hash || '' };
+  } catch {
+    return undefined;
+  }
+}
+
+export function wslCandidateToLinuxPath(
+  candidate: string,
+  wslDistribution = '',
+): string | undefined {
   const cleaned = unwrapMarkdownLinkAndQuotes(candidate);
+  if (/^vscode-agent-host:\/\//iu.test(cleaned)) {
+    const agentHost = parseAgentHostUriString(cleaned, true, wslDistribution);
+    if (!agentHost) {
+      return undefined;
+    }
+    return posix.isAbsolute(agentHost.path) ? posix.normalize(agentHost.path) : undefined;
+  }
   if (cleaned.startsWith('\\\\')) {
     const uncMatch = WSL_UNC_RE.exec(cleaned);
     if (uncMatch?.[1]) {
@@ -444,6 +572,12 @@ export function normalizeUriOrPath(raw: string): string {
       return decoded + (parsed.hash || '');
     } catch {
       return trimmed;
+    }
+  }
+  if (/^vscode-agent-host:\/\//iu.test(trimmed)) {
+    const agentHost = parseAgentHostUriString(trimmed);
+    if (agentHost) {
+      return agentHost.path + agentHost.hash;
     }
   }
   if (trimmed.includes('://')) {

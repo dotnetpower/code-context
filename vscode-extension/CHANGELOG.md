@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.5
+
+- Support VS Code Agents window `vscode-agent-host://` workspace, editor, and
+  tab URIs (`hex-` encoded host authorities and `_ah` query metadata), matching
+  WSL session roots only to the configured WSL distribution and local session
+  roots only to `local` agent hosts while rejecting non-file inner schemes.
+- Skip non-`file:` workspace folders during automatic registration, missing-root
+  worktree verification, and manual folder selection so virtual or remote
+  Agent Host session switches never attempt local `realpath` resolution, and
+  document `extensions.supportAgentsWindow` setup for `file:`-only LSP servers.
+
 ## 0.25.4
 
 - Eliminate Linux cgroup v2 `memory.high` reclaim stalls (`16s–25s` tail latency)

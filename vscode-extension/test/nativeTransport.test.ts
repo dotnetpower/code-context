@@ -145,4 +145,16 @@ void test('WSL roots preserve Linux paths and delegate access checks to the daem
     wslCandidateToLinuxPath('\\\\wsl$\\Ubuntu\\home\\test\\repo\\src'),
     '/home/test/repo/src',
   );
+  assert.equal(
+    resolveWslRoot(roots, undefined, [
+      'vscode-agent-host://hex-77736c3a5562756e74752d32322e3034/home/test/other?_ah%3DeyJzY2hlbWUiOiJmaWxlIn0',
+    ]),
+    '/home/test/other',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath(
+      'vscode-agent-host://local/c:/Users/test/repo?_ah%3DeyJzY2hlbWUiOiJmaWxlIn0',
+    ),
+    undefined,
+  );
 });

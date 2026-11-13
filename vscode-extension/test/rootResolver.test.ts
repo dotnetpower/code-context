@@ -6,10 +6,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  agentHostPartsToPath,
   buildContextArguments,
   buildFilesArguments,
   buildReadArguments,
   buildSearchArguments,
+  decodeAgentHostAuthority,
   extractLineRangeFromPath,
   normalizeGlobPattern,
   normalizeRelativeTargetPath,
@@ -369,4 +371,73 @@ void test('frontend Vite query suffixes, tsc coordinates, @/ aliases, and compou
     paths: ['.github/workflows/ci.yml', 'src/lib.rs'],
   });
   assert.deepEqual(mixedHiddenPaths.paths, ['src/lib.rs']);
+});
+
+void test('vscode-agent-host workspace and file URIs normalize safely across WSL and local hosts', () => {
+  const wslHexAuthority = 'hex-77736c3a5562756e74752d32322e3034';
+  const fileAhEncoded = '_ah%3DeyJzY2hlbWUiOiJmaWxlIn0';
+  const untitledAhRaw = '_ah=eyJzY2hlbWUiOiJ1bnRpdGxlZCJ9';
+
+  assert.equal(decodeAgentHostAuthority(wslHexAuthority), 'wsl:Ubuntu-22.04');
+  assert.equal(
+    normalizeUriOrPath(
+      `vscode-agent-host://${wslHexAuthority}/home/user/code-context?${fileAhEncoded}`,
+    ),
+    '/home/user/code-context',
+  );
+  assert.deepEqual(
+    extractLineRangeFromPath(
+      `vscode-agent-host://${wslHexAuthority}/home/user/code-context/src/query.rs?${fileAhEncoded}#L12-L28`,
+    ),
+    { path: '/home/user/code-context/src/query.rs', start: 12, end: 28 },
+  );
+  assert.equal(
+    normalizeRelativeTargetPath(
+      `vscode-agent-host://${wslHexAuthority}/home/user/code-context/src/query.rs?${fileAhEncoded}`,
+      '/home/user/code-context',
+    ),
+    'src/query.rs',
+  );
+  assert.equal(
+    agentHostPartsToPath(
+      wslHexAuthority,
+      '/home/user/code-context',
+      '_ah=eyJzY2hlbWUiOiJmaWxlIn0',
+      true,
+      'Ubuntu-22.04',
+    ),
+    '/home/user/code-context',
+  );
+  assert.equal(
+    agentHostPartsToPath(
+      wslHexAuthority,
+      '/home/user/code-context',
+      '_ah=eyJzY2hlbWUiOiJmaWxlIn0',
+      true,
+      'Debian',
+    ),
+    undefined,
+  );
+  assert.equal(
+    agentHostPartsToPath(
+      wslHexAuthority,
+      '/home/user/code-context',
+      '_ah=eyJzY2hlbWUiOiJmaWxlIn0',
+      false,
+    ),
+    undefined,
+  );
+  assert.equal(
+    agentHostPartsToPath(
+      'local',
+      '/c:/Users/dev/project',
+      '_ah=eyJzY2hlbWUiOiJmaWxlIn0',
+      false,
+    ),
+    'c:/Users/dev/project',
+  );
+  assert.equal(
+    agentHostPartsToPath(wslHexAuthority, '/untitled/1', untitledAhRaw, true, 'Ubuntu-22.04'),
+    undefined,
+  );
 });

@@ -118,6 +118,9 @@ async function performAutomaticRegistration(
   try {
     let workspaces = await bridge.listWorkspaces(source.token);
     for (const folder of folders) {
+      if (folder.uri.scheme !== 'file') {
+        continue;
+      }
       let folderRoot: string;
       try {
         folderRoot = await realpath(folder.uri.fsPath);
@@ -213,7 +216,15 @@ export async function prepareMissingWorkspace(
   }
   const operation = (async (): Promise<void> => {
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
-      const root = await realpath(folder.uri.fsPath);
+      if (folder.uri.scheme !== 'file') {
+        continue;
+      }
+      let root: string;
+      try {
+        root = await realpath(folder.uri.fsPath);
+      } catch {
+        continue;
+      }
       const child = relative(root, canonicalTarget);
       if (child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))) {
         await autoRegisterWorkspaceFolders(bridge, output, state, [folder]);
@@ -246,6 +257,9 @@ async function registerTrustedWorktree(
   const targetCommon = await realpath(identity.commonDirectory);
   const failures: string[] = [];
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (folder.uri.scheme !== 'file') {
+      continue;
+    }
     try {
       const parent=await requestedGitIdentity(folder.uri.fsPath);
       if (await realpath(parent.commonDirectory)!==targetCommon) {
@@ -286,13 +300,15 @@ async function requestedGitIdentity(directory:string):Promise<{root:string;commo
 }
 
 async function chooseWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
-  const folders = vscode.workspace.workspaceFolders ?? [];
+  const folders = (vscode.workspace.workspaceFolders ?? []).filter(
+    (folder) => folder.uri.scheme === 'file',
+  );
   if (folders.length === 0) {
     throw new Error('Open a folder before registering Code Context.');
   }
   const active = vscode.window.activeTextEditor?.document.uri;
   const activeFolder = active ? vscode.workspace.getWorkspaceFolder(active) : undefined;
-  if (activeFolder) {
+  if (activeFolder?.uri.scheme === 'file') {
     return activeFolder;
   }
   if (folders.length === 1) {

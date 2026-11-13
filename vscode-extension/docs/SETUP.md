@@ -71,8 +71,13 @@ distribution with `command -v cctx` (or `realpath ~/.local/bin/cctx`):
 ```
 
 Keep `codeContextNative.socketPath` empty in this mode. Pass the actual absolute
-Linux project/worktree root to tools. Several registered roots cannot be
-implicitly mapped to a Windows Agents chat.
+Linux project/worktree root to tools when known; active `vscode-agent-host://`
+session folders matching the configured WSL distribution are also accepted as
+fallback candidates. If a local `file:`-only LSP extension (for example
+`charliermarsh.ruff`) logs `Failed to convert workspace URI to file path:
+vscode-agent-host://...` on session switches, set
+`"extensions.supportAgentsWindow": { "charliermarsh.ruff": false }` in User
+settings.
 
 Authorized Git worktrees can be prepared lazily by the daemon. Register manual
 roots inside WSL; the Windows registration command will not reinterpret a

@@ -7,6 +7,7 @@ import { TracedRequestError, type ClientTrace, type DaemonClient } from './daemo
 import { formatToolResult } from './resultFormatter.js';
 import { formatTrace, outcomeLevel, singleLine, slowCallNotice } from './logFormatter.js';
 import {
+  agentHostPartsToPath,
   buildContextArguments,
   buildFilesArguments,
   buildReadArguments,
@@ -292,7 +293,11 @@ export class NativeToolBridge implements vscode.Disposable {
       Date.now() - this.lastResolvedRoot.at < STICKY_ROOT_TTL_MS
         ? [this.lastResolvedRoot.root]
         : [];
-    const candidates = [...workspaceCandidates(), ...extraCandidates, ...stickyCandidate];
+    const candidates = [
+      ...workspaceCandidates(this.client.usesWslBridge, this.client.wslDistribution ?? ''),
+      ...extraCandidates,
+      ...stickyCandidate,
+    ];
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
       try {
@@ -608,8 +613,31 @@ function parseWorkspaceSpec(value: unknown): WorkspaceSpec {
   return spec;
 }
 
-function pushUriCandidate(candidates: string[], seen: Set<string>, uri: vscode.Uri | undefined): void {
-  if (!uri || (uri.scheme !== 'file' && uri.scheme !== 'vscode-remote')) {
+function pushUriCandidate(
+  candidates: string[],
+  seen: Set<string>,
+  uri: vscode.Uri | undefined,
+  usesWslBridge: boolean,
+  wslDistribution: string,
+): void {
+  if (!uri) {
+    return;
+  }
+  if (uri.scheme === 'vscode-agent-host') {
+    const agentPath = agentHostPartsToPath(
+      uri.authority,
+      uri.path,
+      uri.query,
+      usesWslBridge,
+      wslDistribution,
+    );
+    if (agentPath && !seen.has(agentPath)) {
+      seen.add(agentPath);
+      candidates.push(agentPath);
+    }
+    return;
+  }
+  if (uri.scheme !== 'file' && uri.scheme !== 'vscode-remote') {
     return;
   }
   if (uri.scheme === 'vscode-remote' && typeof uri.path === 'string' && uri.path.startsWith('/')) {
@@ -638,27 +666,45 @@ function extractTabUri(tab: unknown): vscode.Uri | undefined {
   return undefined;
 }
 
-function workspaceCandidates(): string[] {
+function workspaceCandidates(usesWslBridge: boolean, wslDistribution: string): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
-  pushUriCandidate(candidates, seen, vscode.window.activeTextEditor?.document.uri);
+  pushUriCandidate(
+    candidates,
+    seen,
+    vscode.window.activeTextEditor?.document.uri,
+    usesWslBridge,
+    wslDistribution,
+  );
   for (const editor of vscode.window.visibleTextEditors ?? []) {
-    pushUriCandidate(candidates, seen, editor.document?.uri);
+    pushUriCandidate(candidates, seen, editor.document?.uri, usesWslBridge, wslDistribution);
   }
   const tabGroups: vscode.TabGroups | undefined = vscode.window.tabGroups;
   if (tabGroups?.activeTabGroup?.activeTab) {
-    pushUriCandidate(candidates, seen, extractTabUri(tabGroups.activeTabGroup.activeTab));
+    pushUriCandidate(
+      candidates,
+      seen,
+      extractTabUri(tabGroups.activeTabGroup.activeTab),
+      usesWslBridge,
+      wslDistribution,
+    );
   }
   for (const group of tabGroups?.all ?? []) {
     if (group.activeTab) {
-      pushUriCandidate(candidates, seen, extractTabUri(group.activeTab));
+      pushUriCandidate(
+        candidates,
+        seen,
+        extractTabUri(group.activeTab),
+        usesWslBridge,
+        wslDistribution,
+      );
     }
   }
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    pushUriCandidate(candidates, seen, folder.uri);
+    pushUriCandidate(candidates, seen, folder.uri, usesWslBridge, wslDistribution);
   }
   for (const doc of vscode.workspace.textDocuments ?? []) {
-    pushUriCandidate(candidates, seen, doc.uri);
+    pushUriCandidate(candidates, seen, doc.uri, usesWslBridge, wslDistribution);
   }
   return candidates;
 }

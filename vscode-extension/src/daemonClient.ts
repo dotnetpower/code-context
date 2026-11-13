@@ -91,6 +91,10 @@ export class DaemonClient {
     return usesWslTransport(this.settings());
   }
 
+  public get wslDistribution(): string {
+    return this.settings().wslDistribution?.trim() ?? '';
+  }
+
   public get endpoint(): string {
     return nativeEndpoint(this.settings());
   }
