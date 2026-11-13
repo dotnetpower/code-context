@@ -510,7 +510,7 @@ fn is_multiline_signature_open(line: &str) -> bool {
         return true;
     }
     let start = crate::query::trim_line_start(trimmed);
-    if (start.starts_with("impl ")
+    (start.starts_with("impl ")
         || start.starts_with("impl<")
         || start.starts_with("pub trait ")
         || start.starts_with("trait ")
@@ -520,10 +520,6 @@ fn is_multiline_signature_open(line: &str) -> bool {
         || start.starts_with("interface "))
         && !trimmed.ends_with('{')
         && !trimmed.ends_with(';')
-    {
-        return true;
-    }
-    false
 }
 
 fn is_overload_or_stub_signature(line: &str) -> bool {

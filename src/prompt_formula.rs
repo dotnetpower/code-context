@@ -1016,10 +1016,7 @@ fn patch_yaml_subagent_file(path: &Path, style: PromptStyle) -> bool {
         }
     }
 
-    if updated != original && std::fs::write(path, updated).is_ok() {
-        return true;
-    }
-    false
+    updated != original && std::fs::write(path, updated).is_ok()
 }
 
 /// Automatically patches any unconfigured Copilot SDK subagent YAML definitions under `home`

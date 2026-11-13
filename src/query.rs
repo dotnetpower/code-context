@@ -1647,7 +1647,7 @@ pub(crate) fn is_comment_only_line(line: &str, is_doc_file: bool) -> bool {
     {
         return true;
     }
-    if !is_doc_file
+    !is_doc_file
         && trimmed.starts_with('#')
         && !trimmed.starts_with("#[")
         && !trimmed.starts_with("#![")
@@ -1662,10 +1662,6 @@ pub(crate) fn is_comment_only_line(line: &str, is_doc_file: bool) -> bool {
         && !trimmed.starts_with("#error")
         && !trimmed.starts_with("#warning")
         && !trimmed.starts_with("#!")
-    {
-        return true;
-    }
-    false
 }
 
 fn is_low_signal_usage_line(line: &str) -> bool {
