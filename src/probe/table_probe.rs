@@ -1128,15 +1128,32 @@ fn inspect_sqlite(path: &Path, args: &TableProbeArgs) -> Result<SqliteSummary> {
     inspect_sqlite_pure_rust(path, page_size, wal_mode, args.table.as_deref())
 }
 
+fn safe_sqlite_cli_path(path: &Path) -> std::path::PathBuf {
+    if path.as_os_str().as_encoded_bytes().starts_with(b"-") {
+        std::path::PathBuf::from(".").join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn safe_sqlite_cli_sql(sql: &str) -> std::borrow::Cow<'_, str> {
+    if sql.starts_with('-') {
+        std::borrow::Cow::Owned(format!(" {sql}"))
+    } else {
+        std::borrow::Cow::Borrowed(sql)
+    }
+}
+
 fn sqlite_cli_json_query(db_path: &Path, sql: &str) -> Result<Vec<Value>> {
+    let safe_path = safe_sqlite_cli_path(db_path);
+    let safe_sql = safe_sqlite_cli_sql(sql);
     let out = Command::new("sqlite3")
         .arg("-safe")
         .arg("-readonly")
         .arg("-json")
         .args(["-cmd", ".timeout 2000"])
-        .arg("--")
-        .arg(db_path)
-        .arg(sql)
+        .arg(&safe_path)
+        .arg(safe_sql.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1217,10 +1234,12 @@ fn inspect_sqlite_via_cli(
             ));
         }
 
+        let safe_path = safe_sqlite_cli_path(path);
+        let safe_sql = safe_sqlite_cli_sql(&batch_sql);
         let out = Command::new("sqlite3")
-            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000", "--"])
-            .arg(path)
-            .arg(&batch_sql)
+            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000"])
+            .arg(&safe_path)
+            .arg(safe_sql.as_ref())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1341,10 +1360,12 @@ fn inspect_sqlite_via_cli(
             ));
         }
 
+        let safe_path = safe_sqlite_cli_path(path);
+        let safe_sql = safe_sqlite_cli_sql(&batch_sql);
         if let Ok(out) = Command::new("sqlite3")
-            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000", "--"])
-            .arg(path)
-            .arg(&batch_sql)
+            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000"])
+            .arg(&safe_path)
+            .arg(safe_sql.as_ref())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
