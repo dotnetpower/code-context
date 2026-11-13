@@ -166,7 +166,10 @@ Search patterns are case-sensitive literals unless `--regex` or
 Matching-line counts and truncation are explicit. A zero-match success differs
 from a refusal, unavailable cache, or system failure.
 
-For Copilot CLI, register the existing backend as a separate MCP server:
+For Copilot CLI and VS Code Agent Host / Copilot SDK sessions, register the
+existing backend as a direct server-side MCP server (`code-context-code_*` /
+`mcp__code-context__*`) so lookups bypass UI client-relay disconnects across
+window reloads, passive views, and autopilot continuations:
 
 ```sh
 copilot mcp add code-context --timeout 30000 -- "$HOME/.local/bin/cctx" shared-mcp

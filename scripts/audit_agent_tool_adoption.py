@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import fnmatch
 import json
 import os
 import re
-import fnmatch
 import tempfile
 import time
 from collections import Counter
@@ -1147,6 +1147,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                 bucket = "file_unavailable"
             elif (
                 "No matching client connected" in err
+                or "advertised tool definition" in err
                 or "disconnected before completing" in err
                 or "skipped from another client" in err
                 or "not available on this client" in err
@@ -1247,7 +1248,7 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def _fmt_tok(value: int | float | None) -> str:
+def _fmt_tok(value: float | None) -> str:
     if value is None:
         return "-"
     num = float(value)

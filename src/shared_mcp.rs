@@ -31,17 +31,19 @@ fn build_tools() -> Value {
                 json!({"type":"boolean","default":true});
         }
         let prefix = match tool["name"].as_str() {
-            Some("code_files") => "Use FIRST for filename/path glob (!content).",
+            Some("code_files") => {
+                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): filename/path glob (!content)."
+            }
             Some("code_grep") => {
-                "Use FIRST for saved-source search. Set regex=true for a|b."
+                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): saved-source search. Set regex=true for a|b."
             }
             Some("code_context") => {
-                "Use FIRST for symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
+                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
             }
-            _ => "Use FIRST for batched ranges (<=150L, <8KiB).",
+            _ => "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): batched ranges (<=150L, <8KiB).",
         };
         tool["description"] = json!(format!(
-            "{prefix} CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch. Do not duplicate a pending native call."
+            "{prefix} CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch and UI client-relay disconnects. Do not duplicate a pending native call."
         ));
     }
     for (name, description) in [

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.25.8
+
+- Eliminate first-call UI client-relay failures (`"No client with the advertised
+  tool definition was connected to run cctxNative*"`, `"No matching client
+  connected"`, `"skipped from another client"`) in VS Code Agent Host, Copilot
+  SDK, subagent, and autopilot sessions: prioritize direct server-side backend
+  MCP (`code-context-code_*` / `mcp__code-context__*`) whenever callable
+  alongside client-relayed `cctxNative*` tools while keeping `#cctxNative*`
+  primary in Editor Chat and VSIX-only setups.
+- Make client-relay fallback sticky for the entire session across autopilot
+  continuations and context compactions (`Recovery` instructions, BPE prompt
+  compiler surfaces, and deduplicated pinned `PostToolUse` continuity entries in
+  `cctx journal`), classify `"advertised tool definition"` errors under
+  `client_disconnected` in `cctx usage` and adoption audits, and auto-provision
+  `code-context` (`cctx shared-mcp`) in Agent Host / VS Code MCP configs when
+  `cctx` is installed locally.
+
 ## 0.25.7
 
 - Accelerate warm daemon IPC and resident lookups (`14.92x -> 17.22x` on the

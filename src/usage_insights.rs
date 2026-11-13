@@ -74,7 +74,10 @@ impl Advisory {
     pub(crate) fn compact_hint(&self) -> (u8, &str) {
         match self.code {
             "native_stall" => (0, "Shared stall detected; check cctx doctor and machine load."),
-            "client_disconnected" => (1, "Native client disconnected; use MCP/CLI until restored."),
+            "client_disconnected" => (
+                1,
+                "Native client disconnected; prefer direct code-context-code_* MCP in Agent Host/SDK sessions.",
+            ),
             "cold_cache_spike" => (2, "Reduce cold-cache costs; compact long sessions and avoid idle gaps."),
             "host_dispatch_delay" => (3, "Host dispatch is slow; check the extension host or use MCP."),
             "unregistered_workspace" => (4, "Register missing workspaces before source lookups."),
@@ -472,7 +475,16 @@ fn advisories(
     }
     let context_calls = calls
         .iter()
-        .filter(|c| matches!(c.tool.as_str(), "cctxNativeContext" | "code-context-code_context" | "code_context"))
+        .filter(|c| {
+            matches!(
+                c.tool.as_str(),
+                "cctxNativeContext"
+                    | "code-context-code_context"
+                    | "code_context"
+                    | "code-context-native_codeContext"
+                    | "mcp__code-context__code_context"
+            )
+        })
         .count();
     if cctx_total >= 25 && context_calls * 20 < cctx_total {
         out.push(Advisory {
@@ -491,7 +503,11 @@ fn advisories(
                         &c.workspace == workspace
                             && matches!(
                                 c.tool.as_str(),
-                                "cctxNativeContext" | "code-context-code_context" | "code_context"
+                                "cctxNativeContext"
+                                    | "code-context-code_context"
+                                    | "code_context"
+                                    | "code-context-native_codeContext"
+                                    | "mcp__code-context__code_context"
                             )
                     })
                     .count();

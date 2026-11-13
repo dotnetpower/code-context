@@ -1033,6 +1033,7 @@ fn decode_hook_stdin(raw: &Value) -> Option<DecodedHookEvent> {
             Value::String(s) => (false, s.clone()),
             Value::Object(map) => {
                 let is_err = map.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+                    || map.get("error").is_some_and(|v| !v.is_null())
                     || map
                         .get("exitCode")
                         .or_else(|| map.get("exit_code"))
@@ -1042,6 +1043,7 @@ fn decode_hook_stdin(raw: &Value) -> Option<DecodedHookEvent> {
                     .get("stdout")
                     .or_else(|| map.get("output"))
                     .or_else(|| map.get("content"))
+                    .or_else(|| map.get("error"))
                     .and_then(Value::as_str)
                     .map(String::from)
                     .unwrap_or_else(|| serde_json::to_string(resp).unwrap_or_default());
@@ -1177,25 +1179,57 @@ pub fn handle_hook_payload(explicit_root: &Path, agent: HookAgent, raw_stdin: &[
                         Ok(())
                     });
                 } else if ev.tool_is_error && !ev.tool_result_text.trim().is_empty() {
+                    let is_client_disconnect =
+                        crate::outcome::detail(Some(&ev.tool_result_text)) == "client_disconnected";
                     let first_err_line = ev
                         .tool_result_text
                         .lines()
                         .find(|l| !l.trim().is_empty())
                         .unwrap_or("tool error");
-                    let summary = format!("{tool_name} failed: {}", truncate_utf8_chars(first_err_line.trim(), 120));
+                    let summary = if is_client_disconnect {
+                        format!(
+                            "UI client relay disconnected on {tool_name}: stay on code-context-code_* / test-context-test_* MCP for this session (do not retry cctxNative*/tctxNative* after compaction)"
+                        )
+                    } else {
+                        format!(
+                            "{tool_name} failed: {}",
+                            truncate_utf8_chars(first_err_line.trim(), 120)
+                        )
+                    };
                     let detail_snip = truncate_utf8_chars(&ev.tool_result_text, 600);
                     let clean_sess = clean_single_line(&ev.session_id, 64);
                     let _ = with_locked_store(&norm_root, true, |_, store, _| {
+                        if is_client_disconnect
+                            && store.entries.iter().any(|e| {
+                                e.pinned
+                                    && e.session_id == clean_sess
+                                    && e.summary.contains("UI client relay disconnected")
+                            })
+                        {
+                            return Ok(());
+                        }
+                        let disconnect_tags = [
+                            "transport".to_string(),
+                            "mcp-fallback".to_string(),
+                        ];
                         let _ = append_entry_to_store(
                             store,
                             EntryDraft {
-                                kind: JournalKind::Failure,
+                                kind: if is_client_disconnect {
+                                    JournalKind::Decision
+                                } else {
+                                    JournalKind::Failure
+                                },
                                 summary: &summary,
                                 detail: Some(&detail_snip),
                                 files: &[],
-                                tags: &[],
+                                tags: if is_client_disconnect {
+                                    &disconnect_tags
+                                } else {
+                                    &[]
+                                },
                                 session_id: &clean_sess,
-                                pinned: false,
+                                pinned: is_client_disconnect,
                             },
                         )?;
                         Ok(())

@@ -1185,6 +1185,21 @@ fn compaction_journal_state_budget_recall_and_multi_agent_hooks() {
         assert_eq!(run_hook(&p, "vscode"), json!({}));
     }
 
+    for _ in 0..2 {
+        let disconnected = json!({
+            "hookEventName": "postToolUse",
+            "sessionId": "sess-hook",
+            "cwd": repo.to_str().unwrap(),
+            "toolName": "cctxNativeFiles",
+            "toolResult": {
+                "resultType": "failure",
+                "textResultForLlm": "No client with the advertised tool definition was connected to run cctxNativeFiles"
+            }
+        })
+        .to_string();
+        assert_eq!(run_hook(&disconnected, "vscode"), json!({}));
+    }
+
     //    (b) PreCompact sets pending_compact -> next UserPromptSubmit injects <=2048B additionalContext once!
     let pre_compact = json!({
         "hook_event_name": "PreCompact",
@@ -1207,6 +1222,13 @@ fn compaction_journal_state_budget_recall_and_multi_agent_hooks() {
         .expect("expected additionalContext after PreCompact");
     assert!(ctx_str.len() <= DEFAULT_STATE_BUDGET);
     assert!(ctx_str.contains("edited_files: src/resident.rs"));
+    assert!(ctx_str.contains("stay on code-context-code_* / test-context-test_* MCP"));
+    assert_eq!(
+        ctx_str
+            .matches("stay on code-context-code_* / test-context-test_* MCP")
+            .count(),
+        1
+    );
     assert!(ctx_str.contains("<cctx_journal_state"));
 
     // Subsequent UserPromptSubmit without another PreCompact injects nothing (zero per-turn overhead!)

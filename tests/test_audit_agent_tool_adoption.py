@@ -551,10 +551,31 @@ class AdoptionAuditTests(unittest.TestCase):
                         "error": {"message": "cctxNativeRead was skipped from another client", "code": "cancelled"},
                     },
                 },
+                {
+                    "type": "tool.execution_start",
+                    "timestamp": "2027-01-15T08:00:03Z",
+                    "data": {
+                        "toolName": "cctxNativeFiles",
+                        "toolCallId": "adv-1",
+                        "arguments": {"glob": "*.rs"},
+                    },
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "timestamp": "2027-01-15T08:00:04Z",
+                    "data": {
+                        "toolCallId": "adv-1",
+                        "success": False,
+                        "error": {
+                            "message": "No client with the advertised tool definition was connected to run cctxNativeFiles",
+                            "code": "client_unavailable",
+                        },
+                    },
+                },
             ]
             trace.write_text("\n".join(map(json.dumps, records)))
             report = MODULE.build_report([trace], 24, now=1_800_000_010)
-            self.assertEqual(report["cctx_failure_breakdown"].get("client_disconnected"), 1)
+            self.assertEqual(report["cctx_failure_breakdown"].get("client_disconnected"), 2)
 
     def test_trace_savings_respect_token_details_compaction_and_sequential_slice(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -55,6 +55,7 @@ pub fn detail(error: Option<&str>) -> &'static str {
     } else if message.contains("TARGET_NOT_INDEXED") || message.contains("reason=not_yet_indexed") {
         "target_not_indexed"
     } else if message.contains("No matching client connected")
+        || message.contains("advertised tool definition")
         || message.contains("disconnected")
         || message.contains("reconnect failed")
         || message.contains("skipped from another client")
@@ -97,6 +98,12 @@ mod tests {
         assert_eq!(detail(Some("TARGET_NOT_INDEXED reason=not_yet_indexed")), "target_not_indexed");
         assert_eq!(detail(Some("READ_POLICY_DENIED")), "policy_denied");
         assert_eq!(detail(Some("No matching client connected")), "client_disconnected");
+        assert_eq!(
+            detail(Some(
+                "No client with the advertised tool definition was connected to run cctxNativeFiles"
+            )),
+            "client_disconnected"
+        );
         assert_eq!(
             detail(Some("cctxNativeRead was skipped from another client")),
             "client_disconnected"
