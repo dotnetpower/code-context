@@ -361,10 +361,16 @@ html:has(.cctx-landing) main > .content-panel > .sl-container {
 
 .cctx-quick-code {
   margin: 0;
-  font: 500 0.76rem/1.45 var(--sl-font-mono);
+  font: 500 0.76rem/1.55 var(--sl-font-mono);
   color: #dbe7ff;
-  overflow-x: auto;
-  white-space: nowrap;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cctx-quick-code code {
+  white-space: inherit;
+  overflow-wrap: inherit;
 }
 
 .cctx-hero-actions {
