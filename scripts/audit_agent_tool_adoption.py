@@ -29,11 +29,22 @@ CATALOG_NAMES = (
 
 
 def classify(name: str) -> str:
-    if name in {"tool_search_tool", "web_search", "web_fetch", "doSearch"}:
+    if name in {
+        "tool_search_tool",
+        "tool_search",
+        "ToolSearch",
+        "web_search",
+        "web_fetch",
+        "WebSearch",
+        "WebFetch",
+        "doSearch",
+        "form-github-search-query",
+        "show-github-search-result",
+    } or name.startswith(("github-mcp-server-", "GitHub-", "mcp__github", "session_store")):
         return "other"
     if name.startswith(("cctxNative", "code-context-native")):
         return "native"
-    if name.startswith("code-context-") or name in {
+    if name.startswith(("code-context-", "mcp__code-context__", "mcp_code_context")) or name in {
         "code_files",
         "code_grep",
         "code_context",
@@ -48,6 +59,9 @@ def classify(name: str) -> str:
         "rg",
         "view",
         "glob",
+        "Read",
+        "Grep",
+        "Glob",
         "usages",
         "read_file",
         "grep_search",

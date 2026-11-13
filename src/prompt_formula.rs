@@ -51,6 +51,8 @@ pub enum PromptTarget {
     SubagentYaml,
     /// VS Code Markdown subagent prompt block (`*.agent.md`).
     SubagentMd,
+    /// Claude Code / Claude Agent Host instructions (`CLAUDE.md`).
+    ClaudeMd,
 }
 
 impl PromptTarget {
@@ -60,6 +62,7 @@ impl PromptTarget {
             Self::Mcp => "mcp",
             Self::SubagentYaml => "subagent-yaml",
             Self::SubagentMd => "subagent-md",
+            Self::ClaudeMd => "claude-md",
         }
     }
 }
@@ -156,9 +159,9 @@ Dispatch:\n\
 - content (a|b => regex=true) => #cctxNativeGrep / code_grep (root={root_binding}, max_matches_per_file: 1..64)\n\
 - range | anchor (path:line:col, path#Lstart-Lend, doc.md#slug, @/) => #cctxNativeRead / code_read (root={root_binding}, lines <= 150, < 8KiB; > 150 => page=true -> next_ranges -> complete=true)\n\
 Guards:\n\
-- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius)\n\
-- deferred => tool_search(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\")\n\
-- subagent(explore, general-purpose, code-review, rubber-duck, security-review) => pass root={root_binding} & require #cctxNative* | code-context-code_* first\n\
+- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius) ; multi-edit => 1 #cctxNativeRead(ranges=[...]) (!parallel view)\n\
+- deferred (even if rg/view/glob visible on turn 0) => call tool_search_tool(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\") first; MCP/headless => tool_search_tool(\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\") (regex: \"cctxNative|code-context\")\n\
+- subagent(explore, general-purpose, code-review, rubber-duck, research, security-review, task) => pass root={root_binding} & require #cctxNative* | code-context-code_* (via tool_search_tool if hidden) first\n\
 Transitions:\n\
 - CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)\n\
 - CACHE_LOAD_FAILED => Host read ; STALE_INDEX => #cctxNativeRead | Host live read ; TARGET_NOT_INDEXED != absent\n\
@@ -183,9 +186,9 @@ Dispatch:\n\
 - Swap: view | read_file => #cctxNativeRead ; rg | grep => #cctxNativeGrep ; glob | find => #cctxNativeFiles\n\
 - Bilingual: Korean/multilingual prompts (함수/심볼+주변코드 => #cctxNativeContext, 파일명/경로 => #cctxNativeFiles, 문자열/정규식 => #cctxNativeGrep, 줄범위 => #cctxNativeRead) follow identical dispatch & preserve user reply language (한글 요청 => 한글 답변)\n\
 Guards:\n\
-- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius)\n\
-- deferred => tool_search(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\")\n\
-- subagent(explore, general-purpose, code-review, rubber-duck, security-review) => pass root={root_binding} & require #cctxNative* | code-context-code_* first\n\
+- known(R) => pass explicit absolute root={root_binding} ; before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius) ; multi-edit => 1 #cctxNativeRead(ranges=[...]) (!parallel view)\n\
+- deferred (Claude/GPT/subagents: even when rg/view/glob are visible on turn 0 & cctx is hidden) => call tool_search_tool (tool_search) FIRST: foreground \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" ; MCP/headless \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" (regex: \"cctxNative|code-context\")\n\
+- subagent(explore, general-purpose, code-review, rubber-duck, research, security-review, task) => pass root={root_binding} in prompt & require #cctxNative* | code-context-code_* (load via tool_search_tool if hidden) first\n\
 Transitions & Fallback:\n\
 - CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)\n\
 - CACHE_LOAD_FAILED => Host read (cooldown) ; STALE_INDEX => #cctxNativeRead | Host live read ; TARGET_NOT_INDEXED != absent\n\
@@ -211,9 +214,9 @@ Native-first: when `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep` an
 - Swap, do not fall back: `view`/`read_file` on a known path or range -> `#cctxNativeRead` (`path:start-end`); `rg`/`grep` -> `#cctxNativeGrep`; `glob`/`find` -> `#cctxNativeFiles`. Keep using them after the first lookup. Never slice a file across turns (`1..150` -> `151..300`) or chain `grep` -> `read` when `#cctxNativeContext` (`paths=[file]`, `radius=25..50`) or batched `ranges` can answer in one turn.\n\
 - Pass the absolute `root` (`{root_binding}`) when the workspace or worktree is known (WSL, subagents, multi-root).\n\
 - Keep each read to `<=150` lines (`<8KiB`) and set `max_matches_per_file` on broad searches so output stays inline; context radius is 0..100, limit 1..64. For large reads use `page=true` and follow `next_ranges` until `complete=true`. Responses that hit the inline budget report `inline_notice` and `next_ranges`.\n\
-- Before editing, use `#cctxNativeContext` (`radius >= 8`) or `#cctxNativeRead` (`around_line` + `radius`) so the first edit has exact indentation, full signatures and 3+ unique context lines.\n\
-- Subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`, `security-review`): include the absolute `root` and tell them to use `#cctxNative*` or `code-context-code_*` first.\n\
-- Deferred tools: discover with `tool_search` using exact names `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"`.\n\n\
+- Before editing, use `#cctxNativeContext` (`radius >= 8`) or `#cctxNativeRead` (`around_line` + `radius`) so the first edit has exact indentation, full signatures and 3+ unique context lines; before a multi-hunk or multi-file edit, batch all needed line ranges into one `#cctxNativeRead(ranges=[...])` call rather than parallel `view` calls.\n\
+- Subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`, `research`, `security-review`, `task`): built-in subagents may run different models (such as Opus, Sonnet, Haiku, or Terra) without custom workspace instructions, so always include the absolute `root` in the delegation prompt and instruct them to use `#cctxNative*` or `code-context-code_*` (loading them with `tool_search_tool` first if hidden) before `view`, `rg`, or `grep`.\n\
+- Deferred tools (Claude, GPT, and subagent sessions where built-in `grep`/`view`/`glob` appear on turn 0 while CCTX tools are hidden): call `tool_search_tool` (`tool_search`) FIRST before any host search/read — query `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` in foreground VS Code sessions, or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` (regex `\"cctxNative|code-context\"`) when native dispatch is unavailable because `tool_search_tool` caps results at 5 tools.\n\n\
 ## Cache and freshness\n\n\
 - CCTX is an optional accelerator, not a prerequisite: a nonblocking root cache. `CACHE_MISS` returns immediately and queues only that root; it is never zero matches or a missing file. Continue that single lookup with a permitted host search/read. Do not poll, repeat, switch transports, change roots or run `code_sync` to wait. `CACHE_LOAD_FAILED` reports the real failure and retry cooldown.\n\
 - `STALE_INDEX` means a checked file differs from the index: do not trust old matches or line numbers; use `#cctxNativeRead` or a host live read. `TARGET_NOT_INDEXED` is not proof of absence.\n\
@@ -242,20 +245,20 @@ Background/unattended session without native dispatch => prefer these backend MC
         (PromptTarget::SubagentYaml, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
             "  # [cctx-subagent-instructions]\n\
   **CCTX & TCTX Formula Rules (Mandatory First Path):**\n\
-  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files) > CLI (cctx --backend shared --root {root_binding}) > Host (view, grep, rg, glob, bash)`\n\
-  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status) > CLI (tctx --root {root_binding} run) > bash`\n\
-  - `Guards`: always pass explicit absolute `root` (`{root_binding}`); `cctxNativeContext(limit <= 64, radius: 0..100)`; `cctxNativeRead(lines <= 120, < 8KiB)`; `target in {{.github/*, .vscode/*, .gitignore, /tmp/*}} => view directly (!CCTX)`.\n\
-  - `Deferred`: if tools are not visible, call `tool_search` first with `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
-  - `Transitions`: `Error(\"No matching client connected\" | \"skipped from another client\") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
+  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files / mcp__code-context__code_*) > CLI (cctx --backend shared --root {root_binding}) > Host (view, grep, rg, glob, bash)`\n\
+  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status / mcp__test-context__test_*) > CLI (tctx --root {root_binding} run) > bash`\n\
+  - `Guards`: always pass explicit absolute `root` (`{root_binding}`); unknown line => `cctxNativeContext(paths=[file], pattern, radius: 25..50)` (!1..150 slicing); multi-range => 1 `cctxNativeRead(ranges=[...], lines <= 120, < 8KiB)` (!parallel view); `target in {{.github/*, .vscode/*, .gitignore, /tmp/*, /dev/shm/*}} => view directly (!CCTX)`.\n\
+  - `Deferred`: EVEN IF `grep`/`view`/`glob` are already visible on turn 0, if `cctx*`/`tctx*` are not in your active tool list, call `tool_search_tool` (`tool_search`) FIRST: foreground `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` ; headless/MCP `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` ; tests `\"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\"` (regex: `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
+  - `Transitions`: `Error(\"No matching client connected\" | \"skipped from another client\") => load & switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
         ),
         (PromptTarget::SubagentYaml, PromptStyle::Prose) => format!(
             "  # [cctx-subagent-instructions]\n\
   **Code Context (`cctx`) & Test Context (`tctx`) Priority (MANDATORY FIRST PATH):**\n\
   - For locating or reading saved source in a registered workspace, ALWAYS use Code Context FIRST before `view`, `grep`, `rg`, `glob`, or `bash`:\n\
-    1. Prefer native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles` when callable; otherwise use MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files`.\n\
-    2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Keep `cctxNativeContext` `limit <= 64` (`radius 0..100`) and keep `cctxNativeRead` / `code_read` batches `<= 120` total lines (`<8KiB`) so responses stay inline.\n\
-    3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` files to Code Context; use `view` directly for those.\n\
-    4. If Code Context or Test Context tools are deferred or not visible in your active tool list, call `tool_search` (`tool_search_tool`) FIRST with exact names: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
+    1. Prefer native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles` when callable; otherwise use MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__code_*`).\n\
+    2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Prefer `cctxNativeContext` (`limit <= 64`, `radius 0..100`) over sequential slicing, and batch multiple line ranges into one `cctxNativeRead` / `code_read` call (`<= 120` total lines, `<8KiB`).\n\
+    3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` / `/dev/shm/*` files to Code Context; use `view` directly for those.\n\
+    4. Even when `grep`/`view`/`glob` are visible on turn 0, if Code Context or Test Context tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` (or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` in headless/MCP sessions; regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
     5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No matching client connected\"` or `\"skipped from another client\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
     6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n\
     7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph`) FIRST before `bash`, passing the explicit absolute `root`.\n"
@@ -263,20 +266,37 @@ Background/unattended session without native dispatch => prefer these backend MC
         (PromptTarget::SubagentMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
             "\n<!-- [cctx-subagent-instructions] -->\n\
 ## CCTX & TCTX Formula Rules (Mandatory First Path)\n\n\
-- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_*) > Host (rg, view, glob)`\n\
-- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_*) > bash`\n\
-- `Guards`: pass explicit `root` (`{root_binding}`); `limit <= 64`; `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/* => Host view only`.\n\
-- `Deferred`: `tool_search(\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\")`\n\
+- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_* / mcp__code-context__code_*) > Host (rg, view, glob)`\n\
+- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_* / mcp__test-context__test_*) > bash`\n\
+- `Guards`: pass explicit `root` (`{root_binding}`); `limit <= 64`; batch multi-range `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/*, /dev/shm/* => Host view only`.\n\
+- `Deferred` (even if `grep`/`view` visible on turn 0): call `tool_search_tool` (`tool_search`) FIRST — foreground `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"`, MCP `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"`, tests `\"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected\"` (regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
 - `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.\n"
         ),
         (PromptTarget::SubagentMd, PromptStyle::Prose) => format!(
             "\n<!-- [cctx-subagent-instructions] -->\n\
 ## Code Context (`cctx`) & Test Context (`tctx`) Priority (Mandatory First Path)\n\n\
-- For locating or reading saved source in a registered workspace, ALWAYS use `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` (or MCP `code-context-code_*`) FIRST before built-in search/read tools.\n\
-- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` (or MCP `test-context-test_*`) FIRST before shell test/lint commands.\n\
-- Always pass the explicit absolute `root` parameter (`{root_binding}`) when known, keep `cctxNativeContext` `limit <= 64`, and keep read batches `<= 120` lines (`<8KiB`). Never send `.github/*`, `.vscode/*`, or `/tmp/*` paths to Code Context.\n\
-- If tools are deferred, discover them with `tool_search` using exact names: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status\"`.\n\
+- For locating or reading saved source in a registered workspace, ALWAYS use `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` (or MCP `code-context-code_*` / `mcp__code-context__code_*`) FIRST before built-in search/read tools.\n\
+- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` (or MCP `test-context-test_*` / `mcp__test-context__test_*`) FIRST before shell test/lint commands.\n\
+- Always pass the explicit absolute `root` parameter (`{root_binding}`) when known, keep `cctxNativeContext` `limit <= 64`, and batch multiple ranges into one read (`<= 120` lines, `<8KiB`). Never send `.github/*`, `.vscode/*`, `/tmp/*`, or `/dev/shm/*` paths to Code Context.\n\
+- Even when built-in `grep`/`view` are visible on turn 0, if CCTX/TCTX tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` (or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"`; regex `\"cctxNative|code-context|tctxNative|test-context\"`).\n\
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.\n"
+        ),
+        (PromptTarget::ClaudeMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
+            "# CCTX & TCTX — Claude / Opus Formula Rules\n\
+- `Source_Priority`: `mcp__code-context__code_context / code_read / code_grep / code_files` (or `#cctxNative*` / `code-context-code_*`) > `CLI (cctx --backend shared --root {root_binding})` > `Host (Read, Grep, Glob, view, rg)`\n\
+- `Test_Priority`: `mcp__test-context__test_run / test_affected / test_graph / test_status` (or `#tctxNative*` / `test-context-test_*`) > `CLI (tctx --root {root_binding} run)` > `Bash (pytest, cargo test, vitest, jest)`\n\
+- `Dispatch`: symbol+context => `code_context(root, pattern, radius: 25..50, limit <= 64)` (!sequential 1..150 slicing) ; glob => `code_files(root, glob)` ; regex (`a|b` => `regex: true`) => `code_grep(root, pattern, max_matches_per_file: 1..64)` ; multi-range / pre-edit => 1 `code_read(root, ranges=[...], lines <= 150)` (!parallel Read/view).\n\
+- `Deferred`: if MCP/native tools are deferred/hidden behind tool search, call `ToolSearch` / `tool_search_tool` FIRST (`\"cctxNative|code-context|tctxNative|test-context\"`) before using built-in `Read`/`Grep`/`Glob`.\n\
+- `Subagents (Task / Agent)`: always pass explicit absolute `root` (`{root_binding}`) and instruct subagents to use `code-context` & `test-context` tools first.\n\
+- `Transitions`: `CACHE_MISS => Host Read/Grep (this lookup only) -> resume CCTX next turn` ; `.github/*, .vscode/*, ignored, /tmp/*, /dev/shm/* => Host tools only`.\n"
+        ),
+        (PromptTarget::ClaudeMd, PromptStyle::Prose) => format!(
+            "# Code Context (`cctx`) & Test Context (`tctx`) for Claude Agents\n\n\
+- Always use `mcp__code-context__code_context`, `mcp__code-context__code_read`, `mcp__code-context__code_grep`, and `mcp__code-context__code_files` (or `#cctxNative*` / `code-context-code_*`) FIRST before built-in `Read`, `Grep`, `Glob`, `view`, or `rg` for saved source in registered workspaces.\n\
+- Always pass the explicit absolute `root` (`{root_binding}`), prefer `code_context` over sequential line slicing, and batch multiple ranges into a single `code_read` call (`<= 150` lines).\n\
+- When tools are deferred behind tool search (`ToolSearch` / `tool_search_tool`), search for `\"cctxNative|code-context|tctxNative|test-context\"` on your first lookup turn even if `Read`/`Grep`/`Glob` are already visible.\n\
+- When spawning `Task`/`Agent` subagents, include the absolute `root` and require `code-context` and `test-context` tools first.\n\
+- On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n"
         ),
     };
     if matches!(target, PromptTarget::Instructions | PromptTarget::Mcp) {
@@ -907,6 +927,7 @@ pub fn build_report(
 const SUBAGENT_MARKER: &str = "# [cctx-subagent-instructions]";
 
 const SUBAGENT_EXTRA_TOOLS: &[&str] = &[
+    "tool_search_tool",
     "cctxNativeFiles",
     "cctxNativeGrep",
     "cctxNativeContext",
@@ -951,6 +972,8 @@ const SUBAGENT_EXTRA_TOOLS: &[&str] = &[
     "test-context-test_sync",
     "test-context-test_invalidate",
     "test-context-test_workspaces",
+    "mcp__code-context__*",
+    "mcp__test-context__*",
 ];
 
 const TARGET_YAML_AGENTS: &[&str] = &[
@@ -1020,10 +1043,11 @@ fn patch_yaml_subagent_file(path: &Path, style: PromptStyle) -> bool {
 }
 
 /// Automatically patches any unconfigured Copilot SDK subagent YAML definitions under `home`
-/// (e.g. after a VS Code Server update) using the active `PromptStyle` (default: `Formula`).
+/// (including standalone Copilot CLI caches and WSL-mounted Windows VS Code SDK bundles)
+/// using the active `PromptStyle` (default: `Formula`).
 pub fn ensure_subagents_configured(home: &Path) -> usize {
     let style = PromptStyle::from_env().unwrap_or_default();
-    let mut patched = 0usize;
+    let mut def_dirs: Vec<PathBuf> = Vec::new();
     for parent_rel in [".vscode-server/bin", ".vscode-server/cli/servers"] {
         let parent = home.join(parent_rel);
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -1033,20 +1057,79 @@ pub fn ensure_subagents_configured(home: &Path) -> usize {
             let base = entry.path();
             for def_rel in [
                 "node_modules/@github/copilot-sdk-linux-x64/definitions",
+                "node_modules/@github/copilot-sdk-linux-arm64/definitions",
                 "extensions/copilot/node_modules/@github/copilot/sdk/definitions",
                 "server/node_modules/@github/copilot-sdk-linux-x64/definitions",
+                "server/node_modules/@github/copilot-sdk-linux-arm64/definitions",
                 "server/extensions/copilot/node_modules/@github/copilot/sdk/definitions",
             ] {
                 let def_dir = base.join(def_rel);
-                if !def_dir.is_dir() {
-                    continue;
+                if def_dir.is_dir() {
+                    def_dirs.push(def_dir);
                 }
-                for agent_name in TARGET_YAML_AGENTS {
-                    let target = def_dir.join(agent_name);
-                    if target.is_file() && patch_yaml_subagent_file(&target, style) {
-                        patched += 1;
+            }
+        }
+    }
+    // Standalone Copilot CLI auto-update cache (`~/.cache/copilot/pkg/<plat>/<ver>/definitions`)
+    for cache_rel in [".cache/copilot/pkg", ".cache/github-copilot-sdk"] {
+        let cache_parent = home.join(cache_rel);
+        if let Ok(plat_entries) = std::fs::read_dir(&cache_parent) {
+            for plat in plat_entries.flatten() {
+                if let Ok(ver_entries) = std::fs::read_dir(plat.path()) {
+                    for ver in ver_entries.flatten() {
+                        let direct = ver.path().join("definitions");
+                        if direct.is_dir() {
+                            def_dirs.push(direct);
+                        }
+                        if let Ok(sub_entries) = std::fs::read_dir(ver.path()) {
+                            for sub in sub_entries.flatten() {
+                                let nested = sub.path().join("definitions");
+                                if nested.is_dir() {
+                                    def_dirs.push(nested);
+                                }
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+    // WSL-mounted Windows VS Code local SDK definitions (only when scanning real host home)
+    if home.starts_with("/home/")
+        && let Ok(users) = std::fs::read_dir("/mnt/c/Users")
+    {
+        for user in users.flatten() {
+            let vscode_app = user
+                .path()
+                .join("AppData/Local/Programs/Microsoft VS Code");
+            let Ok(v_entries) = std::fs::read_dir(&vscode_app) else {
+                continue;
+            };
+            for v_entry in v_entries.flatten() {
+                let p = v_entry.path();
+                for base in [p.join("resources/app"), p.clone()] {
+                    for rel in [
+                        "extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+                        "node_modules.asar.unpacked/@github/copilot-sdk-win32-x64/definitions",
+                        "node_modules.asar.unpacked/@github/copilot-sdk-win32-arm64/definitions",
+                    ] {
+                        let def_dir = base.join(rel);
+                        if def_dir.is_dir() {
+                            def_dirs.push(def_dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    def_dirs.sort();
+    def_dirs.dedup();
+    let mut patched = 0usize;
+    for def_dir in def_dirs {
+        for agent_name in TARGET_YAML_AGENTS {
+            let target = def_dir.join(agent_name);
+            if target.is_file() && patch_yaml_subagent_file(&target, style) {
+                patched += 1;
             }
         }
     }
@@ -1289,5 +1372,27 @@ Q2. Which function calculates retry delay, what formula does it use, and what ca
         assert!(normalized.contains(" => "));
         assert!(normalized.contains(" > "));
         assert!(estimate_bpe_tokens(&normalized) < estimate_bpe_tokens(raw));
+    }
+
+    #[test]
+    fn claude_md_and_cli_cache_subagents_support_all_model_surfaces() {
+        let claude_formula = render(PromptStyle::Formula, PromptTarget::ClaudeMd, Some(Path::new("/repo")));
+        assert!(claude_formula.contains("mcp__code-context__code_context"));
+        assert!(claude_formula.contains("tool_search_tool"));
+
+        let home = tempfile::tempdir().unwrap();
+        let cli_defs = home.path().join(".cache/copilot/pkg/linux-x64/1.0.999/definitions");
+        std::fs::create_dir_all(&cli_defs).unwrap();
+        std::fs::write(
+            cli_defs.join("explore.agent.yaml"),
+            "name: explore\ntools:\n  - view\n  - lsp\nprompt: |\n  Explore codebase.\n",
+        )
+        .unwrap();
+        let patched = ensure_subagents_configured(home.path());
+        assert_eq!(patched, 1);
+        let body = std::fs::read_to_string(cli_defs.join("explore.agent.yaml")).unwrap();
+        assert!(body.contains("tool_search_tool"));
+        assert!(body.contains("mcp__code-context__*"));
+        assert!(body.contains("CCTX & TCTX Formula Rules"));
     }
 }

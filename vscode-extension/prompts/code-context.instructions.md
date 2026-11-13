@@ -14,9 +14,9 @@ Dispatch:
 - `Swap`: `view | read_file => #cctxNativeRead` ; `rg | grep => #cctxNativeGrep` ; `glob | find => #cctxNativeFiles`
 - `Bilingual`: Korean/multilingual requests (`함수/심볼+주변코드 => #cctxNativeContext`, `파일명/경로 => #cctxNativeFiles`, `문자열/정규식 => #cctxNativeGrep`, `줄범위 => #cctxNativeRead`) follow identical dispatch & preserve reply language (`한글 요청 => 한글 답변`)
 Guards:
-- `known(R) => pass explicit absolute root=R` ; `before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius)`
-- `deferred => tool_search("cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files")`
-- `subagent(explore, general-purpose, code-review, rubber-duck, security-review) => pass root=R & require #cctxNative* | code-context-code_* first`
+- `known(R) => pass explicit absolute root=R` ; `before(edit) => #cctxNativeContext(radius >= 8) | #cctxNativeRead(around_line, radius)` ; `multi-edit => 1 #cctxNativeRead(ranges=[...]) (!parallel view)`
+- `deferred (Claude/GPT/subagents: even when rg/view/glob are visible on turn 0 & cctx is hidden) => call tool_search_tool (tool_search) FIRST: foreground "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" ; MCP/headless "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" (regex: "cctxNative|code-context")`
+- `subagent(explore, general-purpose, code-review, rubber-duck, research, security-review, task) => pass root=R in prompt & require #cctxNative* | code-context-code_* (load via tool_search_tool if hidden) first`
 Transitions & Fallback:
 - `CACHE_MISS => !(0 matches | missing file) -> Host read (1 turn only) -> resume CCTX next turn & !(poll | repeat | switch transport | code_sync)`
 - `CACHE_LOAD_FAILED => Host read (cooldown)` ; `STALE_INDEX => #cctxNativeRead | Host live read` ; `TARGET_NOT_INDEXED != absent`

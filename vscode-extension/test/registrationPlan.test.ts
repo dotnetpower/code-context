@@ -76,10 +76,10 @@ void test('automatic globs cover future supported source languages', () => {
   assert.ok(globs.includes('*.java'));
   assert.ok(globs.includes('*.R'));
   assert.equal(new Set(globs).size, globs.length);
-  for (const extension of ['md', 'json', 'yaml', 'yml', 'toml', 'jsonc', 'docx', 'pptx', 'xlsx', 'pdf', 'jsonl', 'srt', 'xliff', 'zig', 'gleam']) {
+  for (const extension of ['md', 'json', 'yaml', 'yml', 'toml', 'jsonc', 'docx', 'pptx', 'xlsx', 'pdf', 'jsonl', 'srt', 'xliff', 'zig', 'gleam', 'dog']) {
     assert.ok(globs.includes(`*.${extension}`));
   }
-  assert.ok(globs.length <= 128);
+  assert.ok(globs.length <= 160);
 });
 
 void test('root source search pattern includes Rust and TypeScript', () => {

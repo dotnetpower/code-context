@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.25.6
+
+- Harden cross-model and subagent Code Context adoption across Gemini, Claude
+  (Opus/Sonnet/Haiku), and GPT sessions: enforce turn-0 `tool_search_tool`
+  discovery with separate foreground/MCP queries (avoiding the 5-tool search
+  cap), require single-call `ranges` batching before multi-edits, add the
+  `claude-md` (`CLAUDE.md`) prompt target, and auto-patch standalone Copilot CLI
+  caches and Windows VS Code SDK subagent bundles (`explore`, `research`,
+  `rubber-duck`, `code-review`, `security-review`, `task`).
+- Emit proactive `PARTIAL_READ` symbol outlines on initial top-of-file single
+  reads (`>120` lines) to prevent `SEQUENTIAL_SLICE` turns before they happen,
+  raise `MAX_GLOBS` (`128 -> 160`) with `*.dog` default source support, and
+  deduplicate unregistered-root worktree diagnostics.
+- Improve `cctx usage` cross-model accuracy: ingest Claude session JSONLs
+  (`~/.claude/projects`), recognize `mcp__code-context__*` MCP calls, exclude
+  `tool_search_tool`/`web_search`/`/dev/shm`/`.gitignore` targets and batched
+  same-file pre-edit `view` calls from fallback penalties, and report
+  warm-adjusted model efficiency alongside `[cold_cache_spike]` advisories.
+
 ## 0.25.5
 
 - Support VS Code Agents window `vscode-agent-host://` workspace, editor, and

@@ -58,6 +58,8 @@ pub struct ModelFacts {
     pub cctx_calls: usize,
     pub used_aic: f64,
     pub saved_aic: f64,
+    pub cold_turns: usize,
+    pub cold_excess_aic: f64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
 }
@@ -279,17 +281,49 @@ fn advisories(
         });
     }
     for model in models.iter().filter(|m| m.used_aic > 0.0) {
+        let adopt_label = if model.lookups == 0 {
+            "no source lookups".to_string()
+        } else {
+            format!("adoption {:.1}%", 100.0 * ratio(model.cctx_calls, model.lookups))
+        };
+        let warm_adj_note = if model.cold_excess_aic >= 20.0
+            && model.cold_excess_aic >= model.used_aic * 0.20
+        {
+            let warm_used = (model.used_aic - model.cold_excess_aic).max(0.1);
+            let warm_pct = 100.0 * model.saved_aic / (warm_used + model.saved_aic);
+            format!(
+                "; warm-adjusted {warm_pct:.1}% excl. {:.0} AIC cold-cache misses",
+                model.cold_excess_aic
+            )
+        } else {
+            String::new()
+        };
         out.push(Advisory {
             code: "model_efficiency",
             message: format!(
-                "{}: saved {:.1}% of spend ({:.1} saved vs {:.1} spent AIC, adoption {:.1}%).",
+                "{}: saved {:.1}% of spend ({:.1} saved vs {:.1} spent AIC, {adopt_label}{warm_adj_note}).",
                 model.name,
                 100.0 * model.saved_aic / (model.used_aic + model.saved_aic),
                 model.saved_aic,
                 model.used_aic,
-                100.0 * ratio(model.cctx_calls, model.lookups)
             ),
         });
+        if model.cold_turns >= 3
+            && model.cold_excess_aic >= 25.0
+            && model.cold_excess_aic >= model.used_aic * 0.20
+        {
+            out.push(Advisory {
+                code: "cold_cache_spike",
+                message: format!(
+                    "{} had {} large-context cold-cache turns (<50% hit), adding ~{:.1} AIC (${:.2}, {:.0}% of model spend): delegate/compact near 250K tok and use #tctxNativeRun before >60s shell waits to avoid 5m implicit-cache TTL expiry.",
+                    model.name,
+                    model.cold_turns,
+                    model.cold_excess_aic,
+                    model.cold_excess_aic * 0.001,
+                    100.0 * model.cold_excess_aic / model.used_aic,
+                ),
+            });
+        }
     }
     for (workspace, stat) in &insights.workspaces {
         let lookups = stat.cctx + stat.builtin;

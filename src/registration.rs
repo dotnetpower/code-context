@@ -144,6 +144,7 @@ pub const DEFAULT_SOURCE_GLOBS: &[&str] = &[
     "*.cts",
     "*.cxx",
     "*.dart",
+    "*.dog",
     "*.docx",
     "*.ejs",
     "*.epub",
@@ -291,7 +292,7 @@ pub fn migrate(
     after.globs.extend(DEFAULT_SOURCE_GLOBS.iter().map(|s| (*s).into()));
     after.globs.sort();
     after.globs.dedup();
-    if after.globs.len() > 128 {
+    if after.globs.len() > 160 {
         after
             .globs
             .retain(|g| DEFAULT_SOURCE_GLOBS.contains(&g.as_str()));
@@ -572,7 +573,7 @@ pub fn prepare_root(target: &Path) -> Result<PathBuf> {
             prepared = Some(existing.root);
             return Ok(());
         }
-        let mut verification_errors = Vec::new();
+        let mut verification_errors = std::collections::BTreeSet::new();
         for parent in specs
             .iter()
             .filter(|s| s.allow_worktrees && s.managed_parent.is_none())
@@ -583,12 +584,15 @@ pub fn prepare_root(target: &Path) -> Result<PathBuf> {
                     prepared = Some(admit(specs, spec)?);
                     return Ok(());
                 }
-                Err(error) => verification_errors.push(error.to_string()),
+                Err(error) => {
+                    verification_errors.insert(error.to_string());
+                }
             }
         }
+        let detail = verification_errors.into_iter().collect::<Vec<_>>().join("; ");
         Err(invalid(format!(
-            "root is not explicitly registered or authorized as a worktree; use local cctx authorize-worktrees on its registered parent, or register this root. {}",
-            verification_errors.join("; ")
+            "root is not explicitly registered or authorized as a worktree; run `cctx --root {} --allow-root-scope register` or `cctx authorize-worktrees` on its registered parent. {detail}",
+            target.display()
         )).into())
     })?;
     prepared.ok_or_else(|| invalid("worktree preparation did not resolve a root").into())

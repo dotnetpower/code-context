@@ -407,10 +407,31 @@ fn classify_tool_group(name: &str) -> &'static str {
     if matches!(name, "tool_search_tool" | "web_search" | "web_fetch" | "doSearch") {
         return "other";
     }
+    if matches!(
+        name,
+        "tool_search_tool"
+            | "tool_search"
+            | "ToolSearch"
+            | "web_search"
+            | "web_fetch"
+            | "WebSearch"
+            | "WebFetch"
+            | "doSearch"
+            | "form-github-search-query"
+            | "show-github-search-result"
+    ) || name.starts_with("github-mcp-server-")
+        || name.starts_with("GitHub-")
+        || name.starts_with("mcp__github")
+        || name.starts_with("session_store")
+    {
+        return "other";
+    }
     if name.starts_with("cctxNative") || name.starts_with("code-context-native") {
         return "native";
     }
     if name.starts_with("code-context-")
+        || name.starts_with("mcp__code-context__")
+        || name.starts_with("mcp_code_context")
         || matches!(
             name,
             "code_files"
@@ -429,6 +450,9 @@ fn classify_tool_group(name: &str) -> &'static str {
         name,
         "rg" | "view"
             | "glob"
+            | "Read"
+            | "Grep"
+            | "Glob"
             | "usages"
             | "read_file"
             | "grep_search"
@@ -763,12 +787,68 @@ fn first_target_path_str(args: &Value) -> Option<&str> {
     None
 }
 
+struct SpecHostFilter {
+    globs: Option<globset::GlobSet>,
+    excludes: Option<globset::GlobSet>,
+}
+
+fn build_spec_host_filter(spec: &crate::catalog::Spec) -> SpecHostFilter {
+    let globs = if spec.globs.is_empty() {
+        None
+    } else {
+        let mut builder = globset::GlobSetBuilder::new();
+        for g in &spec.globs {
+            if let Ok(glob) = globset::Glob::new(g) {
+                builder.add(glob);
+            }
+        }
+        builder.build().ok()
+    };
+    let mut exc_builder = globset::GlobSetBuilder::new();
+    let mut has_exc = false;
+    for ex in &spec.excludes {
+        if let Ok(glob) = globset::Glob::new(ex) {
+            exc_builder.add(glob);
+            has_exc = true;
+        }
+    }
+    let gitignore_path = spec.root.join(".gitignore");
+    if let Ok(body) = std::fs::read_to_string(&gitignore_path)
+        && !body.lines().any(|l| l.trim_start().starts_with('!'))
+    {
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let clean = line.trim_start_matches('/').trim_end_matches('/');
+            if clean.is_empty() {
+                continue;
+            }
+            for pat in [
+                clean.to_string(),
+                format!("{clean}/**"),
+                format!("**/{clean}"),
+                format!("**/{clean}/**"),
+            ] {
+                if let Ok(glob) = globset::Glob::new(&pat) {
+                    exc_builder.add(glob);
+                    has_exc = true;
+                }
+            }
+        }
+    }
+    let excludes = if has_exc { exc_builder.build().ok() } else { None };
+    SpecHostFilter { globs, excludes }
+}
+
 fn infer_call_workspace(
     tool: &str,
     args: &Value,
     session_cwd: Option<&str>,
     registered_specs: &[crate::catalog::Spec],
     git_root_cache: &mut std::collections::BTreeMap<String, Option<String>>,
+    spec_filter_cache: &mut std::collections::BTreeMap<PathBuf, SpecHostFilter>,
 ) -> (Option<String>, Option<String>, bool) {
     let explicit_root = args.get("root").and_then(Value::as_str);
     let raw_target = first_target_path_str(args);
@@ -788,7 +868,7 @@ fn infer_call_workspace(
         .filter(|s| probe.starts_with(&s.root))
         .max_by_key(|s| s.root.components().count())
     {
-        let mut oversized = false;
+        let mut host_only = false;
         if classify_tool_group(tool) == "builtin_search_read"
             && let Some(t) = raw_target
         {
@@ -798,14 +878,28 @@ fn infer_call_workspace(
             } else {
                 spec.root.join(clean)
             };
-            if let Ok(meta) = std::fs::metadata(&candidate)
-                && meta.is_file()
-                && meta.len() > spec.policy.max_file_bytes as u64
+            let filter = spec_filter_cache
+                .entry(spec.root.clone())
+                .or_insert_with(|| build_spec_host_filter(spec));
+            if let Ok(rel) = candidate.strip_prefix(&spec.root)
+                && let Some(ref ex_set) = filter.excludes
+                && ex_set.is_match(rel)
             {
-                oversized = true;
+                host_only = true;
+            }
+            if !host_only && let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() && meta.len() > spec.policy.max_file_bytes as u64 {
+                    host_only = true;
+                } else if meta.is_file()
+                    && let Some(ref g_set) = filter.globs
+                    && let Some(fname) = candidate.file_name()
+                    && !g_set.is_match(fname)
+                {
+                    host_only = true;
+                }
             }
         }
-        return (Some(spec.root.to_string_lossy().into_owned()), None, oversized);
+        return (Some(spec.root.to_string_lossy().into_owned()), None, host_only);
     }
     if registered_specs.is_empty() {
         return (session_cwd.map(str::to_owned), None, false);
@@ -934,6 +1028,8 @@ fn usage_from_home(
     let mut session_cwds: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut active_sessions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut git_root_cache: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut spec_filter_cache: std::collections::BTreeMap<PathBuf, SpecHostFilter> =
         std::collections::BTreeMap::new();
     let mut seq_counter: usize = 0;
 
@@ -1064,6 +1160,9 @@ fn usage_from_home(
                     .get("path")
                     .or_else(|| args.get("paths"))
                     .or_else(|| args.get("filePath"))
+                    .or_else(|| args.get("file_path"))
+                    .or_else(|| args.get("input"))
+                    .or_else(|| args.get("patch"))
                     .map(Value::to_string)
                     .unwrap_or_default();
                 let (effective_cwd, unregistered_root, oversized_host_only) = infer_call_workspace(
@@ -1072,17 +1171,24 @@ fn usage_from_home(
                     cwd.as_deref(),
                     registered_specs,
                     &mut git_root_cache,
+                    &mut spec_filter_cache,
                 );
                 let non_source_host_only = oversized_host_only
                     || (classify_tool_group(&tool) == "builtin_search_read"
                         && [
                             "/tmp/",
+                            "/dev/shm/",
+                            "/var/tmp/",
                             "copilot-tool-output",
                             "/.copilot",
+                            "/.claude",
                             "/.github",
                             "/.vscode",
                             ".png",
                             ".jpg",
+                            ".jpeg",
+                            ".webp",
+                            ".gif",
                             ".pdf",
                             ".vsix",
                         ]
@@ -1151,6 +1257,254 @@ fn usage_from_home(
                     entry.error_detail = outcome::detail(Some(&err_str));
                     entry.cache_miss = err_str.contains("CACHE_MISS root=");
                     entry.cache_load_failed = err_str.contains("CACHE_LOAD_FAILED root=");
+                }
+            }
+        }
+    }
+
+    // Also ingest Claude Code / Claude Agent Host (`~/.claude/projects/**/*.jsonl`) sessions when present.
+    let claude_projects_dir = state_home.join(".claude").join("projects");
+    if let Ok(proj_entries) = std::fs::read_dir(&claude_projects_dir) {
+        let mut claude_files: Vec<PathBuf> = Vec::new();
+        for p_entry in proj_entries.flatten() {
+            let p_path = p_entry.path();
+            if !p_path.is_dir() {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&p_path) {
+                for f_entry in files.flatten() {
+                    let f_path = f_entry.path();
+                    if f_path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                        && let Ok(meta) = f_path.metadata()
+                    {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0.0, |d| d.as_secs_f64());
+                        if mtime >= cutoff {
+                            claude_files.push(f_path);
+                        }
+                    }
+                }
+            }
+        }
+        claude_files.sort();
+        for c_path in &claude_files {
+            let fallback_sid = c_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "claude".into());
+            let Ok(file) = std::fs::File::open(c_path) else {
+                continue;
+            };
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            let mut cwd: Option<String> = None;
+            let mut last_model: Option<String> = None;
+            let mut line = String::with_capacity(4096);
+            while {
+                line.clear();
+                reader.read_line(&mut line).unwrap_or(0) > 0
+            } {
+                let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some(c) = event.get("cwd").and_then(Value::as_str) {
+                    cwd = Some(c.to_owned());
+                }
+                let sid = event
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback_sid)
+                    .to_owned();
+                if let Some(ref c) = cwd {
+                    session_cwds.entry(sid.clone()).or_insert_with(|| c.clone());
+                }
+                let agent_id = event
+                    .get("agentId")
+                    .or_else(|| event.get("parentUuid").filter(|_| event.get("isSidechain") == Some(&Value::Bool(true))))
+                    .and_then(Value::as_str)
+                    .unwrap_or("main")
+                    .to_owned();
+                if let Some(m) = event
+                    .get("message")
+                    .and_then(|msg| msg.get("model"))
+                    .and_then(Value::as_str)
+                {
+                    last_model = Some(m.to_owned());
+                }
+                let Some(ts) = event_unix_ts(&event) else {
+                    continue;
+                };
+                if ts < cutoff || ts > now {
+                    continue;
+                }
+                let ev_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+                if ev_type == "assistant"
+                    && let Some(msg) = event.get("message")
+                {
+                    if let Some(u) = msg.get("usage") {
+                        let model = msg
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .or(last_model.as_deref())
+                            .unwrap_or("claude-opus")
+                            .to_owned();
+                        let uncached_in = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let cw_in = u
+                            .get("cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cr_in = u
+                            .get("cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let total_in_turn = uncached_in + cw_in + cr_in;
+                        let out_turn = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let rates = if model.contains("opus") {
+                            TokenRates {
+                                input: 500.0e-6,
+                                cache_read: 50.0e-6,
+                                cache_write: 625.0e-6,
+                                output: 2500.0e-6,
+                            }
+                        } else if model.contains("haiku") {
+                            TokenRates {
+                                input: 100.0e-6,
+                                cache_read: 10.0e-6,
+                                cache_write: 125.0e-6,
+                                output: 500.0e-6,
+                            }
+                        } else {
+                            TokenRates {
+                                input: 300.0e-6,
+                                cache_read: 30.0e-6,
+                                cache_write: 375.0e-6,
+                                output: 1500.0e-6,
+                            }
+                        };
+                        let est_aic = (uncached_in as f64) * rates.input
+                            + (cw_in as f64) * rates.cache_write
+                            + (cr_in as f64) * rates.cache_read
+                            + (out_turn as f64) * rates.output;
+                        active_sessions.insert(sid.clone());
+                        turns.push(TurnRec {
+                            ts,
+                            session: sid.clone(),
+                            agent_id: agent_id.clone(),
+                            display_name: model.clone(),
+                            model,
+                            effort: "claude-agent".into(),
+                            input_tokens: total_in_turn,
+                            cache_read_tokens: cr_in,
+                            cache_write_tokens: cw_in,
+                            output_tokens: out_turn,
+                            reasoning_tokens: 0,
+                            duration_ms: 0.0,
+                            nano_aiu: (est_aic * 1_000_000_000.0).round() as u64,
+                            rates,
+                            bpe_saved_aic: 0.0,
+                        });
+                    }
+                    if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                                continue;
+                            }
+                            let Some(call_id) = block.get("id").and_then(Value::as_str) else {
+                                continue;
+                            };
+                            let tool = block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_owned();
+                            let args = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                            let target = args
+                                .get("path")
+                                .or_else(|| args.get("paths"))
+                                .or_else(|| args.get("filePath"))
+                                .or_else(|| args.get("file_path"))
+                                .map(Value::to_string)
+                                .unwrap_or_default();
+                            let (effective_cwd, unregistered_root, host_only) = infer_call_workspace(
+                                &tool,
+                                &args,
+                                cwd.as_deref(),
+                                registered_specs,
+                                &mut git_root_cache,
+                                &mut spec_filter_cache,
+                            );
+                            let non_source_host_only = host_only
+                                || (classify_tool_group(&tool) == "builtin_search_read"
+                                    && [
+                                        "/tmp/",
+                                        "/dev/shm/",
+                                        "/var/tmp/",
+                                        "/.copilot",
+                                        "/.claude",
+                                        "/.github",
+                                        "/.vscode",
+                                        ".png",
+                                        ".jpg",
+                                        ".pdf",
+                                        ".vsix",
+                                    ]
+                                    .iter()
+                                    .any(|p| target.contains(p)));
+                            let (batch_ranges, has_anchor, around_line) = read_call_shape(&args);
+                            seq_counter += 1;
+                            active_sessions.insert(sid.clone());
+                            let entry = calls.entry((sid.clone(), call_id.to_owned())).or_default();
+                            entry.session = sid.clone();
+                            entry.agent_id = agent_id.clone();
+                            entry.seq = seq_counter;
+                            entry.cwd = effective_cwd;
+                            entry.unregistered_root = unregistered_root;
+                            entry.tool = tool.clone();
+                            entry.target = target;
+                            entry.model = last_model.clone();
+                            entry.started_at = Some(ts);
+                            entry.completed_at = Some(ts);
+                            entry.success = Some(true);
+                            entry.batch_ranges = batch_ranges;
+                            entry.has_anchor = has_anchor;
+                            entry.around_line = around_line;
+                            entry.turn_compressed = is_turn_compressed(&tool, &args);
+                            entry.non_source_host_only = non_source_host_only;
+                        }
+                    }
+                } else if ev_type == "user"
+                    && let Some(blocks) = event
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(Value::as_array)
+                {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                            continue;
+                        }
+                        let Some(call_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if let Some(entry) = calls.get_mut(&(sid.clone(), call_id.to_owned())) {
+                            entry.completed_at = Some(ts);
+                            let is_err = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                            entry.success = Some(!is_err);
+                            if let Some(content) = block.get("content") {
+                                let (chars, offloaded, seq_slice) = extract_result_chars(content, 0);
+                                entry.payload_tokens = chars.div_ceil(4) as u64;
+                                entry.offloaded = offloaded;
+                                entry.sequential_slice = seq_slice;
+                                if is_err {
+                                    let err_str = content.to_string();
+                                    entry.error_detail = outcome::detail(Some(&err_str));
+                                    entry.cache_miss = err_str.contains("CACHE_MISS root=");
+                                    entry.cache_load_failed = err_str.contains("CACHE_LOAD_FAILED root=");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1239,14 +1593,40 @@ fn usage_from_home(
         .collect();
     valid_calls.sort_by(|a, b| a.session.cmp(&b.session).then_with(|| a.seq.cmp(&b.seq)));
     for i in 0..valid_calls.len() {
-        if valid_calls[i].tool == "view" && !valid_calls[i].non_source_host_only {
+        if matches!(valid_calls[i].tool.as_str(), "view" | "Read") && !valid_calls[i].non_source_host_only {
             let sess = &valid_calls[i].session;
-            let followed_by_edit = valid_calls
+            let raw_view_path = valid_calls[i]
+                .target
+                .trim_matches('"')
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let view_basename = Path::new(&raw_view_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| n.len() >= 5 && n.contains('.'))
+                .unwrap_or("");
+            let immediate_edit = valid_calls
                 .iter()
                 .skip(i + 1)
                 .take(4)
-                .any(|next| &next.session == sess && next.tool == "edit");
-            valid_calls[i].pre_edit_view = followed_by_edit;
+                .any(|next| {
+                    &next.session == sess
+                        && matches!(next.tool.as_str(), "edit" | "Edit" | "MultiEdit" | "apply_patch")
+                });
+            let same_file_batched_edit = !raw_view_path.is_empty()
+                && valid_calls
+                    .iter()
+                    .skip(i + 1)
+                    .take(28)
+                    .take_while(|next| &next.session == sess)
+                    .any(|next| {
+                        matches!(next.tool.as_str(), "edit" | "Edit" | "MultiEdit" | "apply_patch")
+                            && (next.target.contains(&raw_view_path)
+                                || (!view_basename.is_empty() && next.target.contains(view_basename)))
+                    });
+            valid_calls[i].pre_edit_view = immediate_edit || same_file_batched_edit;
         }
     }
     for c in &mut valid_calls {
@@ -1405,6 +1785,21 @@ fn usage_from_home(
         let mut durs: Vec<f64> = m_turns.iter().map(|t| t.duration_ms).filter(|d| *d > 0.0).collect();
         durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med_turn = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
+        let mut m_cold_turns = 0usize;
+        let mut m_cold_excess_aic = 0.0_f64;
+        for t in &m_turns {
+            if t.input_tokens >= 100_000
+                && (t.cache_read_tokens as f64) < (t.input_tokens as f64) * 0.50
+                && t.rates.input > t.rates.cache_read
+            {
+                m_cold_turns += 1;
+                let warm_est = (t.input_tokens as f64)
+                    * (0.95 * t.rates.cache_read
+                        + 0.05 * cold_prefix_rate(t.cache_write_tokens, t.rates))
+                    + (t.output_tokens as f64) * t.rates.output;
+                m_cold_excess_aic += (t.effective_turn_aic() - warm_est).max(0.0);
+            }
+        }
         model_entries.push(json!({
             "model": m_id,
             "display_name": display,
@@ -1419,6 +1814,8 @@ fn usage_from_home(
             "used_aic": m_used_aic,
             "used_usd_0001": m_used_aic * 0.001,
             "used_usd_api_001": m_used_aic * 0.01,
+            "cold_cache_turns": m_cold_turns,
+            "cold_cache_excess_aic": m_cold_excess_aic,
             "cctx_calls": m_cctx.len(),
             "lookup_calls": m_lookup.len(),
             "cctx_cache_hit_percent": m_warm_pct,
@@ -1492,6 +1889,8 @@ fn usage_from_home(
             cctx_calls: m["cctx_calls"].as_u64().unwrap_or(0) as usize,
             used_aic: m["used_aic"].as_f64().unwrap_or(0.0),
             saved_aic: m["saved_aic"].as_f64().unwrap_or(0.0),
+            cold_turns: m["cold_cache_turns"].as_u64().unwrap_or(0) as usize,
+            cold_excess_aic: m["cold_cache_excess_aic"].as_f64().unwrap_or(0.0),
             output_tokens: m["output_tokens"].as_u64().unwrap_or(0),
             reasoning_tokens: m["reasoning_tokens"].as_u64().unwrap_or(0),
         })
@@ -2089,5 +2488,122 @@ mod trace_timing_tests {
             .find(|m| m["model"] == "gpt-6.1-sol")
             .unwrap();
         assert!(sub_entry["saved_aic"].as_f64().unwrap() < 1.0);
+    }
+
+    #[test]
+    fn cross_model_classifiers_exclude_tool_search_batch_pre_edit_and_track_claude_opus() {
+        assert_eq!(super::classify_tool_group("tool_search_tool"), "other");
+        assert_eq!(super::classify_tool_group("web_search"), "other");
+        assert_eq!(super::classify_tool_group("github-mcp-server-search_code"), "other");
+        assert_eq!(super::classify_tool_group("mcp__code-context__code_context"), "mcp");
+        assert_eq!(super::classify_tool_group("mcp__code-context__code_grep"), "mcp");
+        assert_eq!(super::classify_tool_group("Read"), "builtin_search_read");
+        assert_eq!(super::classify_tool_group("Glob"), "builtin_search_read");
+        assert!(super::is_lookup_tool_name("mcp__code-context__code_context"));
+        assert!(!super::is_lookup_tool_name("tool_search_tool"));
+
+        let home = tempfile::tempdir().unwrap();
+        let sess_dir = home.path().join(".copilot/session-state/s-carbon");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let rates = json!([
+            {"tokenType": "input", "tokenCount": 400_000, "batchSize": 1_000_000, "costPerBatch": 200_000_000_000_u64},
+            {"tokenType": "cache_read", "tokenCount": 0, "batchSize": 1_000_000, "costPerBatch": 10_000_000_000_u64},
+            {"tokenType": "output", "tokenCount": 1_000, "batchSize": 1_000_000, "costPerBatch": 1_000_000_000_000_u64}
+        ]);
+        let mut events = vec![
+            json!({"type": "session.start", "timestamp": "2026-11-13T05:00:00Z", "data": {"context": {"cwd": "/repo"}}}),
+            // tool_search_tool + /dev/shm view + batched view (followed 6 calls later by same-file edit) must NOT penalize adoption.
+            json!({"type": "tool.execution_start", "timestamp": "2026-11-13T05:00:01Z", "data": {"toolName": "tool_search_tool", "toolCallId": "ts1", "model": "gemini-4-carbon", "arguments": {"query": "cctxNativeContext"}}}),
+            json!({"type": "tool.execution_complete", "timestamp": "2026-11-13T05:00:01Z", "data": {"toolCallId": "ts1", "model": "gemini-4-carbon", "success": true, "result": {"content": "[\"cctxNativeContext\"]"}}}),
+            json!({"type": "tool.execution_start", "timestamp": "2026-11-13T05:00:02Z", "data": {"toolName": "view", "toolCallId": "v_shm", "model": "gemini-4-carbon", "arguments": {"path": "/dev/shm/probe.txt"}}}),
+            json!({"type": "tool.execution_complete", "timestamp": "2026-11-13T05:00:02Z", "data": {"toolCallId": "v_shm", "model": "gemini-4-carbon", "success": true, "result": {"content": "scratch"}}}),
+            json!({"type": "tool.execution_start", "timestamp": "2026-11-13T05:00:03Z", "data": {"toolName": "view", "toolCallId": "v_pre", "model": "gemini-4-carbon", "arguments": {"path": "/repo/src/gate_kernels.rs", "view_range": [10, 40]}}}),
+            json!({"type": "tool.execution_complete", "timestamp": "2026-11-13T05:00:03Z", "data": {"toolCallId": "v_pre", "model": "gemini-4-carbon", "success": true, "result": {"content": "fn a() {}"}}}),
+        ];
+        for k in 0..6 {
+            let cid = format!("cctx_{k}");
+            events.push(json!({"type": "tool.execution_start", "timestamp": "2026-11-13T05:00:04Z", "data": {"toolName": "cctxNativeContext", "toolCallId": cid, "model": "gemini-4-carbon", "arguments": {"pattern": "gate"}}}));
+            events.push(json!({"type": "tool.execution_complete", "timestamp": "2026-11-13T05:00:04Z", "data": {"toolCallId": cid, "model": "gemini-4-carbon", "success": true, "result": {"content": "matches=1"}}}));
+        }
+        events.push(json!({"type": "tool.execution_start", "timestamp": "2026-11-13T05:00:05Z", "data": {"toolName": "edit", "toolCallId": "ed1", "model": "gemini-4-carbon", "arguments": {"path": "/repo/src/gate_kernels.rs"}}}));
+        events.push(json!({"type": "tool.execution_complete", "timestamp": "2026-11-13T05:00:05Z", "data": {"toolCallId": "ed1", "model": "gemini-4-carbon", "success": true, "result": {"content": "updated"}}}));
+        for k in 0..3 {
+            events.push(json!({
+                "type": "session.usage_record",
+                "timestamp": format!("2026-11-13T05:01:0{k}Z"),
+                "data": {"usage": {
+                    "model": "gemini-4-carbon",
+                    "modelDisplayName": "Gemini 4 Carbon",
+                    "reasoningEffort": "high",
+                    "inputTokens": 400_000,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "outputTokens": 1_000,
+                    "copilotUsage": {"totalNanoAiu": 81_000_000_000_u64, "tokenDetails": rates}
+                }}
+            }));
+        }
+        std::fs::write(
+            sess_dir.join("events.jsonl"),
+            events
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        // Claude Agent Host Opus JSONL session
+        let claude_dir = home.path().join(".claude/projects/repo");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_events = [
+            json!({
+                "type": "assistant",
+                "sessionId": "opus-sess-1",
+                "cwd": "/repo",
+                "timestamp": "2026-11-13T05:02:00Z",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "usage": {"input_tokens": 1_000, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 97_000, "output_tokens": 500},
+                    "content": [{"type": "tool_use", "id": "tu_1", "name": "mcp__code-context__code_context", "input": {"root": "/repo", "pattern": "Planner"}}]
+                }
+            }),
+            json!({
+                "type": "user",
+                "sessionId": "opus-sess-1",
+                "cwd": "/repo",
+                "timestamp": "2026-11-13T05:02:01Z",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": "tu_1", "is_error": false, "content": "matches=1\n1: struct Planner;"}]
+                }
+            }),
+        ];
+        std::fs::write(
+            claude_dir.join("opus-sess-1.jsonl"),
+            claude_events
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let now = super::event_unix_ts(&json!({"timestamp": "2026-11-13T05:10:00Z"})).unwrap();
+        let raw = super::usage_from_home(home.path(), 1.0, now, None, &[], true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let models = parsed["model_usage"].as_array().unwrap();
+        let carbon = models.iter().find(|m| m["model"] == "gemini-4-carbon").unwrap();
+        assert_eq!(carbon["cctx_adoption_percent"].as_f64(), Some(100.0));
+        assert_eq!(carbon["cold_cache_turns"].as_u64(), Some(3));
+        assert!(carbon["cold_cache_excess_aic"].as_f64().unwrap() > 150.0);
+        let opus = models.iter().find(|m| m["model"] == "claude-opus-4-7").unwrap();
+        assert_eq!(opus["cctx_adoption_percent"].as_f64(), Some(100.0));
+        let adv_codes: Vec<&str> = parsed["insights"]["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["code"].as_str())
+            .collect();
+        assert!(adv_codes.contains(&"cold_cache_spike"), "{adv_codes:?}");
     }
 }

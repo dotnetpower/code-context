@@ -11,6 +11,7 @@ from pathlib import Path
 MARKER = "# [cctx-subagent-instructions]"
 
 EXPLORE_EXTRA_TOOLS = (
+    "tool_search_tool",
     "cctxNativeFiles",
     "cctxNativeGrep",
     "cctxNativeContext",
@@ -55,6 +56,8 @@ EXPLORE_EXTRA_TOOLS = (
     "test-context-test_sync",
     "test-context-test_invalidate",
     "test-context-test_workspaces",
+    "mcp__code-context__*",
+    "mcp__test-context__*",
 )
 
 YAML_PROMPT_BLOCK = """\
@@ -84,21 +87,21 @@ MD_PROMPT_BLOCK = """
 YAML_FORMULA_PROMPT_BLOCK = """\
   # [cctx-subagent-instructions]
   **CCTX & TCTX Formula Rules (Mandatory First Path):**
-  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files) > CLI (cctx --backend shared --root <root>) > Host (view, grep, rg, glob, bash)`
-  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status) > CLI (tctx --root <root> run) > bash`
-  - `Guards`: always pass explicit absolute `root`; `cctxNativeContext(limit <= 64, radius: 0..100)`; `cctxNativeRead(lines <= 120, < 8KiB)`; `target in {.github/*, .vscode/*, .gitignore, /tmp/*} => view directly (!CCTX)`.
-  - `Deferred`: if tools are not visible, call `tool_search` first with `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status"`.
-  - `Transitions`: `Error("No matching client connected" | "skipped from another client") => switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
+  - `Source_Priority`: `cctxNativeContext / cctxNativeRead / cctxNativeGrep / cctxNativeFiles > MCP (code-context-code_context / code-context-code_read / code-context-code_grep / code-context-code_files / mcp__code-context__code_*) > CLI (cctx --backend shared --root <root>) > Host (view, grep, rg, glob, bash)`
+  - `Test_Priority`: `tctxNativeRun / tctxNativeAffected / tctxNativeGraph / tctxNativeStatus > MCP (test-context-test_run / test-context-test_affected / test-context-test_graph / test-context-test_status / mcp__test-context__test_*) > CLI (tctx --root <root> run) > bash`
+  - `Guards`: always pass explicit absolute `root`; unknown line => `cctxNativeContext(paths=[file], pattern, radius: 25..50)` (!1..150 slicing); multi-range => 1 `cctxNativeRead(ranges=[...], lines <= 120, < 8KiB)` (!parallel view); `target in {.github/*, .vscode/*, .gitignore, /tmp/*, /dev/shm/*} => view directly (!CCTX)`.
+  - `Deferred`: EVEN IF `grep`/`view`/`glob` are already visible on turn 0, if `cctx*`/`tctx*` are hidden, call `tool_search_tool` (`tool_search`) FIRST: foreground `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"` ; headless/MCP `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` ; tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"` (regex: `"cctxNative|code-context|tctxNative|test-context"`).
+  - `Transitions`: `Error("No matching client connected" | "skipped from another client") => load & switch to code-context-code_* / test-context-test_* MCP or CLI` ; `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
 """
 
 MD_FORMULA_PROMPT_BLOCK = """
 <!-- [cctx-subagent-instructions] -->
 ## CCTX & TCTX Formula Rules (Mandatory First Path)
 
-- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_*) > Host (rg, view, glob)`
-- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_*) > bash`
-- `Guards`: pass explicit `root`; `limit <= 64`; `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/* => Host view only`.
-- `Deferred`: `tool_search("cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles code-context-code_context code-context-code_read code-context-code_grep code-context-code_files tctxNativeRun tctxNativeAffected tctxNativeGraph tctxNativeStatus test-context-test_run test-context-test_affected test-context-test_graph test-context-test_status")`
+- `Source`: `#cctxNativeContext / #cctxNativeRead / #cctxNativeGrep / #cctxNativeFiles > MCP (code-context-code_* / mcp__code-context__code_*) > Host (rg, view, glob)`
+- `Tests`: `#tctxNativeRun / #tctxNativeAffected / #tctxNativeGraph / #tctxNativeStatus > MCP (test-context-test_* / mcp__test-context__test_*) > bash`
+- `Guards`: pass explicit `root`; `limit <= 64`; batch multi-range `Read(lines <= 120, < 8KiB)`; `.github/*, .vscode/*, /tmp/*, /dev/shm/* => Host view only`.
+- `Deferred` (even if `grep`/`view` visible on turn 0): call `tool_search_tool` (`tool_search`) FIRST — foreground `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"`, MCP `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"`, tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"` (regex `"cctxNative|code-context|tctxNative|test-context"`).
 - `CACHE_MISS => Host read/search (1 turn only) -> resume CCTX next turn`.
 """
 
@@ -239,6 +242,18 @@ def discover_definition_dirs(home: Path) -> list[Path]:
             if candidate.is_dir() and candidate not in seen:
                 seen.add(candidate)
                 found.append(candidate)
+    if str(home).startswith("/home/") and Path("/mnt/c/Users").is_dir():
+        win_patterns = (
+            "*/AppData/Local/Programs/Microsoft VS Code/*/resources/app/extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+            "*/AppData/Local/Programs/Microsoft VS Code/resources/app/extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+            "*/AppData/Local/Programs/Microsoft VS Code/*/resources/app/node_modules.asar.unpacked/@github/copilot-sdk-*/definitions",
+            "*/AppData/Local/Programs/Microsoft VS Code/resources/app/node_modules.asar.unpacked/@github/copilot-sdk-*/definitions",
+        )
+        for pattern in win_patterns:
+            for candidate in sorted(Path("/mnt/c/Users").glob(pattern)):
+                if candidate.is_dir() and candidate not in seen:
+                    seen.add(candidate)
+                    found.append(candidate)
     return found
 
 

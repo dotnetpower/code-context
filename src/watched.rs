@@ -486,13 +486,20 @@ mod io_tests {
         )
         .unwrap();
         watched.call("code_sync", json!({})).unwrap();
-        let _slice1 = watched
+        let slice1 = watched
             .call_with_mode(
                 "code_read",
                 json!({"ranges":[{"path":"sliced.rs","start":1,"end":60}]}),
                 true,
             )
             .unwrap();
+        let notice1 = slice1[0]["notice"].as_str().unwrap();
+        assert!(notice1.contains("PARTIAL_READ (1..60 of "), "{notice1}");
+        assert!(
+            notice1.contains("L140:pub fn unread_target_fn"),
+            "{notice1}"
+        );
+        assert!(!notice1.contains("SEQUENTIAL_SLICE"), "{notice1}");
         let slice2 = watched
             .call_with_mode(
                 "code_read",
@@ -3167,6 +3174,20 @@ impl Watched {
                 if !outline.is_empty() {
                     notes.push(format!(
                         "SEQUENTIAL_SLICE #{streak} ({start}..{end} of {total_lines}): unread_outline=[{}] — use code_context(paths=[\"{path}\"], pattern=\"...\") or jump to line",
+                        outline.join(", ")
+                    ));
+                }
+            } else if streak == 1
+                && !is_batch_call
+                && start <= 5
+                && end < total_lines
+                && total_lines > 120
+                && let Some(doc) = doc
+            {
+                let outline = extract_unread_outline(doc, end, 8);
+                if !outline.is_empty() {
+                    notes.push(format!(
+                        "PARTIAL_READ ({start}..{end} of {total_lines}): unread_outline=[{}] — jump via around_line/ranges or code_context(paths=[\"{path}\"], pattern=\"...\") instead of sequential slicing",
                         outline.join(", ")
                     ));
                 }

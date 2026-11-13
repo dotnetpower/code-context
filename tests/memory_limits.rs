@@ -172,7 +172,7 @@ fn scopes_are_canonicalized_and_excludes_remove_generated_trees() {
 #[test]
 fn workspace_configuration_has_count_and_byte_caps() {
     let root = tempfile::tempdir().unwrap();
-    let too_many = (0..129).map(|i| format!("*.{i}")).collect();
+    let too_many = (0..161).map(|i| format!("*.{i}")).collect();
     assert!(Workspace::new(root.path(), vec![".".into()], too_many).is_err());
     assert!(
         Workspace::new_with_excludes(

@@ -12,7 +12,7 @@ pub const MAX_CAPTURE: usize = 8 * 1024 * 1024;
 pub const MAX_FILE: u64 = 2 * 1024 * 1024;
 pub const MAX_RESPONSE: usize = 256 * 1024;
 const MAX_SCOPES: usize = 32;
-const MAX_GLOBS: usize = 128;
+const MAX_GLOBS: usize = 160;
 const MAX_SCOPE_BYTES: usize = 4096;
 const MAX_GLOB_BYTES: usize = 1024;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -228,7 +228,7 @@ impl Workspace {
         }
         if scopes.len() > MAX_SCOPES || globs.len() > MAX_GLOBS || excludes.len() > MAX_GLOBS {
             return Err(
-                invalid("at most 32 scopes and 128 include/exclude globs are allowed").into(),
+                invalid("at most 32 scopes and 160 include/exclude globs are allowed").into(),
             );
         }
         if scopes.iter().any(|scope| scope.len() > MAX_SCOPE_BYTES)

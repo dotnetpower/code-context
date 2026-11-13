@@ -36,6 +36,7 @@ const SOURCE_EXTENSION_LIST = [
   'cts',
   'cxx',
   'dart',
+  'dog',
   'ejs',
   'erl',
   'ex',
