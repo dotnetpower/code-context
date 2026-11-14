@@ -119,8 +119,9 @@ def update_extensions_manifest(manifest_path: Path, win_ext_dir: Path, version: 
     if win_abs.startswith("/mnt/") and len(win_abs) > 6 and win_abs[6] == "/":
         drive = win_abs[5]
         rest = win_abs[6:]
+        rest_win = rest.lstrip("/").replace("/", "\\")
         uri_path = f"/{drive}:{rest}/{target_rel}"
-        fs_path = f"{drive}:\\{rest.lstrip('/').replace('/', '\\')}\\{target_rel}"
+        fs_path = f"{drive}:\\{rest_win}\\{target_rel}"
         external = f"file:///{drive}%3A{rest}/{target_rel}"
     else:
         uri_path = f"{win_abs}/{target_rel}"
