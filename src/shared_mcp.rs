@@ -32,18 +32,18 @@ fn build_tools() -> Value {
         }
         let prefix = match tool["name"].as_str() {
             Some("code_files") => {
-                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): filename/path glob (!content)."
+                "MCP fallback for sessions where the matching Native tool (cctxNativeFiles) is unavailable: filename/path glob (!content)."
             }
             Some("code_grep") => {
-                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): saved-source search. Set regex=true for a|b."
+                "MCP fallback for sessions where the matching Native tool (cctxNativeGrep) is unavailable: saved-source search. Set regex=true for a|b."
             }
             Some("code_context") => {
-                "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
+                "MCP fallback for sessions where the matching Native tool (cctxNativeContext) is unavailable: symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
             }
-            _ => "Direct server-side tool (use FIRST in Agent Host/SDK/CLI/subagents): batched ranges (<=150L, <8KiB).",
+            _ => "MCP fallback for sessions where the matching Native tool (cctxNativeRead) is unavailable: batched ranges (<=150L, <8KiB).",
         };
         tool["description"] = json!(format!(
-            "{prefix} CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch and UI client-relay disconnects. Do not duplicate a pending native call."
+            "{prefix} Do not choose MCP when cctxNative* is callable. CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch when no UI client is connected. Do not duplicate a pending native call."
         ));
     }
     for (name, description) in [

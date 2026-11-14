@@ -1179,57 +1179,28 @@ pub fn handle_hook_payload(explicit_root: &Path, agent: HookAgent, raw_stdin: &[
                         Ok(())
                     });
                 } else if ev.tool_is_error && !ev.tool_result_text.trim().is_empty() {
-                    let is_client_disconnect =
-                        crate::outcome::detail(Some(&ev.tool_result_text)) == "client_disconnected";
                     let first_err_line = ev
                         .tool_result_text
                         .lines()
                         .find(|l| !l.trim().is_empty())
                         .unwrap_or("tool error");
-                    let summary = if is_client_disconnect {
-                        format!(
-                            "UI client relay disconnected on {tool_name}: stay on code-context-code_* / test-context-test_* MCP for this session (do not retry cctxNative*/tctxNative* after compaction)"
-                        )
-                    } else {
-                        format!(
-                            "{tool_name} failed: {}",
-                            truncate_utf8_chars(first_err_line.trim(), 120)
-                        )
-                    };
+                    let summary = format!(
+                        "{tool_name} failed: {}",
+                        truncate_utf8_chars(first_err_line.trim(), 120)
+                    );
                     let detail_snip = truncate_utf8_chars(&ev.tool_result_text, 600);
                     let clean_sess = clean_single_line(&ev.session_id, 64);
                     let _ = with_locked_store(&norm_root, true, |_, store, _| {
-                        if is_client_disconnect
-                            && store.entries.iter().any(|e| {
-                                e.pinned
-                                    && e.session_id == clean_sess
-                                    && e.summary.contains("UI client relay disconnected")
-                            })
-                        {
-                            return Ok(());
-                        }
-                        let disconnect_tags = [
-                            "transport".to_string(),
-                            "mcp-fallback".to_string(),
-                        ];
                         let _ = append_entry_to_store(
                             store,
                             EntryDraft {
-                                kind: if is_client_disconnect {
-                                    JournalKind::Decision
-                                } else {
-                                    JournalKind::Failure
-                                },
+                                kind: JournalKind::Failure,
                                 summary: &summary,
                                 detail: Some(&detail_snip),
                                 files: &[],
-                                tags: if is_client_disconnect {
-                                    &disconnect_tags
-                                } else {
-                                    &[]
-                                },
+                                tags: &[],
                                 session_id: &clean_sess,
-                                pinned: is_client_disconnect,
+                                pinned: false,
                             },
                         )?;
                         Ok(())

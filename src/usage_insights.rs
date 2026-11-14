@@ -76,7 +76,7 @@ impl Advisory {
             "native_stall" => (0, "Shared stall detected; check cctx doctor and machine load."),
             "client_disconnected" => (
                 1,
-                "Native client disconnected; prefer direct code-context-code_* MCP in Agent Host/SDK sessions.",
+                "Native client disconnected; sync Windows VS Code profiles and use MCP only for the disconnected turn.",
             ),
             "cold_cache_spike" => (2, "Reduce cold-cache costs; compact long sessions and avoid idle gaps."),
             "host_dispatch_delay" => (3, "Host dispatch is slow; check the extension host or use MCP."),
@@ -449,7 +449,7 @@ fn advisories(
         out.push(Advisory {
             code: "client_disconnected",
             message: format!(
-                "{disconnects} native calls failed on client disconnect or another-client dispatch stall: switch to code-context-code_* MCP tools or `cctx --backend shared`."
+                "{disconnects} native calls failed on client disconnect or tool-definition mismatch: keep Windows profiles synced (`install-vscode-extension.sh`), use MCP only for that disconnected turn, and resume #cctxNative* on the next foreground turn."
             ),
         });
     }

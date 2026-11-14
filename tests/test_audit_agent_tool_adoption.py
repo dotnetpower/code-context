@@ -655,6 +655,85 @@ class AdoptionAuditTests(unittest.TestCase):
             self.assertEqual(ts["compounded_history_tokens_saved"], 1600)
             self.assertGreater(ts["saved_aic"], 30.0)
 
+    def test_configure_windows_profile_syncs_settings_and_profile_extensions(self):
+        import importlib.util
+        import sqlite3
+
+        script_path = Path(__file__).resolve().parents[1] / "scripts" / "configure_windows_profile.py"
+        spec = importlib.util.spec_from_file_location("configure_windows_profile", script_path)
+        win_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(win_mod)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_data = root / "AppData/Roaming/Code/User"
+            global_storage = user_data / "globalStorage"
+            prof_dir = user_data / "profiles/-77098b13"
+            win_ext = root / ".vscode/extensions"
+            wsl_src = root / "wsl_src/dotnetpower.code-context-native-0.25.9"
+            for d in (global_storage, prof_dir, win_ext, wsl_src / "out", wsl_src / "prompts"):
+                d.mkdir(parents=True, exist_ok=True)
+            (wsl_src / "package.json").write_text('{"version":"0.25.9"}\n', encoding="utf-8")
+
+            with sqlite3.connect(global_storage / "state.vscdb") as con:
+                con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+                con.execute(
+                    "INSERT INTO ItemTable VALUES ('associatedRemoteProfiles', ?)",
+                    (json.dumps({"wsl+Ubuntu-22.04": ["-77098b13"]}),),
+                )
+            (global_storage / "storage.json").write_text(
+                json.dumps(
+                    {
+                        "userDataProfiles": [
+                            {"location": "builtin/agents", "name": "Agents"},
+                            {"location": "-77098b13", "name": "CustomWSL"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (user_data / "settings.json").write_text(
+                json.dumps({"remote.extensionKind": {"moonchoi.code-context-native": ["ui"]}}),
+                encoding="utf-8",
+            )
+            (prof_dir / "settings.json").write_text("{}", encoding="utf-8")
+
+            stale_dir = win_ext / "dotnetpower.code-context-native-0.14.0"
+            stale_dir.mkdir(parents=True)
+            stale_entry = [
+                {
+                    "identifier": {"id": "dotnetpower.code-context-native"},
+                    "version": "0.14.0",
+                    "relativeLocation": "dotnetpower.code-context-native-0.14.0",
+                    "location": {"path": "/c:/Users/dev/.vscode/extensions/dotnetpower.code-context-native-0.14.0"},
+                }
+            ]
+            (win_ext / "extensions.json").write_text(json.dumps(stale_entry), encoding="utf-8")
+            (prof_dir / "extensions.json").write_text(json.dumps(stale_entry), encoding="utf-8")
+
+            ids, names = win_mod.discover_associated_profiles(user_data, "Ubuntu-22.04")
+            self.assertEqual(ids, ["-77098b13"])
+            self.assertEqual(names, ["CustomWSL"])
+
+            self.assertTrue(win_mod.configure_settings(user_data / "settings.json", "Ubuntu-22.04", "/bin/cctx"))
+            self.assertTrue(win_mod.configure_settings(prof_dir / "settings.json", "Ubuntu-22.04", "/bin/cctx"))
+            for sp in (user_data / "settings.json", prof_dir / "settings.json"):
+                parsed = json.loads(sp.read_text(encoding="utf-8"))
+                self.assertEqual(parsed["remote.extensionKind"]["dotnetpower.code-context-native"], ["ui"])
+                self.assertNotIn("moonchoi.code-context-native", parsed["remote.extensionKind"])
+                self.assertEqual(parsed["codeContextNative.wslDistribution"], "Ubuntu-22.04")
+                self.assertEqual(parsed["codeContextNative.wslExecutablePath"], "/bin/cctx")
+
+            stats = win_mod.sync_extension_directories(win_ext, user_data, wsl_src, "0.25.9")
+            self.assertEqual(stats["copied"], 1)
+            self.assertEqual(stats["removed_stale"], 1)
+            self.assertEqual(stats["manifests_updated"], 2)
+            self.assertFalse(stale_dir.exists())
+            self.assertTrue((win_ext / "dotnetpower.code-context-native-0.25.9").is_dir())
+            prof_entries = json.loads((prof_dir / "extensions.json").read_text(encoding="utf-8"))
+            self.assertEqual(prof_entries[0]["version"], "0.25.9")
+            self.assertEqual(prof_entries[0]["relativeLocation"], "dotnetpower.code-context-native-0.25.9")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.25.9
+
+- Restore Native-first priority (`#cctxNativeContext`, `#cctxNativeRead`,
+  `#cctxNativeGrep`, `#cctxNativeFiles` FIRST; never choose MCP when the
+  matching Native tool is callable) and fix the multi-profile Windows + WSL
+  extension mismatch that caused `"No client with the advertised tool
+  definition was connected to run cctxNative*"`: `install-vscode-extension.sh`
+  and `configure_windows_profile.py` now install the VSIX into both the base
+  Windows profile and WSL-associated custom profiles (`associatedRemoteProfiles`),
+  configure `"remote.extensionKind": { "dotnetpower.code-context-native": ["ui"] }`
+  plus `codeContextNative.wslDistribution` and `codeContextNative.wslExecutablePath`
+  across both profiles, and clean stale extension directories so all open
+  windows advertise identical tool definitions.
+- Prevent unsolicited post-compaction and `tool_search_tool` drift to MCP:
+  mark `cctx shared-mcp` tool descriptions explicitly as MCP fallbacks for
+  sessions where `cctxNative*` is unavailable, bound `tool_search_tool`
+  discovery queries within the 5-tool result cap, scope dispatch-error MCP
+  fallback to the current user turn (including unattended autopilot
+  continuations before the next user message), and restore Native-first on the
+  next foreground user turn without pinning MCP in `cctx journal` or mutating
+  MCP config files automatically.
+
 ## 0.25.8
 
 - Eliminate first-call UI client-relay failures (`"No client with the advertised
