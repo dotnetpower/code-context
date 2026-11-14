@@ -1,0 +1,36 @@
+---
+import Default from "@astrojs/starlight/components/MarkdownContent.astro";
+const { entry, id } = Astro.locals.starlightRoute;
+const questions: Record<string, string> = {
+  installation: "How do I install Code Context on my platform?",
+  quickstart: "How do I run my first Code Context lookup?",
+  tools: "Which native VS Code and MCP tools are available?",
+  "probes-and-journal": "When should I use pctx probes and the continuity journal?",
+  benchmarks: "How were Code Context performance results measured?",
+  architecture: "How does Code Context index source code locally?",
+  faq: "What should I know before using Code Context?",
+};
+const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
+---
+<Default>
+  {questions[id] && (
+    <section class="answer-capsule" aria-label="Page answer summary">
+      <dl>
+        <dt>{questions[id]}</dt>
+        <dd>{entry.data.description}</dd>
+        <dt>Scope and evidence</dt>
+        <dd>Local developer tooling, not a hosted source-search service. Benchmark results are workload-specific, not guarantees.</dd>
+      </dl>
+      <details>
+        <summary>Where can I verify the results and limitations?</summary>
+        <p>Read the <a href={`${base}benchmarks/`}>benchmark methodology</a>, <a href={`${base}architecture/`}>architecture and privacy boundaries</a>, and <a href={`${base}faq/`}>technical FAQ</a>.</p>
+      </details>
+    </section>
+  )}
+  <slot />
+</Default>
+<style>
+  .answer-capsule { min-height: 12rem; contain: layout; padding: 1rem; border: 1px solid var(--sl-color-gray-5); border-radius: .5rem; }
+  dt { font-weight: 600; }
+  dd { margin: .25rem 0 1rem; }
+</style>

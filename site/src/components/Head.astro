@@ -9,7 +9,6 @@ const SITE_ROOT_URL = `${SITE_ORIGIN}${BASE_URL}`;
 
 const is404 = id === "404" || Astro.url.pathname.endsWith("/404") || Astro.url.pathname.endsWith("/404/");
 const isHome = id === "" || id === "index";
-const isFaq = id === "faq";
 
 const canonicalEntry = head.find((item) => item.tag === "link" && item.attrs?.rel === "canonical");
 const rawCanonical = typeof canonicalEntry?.attrs?.href === "string"
@@ -25,7 +24,7 @@ const markdownMirrorHref = isHome
   : `${SITE_ROOT_URL}${cleanSlug}.md`;
 
 const defaultDescription =
-  "Cut coding agent lookup tokens by 73–91% and accelerate code retrieval 17.22× with Code Context (cctx): Native VS Code Language Model Tools and MCP server powered by a shared Rust trigram index.";
+  "Code Context (cctx): local Rust source indexing and block-clamped context for AI coding agents, with native VS Code tools and MCP.";
 
 const finalDescription = String(data.description || defaultDescription).replace(/\s+/g, " ").trim();
 
@@ -34,7 +33,7 @@ const seoKeywords =
 
 let finalTitle: string;
 if (isHome) {
-  finalTitle = "Code Context (cctx) — Fast Local Context Cache for AI Coding Agents";
+  finalTitle = String(data.title || siteTitle);
 } else if (is404) {
   finalTitle = `404 — Page Not Found | ${siteTitle}`;
 } else {
@@ -50,6 +49,7 @@ const ogImageAlt =
 
 const googleSiteVerification =
   import.meta.env.PUBLIC_GOOGLE_SITE_VERIFICATION || "jHE9O63_qT7gVGACSA-OA_2d1wzkue6urJ99MGSCzY8";
+const naverSiteVerification = import.meta.env.PUBLIC_NAVER_SITE_VERIFICATION;
 
 // Remove duplicate tags emitted by Starlight before inserting normalized SEO/GEO/AEO tags.
 const filteredHead = head.filter((item) => {
@@ -65,6 +65,7 @@ const filteredHead = head.filter((item) => {
         "keywords",
         "robots",
         "google-site-verification",
+        ...(naverSiteVerification ? ["naver-site-verification"] : []),
         "og:title",
         "og:description",
         "og:url",
@@ -96,41 +97,6 @@ const verifiedDateStr = data.verified instanceof Date && !Number.isNaN(data.veri
 const publishedIso = `${verifiedDateStr}T00:00:00Z`;
 const modifiedIso = "2026-11-14T03:00:00Z";
 
-const faqEntities = [
-  {
-    "@type": "Question",
-    name: "How is Code Context (cctx) different from ripgrep or vector embeddings?",
-    acceptedAnswer: {
-      "@type": "Answer",
-      text: "ripgrep spawns a fresh file scan per call and returns unclamped lines, forcing coding agents into multi-turn rg + view loops. Vector RAG requires external or GPU embedding indexes that drift on edits and blur exact identifiers. Code Context (cctx) maintains a deterministic in-memory Rust trigram index with incremental file watchers and polyglot AST block clamping—cutting lookup payload tokens by 73.2–91.3% and accelerating warm retrieval 17.22× locally.",
-    },
-  },
-  {
-    "@type": "Question",
-    name: "Does Code Context (cctx) upload source code or require an API key?",
-    acceptedAnswer: {
-      "@type": "Answer",
-      text: "No. All indexing, trigram queries, rich document extraction, declarative probes (pctx), and compaction journals (cctx journal) run 100% locally over Unix domain sockets on Linux/WSL/SSH or authenticated loopback RPC on native Windows (cctx.exe), automatically enforcing .gitignore, .env, .github, and .vscode boundaries.",
-    },
-  },
-  {
-    "@type": "Question",
-    name: "Should I use the VS Code Native Extension or the MCP server?",
-    acceptedAnswer: {
-      "@type": "Answer",
-      text: "In VS Code 1.140+, install Code Context by dotnetpower (dotnetpower.code-context-native) from the VS Code Marketplace for foreground #cctxNativeContext dispatch and automatic BPE-aligned agent instructions, and optionally configure 'cctx shared-mcp' for background subagents, Claude Code, Cursor, or CLI agents. Both surfaces share the same resident Rust daemon.",
-    },
-  },
-  {
-    "@type": "Question",
-    name: "Does Code Context work natively on Windows without WSL?",
-    acceptedAnswer: {
-      "@type": "Answer",
-      text: "Yes. Build or copy cctx.exe to %USERPROFILE%\\.local\\bin\\cctx.exe. The VS Code extension starts cctx.exe daemon automatically on first use and falls back to VS Code's bundled rg.exe if ripgrep is not on PATH. WSL2 and Windows Agent Sessions are also supported.",
-    },
-  },
-];
-
 const orgNode = {
   "@type": "Organization",
   "@id": `${SITE_ROOT_URL}#organization`,
@@ -145,7 +111,6 @@ const orgNode = {
   sameAs: [
     "https://github.com/dotnetpower/code-context",
     "https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native",
-    "https://dotnetpower.github.io/agent-tokenomics/",
   ],
 };
 
@@ -189,36 +154,18 @@ const softwareNode = {
     "Fast local file discovery, trigram-indexed source search, smart block-clamped context cache, declarative probes (pctx), and compaction continuity journal for AI coding agents.",
   applicationCategory: "DeveloperApplication",
   operatingSystem: "Linux, Windows, WSL, SSH",
-  softwareVersion: "0.26.0",
   url: SITE_ROOT_URL,
   downloadUrl: "https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native",
   codeRepository: "https://github.com/dotnetpower/code-context",
   license: "https://opensource.org/licenses/MIT",
   publisher: { "@id": `${SITE_ROOT_URL}#organization` },
-  offers: {
-    "@type": "Offer",
-    price: "0",
-    priceCurrency: "USD",
-  },
 };
 
 const graphNodes: Record<string, unknown>[] = [orgNode, websiteNode, webpageNode];
 
 if (isHome) {
   graphNodes.push(softwareNode);
-  graphNodes.push({
-    "@type": "FAQPage",
-    "@id": `${canonicalHref}#faq`,
-    mainEntity: faqEntities,
-  });
 } else if (!is404) {
-  if (isFaq) {
-    graphNodes.push({
-      "@type": "FAQPage",
-      "@id": `${canonicalHref}#faq`,
-      mainEntity: faqEntities,
-    });
-  }
   graphNodes.push({
     "@type": "TechArticle",
     "@id": `${canonicalHref}#article`,
@@ -278,11 +225,10 @@ const jsonLdString = JSON.stringify({
     : "index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1"}
 />
 {googleSiteVerification && <meta name="google-site-verification" content={googleSiteVerification} />}
+{naverSiteVerification && <meta name="naver-site-verification" content={naverSiteVerification} />}
 <meta name="theme-color" content="#0b0e18" />
 <meta name="application-name" content="Code Context (cctx)" />
 <link rel="canonical" href={canonicalHref} />
-{!is404 && <link rel="alternate" hreflang="en" href={canonicalHref} />}
-{!is404 && <link rel="alternate" hreflang="x-default" href={canonicalHref} />}
 <link rel="sitemap" type="application/xml" href={`${SITE_ROOT_URL}sitemap-index.xml`} />
 <link rel="sitemap" type="application/xml" href={`${SITE_ROOT_URL}sitemap.xml`} />
 <link

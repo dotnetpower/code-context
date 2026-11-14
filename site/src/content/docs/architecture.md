@@ -1,6 +1,6 @@
 ---
 title: "Architecture, Adaptive Memory & Privacy"
-description: "Inside the Code Context (cctx) Rust engine: case-folded trigram posting index, HIR regex planner, incremental file watcher reconciliation, cgroup v2 adaptive memory, and local security boundaries."
+description: "Code Context architecture: Rust trigram indexing, regex planning, incremental file watching, adaptive memory, and local source-code privacy boundaries."
 category: architecture
 verified: 2026-11-14
 sidebar:

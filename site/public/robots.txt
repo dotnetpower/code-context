@@ -1,7 +1,7 @@
 # robots.txt for Code Context (cctx) official documentation & showcase
 # https://dotnetpower.github.io/code-context/
-# Public English documentation — all search engines and generative AI answer
-# engines (GEO / AEO) are welcome to crawl and cite published pages.
+# Public English documentation — search and answer engines may retrieve pages.
+# The named training-only crawlers below are opted out separately.
 #
 # Structured LLM index: https://dotnetpower.github.io/code-context/llms.txt
 # Full LLM corpus:      https://dotnetpower.github.io/code-context/llms-full.txt
@@ -19,6 +19,9 @@ User-agent: bingbot
 Allow: /
 
 User-agent: Yeti
+Allow: /
+
+User-agent: Daum
 Allow: /
 
 User-agent: DuckDuckBot
@@ -42,34 +45,35 @@ Allow: /
 User-agent: Perplexity-User
 Allow: /
 
-# Generative AI & research crawlers:
+# Training-only crawlers are opted out, independently of search/retrieval:
 User-agent: GPTBot
-Allow: /
+Disallow: /
 
 User-agent: ClaudeBot
-Allow: /
+Disallow: /
 
 User-agent: Claude-Web
-Allow: /
+Disallow: /
 
 User-agent: anthropic-ai
-Allow: /
+Disallow: /
 
 User-agent: Google-Extended
-Allow: /
+Disallow: /
 
 User-agent: Applebot-Extended
-Allow: /
+Disallow: /
 
 User-agent: CCBot
-Allow: /
+Disallow: /
 
 User-agent: cohere-ai
-Allow: /
+Disallow: /
 
 User-agent: Bytespider
-Allow: /
+Disallow: /
 
+# General product discovery:
 User-agent: Amazonbot
 Allow: /
 

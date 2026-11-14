@@ -1,4 +1,5 @@
 ---
+import LookupBudget from "./LookupBudget.astro";
 const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
 const docUrl = (slug: string) => `${base}${slug.replace(/^\/+/, "")}`;
 const benchSvgUrl = `${base}benchmarks/latency-speedup.svg`;
@@ -23,9 +24,20 @@ const benchSvgUrl = `${base}benchmarks/latency-speedup.svg`;
         Stop feeding coding agents 200-line <code>grep</code> dumps. <strong>Code Context (cctx)</strong> pairs
         native VS Code Language Model Tools (<code>#cctxNativeContext</code>) and an MCP server over one shared
         Rust trigram index—cutting lookup tokens by <strong>73.2–91.3%</strong>, accelerating warm retrieval
-        <strong>17.22×</strong>, and finishing end-to-end coding tasks <strong>24.7% faster</strong> on Linux,
-        native Windows (<code>cctx.exe</code>), WSL, and SSH.
+        <strong>17.22×</strong> in the published retrieval fixture. Linux, native Windows
+        (<code>cctx.exe</code>), WSL, and SSH are supported.
       </p>
+
+      <dl class="cctx-answer-capsule">
+       <dt>What is Code Context?</dt>
+       <dd>A local Rust source index shared by 7 native VS Code and MCP tools.</dd>
+       <dt>What does the 17.22× result mean?</dt>
+       <dd>A warm mixed-retrieval measurement on the published fixture, not a guarantee for other hardware, workloads, or bills. <a href={docUrl("benchmarks/")}>Methodology and limitations</a>.</dd>
+      </dl>
+      <details>
+       <summary>Can this website search my source code?</summary>
+       <p>No. Install the <a href={docUrl("installation/")}>local backend</a> and follow the <a href={docUrl("quickstart/")}>quickstart</a>. The website only publishes documentation.</p>
+      </details>
 
       <div class="cctx-beat-strip" role="group" aria-label="Jump to motion film act">
         <button type="button" class="cctx-beat-pill" data-beat-seek="1.4" data-active="false">
@@ -426,10 +438,9 @@ const benchSvgUrl = `${base}benchmarks/latency-speedup.svg`;
       <details class="cctx-faq-item" open>
         <summary>Does cctx upload source code or require an external API key?</summary>
         <p>
-          Never. Indexing, trigram queries, document extraction, probes (<code>pctx</code>), and continuity journals
-          run entirely on your local machine over Unix domain sockets (Linux/WSL/SSH) or authenticated loopback RPC
-          (native Windows <code>cctx.exe</code>). Ignored paths, secrets, <code>.github</code>, and
-          <code>.vscode</code> boundaries are enforced automatically.
+          Indexing, trigram queries, document extraction, and continuity journals run locally. Explicit
+          <code>pctx http</code> probes contact the URLs you supply. AI clients receiving tool output follow their
+          own data policies; review the <a href={docUrl("architecture/")}>privacy boundaries</a>.
         </p>
       </details>
 
@@ -461,7 +472,14 @@ const benchSvgUrl = `${base}benchmarks/latency-speedup.svg`;
       <a href={docUrl("llms-full.txt")}><code>llms-full.txt</code></a> indexes.
     </p>
   </section>
+  <LookupBudget />
 </div>
+
+<style>
+  .cctx-answer-capsule { min-height: 9rem; contain: layout; margin: 0; }
+  .cctx-answer-capsule dt { font-weight: 600; }
+  .cctx-answer-capsule dd { margin: .25rem 0 .75rem; }
+</style>
 
 <script>
   import { initCctxMotion } from "../scripts/motionStage";

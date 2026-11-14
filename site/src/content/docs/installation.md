@@ -1,6 +1,6 @@
 ---
 title: "Installation & Platform Setup"
-description: "Install the Code Context (cctx) Rust backend and VS Code Native Language Model Tools extension or MCP server on Linux, native Windows (cctx.exe), WSL, SSH, and Windows Agent Sessions."
+description: "Install Code Context and its native VS Code extension or MCP server on Linux, Windows, WSL, and SSH. Includes platform setup and troubleshooting."
 category: setup
 verified: 2026-11-14
 sidebar:

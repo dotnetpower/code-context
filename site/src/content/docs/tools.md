@@ -1,6 +1,6 @@
 ---
-title: "Native VS Code & MCP Tools Reference"
-description: "Complete reference for all seven Code Context tools (#cctxNativeContext, #cctxNativeGrep, #cctxNativeRead, #cctxNativeFiles, Status, Sync, Workspaces), <8 KiB inline budgets, and rich document anchors."
+title: "7 Native VS Code & MCP Tools"
+description: "Reference for 7 native VS Code and MCP tools: context, grep, read, files, status, sync, and workspaces, with inline budgets and document anchors."
 category: tools
 verified: 2026-11-14
 sidebar:

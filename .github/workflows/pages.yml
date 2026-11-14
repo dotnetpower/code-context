@@ -9,6 +9,11 @@ on:
       - "benchmarks/results/aks-store-demo/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "site/**"
+      - "llms.txt"
+      - ".github/workflows/pages.yml"
 
 permissions:
   contents: read
@@ -19,12 +24,19 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  SITE_URL: ${{ vars.SITE_URL || 'https://dotnetpower.github.io' }}
+  BASE_PATH: ${{ vars.BASE_PATH || '/code-context' }}
+  PUBLIC_GOOGLE_SITE_VERIFICATION: ${{ vars.PUBLIC_GOOGLE_SITE_VERIFICATION }}
+  PUBLIC_NAVER_SITE_VERIFICATION: ${{ vars.PUBLIC_NAVER_SITE_VERIFICATION }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -32,20 +44,69 @@ jobs:
           cache-dependency-path: site/package-lock.json
       - name: Install site dependencies
         run: npm --prefix site ci --no-audit --no-fund
+      - name: Check Astro and TypeScript
+        run: npm --prefix site run check
       - name: Build static site and SEO/GEO/AEO artifacts
         run: npm --prefix site run build
       - name: Verify SEO, GEO, AEO, and privacy gates
         run: npm --prefix site run check:seo
+      - name: Test HTTP negotiation, discovery, and negative contract fixtures
+        run: npm --prefix site test
+      - name: Install browser for rendering and CLS gates
+        run: cd site && npx playwright install --with-deps chromium
+      - name: Verify desktop/mobile CLS, no-JS answers, and calculator
+        run: npm --prefix site run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: site-browser-results
+          path: site/test-results
+          if-no-files-found: ignore
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: site/dist
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
       - id: deployment
         uses: actions/deploy-pages@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/site-pages
+      - name: Restore exact deployed contract artifacts
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/site-pages
+        run: mkdir -p site/dist && tar -xf "$ARTIFACT_DIR/artifact.tar" -C site/dist
+      - name: Install verification dependencies
+        run: npm --prefix site ci --no-audit --no-fund
+      - name: Strict post-deployment readiness gate
+        env:
+          DEPLOYED_URL: ${{ vars.AGENT_SITE_URL || steps.deployment.outputs.page_url }}
+        run: npm --prefix site run check:live -- "$DEPLOYED_URL"
+      - id: gsc-auth
+        if: vars.GSC_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GSC_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GSC_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/webmasters
+      - name: Submit verified canonical URLs to IndexNow and GSC
+        env:
+          GSC_ACCESS_TOKEN: ${{ steps.gsc-auth.outputs.access_token || secrets.GSC_ACCESS_TOKEN }}
+          GSC_PROPERTY: ${{ vars.GSC_PROPERTY }}
+        run: npm --prefix site run submit:indexing

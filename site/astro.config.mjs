@@ -37,7 +37,7 @@ function rehypeDocumentLinksNewTab() {
 export default defineConfig({
   site: SITE_URL,
   base: BASE_PATH,
-  trailingSlash: "ignore",
+  trailingSlash: "always",
   markdown: {
     rehypePlugins: [rehypeDocumentLinksNewTab],
   },
@@ -46,6 +46,7 @@ export default defineConfig({
       title: "Code Context (cctx)",
       logo: {
         src: "./public/favicon.svg",
+        alt: "Code Context (cctx) logo",
         replacesTitle: false,
       },
       favicon: "/favicon.svg",
@@ -58,6 +59,8 @@ export default defineConfig({
       customCss: ["./src/styles/custom.css"],
       components: {
         Head: "./src/components/Head.astro",
+        PageTitle: "./src/components/PageTitle.astro",
+        MarkdownContent: "./src/components/MarkdownContent.astro",
       },
       social: [
         {

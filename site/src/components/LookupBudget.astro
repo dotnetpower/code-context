@@ -1,0 +1,36 @@
+<section class="lookup-budget" aria-labelledby="lookup-budget-heading">
+  <h2 id="lookup-budget-heading">Check your lookup payload reduction</h2>
+  <p>Enter token counts from your own tool outputs. This arithmetic is not a forecast of billing or performance.</p>
+  <form id="lookup-budget">
+    <label>Baseline tokens <input name="baseline" type="number" min="1" step="1" required value="200" /></label>
+    <label>Clamped tokens <input name="clamped" type="number" min="0" step="1" required value="50" /></label>
+    <button type="submit">Calculate reduction</button>
+    <output aria-live="polite">Example inputs only. Submit to calculate.</output>
+  </form>
+  <noscript>The calculator requires JavaScript. Formula: (baseline − clamped) ÷ baseline × 100%.</noscript>
+</section>
+<script>
+  const form = document.querySelector<HTMLFormElement>("#lookup-budget");
+  if (form) form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const baseline = Number(data.get("baseline"));
+    const clamped = Number(data.get("clamped"));
+    const output = form.querySelector("output");
+    if (!output) throw new Error("Lookup calculator output is missing");
+    if (!Number.isSafeInteger(baseline) || baseline <= 0 || !Number.isSafeInteger(clamped) || clamped < 0) {
+      output.value = "Enter whole token counts: baseline above zero and clamped zero or greater.";
+      return;
+    }
+    const reduction = (baseline - clamped) / baseline * 100;
+    output.value = `${reduction.toFixed(1)}% payload reduction (${baseline - clamped} tokens). Negative values mean a larger output, not savings.`;
+  });
+</script>
+<style>
+  .lookup-budget { min-height: 20rem; contain: layout; padding: 1.25rem; border: 1px solid var(--sl-color-gray-5); border-radius: .75rem; }
+  form { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; }
+  label { display: grid; gap: .25rem; }
+  input { max-width: 10rem; padding: .5rem; color: var(--sl-color-text); background: var(--sl-color-bg); }
+  button { padding: .6rem 1rem; }
+  output { display: block; flex-basis: 100%; height: 8rem; contain: layout; overflow: auto; overflow-wrap: anywhere; }
+</style>

@@ -1,6 +1,6 @@
 ---
 title: "Zero-Schema Probes (pctx), Journal & Formula Prompts"
-description: "Eliminate JSON, API, SQLite, image, batch log, and compaction token waste with pctx (cctx probe), cctx journal (<=2 KiB continuity), and BPE-aligned cctx prompt formulas."
+description: "Use pctx to inspect JSON, APIs, tables, images, and logs; preserve compact continuity with cctx journal and compile formula prompts."
 category: tools
 verified: 2026-11-14
 sidebar:

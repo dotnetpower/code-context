@@ -1,6 +1,6 @@
 ---
 title: "Frequently Asked Questions (FAQ)"
-description: "Direct technical answers about Code Context (cctx): comparisons with ripgrep, LSP, and vector RAG, VS Code Native vs MCP, token & AI Credit savings, Windows support, and privacy."
+description: "Code Context FAQ: ripgrep and vector RAG comparisons, native VS Code tools versus MCP, Windows support, privacy, and benchmark limitations."
 category: evidence
 verified: 2026-11-14
 sidebar:
@@ -33,7 +33,7 @@ Adding `cctx shared-mcp` is recommended when you also run **background/unattende
 
 ## Does `cctx` upload my code or telemetry anywhere?
 
-**No.** All indexing, trigram postings, document extraction, `pctx` probes, `cctx journal` entries, and `cctx usage` analytics run 100% locally on your machine. No source code, filenames, prompts, or metrics are transmitted to external servers.
+Indexing, trigram postings, document extraction, `cctx journal`, and `cctx usage` analytics run locally; the index is not automatically uploaded. Explicit `pctx http` probes contact the URLs you supply. Any AI client receiving tool output follows its own data policy. This public documentation website cannot access your local workspace.
 
 ---
 

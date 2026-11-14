@@ -1,244 +1,100 @@
-// build-seo-geo.mjs — Post-build SEO, GEO & AEO artifact generator for Code Context (cctx).
-//
-// 1. Syncs root `llms.txt` to `site/public/llms.txt` and `site/dist/llms.txt`.
-// 2. Generates `site/dist/llms-full.txt` concatenating every published English page in
-//    deterministic order with canonical URLs for one-shot generative-engine ingestion.
-// 3. Generates clean `.md` mirrors (`dist/<slug>.md`, `dist/index.md`, and `dist/sitemap.md`)
-//    so AI agents and answer engines can fetch zero-boilerplate Markdown directly.
-// 4. Emits standards-compliant `sitemap-0.xml`, `sitemap.xml`, `sitemap-index.xml`, `rss.xml`,
-//    and IndexNow verification key file.
-
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { attr, BASE_PATH, elements, INDEXNOW_KEY, LIMITATIONS, loadPages, markdownForPage, SITE_ROOT, text, xmlEscape as xml } from "./site-contract.mjs";
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const siteDir = path.resolve(scriptDir, "..");
-const repoRoot = path.resolve(siteDir, "..");
-const docsRoot = path.join(siteDir, "src", "content", "docs");
-const publicDir = path.join(siteDir, "public");
-const distDir = path.join(siteDir, "dist");
+const dist = fileURLToPath(new URL("../dist/", import.meta.url));
+const write = (name, value) => {
+  const target = path.join(dist, name);
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, value);
+};
+const json = (name, value) => write(name, `${JSON.stringify(value, null, 2)}\n`);
+const pages = loadPages(dist).filter((page) => page.indexable);
+if (!pages.length) throw new Error("No indexable rendered pages");
+const corpus = [`# Code Context (cctx) documentation\n\n${LIMITATIONS}\n`];
+const manifest = [];
+for (const page of pages) {
+  const pathname = new URL(page.canonical).pathname;
+  const slug = pathname.slice(BASE_PATH.length).replace(/^\/|\/$/g, "");
+  const markdown = slug ? `${slug}.md` : "index.md";
+  const content = markdownForPage(page);
+  write(markdown, content);
+  manifest.push({ title: page.title, description: page.description, url: page.canonical, markdown: `${SITE_ROOT}/${markdown}` });
+  corpus.push(`\n---\n\n${content}`);
 
-const SITE_URL = (process.env.SITE_URL ?? "https://dotnetpower.github.io").replace(/\/$/, "");
-const BASE_PATH = (process.env.BASE_PATH ?? "/code-context").replace(/\/$/, "");
-const BASE_URL = `${SITE_URL}${BASE_PATH}`;
-
-const BUILD_ISO = "2026-11-14T03:00:00Z";
-const BUILD_PUBDATE = new Date(BUILD_ISO).toUTCString();
-const INDEXNOW_KEY = "c7d4e9a1b2f84c6093e5a7d21f0b8e4c";
-
-function walkDocs(dir) {
-  return readdirSync(dir)
-    .sort()
-    .flatMap((name) => {
-      const full = path.join(dir, name);
-      return statSync(full).isDirectory() ? walkDocs(full) : [full];
-    })
-    .filter((f) => /\.(md|mdx)$/.test(f));
-}
-
-function parseFrontmatterAndBody(raw) {
-  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-  if (!match) return { meta: {}, body: raw.trim() };
-  const [, fmText, body] = match;
-  const meta = {};
-  for (const line of fmText.split(/\r?\n/)) {
-    const m = line.match(/^([a-zA-Z0-9_-]+):\s*(.+)$/);
-    if (m) {
-      meta[m[1]] = m[2].replace(/^["']|["']$/g, "").trim();
-    }
-  }
-  return { meta, body: body.trim() };
-}
-
-function cleanMdxBody(body) {
-  return body
-    .replace(/^import\s+[^\n]+\n?/gm, "")
-    .replace(/^export\s+const\s+[^\n]+\n?/gm, "")
-    .replace(/<MotionLanding[^>]*\/>/g, "")
-    .replace(/<figure[\s\S]*?<\/figure>/g, "")
-    .trim();
-}
-
-function docCanonicalUrl(relPath) {
-  let slug = relPath.replace(/\.(md|mdx)$/, "");
-  if (slug === "index") return `${BASE_URL}/`;
-  if (slug.endsWith("/index")) slug = slug.slice(0, -"/index".length);
-  return `${BASE_URL}/${slug}/`;
-}
-
-function docSlug(relPath) {
-  return relPath.replace(/\.(md|mdx)$/, "");
-}
-
-function xmlEscape(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-// 1. Sync root llms.txt & IndexNow key
-const rootLlmsPath = path.join(repoRoot, "llms.txt");
-const rootLlmsText = existsSync(rootLlmsPath) ? readFileSync(rootLlmsPath, "utf8") : "";
-if (rootLlmsText) {
-  writeFileSync(path.join(publicDir, "llms.txt"), rootLlmsText, "utf8");
-  if (existsSync(distDir)) {
-    writeFileSync(path.join(distDir, "llms.txt"), rootLlmsText, "utf8");
-  }
-}
-
-writeFileSync(path.join(publicDir, `${INDEXNOW_KEY}.txt`), `${INDEXNOW_KEY}\n`, "utf8");
-if (existsSync(distDir)) {
-  writeFileSync(path.join(distDir, `${INDEXNOW_KEY}.txt`), `${INDEXNOW_KEY}\n`, "utf8");
-}
-
-// 2. Order documentation pages deterministically (index first, then sidebar order)
-const ORDER_PRIORITY = [
-  "index",
-  "installation",
-  "quickstart",
-  "tools",
-  "probes-and-journal",
-  "benchmarks",
-  "architecture",
-  "faq",
-];
-
-const allDocs = walkDocs(docsRoot)
-  .map((f) => {
-    const relPath = path.relative(docsRoot, f).split(path.sep).join("/");
-    return { fullPath: f, relPath, slug: docSlug(relPath) };
-  })
-  .sort((a, b) => {
-    const ia = ORDER_PRIORITY.indexOf(a.slug);
-    const ib = ORDER_PRIORITY.indexOf(b.slug);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.slug.localeCompare(b.slug);
+  // Schema answers are extracted from visible HTML, never independently invented.
+  const main = elements(page.doc, (n) => n.tagName === "main")[0];
+  const questions = elements(main, (n) => n.tagName === "details").flatMap((node) => {
+    const summary = node.childNodes.find((n) => n.tagName === "summary");
+    const answer = node.childNodes.filter((n) => n !== summary).map(text).join(" ").replace(/\s+/g, " ").trim();
+    return summary && answer ? [{ "@type": "Question", name: text(summary).trim(), acceptedAnswer: { "@type": "Answer", text: answer } }] : [];
   });
-
-const fullSections = [
-  `# Code Context (cctx) — Complete English Documentation Corpus
-
-Website: ${BASE_URL}/
-Repository: https://github.com/dotnetpower/code-context
-VS Code Marketplace: https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native
-Structured Index: ${BASE_URL}/llms.txt
-Markdown Sitemap: ${BASE_URL}/sitemap.md
-Generated for search and generative-engine (GEO / AEO) ingestion.
-`,
-];
-
-const sitemapMdLines = [
-  `# Code Context (cctx) — Semantic Documentation Map`,
-  ``,
-  `- Website: ${BASE_URL}/`,
-  `- Structured LLM Index: ${BASE_URL}/llms.txt`,
-  `- Full Single-Fetch Corpus: ${BASE_URL}/llms-full.txt`,
-  ``,
-  `## Pages`,
-  ``,
-];
-
-const rssItems = [];
-const sitemapEntries = [];
-
-for (const { fullPath, relPath, slug } of allDocs) {
-  const raw = readFileSync(fullPath, "utf8");
-  const { meta, body } = parseFrontmatterAndBody(raw);
-  const cleaned = cleanMdxBody(body);
-  const url = docCanonicalUrl(relPath);
-  const mdUrl = `${BASE_URL}/${slug}.md`;
-  const title = meta.title || slug;
-  const desc =
-    meta.description ||
-    "Fast local file discovery, trigram-indexed source search, and block-clamped context cache for AI coding agents.";
-
-  const effectiveBody =
-    slug === "index" && !cleaned
-      ? rootLlmsText
-      : cleaned;
-
-  // Per-page .md mirror in dist/
-  if (existsSync(distDir)) {
-    const outMdPath = path.join(distDir, `${slug}.md`);
-    mkdirSync(path.dirname(outMdPath), { recursive: true });
-    const mirrorContent = `---\ntitle: "${title}"\ndescription: "${desc}"\nurl: "${url}"\n---\n\n# ${title}\n\n> ${desc}\n\n${effectiveBody}\n`;
-    writeFileSync(outMdPath, mirrorContent, "utf8");
-  }
-
-  sitemapMdLines.push(`- [${title}](${url}) — ${desc} ([Markdown](${mdUrl}))`);
-
-  rssItems.push(
-    `    <item>\n` +
-      `      <title>${xmlEscape(title)}</title>\n` +
-      `      <link>${xmlEscape(url)}</link>\n` +
-      `      <guid isPermaLink="true">${xmlEscape(url)}</guid>\n` +
-      `      <description>${xmlEscape(desc)}</description>\n` +
-      `      <pubDate>${BUILD_PUBDATE}</pubDate>\n` +
-      `    </item>`,
-  );
-
-  sitemapEntries.push(url);
-
-  fullSections.push(
-    `\n---\n\n## ${title}\n\nCanonical URL: <${url}>\nMarkdown Mirror: <${mdUrl}>\n\n> ${desc}\n\n${effectiveBody}\n`,
-  );
+  const schema = elements(page.doc, (n) => n.tagName === "script" && attr(n, "type") === "application/ld+json");
+  if (schema.length !== 1) throw new Error(`Expected one graph: ${page.relative}`);
+  const graph = JSON.parse(text(schema[0]));
+  graph["@graph"] = graph["@graph"].filter((node) => node["@type"] !== "FAQPage");
+  if (questions.length) graph["@graph"].push({ "@type": "FAQPage", "@id": `${page.canonical}#faq`, url: page.canonical, mainEntity: questions });
+  writeFileSync(page.file, page.html.replace(text(schema[0]), JSON.stringify(graph).replace(/</g, "\\u003c")));
 }
 
-if (existsSync(distDir)) {
-  writeFileSync(path.join(distDir, "llms-full.txt"), fullSections.join(""), "utf8");
-  writeFileSync(path.join(distDir, "sitemap.md"), `${sitemapMdLines.join("\n")}\n`, "utf8");
+json("docs-index.json", { name: "Code Context documentation index", language: "en", limitations: LIMITATIONS, pages: manifest });
+write("llms-full.txt", corpus.join("\n"));
+write("llms.txt", `# Code Context (cctx)\n\n> Local Rust source indexing and block-clamped context for AI coding agents. This is an English documentation site, not a hosted workspace API.\n\n## Canonical pages\n\n${manifest.map((p) => `- [${p.title}](${p.url}): ${p.description}`).join("\n")}\n\n## Agent resources\n\n- [Full corpus](${SITE_ROOT}/llms-full.txt)\n- [Documentation JSON index](${SITE_ROOT}/docs-index.json)\n- [OpenAPI](${SITE_ROOT}/openapi.json)\n- [Authentication policy](${SITE_ROOT}/auth.md)\n\n## Sources and limitations\n\n${LIMITATIONS}\n\nSources: [published raw benchmark results](https://github.com/dotnetpower/code-context/tree/main/benchmarks/results/aks-store-demo) and the canonical documentation above. No ratings, commerce, OAuth provisioning or remote code-search service are offered.\n`);
+write("sitemap.md", `# Documentation map\n\n${manifest.map((p) => `- [${p.title}](${p.url}) ([Markdown](${p.markdown}))`).join("\n")}\n`);
+write("robots.txt", readFileSync(new URL("../public/robots.txt", import.meta.url), "utf8").replaceAll("https://dotnetpower.github.io/code-context", SITE_ROOT));
+write(`${INDEXNOW_KEY}.txt`, `${INDEXNOW_KEY}\n`);
 
-  // 3. Emit sitemap-0.xml, sitemap.xml, and sitemap-index.xml
-  const urlNodes = sitemapEntries.map(
-    (loc) =>
-      `  <url>\n` +
-      `    <loc>${xmlEscape(loc)}</loc>\n` +
-      `    <lastmod>${BUILD_ISO}</lastmod>\n` +
-      `    <xhtml:link rel="alternate" hreflang="en" href="${xmlEscape(loc)}"/>\n` +
-      `    <xhtml:link rel="alternate" hreflang="x-default" href="${xmlEscape(loc)}"/>\n` +
-      `  </url>`,
-  );
-
-  const sitemapXml =
-    `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">\n` +
-    `${urlNodes.join("\n")}\n` +
-    `</urlset>\n`;
-
-  writeFileSync(path.join(distDir, "sitemap-0.xml"), sitemapXml, "utf8");
-  writeFileSync(path.join(distDir, "sitemap.xml"), sitemapXml, "utf8");
-
-  const sitemapIndexXml =
-    `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
-    `  <sitemap>\n` +
-    `    <loc>${xmlEscape(`${BASE_URL}/sitemap-0.xml`)}</loc>\n` +
-    `    <lastmod>${BUILD_ISO}</lastmod>\n` +
-    `  </sitemap>\n` +
-    `</sitemapindex>\n`;
-  writeFileSync(path.join(distDir, "sitemap-index.xml"), sitemapIndexXml, "utf8");
-
-  // 4. Emit RSS 2.0 feed
-  const rssXml =
-    `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n` +
-    `  <channel>\n` +
-    `    <title>Code Context (cctx) Documentation</title>\n` +
-    `    <link>${xmlEscape(`${BASE_URL}/`)}</link>\n` +
-    `    <description>Fast local file discovery, trigram-indexed source search, and block-clamped context cache for AI coding agents.</description>\n` +
-    `    <language>en-us</language>\n` +
-    `    <lastBuildDate>${BUILD_PUBDATE}</lastBuildDate>\n` +
-    `    <atom:link href="${xmlEscape(`${BASE_URL}/rss.xml`)}" rel="self" type="application/rss+xml"/>\n` +
-    `${rssItems.join("\n")}\n` +
-    `  </channel>\n` +
-    `</rss>\n`;
-  writeFileSync(path.join(distDir, "rss.xml"), rssXml, "utf8");
-
-  console.log(`[build-seo-geo] generated SEO/GEO/AEO artifacts for ${allDocs.length} pages at ${BASE_URL}`);
+const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.map((url) => `  <url><loc>${xml(url)}</loc></url>`).join("\n")}\n</urlset>\n`;
+const urls = manifest.map((p) => p.url);
+const shards = [];
+for (let i = 0; i < urls.length; i += 4000) {
+  const name = `sitemap-${i / 4000}.xml`;
+  shards.push(name);
+  write(name, urlset(urls.slice(i, i + 4000)));
 }
+const sitemapIndex = `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${shards.map((name) => `  <sitemap><loc>${xml(`${SITE_ROOT}/${name}`)}</loc></sitemap>`).join("\n")}\n</sitemapindex>\n`;
+write("sitemap-index.xml", sitemapIndex);
+write("sitemap.xml", urls.length <= 4000 ? urlset(urls) : sitemapIndex);
+write("rss.xml", `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>Code Context documentation</title><link>${xml(SITE_ROOT)}/</link><description>Local code-context tooling documentation</description>${manifest.map((p) => `<item><title>${xml(p.title)}</title><link>${xml(p.url)}</link><guid isPermaLink="true">${xml(p.url)}</guid><description>${xml(p.description)}</description></item>`).join("\n")}</channel></rss>\n`);
+
+write("auth.md", `# auth.md\n\n## Service\n\nCode Context documentation: ${SITE_ROOT}/\n\n## Authentication\n\nPublic read-only access is **anonymous**. Use unauthenticated GET requests to ${SITE_ROOT}/docs-index.json and the published documentation resources. No Authorization header, API key, OAuth flow, bot account or automatic account issuer is used. No write, purchase, payment or remote workspace operations exist here. Local daemon authentication is separate and is not exposed by this website.\n\n## Discovery and representations\n\nOpenAPI: ${SITE_ROOT}/openapi.json\nAPI catalog: ${SITE_ROOT}/.well-known/api-catalog\nFull corpus: ${SITE_ROOT}/llms-full.txt\n\nExplicit .md mirrors work on static hosting. Accept: text/markdown negotiation requires the provided HTTP gateway; GitHub Pages alone cannot implement it. Check HTTP response headers rather than assuming deployment support.\n\n## Limitations\n\n${LIMITATIONS}\n`);
+json(".well-known/api-catalog", {
+  linkset: [{
+    anchor: `${SITE_ROOT}/.well-known/api-catalog`,
+    item: [{ href: `${SITE_ROOT}/docs-index.json`, type: "application/json" }],
+  }, {
+    anchor: `${SITE_ROOT}/docs-index.json`,
+    "service-desc": [{ href: `${SITE_ROOT}/openapi.json`, type: "application/openapi+json" }],
+    "service-doc": [{ href: `${SITE_ROOT}/auth.md`, type: "text/markdown" }],
+  }],
+});
+json("openapi.json", {
+  openapi: "3.1.0",
+  info: { title: "Code Context public documentation index", version: "1.0.0", description: "Static documentation metadata only. No local workspace access, writes, commerce or account provisioning." },
+  servers: [{ url: SITE_ROOT }],
+  security: [],
+  paths: {
+    "/docs-index.json": {
+      get: {
+        operationId: "getDocumentationIndex", summary: "List published English documentation pages",
+        responses: {
+          200: {
+            description: "Canonical titles, summaries and Markdown URLs",
+            content: { "application/json": { schema: {
+              type: "object", required: ["name", "language", "limitations", "pages"],
+              properties: {
+                name: { type: "string" }, language: { const: "en" }, limitations: { type: "string" },
+                pages: { type: "array", items: {
+                  type: "object", required: ["title", "description", "url", "markdown"],
+                  properties: Object.fromEntries(["title", "description", "url", "markdown"].map((key) => [key, { type: "string", ...(["url", "markdown"].includes(key) ? { format: "uri" } : {}) }])),
+                } },
+              },
+            } } },
+          },
+        },
+      },
+    },
+  },
+});
+console.log(`[build-seo-geo] ${pages.length} rendered canonical pages; corpus, discovery, sitemaps and RSS generated at ${SITE_ROOT}/`);
