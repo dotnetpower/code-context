@@ -573,3 +573,150 @@ fn external_inventory_command_has_a_hard_timeout() {
     assert!(error.to_string().contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(1));
 }
+
+#[test]
+fn tiered_inventory_capping_preserves_core_code_and_serves_capped_files_without_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("data")).unwrap();
+    std::fs::create_dir_all(root.path().join("docs/archive")).unwrap();
+    std::fs::write(root.path().join("src/core.rs"), "pub fn core_needle() {}\n").unwrap();
+    std::fs::write(root.path().join("src/helper.py"), "def py_needle(): pass\n").unwrap();
+    // Bulk data & archive docs push total bytes well past max_source_bytes (512 bytes),
+    // plus an oversized >max_file_bytes file.
+    std::fs::write(root.path().join("data/dump1.json"), format!("{{\"k\":\"{}\"}}\n", "x".repeat(320))).unwrap();
+    std::fs::write(root.path().join("data/dump2.json"), format!("{{\"k\":\"{}\"}}\n", "y".repeat(320))).unwrap();
+    std::fs::write(root.path().join("docs/archive/old.md"), format!("# Old\n{}\n", "z".repeat(320))).unwrap();
+    std::fs::write(root.path().join("data/oversized.json"), "o".repeat(2048)).unwrap();
+
+    let mut limited = policy();
+    limited.max_file_bytes = 512;
+    limited.max_source_bytes = 512;
+    limited.max_staged_bytes = 512;
+    limited.max_total_lines = 1000;
+
+    let mut watched = Watched::new(Spec {
+        root: root.path().to_path_buf(),
+        scopes: vec![".".into()],
+        globs: vec!["*.rs".into(), "*.py".into(), "*.json".into(), "*.md".into()],
+        excludes: Vec::new(),
+        default_excludes: true,
+        prewarm: false,
+        policy: limited,
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    // Core Tier-1 source remains indexed and searchable.
+    let grep = watched.call("code_grep", json!({"pattern": "core_needle"})).unwrap();
+    assert_eq!(grep["total_matches"], 1);
+    assert!(grep["freshness"]["inventory_capped_files"].as_u64().unwrap() >= 2);
+
+    // code_files discovers ALL permitted files, including tier-capped and oversized files.
+    let all_files = watched.call("code_files", json!({"glob": "*"})).unwrap();
+    let paths: Vec<String> = serde_json::from_value(all_files["paths"].clone()).unwrap();
+    assert!(paths.contains(&"src/core.rs".to_string()));
+    assert!(paths.contains(&"data/dump1.json".to_string()));
+    assert!(paths.contains(&"data/oversized.json".to_string()));
+
+    // code_read transparently serves tier-capped <=max_file_bytes files on demand without failing.
+    let capped_read = watched
+        .call(
+            "code_read",
+            json!({"ranges": [{"path": "data/dump1.json", "start": 1, "end": 1}]}),
+        )
+        .unwrap();
+    assert!(capped_read[0]["lines"][0].as_str().unwrap().contains("\"k\":"));
+
+    // Runtime additions beyond max_source_bytes cap cleanly without poisoning reconciliation.
+    std::fs::write(root.path().join("data/dump3.json"), format!("{{\"k\":\"{}\"}}\n", "w".repeat(320))).unwrap();
+    let sync = watched.call("code_sync", json!({})).unwrap();
+    assert_eq!(sync["inventory_complete"], false);
+    assert!(sync["inventory_capped_files"].as_u64().unwrap() >= 3);
+    assert!(sync["unindexed_extra_files"].as_u64().unwrap() >= 4);
+    let status = watched.call("code_status", json!({})).unwrap();
+    assert!(status["blocked"].is_null());
+
+    // Markdown section anchors resolve transparently even on tier-capped .md files.
+    std::fs::write(
+        root.path().join("docs/archive/old.md"),
+        format!("# Intro\n{}\n## Target Section\nanchor_hit_line\n", "z".repeat(280)),
+    )
+    .unwrap();
+    watched.call("code_sync", json!({})).unwrap();
+    let anchor_read = watched
+        .call(
+            "code_read",
+            json!({"ranges": [{"path": "docs/archive/old.md#target-section", "start": 1, "end": 5}]}),
+        )
+        .unwrap();
+    assert!(
+        anchor_read[0]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str() == Some("anchor_hit_line")),
+        "{anchor_read}"
+    );
+}
+
+#[test]
+fn default_source_budget_is_512_mib_and_staged_squeeze_auto_trims_then_promotes() {
+    assert_eq!(MemoryPolicy::default().max_source_bytes, 512 * 1024 * 1024);
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("data")).unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "pub fn stay_warm() {}\n").unwrap();
+    let mut watched = Watched::new(Spec {
+        root: root.path().to_path_buf(),
+        scopes: vec![".".into()],
+        globs: vec!["*.rs".into(), "*.json".into()],
+        excludes: Vec::new(),
+        default_excludes: true,
+        prewarm: false,
+        policy: MemoryPolicy::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let initial = watched.call("code_sync", json!({})).unwrap();
+    assert_eq!(initial["inventory_complete"], true);
+
+    // Oversized runtime file created via single-file path still surfaces in code_files and marks inventory_complete=false.
+    std::fs::write(root.path().join("data/big.json"), "b".repeat(2 * 1024 * 1024)).unwrap();
+    let after_big = watched.call("code_sync", json!({})).unwrap();
+    assert_eq!(after_big["inventory_complete"], false);
+    let found = watched.call("code_files", json!({"glob": "big.json"})).unwrap();
+    assert_eq!(found["paths"], json!(["data/big.json"]));
+}
+
+#[test]
+fn corrupt_non_code_documents_are_isolated_without_aborting_workspace_load() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("assets")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn healthy_symbol() {}\n").unwrap();
+    // Corrupt PPTX container and non-UTF8 CSV must not poison CoreCode indexing.
+    std::fs::write(root.path().join("assets/broken.pptx"), b"PK\x03\x04not-a-valid-zip").unwrap();
+    std::fs::write(root.path().join("assets/legacy.csv"), [0xc7, 0xd1, 0xb1, 0xdb, b'\n']).unwrap();
+
+    let mut watched = Watched::new(Spec {
+        root: root.path().to_path_buf(),
+        scopes: vec![".".into()],
+        globs: vec!["*.rs".into(), "*.pptx".into(), "*.csv".into()],
+        excludes: Vec::new(),
+        default_excludes: true,
+        prewarm: false,
+        policy: MemoryPolicy::default(),
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+
+    let grep = watched.call("code_grep", json!({"pattern": "healthy_symbol"})).unwrap();
+    assert_eq!(grep["total_matches"], 1);
+    let status = watched.call("code_status", json!({})).unwrap();
+    assert_eq!(status["stats"]["skipped_unreadable_files"], 2);
+}

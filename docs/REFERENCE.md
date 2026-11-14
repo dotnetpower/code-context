@@ -50,9 +50,14 @@ it does not load all source. Hidden paths, ignored files, unsafe paths, symlinks
 and policy-excluded files are not eligible. Never register content excluded by
 your host's organization policy: the standalone daemon cannot discover it.
 
-Default dependency/build/cache exclusions and ecosystem profiles keep generated
-content out. Use `--no-default-excludes` only for an intentional, authorized
-coverage change, not to bypass a refusal.
+Default dependency/build/cache exclusions and ecosystem profiles (including
+nested monorepo manifests up to two directory levels under `.`) keep generated
+content out. When a workspace exceeds aggregate inventory or admission budgets,
+`cctx` prioritizes core source code first, config/docs second, and bulk
+data/rich assets third (`capped_files` / `oversized_files` in `plan`), keeping
+`code_files` and on-demand `code_read` available without failing the root. Use
+`--no-default-excludes` only for an intentional, authorized coverage change,
+not to bypass a refusal.
 
 ## CLI and MCP
 

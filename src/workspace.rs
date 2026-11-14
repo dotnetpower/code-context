@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const MAX_CAPTURE: usize = 8 * 1024 * 1024;
+pub const MAX_DISCOVERY_CAPTURE: usize = 32 * 1024 * 1024;
 pub const MAX_FILE: u64 = 2 * 1024 * 1024;
 pub const MAX_RESPONSE: usize = 256 * 1024;
 const MAX_SCOPES: usize = 32;
@@ -128,8 +129,126 @@ mod candidate_policy_tests {
 pub struct FileInventory {
     pub files: HashSet<PathBuf>,
     pub(crate) stamps: std::collections::BTreeMap<String, crate::incremental::Stamp>,
+    pub(crate) extra_files: std::collections::BTreeMap<String, crate::incremental::Stamp>,
+    pub capped_count: usize,
+    pub oversized_count: usize,
     pub total_path_bytes: usize,
     pub metadata_source_bytes: u64,
+}
+
+impl FileInventory {
+    pub(crate) fn trim_to_source_budget(&mut self, max_source_bytes: u64) -> usize {
+        if self.metadata_source_bytes <= max_source_bytes {
+            return 0;
+        }
+        let mut removable: Vec<(u8, bool, u64, String)> = self
+            .stamps
+            .iter()
+            .filter_map(|(name, stamp)| {
+                let (tier, secondary, len) = inventory_priority_key(Path::new(name), stamp.length);
+                (tier > 0).then(|| (tier, secondary, len, name.clone()))
+            })
+            .collect();
+        // Drop lowest-priority (highest tier, secondary subtree, largest bytes) first.
+        removable.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.3.cmp(&a.3))
+        });
+        let mut trimmed = 0usize;
+        for (_, _, _, name) in removable {
+            if self.metadata_source_bytes <= max_source_bytes {
+                break;
+            }
+            if let Some(stamp) = self.stamps.remove(&name) {
+                self.files.remove(Path::new(&name));
+                self.metadata_source_bytes =
+                    self.metadata_source_bytes.saturating_sub(stamp.length);
+                self.total_path_bytes = self.total_path_bytes.saturating_sub(name.len());
+                self.extra_files.insert(name, stamp);
+                self.capped_count = self.capped_count.saturating_add(1);
+                trimmed += 1;
+            }
+        }
+        trimmed
+    }
+}
+
+pub(crate) fn inventory_priority_key(path: &Path, len: u64) -> (u8, bool, u64) {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let tier = match ext.as_str() {
+        "rs" | "py" | "pyi" | "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+        | "go" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "cs" | "java" | "kt"
+        | "kts" | "scala" | "swift" | "rb" | "php" | "lua" | "zig" | "nim" | "dart" | "ex"
+        | "exs" | "erl" | "hrl" | "hs" | "ml" | "mli" | "clj" | "cljs" | "r" | "jl" | "sh"
+        | "bash" | "zsh" | "ps1" | "psm1" | "psd1" | "sql" | "proto" | "graphql" | "gql"
+        | "graphqls" | "prisma" | "tf" | "tftpl" | "hcl" | "bicep" | "nix" | "cmake" | "mk"
+        | "vue" | "svelte" | "astro" | "dog" | "wit" | "rego" | "cue" | "dhall" | "pkl"
+        | "glsl" | "wgsl" | "hlsl" | "metal" => 0,
+        "" if matches!(
+            file_name,
+            "Makefile"
+                | "GNUmakefile"
+                | "Dockerfile"
+                | "Containerfile"
+                | "Justfile"
+                | "BUILD"
+                | "WORKSPACE"
+                | "Gemfile"
+                | "Rakefile"
+                | "Brewfile"
+                | "Procfile"
+                | "Vagrantfile"
+                | "Tiltfile"
+                | "Earthfile"
+                | "Podfile"
+        ) =>
+        {
+            0
+        }
+        "txt" if file_name == "CMakeLists.txt" => 0,
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "css" | "scss" | "less" | "sass" | "pcss"
+        | "postcss" | "styl" | "hbs" | "ejs" | "md" | "mdx" | "markdown" | "mdown" | "mkd"
+        | "qmd" | "rmd" | "rst" | "adoc" | "org" | "typ" | "tex" | "bib" | "mmd" | "mermaid"
+        | "puml" | "plantuml" => 1,
+        "json" | "jsonc"
+            if matches!(
+                file_name,
+                "package.json"
+                    | "tsconfig.json"
+                    | "jsconfig.json"
+                    | "deno.json"
+                    | "deno.jsonc"
+                    | "biome.json"
+                    | "composer.json"
+                    | "devcontainer.json"
+                    | "context7.json"
+            ) =>
+        {
+            1
+        }
+        _ => 2,
+    };
+    let secondary = path.components().any(|comp| {
+        comp.as_os_str().to_str().is_some_and(|seg| {
+            matches!(
+                seg,
+                "archive"
+                    | "features_change"
+                    | "collected"
+                    | "fixtures"
+                    | "testdata"
+                    | "benchmarks"
+            )
+        })
+    });
+    (tier, secondary, len)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -494,6 +613,9 @@ impl Workspace {
             return Ok(FileInventory {
                 files: HashSet::new(),
                 stamps: std::collections::BTreeMap::new(),
+                extra_files: std::collections::BTreeMap::new(),
+                capped_count: 0,
+                oversized_count: 0,
                 total_path_bytes: 0,
                 metadata_source_bytes: 0,
             });
@@ -503,76 +625,197 @@ impl Workspace {
             command.args(["--max-depth", "1", "--threads", "1"]);
         }
         command.args(["--files", "--null", "--"]).args(&active_targets);
-        let output = capture(&mut command)?;
+        let output = if skip_oversized {
+            capture_discovery(&mut command)?
+        } else {
+            capture(&mut command)?
+        };
         let estimated_count = bytecount_zero(&output).min(policy.max_files);
         let mut paths = HashSet::with_capacity(estimated_count);
         let mut stamps = std::collections::BTreeMap::new();
+        let mut extra_files = std::collections::BTreeMap::new();
         let mut checked_dirs: HashSet<PathBuf> = HashSet::with_capacity((estimated_count / 4).max(16));
         let mut total_path_bytes = 0usize;
         let mut metadata_source_bytes = 0u64;
+        let mut oversized_count = 0usize;
+        if !skip_oversized {
+            for path in output.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let text = std::str::from_utf8(path)?;
+                let path = Path::new(text);
+                safe_relative(path)?;
+                let metadata =
+                    match reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs) {
+                        Ok(metadata) => metadata,
+                        Err(error)
+                            if error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io_err| {
+                                    io_err.kind() == std::io::ErrorKind::NotFound
+                                }) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let normalized = normalize(path);
+                if paths.insert(normalized.clone()) {
+                    total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());
+                    if paths.len() > policy.max_files {
+                        return Err(invalid(format!(
+                            "workspace exceeds max_files ({})",
+                            policy.max_files
+                        ))
+                        .into());
+                    }
+                    if total_path_bytes > policy.max_total_path_bytes {
+                        return Err(invalid(format!(
+                            "workspace exceeds max_total_path_bytes ({})",
+                            policy.max_total_path_bytes
+                        ))
+                        .into());
+                    }
+                    if metadata.len() > policy.max_file_bytes as u64 {
+                        return Err(invalid(format!(
+                            "file exceeds configured max_file_bytes: {}",
+                            normalized.display()
+                        ))
+                        .into());
+                    }
+                    metadata_source_bytes = metadata_source_bytes.saturating_add(metadata.len());
+                    if metadata_source_bytes > policy.max_source_bytes as u64 {
+                        return Err(invalid(format!(
+                            "workspace metadata exceeds max_source_bytes ({})",
+                            policy.max_source_bytes
+                        ))
+                        .into());
+                    }
+                    let normalized_name = normalized
+                        .to_str()
+                        .ok_or_else(|| invalid("non-UTF8 path"))?
+                        .to_owned();
+                    stamps.insert(
+                        normalized_name,
+                        crate::incremental::stamp_from_metadata(&metadata)?,
+                    );
+                }
+            }
+            return Ok(FileInventory {
+                files: paths,
+                stamps,
+                extra_files,
+                capped_count: 0,
+                oversized_count: 0,
+                total_path_bytes,
+                metadata_source_bytes,
+            });
+        }
+
+        let mut seen_names: HashSet<String> = HashSet::with_capacity(estimated_count);
+        let mut candidates: Vec<(PathBuf, String, crate::incremental::Stamp, usize)> =
+            Vec::with_capacity(estimated_count);
+        let mut extra_path_bytes = 0usize;
         for path in output.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-            let text = std::str::from_utf8(path)?;
+            let Ok(text) = std::str::from_utf8(path) else {
+                continue;
+            };
             let path = Path::new(text);
-            safe_relative(path)?;
-            let metadata = match reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs) {
+            if safe_relative(path).is_err() {
+                continue;
+            }
+            let metadata = match reject_symlinks_metadata_cached(&self.root, path, &mut checked_dirs)
+            {
                 Ok(metadata) => metadata,
                 Err(error)
                     if error
                         .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                        || error
+                            .to_string()
+                            .contains("symlinks are unsupported in this local experiment") =>
                 {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             let normalized = normalize(path);
-            if skip_oversized && metadata.len() > policy.max_file_bytes as u64 {
+            let Some(normalized_str) = normalized.to_str() else {
+                continue;
+            };
+            let normalized_name = normalized_str.to_owned();
+            if !seen_names.insert(normalized_name.clone()) {
                 continue;
             }
-            if paths.insert(normalized.clone()) {
-                total_path_bytes = total_path_bytes.saturating_add(path.as_os_str().len());
-                if paths.len() > policy.max_files {
-                    return Err(invalid(format!(
-                        "workspace exceeds max_files ({})",
-                        policy.max_files
-                    ))
-                    .into());
+            let stamp = crate::incremental::stamp_from_metadata(&metadata)?;
+            let raw_path_len = path.as_os_str().len();
+            if metadata.len() > policy.max_file_bytes as u64 {
+                oversized_count = oversized_count.saturating_add(1);
+                if extra_files.len() < policy.max_files
+                    && extra_path_bytes.saturating_add(raw_path_len) <= policy.max_total_path_bytes
+                {
+                    extra_path_bytes = extra_path_bytes.saturating_add(raw_path_len);
+                    extra_files.insert(normalized_name, stamp);
                 }
-                if total_path_bytes > policy.max_total_path_bytes {
-                    return Err(invalid(format!(
-                        "workspace exceeds max_total_path_bytes ({})",
-                        policy.max_total_path_bytes
-                    ))
-                    .into());
+                continue;
+            }
+            total_path_bytes = total_path_bytes.saturating_add(raw_path_len);
+            metadata_source_bytes = metadata_source_bytes.saturating_add(metadata.len());
+            candidates.push((normalized, normalized_name, stamp, raw_path_len));
+        }
+
+        if candidates.len() <= policy.max_files
+            && total_path_bytes <= policy.max_total_path_bytes
+            && metadata_source_bytes <= policy.max_source_bytes as u64
+        {
+            for (normalized, normalized_name, stamp, _) in candidates {
+                paths.insert(normalized);
+                stamps.insert(normalized_name, stamp);
+            }
+            return Ok(FileInventory {
+                files: paths,
+                stamps,
+                extra_files,
+                capped_count: 0,
+                oversized_count,
+                total_path_bytes,
+                metadata_source_bytes,
+            });
+        }
+
+        // Graceful 3-tier priority capping when aggregate inventory exceeds static policy limits.
+        candidates.sort_unstable_by(|a, b| {
+            inventory_priority_key(&a.0, a.2.length)
+                .cmp(&inventory_priority_key(&b.0, b.2.length))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        total_path_bytes = 0;
+        metadata_source_bytes = 0;
+        let mut capped_count = 0usize;
+        for (normalized, normalized_name, stamp, raw_path_len) in candidates {
+            if paths.len() < policy.max_files
+                && total_path_bytes.saturating_add(raw_path_len) <= policy.max_total_path_bytes
+                && metadata_source_bytes.saturating_add(stamp.length)
+                    <= policy.max_source_bytes as u64
+            {
+                total_path_bytes = total_path_bytes.saturating_add(raw_path_len);
+                metadata_source_bytes = metadata_source_bytes.saturating_add(stamp.length);
+                paths.insert(normalized);
+                stamps.insert(normalized_name, stamp);
+            } else {
+                capped_count = capped_count.saturating_add(1);
+                if extra_files.len() < policy.max_files
+                    && extra_path_bytes.saturating_add(raw_path_len) <= policy.max_total_path_bytes
+                {
+                    extra_path_bytes = extra_path_bytes.saturating_add(raw_path_len);
+                    extra_files.insert(normalized_name, stamp);
                 }
-                if metadata.len() > policy.max_file_bytes as u64 {
-                    return Err(invalid(format!(
-                        "file exceeds configured max_file_bytes: {}",
-                        normalized.display()
-                    ))
-                    .into());
-                }
-                metadata_source_bytes = metadata_source_bytes.saturating_add(metadata.len());
-                if metadata_source_bytes > policy.max_source_bytes as u64 {
-                    return Err(invalid(format!(
-                        "workspace metadata exceeds max_source_bytes ({})",
-                        policy.max_source_bytes
-                    ))
-                    .into());
-                }
-                let normalized_name = normalized
-                    .to_str()
-                    .ok_or_else(|| invalid("non-UTF8 path"))?
-                    .to_owned();
-                stamps.insert(
-                    normalized_name,
-                    crate::incremental::stamp_from_metadata(&metadata)?,
-                );
             }
         }
         Ok(FileInventory {
             files: paths,
             stamps,
+            extra_files,
+            capped_count,
+            oversized_count,
             total_path_bytes,
             metadata_source_bytes,
         })
@@ -696,7 +939,9 @@ impl Workspace {
                 ))
                 .into());
             }
-            if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)? {
+            if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)
+                .map_err(|err| invalid(format!("document extraction failed for {}: {err}", path.display())))?
+            {
                 return Ok(extracted.into_bytes());
             }
             if memchr::memchr(0, &bytes).is_some() {
@@ -755,7 +1000,9 @@ impl Workspace {
             ))
             .into());
         }
-        if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)? {
+        if let Some(extracted) = crate::document::extract_document_bytes(path, &bytes)
+            .map_err(|err| invalid(format!("document extraction failed for {}: {err}", path.display())))?
+        {
             return Ok(extracted.into_bytes());
         }
         if memchr::memchr(0, &bytes).is_some() {
@@ -958,7 +1205,36 @@ pub fn capture(command: &mut Command) -> Result<Vec<u8>> {
     capture_with_timeout(command, COMMAND_TIMEOUT)
 }
 
+pub(crate) fn capture_discovery(command: &mut Command) -> Result<Vec<u8>> {
+    capture_inner(command, COMMAND_TIMEOUT, MAX_DISCOVERY_CAPTURE, true)
+}
+
 pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
+    capture_inner(command, timeout, MAX_CAPTURE, false)
+}
+
+fn is_transient_missing_stderr(stderr: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let mut saw_line = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        saw_line = true;
+        let missing = line.contains("No such file or directory")
+            || line.contains("The system cannot find the");
+        if !missing {
+            return false;
+        }
+    }
+    saw_line
+}
+
+fn capture_inner(
+    command: &mut Command,
+    timeout: Duration,
+    max_capture: usize,
+    ignore_transient_missing: bool,
+) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -992,7 +1268,7 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         .spawn(move || {
             let mut bytes = Vec::with_capacity(8192);
             stdout
-                .take(MAX_CAPTURE as u64 + 1)
+                .take(max_capture as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map(|_| bytes)
         }) {
@@ -1061,8 +1337,18 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         ))
         .into());
     }
-    if stdout.len() > MAX_CAPTURE {
-        return Err(invalid("command output exceeds 8 MiB; narrow the search").into());
+    if stdout.len() > max_capture {
+        return Err(invalid(format!(
+            "command output exceeds {} MiB; narrow the search",
+            max_capture / (1024 * 1024)
+        ))
+        .into());
+    }
+    if ignore_transient_missing
+        && status.code() == Some(2)
+        && is_transient_missing_stderr(&stderr)
+    {
+        return Ok(stdout);
     }
     if !status.success() && status.code() != Some(1) {
         return Err(invalid(format!(
@@ -1071,7 +1357,7 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         ))
         .into());
     }
-    if !stderr.is_empty() {
+    if !stderr.is_empty() && (!ignore_transient_missing || !is_transient_missing_stderr(&stderr)) {
         return Err(invalid(format!(
             "command reported an error: {}",
             String::from_utf8_lossy(&stderr)
@@ -1079,4 +1365,23 @@ pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         .into());
     }
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod transient_discovery_tests {
+    use super::is_transient_missing_stderr;
+
+    #[test]
+    fn transient_missing_stderr_filters_only_vanished_paths() {
+        assert!(is_transient_missing_stderr(
+            b"data/autonomy/rsi_staging/rustcyV0GMn: No such file or directory (os error 2)\n"
+        ));
+        assert!(!is_transient_missing_stderr(b""));
+        assert!(!is_transient_missing_stderr(
+            b"rg: regex parse error: unclosed group\n"
+        ));
+        assert!(!is_transient_missing_stderr(
+            b"data/a: No such file or directory (os error 2)\nsecret: Permission denied (os error 13)\n"
+        ));
+    }
 }

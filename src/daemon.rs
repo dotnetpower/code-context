@@ -31,7 +31,28 @@ const MAX_CACHE_FAILURES: usize = 32;
 const MAX_COLD_LOAD_RETRIES: u8 = 6;
 const MIN_COLD_RETRY_RESERVE: usize = 128 * 1024 * 1024;
 const CACHE_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+const ADMISSION_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const IDLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+
+fn failure_cooldown(error: &str) -> Duration {
+    if error.contains("resident admission budget exceeded") {
+        ADMISSION_FAILURE_COOLDOWN
+    } else {
+        CACHE_FAILURE_COOLDOWN
+    }
+}
+
+fn glob_has_non_core_tier(glob: &str) -> bool {
+    let trimmed = glob.trim_start_matches("**/").trim_start_matches('*');
+    let probe = if let Some(ext) = trimmed.strip_prefix('.') {
+        format!("probe.{ext}")
+    } else if trimmed.is_empty() {
+        return true;
+    } else {
+        trimmed.to_owned()
+    };
+    crate::workspace::inventory_priority_key(std::path::Path::new(&probe), 0).0 > 0
+}
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SERVICE_READ_BPS: u64 = 256_000_000;
 const SERVICE_WRITE_BPS: u64 = 16_000_000;
@@ -385,17 +406,20 @@ struct BackgroundRoot {
     owner: Option<(u64, bool)>,
     reply_abandoned: bool,
     retry: u8,
+    tier_trimmed: bool,
 }
 
 struct PendingRoot {
     requested: PathBuf,
     retry: u8,
+    tier_trimmed: bool,
 }
 
 struct RootPreparation {
     requested: PathBuf,
     receiver: std::sync::mpsc::Receiver<Result<Spec>>,
     retry: u8,
+    tier_trimmed: bool,
     policy_snapshot: Vec<Spec>,
 }
 
@@ -1232,7 +1256,8 @@ impl Server {
         } else {
             let remaining = self.memory.limits.target.saturating_sub(used);
             let cushion = (128 * 1024 * 1024).min(remaining / 2);
-            remaining.saturating_sub(cushion)
+            let unhinted_floor = (384 * 1024 * 1024).min(self.memory.limits.target);
+            remaining.saturating_sub(cushion).max(unhinted_floor)
         }
     }
 
@@ -1295,12 +1320,13 @@ impl Server {
     }
 
     fn queue_root(&mut self, requested: PathBuf) -> Result<CacheMiss> {
-        if let Some((at, error)) = self.cache_failures.get(&requested)
-            && at.elapsed() < CACHE_FAILURE_COOLDOWN
-        {
-            return Err(invalid(format!(
+        if let Some((at, error)) = self.cache_failures.get(&requested) {
+            let cooldown = failure_cooldown(error);
+            if at.elapsed() < cooldown {
+                return Err(invalid(format!(
                     "CACHE_LOAD_FAILED root={}: {error}. Continue with a permitted host read; no cached absence result is available. Automatic retry is suppressed for {}s; do not poll or widen access.",
-                    requested.display(), CACHE_FAILURE_COOLDOWN.as_secs())).into());
+                    requested.display(), cooldown.as_secs())).into());
+            }
         }
         let previous_failure = self.cache_failures.remove(&requested).map(|(_, error)| error);
         let eta_ms = expected_load_ms(&self.background_timings, &requested);
@@ -1338,6 +1364,7 @@ impl Server {
             self.pending_roots.push_back(PendingRoot {
                 requested: requested.clone(),
                 retry: 0,
+                tier_trimmed: false,
             });
             "queued"
         };
@@ -1411,7 +1438,9 @@ impl Server {
                 {
                     eprintln!("CCTX_PREPARATION_RETRY root={} reason=authorization_changed", job.requested.display());
                     self.pending_roots.push_front(PendingRoot {
-                        requested: job.requested, retry: job.retry + 1,
+                        requested: job.requested,
+                        retry: job.retry + 1,
+                        tier_trimmed: job.tier_trimmed,
                     });
                     return;
                 }
@@ -1431,7 +1460,7 @@ impl Server {
                     .get(&spec.root)
                     .is_none_or(|entry| entry.spec != spec)
                 {
-                    self.start_root_job(spec, None, job.retry)?;
+                    self.start_root_job_with_options(spec, None, job.retry, job.tier_trimmed)?;
                 }
                 Ok(())
             });
@@ -1471,7 +1500,12 @@ impl Server {
                         .get(&spec.root)
                         .is_none_or(|entry| entry.spec != spec)
                     {
-                        self.start_root_job(spec, None, job.retry)?;
+                        self.start_root_job_with_options(
+                            spec,
+                            None,
+                            job.retry,
+                            job.tier_trimmed,
+                        )?;
                     }
                     Ok(())
                 });
@@ -1507,6 +1541,7 @@ impl Server {
                     requested: job.requested,
                     receiver,
                     retry: job.retry,
+                    tier_trimmed: job.tier_trimmed,
                     policy_snapshot: self.registry.iter()
                         .filter(|spec|spec.managed_parent.is_none()).cloned().collect(),
                 })
@@ -1576,7 +1611,7 @@ impl Server {
             return Ok(false);
         };
         if let Some((at, error)) = self.cache_failures.get(&spec.root)
-            && at.elapsed() < CACHE_FAILURE_COOLDOWN
+            && at.elapsed() < failure_cooldown(error)
         {
             return Err(invalid(error.clone()).into());
         }
@@ -1602,6 +1637,16 @@ impl Server {
         spec: Spec,
         requester: Option<(u64, bool)>,
         retry: u8,
+    ) -> Result<()> {
+        self.start_root_job_with_options(spec, requester, retry, false)
+    }
+
+    fn start_root_job_with_options(
+        &mut self,
+        spec: Spec,
+        requester: Option<(u64, bool)>,
+        retry: u8,
+        tier_trimmed: bool,
     ) -> Result<()> {
         if self
             .roots
@@ -1670,9 +1715,12 @@ impl Server {
                         watched.restore_admission(previous);
                         Ok((watched, Some(outcome)))
                     }
-                    None => {
-                        Watched::new_with_budget(worker_spec, budget).map(|watched| (watched, None))
-                    }
+                    None => Watched::new_with_budget_and_tier_trim(
+                        worker_spec,
+                        budget,
+                        tier_trimmed,
+                    )
+                    .map(|watched| (watched, None)),
                 };
                 let result = result.and_then(|(watched, outcome)| {
                     let registry = catalog::load()?;
@@ -1699,6 +1747,7 @@ impl Server {
             owner,
             reply_abandoned: false,
             retry,
+            tier_trimmed,
         });
         Ok(())
     }
@@ -1797,6 +1846,42 @@ impl Server {
                     let Some(retry_budget) = Self::cold_retry_budget_with_limit(
                         &job.spec, job.budget, required, job.retry, self.memory.limits.target,
                     ) else {
+                        let can_tier_trim = !job.tier_trimmed
+                            && job.spec.root.is_dir()
+                            && self.pending_roots.len() < MAX_PENDING_ROOTS
+                            && job.spec.globs.iter().any(|g| glob_has_non_core_tier(g));
+                        if can_tier_trim {
+                            let tier_trim_budget = (required / 2)
+                                .max(256 * 1024 * 1024)
+                                .min(self.memory.limits.target);
+                            self.root_size_hints.insert(
+                                job.spec.root.clone(),
+                                (
+                                    job.spec.clone(),
+                                    tier_trim_budget.saturating_sub(job.spec.policy.max_staged_bytes),
+                                ),
+                            );
+                            while self
+                                .roots
+                                .values()
+                                .map(Watched::estimated_bytes)
+                                .sum::<usize>()
+                                .saturating_add(tier_trim_budget)
+                                > self.memory.limits.target
+                            {
+                                let Some(oldest) = self.eviction_candidate(None) else {
+                                    break;
+                                };
+                                self.evict(&oldest, "cold_build_peak_admission");
+                            }
+                            release_allocator_memory();
+                            self.pending_roots.push_front(PendingRoot {
+                                requested: job.spec.root,
+                                retry: job.retry,
+                                tier_trimmed: true,
+                            });
+                            return;
+                        }
                         self.fail_background_root(&job, error.to_string());
                         return;
                     };
@@ -1823,6 +1908,7 @@ impl Server {
                         self.pending_roots.push_front(PendingRoot {
                             requested: job.spec.root,
                             retry: job.retry + 1,
+                            tier_trimmed: job.tier_trimmed,
                         });
                     } else {
                         self.fail_background_root(&job, error.to_string());
@@ -2183,8 +2269,12 @@ impl Server {
             }
         }
         self.drive_lazy_loads();
+        let maint_budget = self.available_cache_budget();
         for entry in self.roots.values_mut() {
-            if let Err(error) = entry.maintenance_tick() {
+            let previous = entry.restrict_admission(maint_budget);
+            let tick_res = entry.maintenance_tick();
+            entry.restore_admission(previous);
+            if let Err(error) = tick_res {
                 eprintln!("background root reconciliation failed: {error}");
             }
         }
@@ -3179,7 +3269,11 @@ mod tests {
         let mut server=Server::default();
         assert_eq!(server.poll_interval(false),Duration::from_secs(1));
         assert_eq!(server.poll_interval(true),Duration::from_millis(5));
-        server.pending_roots.push_back(PendingRoot {requested:PathBuf::from("/test/root"),retry:0});
+        server.pending_roots.push_back(PendingRoot {
+            requested: PathBuf::from("/test/root"),
+            retry: 0,
+            tier_trimmed: false,
+        });
         assert_eq!(server.poll_interval(false),Duration::from_millis(5));
     }
 
@@ -3255,6 +3349,7 @@ mod tests {
             owner: None,
             reply_abandoned: false,
             retry: 0,
+            tier_trimmed: false,
         }
     }
 
@@ -3392,7 +3487,10 @@ mod tests {
         linked.managed_parent = Some(parent.root.clone());
         let (_, receiver) = std::sync::mpsc::sync_channel(1);
         let job = RootPreparation {
-            requested: linked.root.clone(), receiver, retry: 0,
+            requested: linked.root.clone(),
+            receiver,
+            retry: 0,
+            tier_trimmed: false,
             policy_snapshot: vec![parent.clone()],
         };
         assert!(!job.policy_changed(&[parent.clone(), linked]));
@@ -3704,5 +3802,74 @@ mod tests {
             server.memory.limits.target,
             "cold_load_budget must see used==0 after root_limit eviction instead of starving to 0"
         );
+    }
+
+    #[test]
+    fn unhinted_cold_load_evicts_lru_roots_instead_of_starving_on_tiny_remainder() {
+        let (directory, mut server) = cached_test_roots(4);
+        let used = server
+            .roots
+            .values()
+            .map(Watched::estimated_bytes)
+            .sum::<usize>();
+        // Leave only 8 MiB of free target headroom across 4 loaded roots.
+        server.memory.limits.target = used + 8 * 1024 * 1024;
+        let incoming = directory.path().join("incoming-unhinted");
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("source.rs"), "pub fn incoming() {}\n").unwrap();
+        let spec = test_spec(incoming);
+        server.start_root_job(spec, None, 0).unwrap();
+        let reserved = server.background.as_ref().unwrap().budget;
+        assert!(
+            reserved >= 384 * 1024 * 1024,
+            "expected >=384 MiB unhinted floor, got {reserved}"
+        );
+        assert!(server.roots.len() < 4, "expected LRU eviction to free budget");
+    }
+
+    #[test]
+    fn proportional_small_headroom_and_short_admission_cooldown_prevent_false_lockout() {
+        // A 2 MiB resident footprint must not inflate to >160 MiB required budget.
+        let req = Watched::budget_for_resident(2 * 1024 * 1024);
+        assert!(req <= 8 * 1024 * 1024, "unexpectedly large budget {req}");
+
+        let mut server = Server::default();
+        let adm_root = PathBuf::from("/test/admission-dip");
+        server.record_cache_failure(
+            adm_root.clone(),
+            "resident admission budget exceeded by source inventory (required_bytes=1449109)".into(),
+        );
+        assert!(server.request_cache(adm_root.clone()).is_err());
+        server.cache_failures.get_mut(&adm_root).unwrap().0 =
+            Instant::now() - ADMISSION_FAILURE_COOLDOWN - Duration::from_secs(1);
+        assert_eq!(server.request_cache(adm_root).unwrap().state, "queued");
+    }
+
+    #[test]
+    fn glob_tier_probe_and_tier_trimmed_fallback_preserve_unrelated_small_roots() {
+        assert!(!glob_has_non_core_tier("*.rs"));
+        assert!(!glob_has_non_core_tier("*.py"));
+        assert!(glob_has_non_core_tier("*.toml"));
+        assert!(glob_has_non_core_tier("*.json"));
+        assert!(glob_has_non_core_tier("*"));
+
+        let (directory, mut server) = cached_test_roots(1);
+        let warm_sibling = directory.path().join("root-0");
+        let incoming = directory.path().join("incoming-polyglot");
+        std::fs::create_dir(&incoming).unwrap();
+        let mut spec = test_spec(incoming.clone());
+        spec.globs = vec!["*.rs".into(), "*.json".into(), "*.toml".into()];
+        // Simulate full load exceeding GLOBAL_RESIDENT_TARGET (3 GiB) while 1 small sibling (~160 MiB) is resident.
+        server.background = Some(failed_cold_job(
+            spec,
+            GLOBAL_RESIDENT_TARGET,
+            GLOBAL_RESIDENT_TARGET,
+        ));
+        server.poll_background();
+        assert_eq!(server.pending_roots.len(), 1);
+        assert!(server.pending_roots[0].tier_trimmed);
+        // Because tier_trim_budget (~1.58 GiB) + warm_sibling (~160 MiB) <= 3 GiB, the warm sibling stays resident!
+        assert!(server.roots.contains_key(&warm_sibling));
+        assert!(server.evictions.is_empty());
     }
 }

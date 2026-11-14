@@ -590,6 +590,79 @@ fn base_universal_patterns_vec() -> &'static Vec<String> {
     VEC.get_or_init(|| base_universal_patterns().iter().cloned().collect())
 }
 
+fn nested_monorepo_roots(root: &Path) -> Vec<(String, std::path::PathBuf)> {
+    const MAX_SUBDIRS: usize = 256;
+    let skip_dir = |name: &str| -> bool {
+        name.starts_with('.') || UNIVERSAL_EXCLUDED_DIRS.contains(&name)
+    };
+    let skip_l2_descent = |name: &str| -> bool {
+        matches!(
+            name,
+            "data"
+                | "docs"
+                | "logs"
+                | "state"
+                | "workspaces"
+                | "test-files"
+                | "archive"
+                | "fixtures"
+        )
+    };
+    let mut out = Vec::new();
+    let Ok(level1) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut l1_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in level1.filter_map(std::result::Result::ok) {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if skip_dir(name) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            l1_dirs.push((name.to_owned(), entry.path()));
+        }
+    }
+    l1_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Breadth-first: include all level-1 directories before descending to level-2.
+    for (l1_name, l1_path) in &l1_dirs {
+        if out.len() >= MAX_SUBDIRS {
+            return out;
+        }
+        out.push((l1_name.clone(), l1_path.clone()));
+    }
+    for (l1_name, l1_path) in l1_dirs {
+        if skip_l2_descent(&l1_name) {
+            continue;
+        }
+        if let Ok(level2) = std::fs::read_dir(&l1_path) {
+            let mut l2_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+            for entry in level2.filter_map(std::result::Result::ok) {
+                let name_os = entry.file_name();
+                let Some(name) = name_os.to_str() else {
+                    continue;
+                };
+                if skip_dir(name) {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    l2_dirs.push((format!("{l1_name}/{name}"), entry.path()));
+                }
+            }
+            l2_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+            for item in l2_dirs {
+                if out.len() >= MAX_SUBDIRS {
+                    return out;
+                }
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
 pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
     let mut roots = vec![(String::new(), root.to_path_buf())];
     roots.extend(
@@ -599,13 +672,18 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             .map(|scope| (scope.clone(), root.join(scope))),
     );
     let mut profiles = BTreeSet::new();
+    let mut root_profiles = BTreeSet::new();
     let mut extra_patterns = BTreeSet::new();
 
     for (prefix, project_root) in roots {
         let snapshot = RootSnapshot::scan(project_root.as_path());
         for rule in PROFILE_RULES {
+            let matched = snapshot.matches(project_root.as_path(), rule);
+            if matched && prefix.is_empty() {
+                root_profiles.insert(rule.name);
+            }
             apply_scoped(
-                snapshot.matches(project_root.as_path(), rule),
+                matched,
                 prefix.as_str(),
                 rule.name,
                 rule.patterns,
@@ -613,11 +691,15 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
                 &mut extra_patterns,
             );
         }
+        let r_matched = snapshot.files.contains("DESCRIPTION")
+            && (snapshot.files.contains("NAMESPACE")
+                || snapshot.extensions.contains("R")
+                || snapshot.extensions.contains("r"));
+        if r_matched && prefix.is_empty() {
+            root_profiles.insert("r");
+        }
         apply_scoped(
-            snapshot.files.contains("DESCRIPTION")
-                && (snapshot.files.contains("NAMESPACE")
-                    || snapshot.extensions.contains("R")
-                    || snapshot.extensions.contains("r")),
+            r_matched,
             prefix.as_str(),
             "r",
             R_PROJECT,
@@ -628,6 +710,34 @@ pub fn detect(root: &Path, scopes: &[String]) -> EffectiveExclusions {
             && project_root.join("packages/repositories.config").is_file()
         {
             extra_patterns.insert(scoped_pattern(prefix.as_str(), "packages/**"));
+        }
+    }
+
+    if scopes.iter().any(|scope| scope == ".") {
+        for (prefix, sub_root) in nested_monorepo_roots(root) {
+            let snapshot = RootSnapshot::scan(sub_root.as_path());
+            for rule in PROFILE_RULES {
+                if rule.files.is_empty() {
+                    continue;
+                }
+                let matched = rule.files.iter().any(|&name| {
+                    if name == "ProjectSettings/ProjectVersion.txt" {
+                        snapshot.has_project_settings && sub_root.join(name).is_file()
+                    } else {
+                        snapshot.files.contains(name)
+                    }
+                });
+                if matched {
+                    profiles.insert(rule.name);
+                    if !root_profiles.contains(rule.name) {
+                        extra_patterns.extend(
+                            rule.patterns
+                                .iter()
+                                .map(|pattern| scoped_pattern(prefix.as_str(), pattern)),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -657,6 +767,11 @@ pub fn is_profile_marker_for_scopes(path: &Path, scopes: &[String]) -> bool {
         || parent_str == "."
         || parent_str == "ProjectSettings"
         || parent_str == "packages"
+        || (scopes.iter().any(|s| s == ".")
+            && parent.components().count() <= 2
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                PROFILE_RULES.iter().any(|r| r.files.contains(&name))
+            }))
         || scopes.iter().any(|s| {
             s == parent_str
                 || parent_str

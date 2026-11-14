@@ -264,6 +264,7 @@ pub fn plan(spec: &Spec) -> Result<Value> {
         "excludes":workspace.excludes, "default_excludes":workspace.default_excludes,
         "prewarm":spec.prewarm, "policy":spec.policy, "allow_worktrees":spec.allow_worktrees,
         "managed_parent":spec.managed_parent, "files":inventory.files.len(),
+        "capped_files":inventory.capped_count, "oversized_files":inventory.oversized_count,
         "metadata_source_bytes":inventory.metadata_source_bytes,
         "path_bytes":inventory.total_path_bytes, "watch_directories":watches.len(),
         "detected_profiles":workspace.exclusion_summary().profiles,
@@ -285,6 +286,9 @@ pub fn migrate(
         return Err(invalid("migrate the authorized parent, not a managed worktree").into());
     }
     let mut after = before.clone();
+    if after.policy.max_source_bytes == 256 * 1024 * 1024 {
+        after.policy.max_source_bytes = crate::policy::MemoryPolicy::default().max_source_bytes;
+    }
     after.scopes.extend_from_slice(add_scopes);
     after.excludes.extend_from_slice(add_excludes);
     after.excludes.sort();

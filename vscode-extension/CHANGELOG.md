@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.26.0
+
+- Eliminate inventory-exceeded `CACHE_LOAD_FAILED` cliffs and host-tool fallback
+  storms on large polyglot repositories:
+  - Add **3-tier priority inventory & graceful budget capping** (core source
+    code first, configs/docs second, bulk data/rich assets third) across cold
+    loads, incremental directory watcher scans, and 60s background maintenance,
+    with automatic self-healing promotion back to full residency when memory
+    headroom recovers.
+  - Keep `#cctxNativeFiles` (`code_files`) at 100% permitted-path coverage and
+    serve tier-capped files (including Markdown `#toc` / `#outline` / `#section`
+    anchors) transparently on demand via `#cctxNativeRead` (`code_read`) without
+    falling back to built-in `view` or `glob`, while exposing
+    `inventory_complete`, `inventory_capped_files`, and `unindexed_extra_files`
+    in `code_sync`, `code_status`, and `freshness` metadata.
+- Harden adaptive memory admission and WSL2 host coordination:
+  - Add a soft-landing reserve curve on high-RAM hosts, include Linux
+    `SReclaimable` slab caches in WSL2 reclaimable memory accounting, debounce
+    transient single-sample allocation spikes, recover immediately below `4 GiB`,
+    extend WSL2 Windows host report TTL to `600s`, restore LRU eviction floors
+    for unhinted cold loads, match `budget_for_resident` proportionally to small
+    footprints, and shorten transient admission retry cooldowns from `60s` to
+    `5s`.
+  - Raise default `max_source_bytes` to `512 MiB` (upgrading legacy `256 MiB`
+    registrations on `cctx migrate`), expand file-discovery capture to `32 MiB`
+    with immunity to transient `ENOENT` build/test races, isolate corrupt or
+    non-UTF8 non-code documents per-file (`skipped_unreadable_files`), and
+    detect nested monorepo manifests up to two directory levels under `.`.
+
 ## 0.25.9
 
 - Restore Native-first priority (`#cctxNativeContext`, `#cctxNativeRead`,

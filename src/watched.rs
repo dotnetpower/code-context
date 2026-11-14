@@ -1,7 +1,10 @@
 use crate::catalog::Spec;
 use crate::context::{ReadRequest, Snippet, assemble_trusted};
 use crate::exclusion_policy;
-use crate::incremental::{Stamp, stamp, stamps, validate_stamps};
+use crate::incremental::{
+    InventorySnapshot, Stamp, enforce_stamp_budget, inventory_snapshot, stamp,
+    trim_stamps_to_source_budget,
+};
 use crate::policy::WORKER_STACK_BYTES;
 use crate::query::{Query, QueryCache, search_fast_arc, search_profiled, search_profiled_mode};
 use crate::resident::Resident;
@@ -24,7 +27,17 @@ mod io_tests {
     fn unchanged_metadata_result_preserves_stats_without_running_an_update() {
         let (_root,mut watched)=fixture();
         let before=serde_json::to_value(&watched.resident.stats).unwrap();
-        watched.maintenance_tx.try_send((watched.mutation_epoch,Ok(watched.stamps.clone()))).unwrap();
+        watched
+            .maintenance_tx
+            .try_send((
+                watched.mutation_epoch,
+                Ok(crate::incremental::InventorySnapshot {
+                    stamps: watched.stamps.clone(),
+                    extra_files: watched.extra_files.clone(),
+                    capped_count: watched.capped_files_count,
+                }),
+            ))
+            .unwrap();
         watched.apply_maintenance().unwrap();
         assert_eq!(watched.io_profile.maintenance_noop_applies,1);
         assert_eq!(serde_json::to_value(&watched.resident.stats).unwrap(),before);
@@ -558,7 +571,7 @@ pub(crate) fn lease_multiplier(lookups: u64) -> u32 {
     }
 }
 const ROOT_RUNTIME_HEADROOM: usize = 160 * 1024 * 1024;
-type MaintenanceResult = (u64, Result<BTreeMap<String, Stamp>>);
+type MaintenanceResult = (u64, Result<InventorySnapshot>);
 
 #[derive(Default, serde::Serialize)]
 struct IoProfile {
@@ -582,6 +595,9 @@ pub struct Watched {
     events: Receiver<notify::Result<Event>>,
     overflow: Arc<AtomicBool>,
     stamps: BTreeMap<String, Stamp>,
+    extra_files: BTreeMap<String, Stamp>,
+    capped_files_count: usize,
+    tier_trimmed_active: bool,
     last_reconcile: Instant,
     last_used: Instant,
     source_lookups: u64,
@@ -617,7 +633,16 @@ impl Watched {
     }
 
     pub(crate) fn budget_for_resident(required_bytes: usize) -> usize {
-        required_bytes.saturating_add(ROOT_RUNTIME_HEADROOM)
+        if required_bytes == 0 {
+            return ROOT_RUNTIME_HEADROOM;
+        }
+        if required_bytes >= 512 * 1024 * 1024 - ROOT_RUNTIME_HEADROOM {
+            required_bytes.saturating_add(ROOT_RUNTIME_HEADROOM)
+        } else {
+            required_bytes
+                .saturating_add(required_bytes.div_ceil(3))
+                .max(4 * 1024 * 1024)
+        }
     }
 
     pub fn new(spec: Spec) -> Result<Self> {
@@ -625,11 +650,31 @@ impl Watched {
     }
 
     pub fn new_with_budget(spec: Spec, max_owned_bytes: usize) -> Result<Self> {
+        Self::new_with_budget_and_tier_trim(spec, max_owned_bytes, false)
+    }
+
+    pub(crate) fn new_with_budget_and_tier_trim(
+        spec: Spec,
+        max_owned_bytes: usize,
+        trim_tiers_for_budget: bool,
+    ) -> Result<Self> {
         let workspace = spec.workspace()?;
         let mut inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
+        let resident_budget =
+            max_owned_bytes.saturating_sub(Self::effective_headroom(max_owned_bytes));
+        if trim_tiers_for_budget {
+            let safe_source_ceiling = (resident_budget / 3).max(4 * 1024 * 1024) as u64;
+            inventory.trim_to_source_budget(safe_source_ceiling);
+        }
         let mut stamps = std::mem::take(&mut inventory.stamps);
+        let extra_files = std::mem::take(&mut inventory.extra_files);
+        let capped_files_count = inventory.capped_count;
         let watched_dirs = workspace.watch_directories_for(
-            inventory.files.iter().map(std::path::PathBuf::as_path),
+            inventory
+                .files
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .chain(extra_files.keys().map(std::path::Path::new)),
             &spec.policy,
         )?;
         let (tx, events) = sync_channel(4096);
@@ -737,7 +782,7 @@ impl Watched {
             true,
             1,
             spec.policy.clone(),
-            max_owned_bytes.saturating_sub(Self::effective_headroom(max_owned_bytes)),
+            resident_budget,
             inventory,
         )?;
         stamps.retain(|path, _| resident.paths.contains_key(path.as_str()));
@@ -758,6 +803,9 @@ impl Watched {
             events,
             overflow,
             stamps,
+            extra_files,
+            capped_files_count,
+            tier_trimmed_active: trim_tiers_for_budget,
             last_reconcile: Instant::now(),
             last_used: Instant::now(),
             source_lookups: 0,
@@ -796,8 +844,12 @@ impl Watched {
 
     pub(crate) fn restrict_admission(&mut self, total_budget: usize) -> usize {
         let previous = self.resident.max_owned_bytes;
-        self.resident.max_owned_bytes =
-            previous.min(total_budget.saturating_sub(Self::effective_headroom(total_budget)));
+        if total_budget > 0 {
+            self.resident.max_owned_bytes =
+                total_budget.saturating_sub(Self::effective_headroom(total_budget));
+        } else {
+            self.resident.max_owned_bytes = 0;
+        }
         previous
     }
 
@@ -806,11 +858,17 @@ impl Watched {
     }
 
     pub fn estimated_bytes(&self) -> usize {
+        let extra_bytes = self
+            .extra_files
+            .keys()
+            .map(|k| k.len() + std::mem::size_of::<Stamp>() + 64)
+            .sum::<usize>();
         let stamp_bytes = self
             .resident
             .stats
             .path_bytes
-            .saturating_add(self.stamps.len().saturating_mul(std::mem::size_of::<Stamp>() + 64));
+            .saturating_add(self.stamps.len().saturating_mul(std::mem::size_of::<Stamp>() + 64))
+            .saturating_add(extra_bytes);
         let cap_headroom =
             if self.resident.max_owned_bytes >= 512 * 1024 * 1024 - ROOT_RUNTIME_HEADROOM {
                 ROOT_RUNTIME_HEADROOM
@@ -1199,6 +1257,16 @@ impl Watched {
                     .update(&workspace, &actual_changed, &self.stamps, verify_all)
                 {
                     Ok(update) => {
+                        let max_file = self.spec.policy.max_file_bytes as u64;
+                        let max_files = self.spec.policy.max_files;
+                        for (path, s) in &self.stamps {
+                            if !self.resident.paths.contains_key(path.as_str())
+                                && s.length > max_file
+                                && self.extra_files.len() < max_files
+                            {
+                                self.extra_files.insert(path.clone(), s.clone());
+                            }
+                        }
                         self.stamps
                             .retain(|path, _| self.resident.paths.contains_key(path.as_str()));
                         self.record_update(update);
@@ -1218,7 +1286,24 @@ impl Watched {
             }
         }
         self.io_profile.full_inventory_scans += 1;
-        let mut current = stamps(&workspace, &self.spec.policy)?;
+        let snapshot = inventory_snapshot(&workspace, &self.spec.policy)?;
+        let mut current = snapshot.stamps;
+        self.extra_files = snapshot.extra_files;
+        self.capped_files_count = snapshot.capped_count;
+        if self.tier_trimmed_active && self.resident.max_owned_bytes < usize::MAX {
+            let safe_ceiling = (self.resident.max_owned_bytes / 3).max(4 * 1024 * 1024) as u64;
+            let trimmed = trim_stamps_to_source_budget(
+                &mut current,
+                &mut self.extra_files,
+                safe_ceiling,
+                self.spec.policy.max_files,
+            );
+            if trimmed > 0 {
+                self.capped_files_count = self.capped_files_count.saturating_add(trimmed);
+            } else {
+                self.tier_trimmed_active = false;
+            }
+        }
         if let Some((_, cached_policy)) = &self.watcher_policy
             && workspace.candidate_policy_key() != cached_policy.key
         {
@@ -1253,12 +1338,47 @@ impl Watched {
             }
         }
         if need_watch_refresh {
-            self.refresh_watch_directories(&workspace, current.keys().map(std::path::Path::new))?;
+            let watch_paths: Vec<PathBuf> = current
+                .keys()
+                .chain(self.extra_files.keys())
+                .map(PathBuf::from)
+                .collect();
+            self.refresh_watch_directories(&workspace, watch_paths.iter().map(PathBuf::as_path))?;
         }
         // Unchanged files are not reopened except for an explicit strict barrier.
-        let update =
-            self.resident
-                .update(&workspace, &changed, &current, verify_all || watcher_rescan)?;
+        let update = match self
+            .resident
+            .update(&workspace, &changed, &current, verify_all || watcher_rescan)
+        {
+            Ok(update) => update,
+            Err(error)
+                if self.resident.max_owned_bytes < usize::MAX
+                    && error
+                        .to_string()
+                        .contains("staged update exceeds resident admission peak") =>
+            {
+                let safe_ceiling = (self.resident.max_owned_bytes / 3).max(4 * 1024 * 1024) as u64;
+                let trimmed = trim_stamps_to_source_budget(
+                    &mut current,
+                    &mut self.extra_files,
+                    safe_ceiling,
+                    self.spec.policy.max_files,
+                );
+                if trimmed == 0 {
+                    return Err(error);
+                }
+                self.tier_trimmed_active = true;
+                self.capped_files_count = self.capped_files_count.saturating_add(trimmed);
+                for path in self.stamps.keys() {
+                    if !current.contains_key(path) {
+                        changed.insert(path.clone());
+                    }
+                }
+                self.resident
+                    .update(&workspace, &changed, &current, verify_all || watcher_rescan)?
+            }
+            Err(error) => return Err(error),
+        };
         current.retain(|path, _| self.resident.paths.contains_key(path.as_str()));
         self.record_update(update);
         self.query_cache
@@ -1317,6 +1437,14 @@ impl Watched {
                     path.parent().unwrap_or(Path::new("")) != directory
                 }
             });
+            self.extra_files.retain(|name, _| {
+                let path = Path::new(name);
+                if *recursive {
+                    !path.starts_with(&directory)
+                } else {
+                    path.parent().unwrap_or(Path::new("")) != directory
+                }
+            });
             if !workspace.root.join(&directory).is_dir() {
                 continue;
             }
@@ -1349,8 +1477,17 @@ impl Watched {
             for (name, metadata) in inventory.stamps {
                 current.insert(name, metadata);
             }
+            for (name, metadata) in inventory.extra_files {
+                self.extra_files.insert(name, metadata);
+            }
         }
-        validate_stamps(&current, &self.spec.policy)?;
+        let capped_delta = enforce_stamp_budget(&mut current, &mut self.extra_files, &self.spec.policy);
+        self.capped_files_count = self
+            .extra_files
+            .values()
+            .filter(|s| s.length <= self.spec.policy.max_file_bytes as u64)
+            .count()
+            .max(capped_delta);
         if let Some((_, cached_policy)) = &self.watcher_policy
             && workspace.candidate_policy_key() != cached_policy.key
         {
@@ -1425,7 +1562,7 @@ impl Watched {
                     Some(workspace) => Ok(workspace),
                     None => spec.workspace(),
                 }
-                .and_then(|workspace| stamps(&workspace, &policy));
+                .and_then(|workspace| inventory_snapshot(&workspace, &policy));
                 let _ = sender.try_send((epoch, result));
                 active.store(false, Ordering::Release);
             })
@@ -1441,14 +1578,31 @@ impl Watched {
             if epoch != self.mutation_epoch {
                 continue;
             }
-            let mut current = match result {
-                Ok(current) => current,
+            let snapshot = match result {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.prune_deleted_watches();
                     self.blocked = Some(error.to_string());
                     return Err(error);
                 }
             };
+            let mut current = snapshot.stamps;
+            self.extra_files = snapshot.extra_files;
+            self.capped_files_count = snapshot.capped_count;
+            if self.tier_trimmed_active && self.resident.max_owned_bytes < usize::MAX {
+                let safe_ceiling = (self.resident.max_owned_bytes / 3).max(4 * 1024 * 1024) as u64;
+                let trimmed = trim_stamps_to_source_budget(
+                    &mut current,
+                    &mut self.extra_files,
+                    safe_ceiling,
+                    self.spec.policy.max_files,
+                );
+                if trimmed > 0 {
+                    self.capped_files_count = self.capped_files_count.saturating_add(trimmed);
+                } else {
+                    self.tier_trimmed_active = false;
+                }
+            }
             self.prune_deleted_watches();
             if current==self.stamps {
                 let workspace = self.workspace()?.into_owned();
@@ -1489,14 +1643,49 @@ impl Watched {
                 }
             }
             if need_watch_refresh {
+                let watch_paths: Vec<PathBuf> = current
+                    .keys()
+                    .chain(self.extra_files.keys())
+                    .map(PathBuf::from)
+                    .collect();
                 self.refresh_watch_directories(
                     &workspace,
-                    current.keys().map(std::path::Path::new),
+                    watch_paths.iter().map(PathBuf::as_path),
                 )?;
             }
-            let update = self
+            let update = match self
                 .resident
-                .update(&workspace, &changed, &current, false)?;
+                .update(&workspace, &changed, &current, false)
+            {
+                Ok(update) => update,
+                Err(error)
+                    if self.resident.max_owned_bytes < usize::MAX
+                        && error
+                            .to_string()
+                            .contains("staged update exceeds resident admission peak") =>
+                {
+                    let safe_ceiling =
+                        (self.resident.max_owned_bytes / 3).max(4 * 1024 * 1024) as u64;
+                    let trimmed = trim_stamps_to_source_budget(
+                        &mut current,
+                        &mut self.extra_files,
+                        safe_ceiling,
+                        self.spec.policy.max_files,
+                    );
+                    if trimmed == 0 {
+                        return Err(error);
+                    }
+                    self.tier_trimmed_active = true;
+                    self.capped_files_count = self.capped_files_count.saturating_add(trimmed);
+                    for path in self.stamps.keys() {
+                        if !current.contains_key(path) {
+                            changed.insert(path.clone());
+                        }
+                    }
+                    self.resident.update(&workspace, &changed, &current, false)?
+                }
+                Err(error) => return Err(error),
+            };
             current.retain(|path, _| self.resident.paths.contains_key(path.as_str()));
             self.record_update(update);
             self.query_cache
@@ -1517,12 +1706,20 @@ impl Watched {
     fn freshness_ref<'a>(&self, returned_file_check: &'a str, regex_hint: bool) -> FreshnessRef<'a> {
         const BASE_NOTICE: &str = "Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence.";
         const REGEX_NOTICE: &str = "Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence. (Pattern contains regex syntax with regex=false; set regex=true if a regular expression was intended.)";
+        const CAPPED_NOTICE: &str = "Verify recent edits with code_read or a host policy-aware live disk read; lower-priority data/doc files were capped by inventory budget (code_files and code_read still cover them; do not claim workspace-wide absence across capped files).";
         FreshnessRef {
             basis: "watcher_snapshot",
             generation: self.resident.stats.generation,
             returned_file_check,
             full_disk_verified: false,
-            notice: if regex_hint { REGEX_NOTICE } else { BASE_NOTICE },
+            notice: if regex_hint {
+                REGEX_NOTICE
+            } else if self.capped_files_count > 0 {
+                CAPPED_NOTICE
+            } else {
+                BASE_NOTICE
+            },
+            inventory_capped_files: self.capped_files_count,
         }
     }
 
@@ -1549,13 +1746,20 @@ impl Watched {
                 }
                 self.filter_multi_search_paths(&mut request.paths);
                 self.check_explicit_search_targets(&request.paths, Some(&request.glob))?;
-                let result = if self.resident.ids_are_path_sorted {
+                let result = if self.extra_files.is_empty() && self.resident.ids_are_path_sorted {
                     crate::files::find(
                         self.resident.documents.iter().map(|d| d.path.as_ref()),
                         &request,
                     )?
                 } else {
-                    crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?
+                    crate::files::find(
+                        self.resident
+                            .paths
+                            .keys()
+                            .map(|p| p.as_ref())
+                            .chain(self.extra_files.keys().map(String::as_str)),
+                        &request,
+                    )?
                 };
                 self.check_search_paths(result.paths.iter().map(String::as_str))?;
                 #[derive(serde::Serialize)]
@@ -2124,13 +2328,20 @@ impl Watched {
                 }
                 self.filter_multi_search_paths(&mut request.paths);
                 self.check_explicit_search_targets(&request.paths, Some(&request.glob))?;
-                let result = if self.resident.ids_are_path_sorted {
+                let result = if self.extra_files.is_empty() && self.resident.ids_are_path_sorted {
                     crate::files::find(
                         self.resident.documents.iter().map(|d| d.path.as_ref()),
                         &request,
                     )?
                 } else {
-                    crate::files::find(self.resident.paths.keys().map(|p| p.as_ref()), &request)?
+                    crate::files::find(
+                        self.resident
+                            .paths
+                            .keys()
+                            .map(|p| p.as_ref())
+                            .chain(self.extra_files.keys().map(String::as_str)),
+                        &request,
+                    )?
                 };
                 self.check_search_paths(result.paths.iter().map(String::as_str))?;
                 if compact {
@@ -2647,7 +2858,7 @@ impl Watched {
                     .strip_prefix("a/")
                     .or_else(|| raw.strip_prefix("b/"))
                     && !rest.is_empty()
-                    && self.stamps.contains_key(rest)
+                    && (self.stamps.contains_key(rest) || self.extra_files.contains_key(rest))
                 {
                     *raw = rest.to_owned();
                 }
@@ -2705,37 +2916,62 @@ impl Watched {
                         range.get("path").and_then(Value::as_str).map(str::to_owned)
                     && crate::document::is_document_path(&path_str)
                     && range.get("start").and_then(Value::as_u64).unwrap_or(1) == 1
-                    && let Some(&doc_id) = self.resident.paths.get(path_str.as_str())
                 {
-                    if anchor.eq_ignore_ascii_case("toc") || anchor.eq_ignore_ascii_case("outline")
+                    let doc_text: Option<std::borrow::Cow<'_, str>> = if let Some(&doc_id) =
+                        self.resident.paths.get(path_str.as_str())
                     {
-                        let remaining_after = initial_len.saturating_sub(idx + 1);
-                        let budget = 64usize
-                            .saturating_sub(expanded_ranges.len() + remaining_after)
-                            .max(1);
-                        let toc_ranges = crate::document::resolve_toc_ranges(
+                        Some(std::borrow::Cow::Borrowed(
                             &self.resident.documents[doc_id].text,
-                            budget,
-                        );
-                        if !toc_ranges.is_empty() {
-                            for (s, e) in toc_ranges {
-                                expanded_ranges.push(json!({
-                                    "path": path_str,
-                                    "start": s,
-                                    "end": e,
-                                }));
+                        ))
+                    } else if self
+                        .extra_files
+                        .get(path_str.as_str())
+                        .is_some_and(|s| s.length <= self.spec.policy.max_file_bytes as u64)
+                    {
+                        self.workspace()
+                            .ok()
+                            .and_then(|ws| {
+                                ws.read_known_with_limit(
+                                    Path::new(&path_str),
+                                    self.spec.policy.max_file_bytes,
+                                )
+                                .ok()
+                            })
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .map(std::borrow::Cow::Owned)
+                    } else {
+                        None
+                    };
+                    if let Some(text_ref) = doc_text {
+                        if anchor.eq_ignore_ascii_case("toc")
+                            || anchor.eq_ignore_ascii_case("outline")
+                        {
+                            let remaining_after = initial_len.saturating_sub(idx + 1);
+                            let budget = 64usize
+                                .saturating_sub(expanded_ranges.len() + remaining_after)
+                                .max(1);
+                            let toc_ranges =
+                                crate::document::resolve_toc_ranges(text_ref.as_ref(), budget);
+                            if !toc_ranges.is_empty() {
+                                for (s, e) in toc_ranges {
+                                    expanded_ranges.push(json!({
+                                        "path": path_str,
+                                        "start": s,
+                                        "end": e,
+                                    }));
+                                }
+                                continue;
                             }
-                            continue;
+                        } else if let Some((sec_start, sec_end)) =
+                            crate::document::resolve_markdown_anchor_range(
+                                text_ref.as_ref(),
+                                &anchor,
+                            )
+                            && let Some(obj) = range.as_object_mut()
+                        {
+                            obj.insert("start".into(), json!(sec_start));
+                            obj.insert("end".into(), json!(sec_end));
                         }
-                    } else if let Some((sec_start, sec_end)) =
-                        crate::document::resolve_markdown_anchor_range(
-                            &self.resident.documents[doc_id].text,
-                            &anchor,
-                        )
-                        && let Some(obj) = range.as_object_mut()
-                    {
-                        obj.insert("start".into(), json!(sec_start));
-                        obj.insert("end".into(), json!(sec_end));
                     }
                 }
                 expanded_ranges.push(range);
@@ -2762,6 +2998,11 @@ impl Watched {
                     "reconcile_interval_seconds":RECONCILE_INTERVAL.as_secs(),
                     "detected_profiles":exclusion_summary.profiles,
                     "effective_exclude_count":workspace.excludes.len()+exclusion_summary.patterns.len(),
+                    "inventory_complete":self.capped_files_count == 0
+                        && self.resident.stats.skipped_unreadable_files == 0
+                        && self.extra_files.is_empty(),
+                    "inventory_capped_files":self.capped_files_count,
+                    "unindexed_extra_files":self.extra_files.len(),
                     "idle_timeout_seconds":IDLE_ROOT_TIMEOUT.as_secs()}))
     }
 
@@ -2819,7 +3060,11 @@ impl Watched {
             }
             last_path = Some(path);
             let rel_path = Path::new(path);
-            let Some(expected) = self.stamps.get(path) else {
+            let Some(expected) = self
+                .stamps
+                .get(path)
+                .or_else(|| self.extra_files.get(path))
+            else {
                 crate::workspace::safe_relative(rel_path)?;
                 return Err(self.stale_search_error(path).into());
             };
@@ -2915,9 +3160,19 @@ impl Watched {
             } else {
                 match std::fs::symlink_metadata(self.spec.root.join(&path)) {
                     Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                        let reason = self.workspace()?.unindexed_reason(&name, &self.spec.policy)?;
+                        let reason = if let Some(extra) = self.extra_files.get(name.as_ref()) {
+                            if extra.length > self.spec.policy.max_file_bytes as u64 {
+                                "exceeds_max_file_bytes"
+                            } else {
+                                "inventory_tier_capped"
+                            }
+                        } else {
+                            self.workspace()?.unindexed_reason(&name, &self.spec.policy)?
+                        };
                         let action = if reason == "not_yet_indexed" {
                             "Use code_read for known saved ranges or a permitted host read; do not interpret this as absence.".into()
+                        } else if reason == "inventory_tier_capped" {
+                            "Use code_read directly for this file (supported even when tier-capped) or pctx json/table/log for structured data; do not interpret this as absence.".into()
                         } else if reason == "unsupported_glob" {
                             format!(
                                 "Do not retry this target with code_context/code_grep/code_read or switch CCTX transports. Use a policy-aware host read only if allowed; do not widen access automatically. (To admit standard source/config globs on a legacy registration, run: cctx --root {} migrate --apply)",
@@ -2954,11 +3209,20 @@ impl Watched {
     }
 
     fn search_freshness(&self, returned_file_check: &str) -> Value {
-        json!({
-            "basis":"watcher_snapshot", "generation":self.resident.stats.generation,
-            "returned_file_check":returned_file_check, "full_disk_verified":false,
-            "notice":"Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence."
-        })
+        if self.capped_files_count > 0 {
+            json!({
+                "basis":"watcher_snapshot", "generation":self.resident.stats.generation,
+                "returned_file_check":returned_file_check, "full_disk_verified":false,
+                "inventory_capped_files":self.capped_files_count,
+                "notice":"Verify recent edits with code_read or a host policy-aware live disk read; lower-priority data/doc files were capped by inventory budget (code_files and code_read still cover them; do not claim workspace-wide absence across capped files)."
+            })
+        } else {
+            json!({
+                "basis":"watcher_snapshot", "generation":self.resident.stats.generation,
+                "returned_file_check":returned_file_check, "full_disk_verified":false,
+                "notice":"Verify recent edits with code_read or a host policy-aware live disk read; use code_sync before claiming absence."
+            })
+        }
     }
 
     fn verified_context(
@@ -3140,7 +3404,10 @@ impl Watched {
             .collect();
         for attempt in 0..3 {
             let ranges = self.plan_read_ranges(request)?;
-            match self.resident.read_many(&ranges) {
+            match self
+                .resident
+                .read_many_with_fallback(&workspace, &ranges, &self.extra_files)
+            {
                 Ok(snippets) => {
                     match self.stale_snippet_path_with_workspace(&workspace, &snippets)? {
                         None => {
@@ -3259,7 +3526,9 @@ impl Watched {
                 continue;
             }
             if seen.insert(snippet.path.as_str()) {
-                if !self.stamps.contains_key(&snippet.path) {
+                if !self.stamps.contains_key(&snippet.path)
+                    && !self.extra_files.contains_key(&snippet.path)
+                {
                     return Err(invalid(
                         "file is outside configured scope, ignored, or excluded by glob",
                     )
@@ -3896,6 +4165,10 @@ impl Watched {
     }
 }
 
+fn is_zero_capped(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(serde::Serialize)]
 struct FreshnessRef<'a> {
     basis: &'static str,
@@ -3903,6 +4176,8 @@ struct FreshnessRef<'a> {
     returned_file_check: &'a str,
     full_disk_verified: bool,
     notice: &'static str,
+    #[serde(skip_serializing_if = "is_zero_capped")]
+    inventory_capped_files: usize,
 }
 
 fn serialize_wire_json<T: serde::Serialize>(

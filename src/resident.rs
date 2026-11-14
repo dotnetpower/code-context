@@ -338,6 +338,10 @@ impl Document {
     }
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Stats {
     pub files: usize,
@@ -354,6 +358,8 @@ pub struct Stats {
     pub line_offset_bytes: usize,
     pub document_bytes: usize,
     pub posting_bytes_estimate: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub skipped_unreadable_files: usize,
 }
 
 pub struct Resident {
@@ -389,13 +395,14 @@ impl Resident {
     ) -> Result<Self> {
         policy.validate().map_err(invalid)?;
         let inventory = workspace.files_limited(&policy)?;
-        Self::load_with_inventory(
+        Self::load_with_inventory_options(
             workspace,
             indexed,
             generation,
             policy,
             max_owned_bytes,
             inventory,
+            false,
         )
     }
 
@@ -406,6 +413,26 @@ impl Resident {
         policy: MemoryPolicy,
         max_owned_bytes: usize,
         inventory: FileInventory,
+    ) -> Result<Self> {
+        Self::load_with_inventory_options(
+            workspace,
+            indexed,
+            generation,
+            policy,
+            max_owned_bytes,
+            inventory,
+            true,
+        )
+    }
+
+    pub(crate) fn load_with_inventory_options(
+        workspace: &Workspace,
+        indexed: bool,
+        generation: u64,
+        policy: MemoryPolicy,
+        max_owned_bytes: usize,
+        inventory: FileInventory,
+        isolate_unreadable: bool,
     ) -> Result<Self> {
         policy.validate().map_err(invalid)?;
         let source_floor = usize::try_from(inventory.metadata_source_bytes)?
@@ -426,6 +453,7 @@ impl Resident {
         let mut source_bytes = 0;
         let mut line_count = 0usize;
         let mut doc_owned_bytes = 0usize;
+        let mut skipped_unreadable_files = 0usize;
         let mut digest = Sha256::new();
         let can_parallel_load = paths.len() >= 16
             && inventory.metadata_source_bytes >= 64 * 1024
@@ -442,7 +470,9 @@ impl Resident {
                     Err(error)
                         if error
                             .downcast_ref::<std::io::Error>()
-                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound) =>
+                            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                            || (isolate_unreadable
+                                && crate::incremental::is_skippable_file_load_error(error.as_ref())) =>
                     {
                         continue;
                     }
@@ -461,7 +491,10 @@ impl Resident {
                             .stack_size(crate::policy::WORKER_STACK_BYTES)
                             .spawn_scoped(scope, move || {
                                 let mut out = Vec::with_capacity(chunk.len());
+                                let mut skipped = 0usize;
                                 for &(path, name) in chunk {
+                                    let isolate_file = isolate_unreadable
+                                        && crate::workspace::inventory_priority_key(path, 0).0 > 0;
                                     let bytes = match workspace
                                         .read_known_nofollow_after_dir_check(path, max_file_bytes)
                                     {
@@ -478,9 +511,25 @@ impl Resident {
                                         {
                                             continue;
                                         }
+                                        Err(error)
+                                            if isolate_file
+                                                && crate::incremental::is_skippable_file_load_error(
+                                                    error.as_ref(),
+                                                ) =>
+                                        {
+                                            skipped += 1;
+                                            continue;
+                                        }
                                         Err(error) => return Err(error),
                                     };
-                                    let text = String::from_utf8(bytes)?;
+                                    let text = match String::from_utf8(bytes) {
+                                        Ok(text) => text,
+                                        Err(_) if isolate_file => {
+                                            skipped += 1;
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error.into()),
+                                    };
                                     let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
                                     let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
                                     let starts = build_line_starts(&text)?;
@@ -492,7 +541,7 @@ impl Resident {
                                         sha256_hex,
                                     });
                                 }
-                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(out)
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((out, skipped))
                             })
                     })
                     .collect::<std::io::Result<Vec<_>>>()?;
@@ -505,36 +554,47 @@ impl Resident {
                     })
                     .collect::<Result<Vec<_>>>()
             })?;
-            for doc in loaded_chunks.into_iter().flatten() {
-                source_bytes += doc.text.len();
-                if source_bytes > policy.max_source_bytes {
-                    return Err(invalid("resident source budget exceeds configured limit").into());
-                }
-                line_count = line_count.saturating_add(doc.starts.len());
-                if line_count > policy.max_total_lines {
-                    return Err(invalid("resident line count exceeds configured limit").into());
-                }
-                digest.update((doc.path.len() as u64).to_le_bytes());
-                digest.update(doc.path.as_bytes());
-                digest.update((doc.text.len() as u64).to_le_bytes());
-                digest.update(doc.sha256);
-                doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
-                documents.push(doc);
-                let floor = source_bytes
-                    .saturating_add(inventory.total_path_bytes.saturating_mul(2))
-                    .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
-                    .saturating_add(documents.len().saturating_mul(128));
-                if floor > max_owned_bytes {
-                    return Err(ResidentAdmissionError::new(
-                        "resident admission budget exceeded while loading files",
-                        floor,
-                    )
-                    .into());
+            for (chunk_docs, chunk_skipped) in loaded_chunks {
+                skipped_unreadable_files = skipped_unreadable_files.saturating_add(chunk_skipped);
+                for doc in chunk_docs {
+                    source_bytes += doc.text.len();
+                    if source_bytes > policy.max_source_bytes {
+                        return Err(invalid("resident source budget exceeds configured limit").into());
+                    }
+                    line_count = line_count.saturating_add(doc.starts.len());
+                    if line_count > policy.max_total_lines {
+                        if isolate_unreadable {
+                            source_bytes -= doc.text.len();
+                            line_count -= doc.starts.len();
+                            skipped_unreadable_files = skipped_unreadable_files.saturating_add(1);
+                            continue;
+                        }
+                        return Err(invalid("resident line count exceeds configured limit").into());
+                    }
+                    digest.update((doc.path.len() as u64).to_le_bytes());
+                    digest.update(doc.path.as_bytes());
+                    digest.update((doc.text.len() as u64).to_le_bytes());
+                    digest.update(doc.sha256);
+                    doc_owned_bytes = doc_owned_bytes.saturating_add(doc.owned_bytes());
+                    documents.push(doc);
+                    let floor = source_bytes
+                        .saturating_add(inventory.total_path_bytes.saturating_mul(2))
+                        .saturating_add(line_count.saturating_mul(std::mem::size_of::<u32>()))
+                        .saturating_add(documents.len().saturating_mul(128));
+                    if floor > max_owned_bytes {
+                        return Err(ResidentAdmissionError::new(
+                            "resident admission budget exceeded while loading files",
+                            floor,
+                        )
+                        .into());
+                    }
                 }
             }
         } else {
             for path in paths {
                 let name = path.to_str().ok_or_else(|| invalid("non-UTF8 path"))?;
+                let isolate_file = isolate_unreadable
+                    && crate::workspace::inventory_priority_key(path, 0).0 > 0;
                 let bytes = match workspace.read_known_with_limit_cached(
                     path,
                     policy.max_file_bytes,
@@ -551,24 +611,43 @@ impl Resident {
                     {
                         continue;
                     }
+                    Err(error)
+                        if isolate_file
+                            && crate::incremental::is_skippable_file_load_error(error.as_ref()) =>
+                    {
+                        skipped_unreadable_files = skipped_unreadable_files.saturating_add(1);
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 };
-                let text = String::from_utf8(bytes)?;
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) if isolate_file => {
+                        skipped_unreadable_files = skipped_unreadable_files.saturating_add(1);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 source_bytes += text.len();
                 if source_bytes > policy.max_source_bytes {
                     return Err(invalid("resident source budget exceeds configured limit").into());
                 }
                 let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                let starts = build_line_starts(&text)?;
+                if line_count.saturating_add(starts.len()) > policy.max_total_lines {
+                    if isolate_unreadable {
+                        source_bytes -= text.len();
+                        skipped_unreadable_files = skipped_unreadable_files.saturating_add(1);
+                        continue;
+                    }
+                    return Err(invalid("resident line count exceeds configured limit").into());
+                }
+                line_count = line_count.saturating_add(starts.len());
                 digest.update((name.len() as u64).to_le_bytes());
                 digest.update(name.as_bytes());
                 digest.update((text.len() as u64).to_le_bytes());
                 digest.update(sha256);
                 let sha256_hex: Arc<str> = digest_hex_arc(&sha256);
-                let starts = build_line_starts(&text)?;
-                line_count = line_count.saturating_add(starts.len());
-                if line_count > policy.max_total_lines {
-                    return Err(invalid("resident line count exceeds configured limit").into());
-                }
                 let doc = Document {
                     path: Arc::from(name),
                     text,
@@ -612,6 +691,7 @@ impl Resident {
             line_offset_bytes: line_count * std::mem::size_of::<u32>(),
             document_bytes: source_bytes,
             posting_bytes_estimate: 0,
+            skipped_unreadable_files,
         };
         let mut resident = Self {
             documents,
@@ -1230,6 +1310,145 @@ impl Resident {
         truncate_search_to_budget(&mut result);
         check_search_size(&result)?;
         Ok(result)
+    }
+
+    pub(crate) fn read_many_with_fallback(
+        &self,
+        workspace: &Workspace,
+        ranges: &[ReadRange],
+        extra_files: &BTreeMap<String, crate::incremental::Stamp>,
+    ) -> Result<Vec<Snippet>> {
+        if extra_files.is_empty() {
+            return self.read_many(ranges);
+        }
+        validate_ranges(ranges)?;
+        let mut snippets = Vec::with_capacity(ranges.len());
+        let mut on_demand_docs: BTreeMap<String, Document> = BTreeMap::new();
+        for range in ranges {
+            if let Some(&id) = self.paths.get(range.path.as_str()) {
+                let document = &self.documents[id];
+                if range.start > document.starts.len() {
+                    return Err(SnapshotRangeError {
+                        path: document.path.to_string(),
+                        start: range.start,
+                        end: range.end,
+                        lines: document.starts.len(),
+                    }
+                    .into());
+                }
+                let end = range.end.min(document.starts.len());
+                let mut lines = Vec::with_capacity(end - range.start + 1);
+                for line in (range.start - 1)..end {
+                    lines.push(document.line(line).into());
+                }
+                snippets.push(Snippet {
+                    path: document.path.to_string(),
+                    start: range.start,
+                    end,
+                    sha256: document.sha256_hex.to_string(),
+                    lines,
+                });
+                continue;
+            }
+            safe_relative(Path::new(&range.path))?;
+            let normalized = normalize(Path::new(&range.path));
+            let name = normalized
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF8 path"))?;
+            if let Some(&id) = self.paths.get(name) {
+                let document = &self.documents[id];
+                if range.start > document.starts.len() {
+                    return Err(SnapshotRangeError {
+                        path: document.path.to_string(),
+                        start: range.start,
+                        end: range.end,
+                        lines: document.starts.len(),
+                    }
+                    .into());
+                }
+                let end = range.end.min(document.starts.len());
+                let mut lines = Vec::with_capacity(end - range.start + 1);
+                for line in (range.start - 1)..end {
+                    lines.push(document.line(line).into());
+                }
+                snippets.push(Snippet {
+                    path: document.path.to_string(),
+                    start: range.start,
+                    end,
+                    sha256: document.sha256_hex.to_string(),
+                    lines,
+                });
+                continue;
+            }
+            let Some(stamp) = extra_files.get(name) else {
+                return Err(SnapshotMissError {
+                    path: name.to_owned(),
+                }
+                .into());
+            };
+            if stamp.length > self.policy.max_file_bytes as u64 {
+                return Err(SnapshotMissError {
+                    path: name.to_owned(),
+                }
+                .into());
+            }
+            if !on_demand_docs.contains_key(name) {
+                let bytes = match workspace
+                    .read_known_with_limit(Path::new(name), self.policy.max_file_bytes)
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Err(SnapshotMissError {
+                            path: name.to_owned(),
+                        }
+                        .into());
+                    }
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    return Err(SnapshotMissError {
+                        path: name.to_owned(),
+                    }
+                    .into());
+                };
+                let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                let sha256_hex = digest_hex_arc(&sha256);
+                let starts = build_line_starts(&text)?;
+                on_demand_docs.insert(
+                    name.to_owned(),
+                    Document {
+                        path: Arc::from(name),
+                        text,
+                        starts,
+                        sha256,
+                        sha256_hex,
+                    },
+                );
+            }
+            let document = &on_demand_docs[name];
+            if range.start > document.starts.len() {
+                return Err(SnapshotRangeError {
+                    path: document.path.to_string(),
+                    start: range.start,
+                    end: range.end,
+                    lines: document.starts.len(),
+                }
+                .into());
+            }
+            let end = range.end.min(document.starts.len());
+            let mut lines = Vec::with_capacity(end - range.start + 1);
+            for line in (range.start - 1)..end {
+                lines.push(document.line(line).into());
+            }
+            snippets.push(Snippet {
+                path: document.path.to_string(),
+                start: range.start,
+                end,
+                sha256: document.sha256_hex.to_string(),
+                lines,
+            });
+        }
+        check_snippets_size(&snippets)?;
+        Ok(snippets)
     }
 
     pub fn read_many(&self, ranges: &[ReadRange]) -> Result<Vec<Snippet>> {

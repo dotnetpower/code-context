@@ -32,42 +32,151 @@ pub(crate) fn stamp_from_metadata(metadata: &std::fs::Metadata) -> Result<Stamp>
     })
 }
 
-pub(crate) fn stamps(
-    workspace: &Workspace,
-    policy: &MemoryPolicy,
-) -> Result<BTreeMap<String, Stamp>> {
-    Ok(workspace.files_limited_skip_oversized(policy)?.stamps)
+pub(crate) struct InventorySnapshot {
+    pub(crate) stamps: BTreeMap<String, Stamp>,
+    pub(crate) extra_files: BTreeMap<String, Stamp>,
+    pub(crate) capped_count: usize,
 }
 
-pub(crate) fn validate_stamps(
-    current: &BTreeMap<String, Stamp>,
+pub(crate) fn inventory_snapshot(
+    workspace: &Workspace,
     policy: &MemoryPolicy,
-) -> Result<()> {
-    if current.len() > policy.max_files {
-        return Err(
-            invalid("incremental inventory exceeds configured file/source/path budget").into(),
-        );
+) -> Result<InventorySnapshot> {
+    let inv = workspace.files_limited_skip_oversized(policy)?;
+    Ok(InventorySnapshot {
+        stamps: inv.stamps,
+        extra_files: inv.extra_files,
+        capped_count: inv.capped_count,
+    })
+}
+
+pub(crate) fn trim_stamps_to_source_budget(
+    current: &mut BTreeMap<String, Stamp>,
+    extra_files: &mut BTreeMap<String, Stamp>,
+    max_source_bytes: u64,
+    max_files: usize,
+) -> usize {
+    let mut total_source: u64 = current
+        .values()
+        .fold(0u64, |acc, s| acc.saturating_add(s.length));
+    if total_source <= max_source_bytes {
+        return 0;
     }
+    let mut removable: Vec<(u8, bool, u64, String)> = current
+        .iter()
+        .filter_map(|(name, stamp)| {
+            let (tier, secondary, len) =
+                crate::workspace::inventory_priority_key(Path::new(name), stamp.length);
+            (tier > 0).then(|| (tier, secondary, len, name.clone()))
+        })
+        .collect();
+    removable.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    let mut trimmed = 0usize;
+    for (_, _, _, name) in removable {
+        if total_source <= max_source_bytes {
+            break;
+        }
+        if let Some(stamp) = current.remove(&name) {
+            total_source = total_source.saturating_sub(stamp.length);
+            if extra_files.len() < max_files {
+                extra_files.insert(name, stamp);
+            }
+            trimmed = trimmed.saturating_add(1);
+        }
+    }
+    trimmed
+}
+
+pub(crate) fn enforce_stamp_budget(
+    current: &mut BTreeMap<String, Stamp>,
+    extra_files: &mut BTreeMap<String, Stamp>,
+    policy: &MemoryPolicy,
+) -> usize {
+    let max_file = policy.max_file_bytes as u64;
     let mut total_source: u128 = 0;
     let mut total_path_bytes: usize = 0;
-    let max_file = policy.max_file_bytes as u64;
-    for (path, stamp) in current {
+    let mut has_oversized = false;
+    for (path, stamp) in current.iter() {
         if stamp.length > max_file {
-            return Err(
-                invalid("incremental inventory exceeds configured file/source/path budget").into(),
-            );
+            has_oversized = true;
+        } else {
+            total_source += stamp.length as u128;
+            total_path_bytes += path.len();
         }
-        total_source += stamp.length as u128;
-        total_path_bytes += path.len();
     }
-    if total_source > policy.max_source_bytes as u128
-        || total_path_bytes > policy.max_total_path_bytes
+    if !has_oversized
+        && current.len() <= policy.max_files
+        && total_source <= policy.max_source_bytes as u128
+        && total_path_bytes <= policy.max_total_path_bytes
     {
-        return Err(
-            invalid("incremental inventory exceeds configured file/source/path budget").into(),
-        );
+        return 0;
     }
-    Ok(())
+    let drained = std::mem::take(current);
+    let mut candidates: Vec<(String, Stamp)> = Vec::with_capacity(drained.len());
+    for (path, stamp) in drained {
+        if stamp.length > max_file {
+            if extra_files.len() < policy.max_files {
+                extra_files.insert(path, stamp);
+            }
+        } else {
+            candidates.push((path, stamp));
+        }
+    }
+    candidates.sort_unstable_by(|a, b| {
+        crate::workspace::inventory_priority_key(Path::new(&a.0), a.1.length)
+            .cmp(&crate::workspace::inventory_priority_key(
+                Path::new(&b.0),
+                b.1.length,
+            ))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut kept_source = 0u64;
+    let mut kept_path_bytes = 0usize;
+    let mut capped = 0usize;
+    for (path, stamp) in candidates {
+        if current.len() < policy.max_files
+            && kept_path_bytes.saturating_add(path.len()) <= policy.max_total_path_bytes
+            && kept_source.saturating_add(stamp.length) <= policy.max_source_bytes as u64
+        {
+            kept_path_bytes = kept_path_bytes.saturating_add(path.len());
+            kept_source = kept_source.saturating_add(stamp.length);
+            current.insert(path, stamp);
+        } else {
+            capped = capped.saturating_add(1);
+            if extra_files.len() < policy.max_files {
+                extra_files.insert(path, stamp);
+            }
+        }
+    }
+    capped
+}
+
+pub(crate) fn is_skippable_file_load_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if crate::resident::is_admission_error(error) {
+        return false;
+    }
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return true;
+    }
+    if error.downcast_ref::<std::string::FromUtf8Error>().is_some()
+        || error.downcast_ref::<std::str::Utf8Error>().is_some()
+    {
+        return true;
+    }
+    let msg = error.to_string();
+    msg.contains("file larger than configured max_file_bytes is unsupported")
+        || msg.contains("binary file or file larger than configured limit is unsupported")
+        || msg.contains("document extraction failed for ")
+        || msg.contains("symlinks are unsupported in this local experiment")
+        || msg.contains("exceeds max_unique_trigrams_per_file")
 }
 
 fn keys(text: &str, limit: usize) -> Result<Vec<u32>> {
@@ -220,6 +329,9 @@ impl Resident {
                     false
                 }
             };
+            let is_non_code =
+                crate::workspace::inventory_priority_key(Path::new(&path), 0).0 > 0;
+            let mut skipped_poison = false;
             let new = if is_allowed {
                 match workspace.read_known_with_limit_cached(
                     Path::new(&path),
@@ -229,7 +341,16 @@ impl Resident {
                     Ok(bytes) => {
                         source_files_read += 1;
                         source_bytes_read += bytes.len();
-                        Some(document(path.clone(), bytes)?)
+                        match document(path.clone(), bytes) {
+                            Ok(doc) => Some(doc),
+                            Err(error)
+                                if is_non_code && is_skippable_file_load_error(error.as_ref()) =>
+                            {
+                                skipped_poison = true;
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     Err(error)
                         if error
@@ -241,11 +362,32 @@ impl Resident {
                     {
                         None
                     }
+                    Err(error) if is_non_code && is_skippable_file_load_error(error.as_ref()) => {
+                        skipped_poison = true;
+                        None
+                    }
                     Err(error) => return Err(error),
                 }
             } else {
                 None
             };
+            let mut new = new;
+            let mut new_keys = match &new {
+                Some(document) => match keys(&document.text, self.policy.max_unique_trigrams_per_file) {
+                    Ok(k) => k,
+                    Err(error) if is_non_code && is_skippable_file_load_error(error.as_ref()) => {
+                        skipped_poison = true;
+                        new = None;
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => Vec::new(),
+            };
+            if skipped_poison {
+                self.stats.skipped_unreadable_files =
+                    self.stats.skipped_unreadable_files.saturating_add(1);
+            }
             if old.map(|d| &d.sha256) == new.as_ref().map(|d| &d.sha256) {
                 continue;
             }
@@ -258,10 +400,7 @@ impl Resident {
                 Some(document) => keys(&document.text, self.policy.max_unique_trigrams_per_file)?,
                 None => Vec::new(),
             };
-            let new_keys = match &new {
-                Some(document) => keys(&document.text, self.policy.max_unique_trigrams_per_file)?,
-                None => Vec::new(),
-            };
+            let _ = &mut new_keys;
             staged_bytes += new.as_ref().map_or(0, |d| d.text.len());
             staged_postings += new_keys.len();
             staged_work_bytes = staged_work_bytes

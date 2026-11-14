@@ -422,3 +422,40 @@ fn frontend_and_vite_profiles_exclude_lockfiles_bundles_sourcemaps_and_generated
         ]
     );
 }
+
+#[test]
+fn nested_monorepo_manifests_activate_scoped_profiles_under_root_scope() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src/logs")).unwrap();
+    std::fs::create_dir_all(root.path().join("frontend/logs")).unwrap();
+    std::fs::create_dir_all(root.path().join("lib_rs/core_crate/src")).unwrap();
+
+    std::fs::write(root.path().join("src/logs/keep.ts"), "export const keep = 1;\n").unwrap();
+    std::fs::write(root.path().join("frontend/package.json"), "{\"name\":\"web\"}\n").unwrap();
+    std::fs::write(root.path().join("frontend/app.ts"), "export const app = 2;\n").unwrap();
+    std::fs::write(root.path().join("frontend/package-lock.json"), "{}\n").unwrap();
+    std::fs::write(root.path().join("frontend/logs/noise.ts"), "noise\n").unwrap();
+    std::fs::write(root.path().join("lib_rs/core_crate/Cargo.toml"), "[package]\nname=\"c\"\n").unwrap();
+    std::fs::write(root.path().join("lib_rs/core_crate/src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+    let workspace = Workspace::new(
+        root.path(),
+        vec![".".into()],
+        vec!["*.ts".into(), "*.rs".into(), "*.json".into(), "*.toml".into()],
+    )
+    .unwrap();
+
+    let profiles = workspace.detected_profiles();
+    assert!(profiles.contains(&"node"), "{profiles:?}");
+    assert!(profiles.contains(&"rust"), "{profiles:?}");
+    assert_eq!(
+        files(&workspace),
+        [
+            "frontend/app.ts",
+            "frontend/package.json",
+            "lib_rs/core_crate/Cargo.toml",
+            "lib_rs/core_crate/src/lib.rs",
+            "src/logs/keep.ts",
+        ]
+    );
+}

@@ -24,7 +24,7 @@ impl Default for MemoryPolicy {
     fn default() -> Self {
         Self {
             max_files: 100_000,
-            max_source_bytes: 256 * 1024 * 1024,
+            max_source_bytes: 512 * 1024 * 1024,
             max_file_bytes: 1024 * 1024,
             max_total_lines: 10_000_000,
             max_total_path_bytes: 16 * 1024 * 1024,

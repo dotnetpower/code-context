@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * MIB;
 const RUNTIME_FLOOR: usize = 64 * MIB;
+const WINDOWS_HOST_REPORT_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Limits {
@@ -64,8 +65,12 @@ impl Policy {
 
     pub fn calculate(&self, total: usize, available: usize, own: usize, parent_room: usize) -> Limits {
         let reserve = self.reserve.unwrap_or((2 * GIB).max(total / 5));
-        let safe = available.saturating_add(own).min(total)
-            .saturating_sub(reserve).min(parent_room);
+        let reclaimable = available.saturating_add(own).min(total);
+        let mut safe = reclaimable.saturating_sub(reserve);
+        if safe == 0 && self.reserve.is_none() && reclaimable > 2 * GIB {
+            safe = (reclaimable - 2 * GIB) / 4;
+        }
+        let safe = safe.min(parent_room);
         let maximum = self.fixed_max.map_or(safe, |fixed| fixed.min(safe));
         Limits::fixed(maximum.max(RUNTIME_FLOOR))
     }
@@ -108,6 +113,7 @@ pub struct Controller {
     windows_host: Option<(usize, usize, Instant)>,
     last_sample: Instant,
     last_growth: Instant,
+    shrink_streak: u8,
     pub last_error: Option<String>,
 }
 
@@ -116,7 +122,8 @@ impl Default for Controller {
         Self {
             limits: Limits::fixed(4 * GIB), policy: None, group: None, managed: false,
             wsl: false, windows_host: None,
-            last_sample: Instant::now(), last_growth: Instant::now(), last_error: None,
+            last_sample: Instant::now(), last_growth: Instant::now(), shrink_streak: 0,
+            last_error: None,
         }
     }
 }
@@ -257,7 +264,8 @@ impl Controller {
         let local = policy.calculate(total, available, anon, parent_room(group, own, self.managed)?);
         let wsl_reclaimable = field(&text, "Cached:")
             .unwrap_or(0)
-            .saturating_add(field(&text, "Buffers:").unwrap_or(0));
+            .saturating_add(field(&text, "Buffers:").unwrap_or(0))
+            .saturating_add(field(&text, "SReclaimable:").unwrap_or(0));
         let host_max = self.host_ceiling(policy, anon.saturating_add(wsl_reclaimable));
         static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let page = *PAGE_SIZE.get_or_init(|| {
@@ -269,7 +277,7 @@ impl Controller {
     fn host_ceiling(&self, policy: &Policy, own: usize) -> usize {
         if !self.wsl { return usize::MAX; }
         if let Some((total, available, at)) = self.windows_host
-            && at.elapsed() < Duration::from_secs(120)
+            && at.elapsed() < WINDOWS_HOST_REPORT_TTL
         {
             return policy.calculate(total, available, own, usize::MAX).max;
         }
@@ -297,6 +305,15 @@ impl Controller {
         }
         self.last_sample = Instant::now();
         let next = self.sample()?;
+        if next.max < self.limits.max / 2 && next.max > RUNTIME_FLOOR {
+            self.shrink_streak = self.shrink_streak.saturating_add(1);
+            if self.shrink_streak < 2 {
+                self.last_error = None;
+                return Ok(false);
+            }
+        } else {
+            self.shrink_streak = 0;
+        }
         self.consider(next);
         self.last_error = None;
         Ok(true)
@@ -309,7 +326,7 @@ impl Controller {
     fn consider(&mut self, next: Limits) {
         let change = next.max.abs_diff(self.limits.max);
         let threshold = (64 * MIB).max(self.limits.max / 10);
-        let can_grow = self.limits.max < 2 * GIB || self.last_growth.elapsed() >= Duration::from_secs(30);
+        let can_grow = self.limits.max < 4 * GIB || self.last_growth.elapsed() >= Duration::from_secs(30);
         if next.max < self.limits.max && change >= 16 * MIB
             || next.max > self.limits.max && change >= threshold && can_grow
         {
@@ -354,7 +371,8 @@ impl Controller {
             "resident_root_limit":self.limits.root_limit(),
             "wsl":self.wsl,
             "windows_host_report_age_seconds":self.windows_host.map(|(_,_,at)|at.elapsed().as_secs()),
-            "windows_host_fresh":self.windows_host.is_some_and(|(_,_,at)|at.elapsed()<Duration::from_secs(120)),
+            "windows_host_report_ttl_seconds":WINDOWS_HOST_REPORT_TTL.as_secs(),
+            "windows_host_fresh":self.windows_host.is_some_and(|(_,_,at)|at.elapsed()<WINDOWS_HOST_REPORT_TTL),
             "wsl_without_host_report_ceiling_bytes":4 * GIB,
             "reserve_bytes":self.policy.as_ref().and_then(|policy|policy.reserve),
             "reserve_default":"max(2GiB,20% of MemTotal)","sample_interval_seconds":5,"growth_interval_seconds":30,
@@ -444,7 +462,9 @@ mod tests {
         assert!(controller.host_ceiling(&policy, GIB) > 4 * GIB);
         controller.observe_windows_host(32 * GIB, GIB).unwrap();
         assert_eq!(controller.host_ceiling(&policy, GIB), RUNTIME_FLOOR);
-        controller.windows_host = Some((32 * GIB, 24 * GIB, Instant::now() - Duration::from_secs(121)));
+        controller.windows_host = Some((32 * GIB, 24 * GIB, Instant::now() - Duration::from_secs(300)));
+        assert!(controller.host_ceiling(&policy, GIB) > 4 * GIB);
+        controller.windows_host = Some((32 * GIB, 24 * GIB, Instant::now() - Duration::from_secs(601)));
         assert_eq!(controller.host_ceiling(&policy, GIB), 4 * GIB);
         assert!(controller.observe_windows_host(0, 0).is_err());
         assert!(controller.observe_windows_host(GIB, 2 * GIB).is_err());
@@ -471,5 +491,22 @@ mod tests {
         assert_eq!(controller.limits.max, RUNTIME_FLOOR);
         controller.consider(Limits::fixed(16 * GIB));
         assert_eq!(controller.limits.max, 16 * GIB);
+    }
+
+    #[test]
+    fn large_host_soft_landing_and_sub_four_gib_recovery_avoid_admission_cliffs() {
+        let policy = Policy { fixed_max: None, reserve: None };
+        // On a 96 GiB host, 20% reserve is 19.2 GiB; with 18 GiB free, soft-landing yields 4 GiB
+        // (leaving 14 GiB untouched) instead of collapsing to 64 MiB RUNTIME_FLOOR.
+        let soft = policy.calculate(96 * GIB, 16 * GIB, 2 * GIB, usize::MAX);
+        assert_eq!(soft.max, 4 * GIB);
+        assert_eq!(soft.target, 3 * GIB);
+
+        let mut controller = Controller::default();
+        controller.consider(Limits::fixed(3 * GIB));
+        assert_eq!(controller.limits.max, 3 * GIB);
+        // Recovery from < 4 GiB does not wait for the 30-second growth cooldown.
+        controller.consider(Limits::fixed(24 * GIB));
+        assert_eq!(controller.limits.max, 24 * GIB);
     }
 }

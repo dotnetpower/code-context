@@ -37,7 +37,7 @@ struct Args {
     preserve_registration_settings: bool,
     #[arg(long, default_value_t = 100_000)]
     max_files: usize,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 512)]
     max_source_mib: usize,
     #[arg(long, default_value_t = 1)]
     max_file_mib: usize,
@@ -367,6 +367,8 @@ fn run() -> Result<()> {
                 "effective_excludes":effective_excludes,
                 "prewarm":spec.prewarm,
                 "files":inventory.files.len(),
+                "capped_files":inventory.capped_count,
+                "oversized_files":inventory.oversized_count,
                 "watch_directories":watch_directories.len(),
                 "path_bytes":inventory.total_path_bytes,
                 "metadata_source_bytes":inventory.metadata_source_bytes,
