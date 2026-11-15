@@ -74,6 +74,8 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GSC_ACCESS_TOKEN: ${{ secrets.GSC_ACCESS_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -93,10 +95,15 @@ jobs:
         run: mkdir -p site/dist && tar -xf "$ARTIFACT_DIR/artifact.tar" -C site/dist
       - name: Install verification dependencies
         run: npm --prefix site ci --no-audit --no-fund
-      - name: Strict post-deployment readiness gate
+      - name: Verify GitHub Pages static deployment
         env:
-          DEPLOYED_URL: ${{ vars.AGENT_SITE_URL || steps.deployment.outputs.page_url }}
-        run: npm --prefix site run check:live -- "$DEPLOYED_URL"
+          DEPLOYED_URL: ${{ steps.deployment.outputs.page_url }}
+        run: npm --prefix site run check:live -- "$DEPLOYED_URL" --hosting pages
+      - name: Strict gateway readiness gate
+        if: vars.AGENT_SITE_URL != ''
+        env:
+          DEPLOYED_URL: ${{ vars.AGENT_SITE_URL }}
+        run: npm --prefix site run check:live -- "$DEPLOYED_URL" --hosting gateway
       - id: gsc-auth
         if: vars.GSC_WORKLOAD_IDENTITY_PROVIDER != ''
         uses: google-github-actions/auth@v3
@@ -106,7 +113,11 @@ jobs:
           token_format: access_token
           access_token_scopes: https://www.googleapis.com/auth/webmasters
       - name: Submit verified canonical URLs to IndexNow and GSC
+        if: vars.GSC_WORKLOAD_IDENTITY_PROVIDER != '' || env.GSC_ACCESS_TOKEN != ''
         env:
           GSC_ACCESS_TOKEN: ${{ steps.gsc-auth.outputs.access_token || secrets.GSC_ACCESS_TOKEN }}
           GSC_PROPERTY: ${{ vars.GSC_PROPERTY }}
         run: npm --prefix site run submit:indexing
+      - name: Report unconfigured search submissions
+        if: vars.GSC_WORKLOAD_IDENTITY_PROVIDER == '' && env.GSC_ACCESS_TOKEN == ''
+        run: echo "::notice::IndexNow/GSC submissions disabled. Configure GSC workload identity or GSC_ACCESS_TOKEN to enable them."

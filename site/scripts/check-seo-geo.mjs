@@ -224,8 +224,10 @@ export async function validateArtifacts(dist = defaultDist) {
   return { failures, pages, index };
 }
 
-export async function validateLive(baseUrl, { dist = defaultDist, pages, index } = {}) {
+export async function validateLive(baseUrl, { dist = defaultDist, pages, index, hosting = "gateway" } = {}) {
+  if (!["gateway", "pages"].includes(hosting)) throw new Error("--hosting must be gateway or pages");
   const failures = [];
+  const gateway = hosting === "gateway";
   const target = new URL(`${baseUrl.replace(/\/$/, "")}/`);
   const localUrl = (canonical) => new URL(new URL(canonical).pathname.slice(BASE_PATH.length).replace(/^\/+/, ""), target);
   const request = async (url, accept) => {
@@ -239,17 +241,21 @@ export async function validateLive(baseUrl, { dist = defaultDist, pages, index }
     return tokens.includes("accept") && tokens.includes("accept-encoding") && /\bno-store\b/i.test(response.headers.get("cdn-cache-control") ?? "");
   };
   for (const page of pages) {
-    for (const accept of ["text/markdown, text/html;q=0.8", "text/html", "text/markdown", "text/html, text/markdown;q=0.5"]) {
-      const { response, body } = await request(localUrl(page.canonical), accept);
+    for (const accept of gateway ? ["text/markdown, text/html;q=0.8", "text/html", "text/markdown", "text/html, text/markdown;q=0.5"] : ["text/html", "text/markdown"]) {
       const markdown = accept.startsWith("text/markdown");
+      const mirror = index.pages.find((entry) => entry.url === page.canonical).markdown;
+      const { response, body } = await request(localUrl(!gateway && markdown ? mirror : page.canonical), accept);
       check(response.status === 200, `http:page_status:${page.canonical}:${response.status}`);
-      check(vary(response), `http:cache_isolation:${page.canonical}:${accept}`);
-      check(response.headers.get("content-type")?.startsWith(markdown ? "text/markdown; charset=utf-8" : "text/html"), `http:content_type:${page.canonical}:${accept}`);
+      if (gateway) check(vary(response), `http:cache_isolation:${page.canonical}:${accept}`);
+      const contentType = response.headers.get("content-type") ?? "";
+      check(markdown && !gateway ? /^(text\/markdown|text\/plain)\b/.test(contentType) : contentType.startsWith(markdown ? "text/markdown; charset=utf-8" : "text/html"), `http:content_type:${page.canonical}:${accept}`);
       if (markdown) {
-        const mirror = index.pages.find((entry) => entry.url === page.canonical).markdown;
         const expected = readFileSync(path.join(dist, new URL(mirror).pathname.slice(BASE_PATH.length + 1)), "utf8");
         check(body === expected, `http:markdown_contamination:${page.canonical}`);
-      } else failures.push(...validatePage(body, page.canonical).map((name) => `http:${page.canonical}:${name}`));
+      } else {
+        check(body === page.html, `http:stale_page:${page.canonical}`);
+        failures.push(...validatePage(body, page.canonical).map((name) => `http:${page.canonical}:${name}`));
+      }
     }
   }
   for (const [resource, type] of [
@@ -259,16 +265,22 @@ export async function validateLive(baseUrl, { dist = defaultDist, pages, index }
     ["rss.xml", "application/xml"], [`${INDEXNOW_KEY}.txt`, "text/plain"],
   ]) {
     const { response, body } = await request(new URL(resource, target), type);
-    check(response.status === 200 && response.headers.get("content-type")?.startsWith(type), `http:discovery:${resource}:${response.status}`);
+    const types = gateway ? [type] : resource.endsWith(".json") ? ["application/json"] :
+      resource.endsWith(".xml") ? ["application/xml", "text/xml"] :
+      resource.endsWith(".md") ? ["text/markdown", "text/plain"] :
+      resource === ".well-known/api-catalog" ? ["application/octet-stream"] : [type];
+    check(response.status === 200 && types.some((type) => response.headers.get("content-type")?.startsWith(type)), `http:discovery:${resource}:${response.status}`);
     check(body === readFileSync(path.join(dist, resource), "utf8"), `http:stale_resource:${resource}`);
-    if (resource !== "docs-index.json" && !resource.endsWith(".xml")) {
+    if (gateway && resource !== "docs-index.json" && !resource.endsWith(".xml")) {
       const root = await request(new URL(`/${resource}`, target), type);
       check(root.response.status === 200 && root.response.headers.get("content-type")?.startsWith(type) && root.body === body, `http:root_discovery:${resource}`);
     }
   }
-  const home = await request(target, "text/html");
-  for (const value of discoveryLink().split(", ")) {
-    check(home.response.headers.get("link")?.includes(value), `http:missing_link_header:${value}`);
+  if (gateway) {
+    const home = await request(target, "text/html");
+    for (const value of discoveryLink().split(", ")) {
+      check(home.response.headers.get("link")?.includes(value), `http:missing_link_header:${value}`);
+    }
   }
   const resources = new Set();
   for (const page of pages) {
@@ -298,14 +310,17 @@ export async function validateLive(baseUrl, { dist = defaultDist, pages, index }
 async function main() {
   const result = await validateArtifacts();
   const urlAt = process.argv.indexOf("--url");
+  const hostingAt = process.argv.indexOf("--hosting");
+  const hosting = hostingAt === -1 ? "gateway" : process.argv[hostingAt + 1];
+  if (!["gateway", "pages"].includes(hosting)) throw new Error("--hosting must be gateway or pages");
   if (urlAt !== -1) {
     const url = process.argv[urlAt + 1];
     if (!url) throw new Error("--url requires the deployed site URL, including its base path");
-    result.failures.push(...await validateLive(url, result));
+    result.failures.push(...await validateLive(url, { ...result, hosting }));
   }
   for (const failure of result.failures.slice(0, 40)) console.error(`  - ${failure}`);
   if (result.failures.length > 40) console.error(`  ... ${result.failures.length - 40} further errors (use the exported validators for full results)`);
-  console.log(`[check-seo-geo] ${result.pages.length} indexable HTML pages; ${result.failures.length} errors${urlAt === -1 ? " (build artifacts only; HTTP and CWV not measured)" : " (artifacts + strict HTTP gate; CWV requires browser measurement)"}`);
+  console.log(`[check-seo-geo] ${result.pages.length} indexable HTML pages; ${result.failures.length} errors${urlAt === -1 ? " (build artifacts only; HTTP and CWV not measured)" : ` (artifacts + ${hosting === "gateway" ? "strict gateway HTTP" : "GitHub Pages static deployment"} gate; CWV requires browser measurement)`}`);
   if (result.failures.length) process.exitCode = 1;
 }
 

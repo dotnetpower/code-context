@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,6 +97,53 @@ test("live gate rejects HTML-only hosts and missing cache isolation", async () =
     for (const prefix of ["http:cache_isolation:", "http:markdown_contamination:", "http:root_discovery:", "http:missing_link_header:", "http:not_honest_404:"]) {
       assert.ok(failures.some((failure) => failure.startsWith(prefix)), prefix);
     }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("Pages gate verifies static deployment without weakening the gateway gate", async () => {
+  const result = await validateArtifacts(dist);
+  let staleResource = "";
+  let redirectHome = false;
+  let missingStatus = 404;
+  const server = createServer((req, res) => {
+    const pathname = new URL(req.url, "http://localhost").pathname;
+    if (redirectHome && pathname === `${BASE_PATH}/`) {
+      res.writeHead(301, { Location: `${BASE_PATH}/index.html` });
+      res.end();
+      return;
+    }
+    const relative = pathname.slice(BASE_PATH.length).replace(/^\/+/, "");
+    const file = path.join(dist, relative.endsWith("/") || !relative ? `${relative}index.html` : relative);
+    const found = pathname.startsWith(`${BASE_PATH}/`) && existsSync(file);
+    const types = { ".html": "text/html", ".json": "application/json", ".md": "text/markdown", ".xml": "application/xml", ".txt": "text/plain" };
+    res.writeHead(found ? 200 : missingStatus, { "Content-Type": found ? types[path.extname(file)] ?? "application/octet-stream" : "text/html" });
+    const body = readFileSync(found ? file : path.join(dist, "404.html"));
+    res.end(staleResource && (relative || "index.html") === staleResource ? Buffer.concat([body, Buffer.from("\n")]) : body);
+  });
+  server.listen(0, "127.0.0.1");
+  try {
+    await once(server, "listening");
+    const url = `http://127.0.0.1:${server.address().port}${BASE_PATH}/`;
+    const options = { ...result, dist, hosting: "pages" };
+    assert.deepEqual(await validateLive(url, options), []);
+    const strictFailures = await validateLive(url, { ...options, hosting: "gateway" });
+    for (const prefix of ["http:cache_isolation:", "http:markdown_contamination:", "http:root_discovery:", "http:missing_link_header:"]) {
+      assert.ok(strictFailures.some((failure) => failure.startsWith(prefix)), prefix);
+    }
+    for (const [resource, prefix] of [["docs-index.json", "http:stale_resource:docs-index.json"], ["index.md", "http:markdown_contamination:"], ["index.html", "http:stale_page:"]]) {
+      staleResource = resource;
+      assert.ok((await validateLive(url, options)).some((failure) => failure.startsWith(prefix)), prefix);
+    }
+    staleResource = "";
+    redirectHome = true;
+    assert.ok((await validateLive(url, options)).some((failure) => failure.startsWith("http:page_status:")));
+    redirectHome = false;
+    missingStatus = 200;
+    assert.ok((await validateLive(url, options)).some((failure) => failure.startsWith("http:not_honest_404:")));
+    await assert.rejects(validateLive(url, { ...options, hosting: "unknown" }), /--hosting/);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

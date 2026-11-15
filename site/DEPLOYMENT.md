@@ -79,23 +79,32 @@ No Naver verification token is invented when none is configured.
 
 ```sh
 npm --prefix site run check:live -- https://your-owned-domain.example/
+npm --prefix site run check:live -- https://dotnetpower.github.io/code-context/ --hosting pages
 npm --prefix site run submit:indexing -- --dry-run
 ```
 
 The live gate requires the exact built discovery files, both response
 representations, no redirects on canonical pages, domain-root discovery and
 noindex 404s. Cache isolation is checked in both alternating request orders.
-A plain GitHub Pages deployment **fails** this strict gate by design.
+`--hosting gateway` is the default strict profile. A plain GitHub Pages deployment
+**fails** it by design. `--hosting pages` instead verifies canonical HTML,
+explicit Markdown mirrors, discovery files and internal assets against the exact
+built bytes, plus noindex 404s. It uses the static host's extension-based MIME
+types and does not claim content negotiation, cache isolation or root discovery.
 
 The [Pages workflow](../.github/workflows/pages.yml) runs artifact, Node and
-browser gates before deployment, then checks the exact deployed artifact.
+browser gates before deployment, then checks the exact deployed artifact with
+the Pages profile. If `AGENT_SITE_URL` is configured, it also runs the strict
+gateway gate against that URL; failures still block search submissions.
 Set repository variables `SITE_URL`, `BASE_PATH`, and `AGENT_SITE_URL` for the
-actual gateway-backed canonical deployment. Until that infrastructure exists,
-the post-deployment job remains red instead of claiming full agent readiness.
+actual gateway-backed canonical deployment. Without `AGENT_SITE_URL`, only
+static Pages deployment is verified, not full gateway agent readiness.
 Deploying a separate gateway remains an operator responsibility; the workflow
 does not pretend that uploading static Pages files starts a Node server.
 
-IndexNow and GSC run only after the strict live gate succeeds. IndexNow verifies
+IndexNow and GSC run after the configured live gates succeed and only when Google
+credentials are configured. Otherwise the workflow reports a notice and skips
+submissions. Explicit CLI submission without credentials still fails. IndexNow verifies
 the published key before POSTing batches of at most 10,000 canonical URLs.
 GSC uses the authenticated Sitemaps API `PUT`, not the retired unauthenticated
 ping endpoint. Configure `GSC_WORKLOAD_IDENTITY_PROVIDER` and `GSC_SERVICE_ACCOUNT`
