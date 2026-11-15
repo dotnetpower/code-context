@@ -77,6 +77,48 @@ test("payload calculator is accurate and reserves its result area", async ({ pag
   expect(await form.locator('input[name="baseline"]').evaluate((input) => input.validity.valid)).toBe(false);
 });
 
+for (const theme of ["light", "dark"]) {
+  test(`payload calculator styling and keyboard focus: ${theme}`, async ({ page }, testInfo) => {
+    await page.emulateMedia({ colorScheme: theme });
+    await page.goto(`${origin}${BASE_PATH}/`, { waitUntil: "networkidle" });
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    const section = page.locator(".lookup-budget");
+    const form = section.locator("form");
+    const button = form.getByRole("button");
+    await section.scrollIntoViewIfNeeded();
+    const primaryButton = page.locator(".cctx-hero-actions .cctx-btn-primary").first();
+    for (const property of ["background-image", "color", "border-radius"]) {
+      await expect(button).toHaveCSS(property, await primaryButton.evaluate((element, property) =>
+        getComputedStyle(element).getPropertyValue(property), property));
+    }
+    for (const input of await form.locator("input").all()) {
+      await expect(input).toHaveCSS("border-top-style", "solid");
+      await expect(input).toHaveCSS("background-color", await section.evaluate((element) => getComputedStyle(element).backgroundColor));
+      expect(await input.evaluate((element) => parseFloat(getComputedStyle(element).borderTopLeftRadius))).toBeGreaterThanOrEqual(8);
+    }
+    const sectionBox = await section.boundingBox();
+    const controls = await Promise.all([form.getByLabel("Baseline tokens"), form.getByLabel("Clamped tokens"), button].map((control) => control.boundingBox()));
+    for (const box of controls) {
+      expect(box.x).toBeGreaterThanOrEqual(sectionBox.x);
+      expect(box.x + box.width).toBeLessThanOrEqual(sectionBox.x + sectionBox.width);
+      expect(box.height).toBeGreaterThanOrEqual(44);
+    }
+    if (page.viewportSize().width <= 640) {
+      expect(controls[2].y).toBeGreaterThanOrEqual(controls[0].y + controls[0].height);
+    } else {
+      expect(controls[2].y).toBeCloseTo(controls[0].y, 0);
+    }
+    await form.getByLabel("Clamped tokens").focus();
+    await expect(form.getByLabel("Clamped tokens")).toHaveCSS("outline-style", "solid");
+    await page.keyboard.press("Tab");
+    await expect(button).toBeFocused();
+    await expect(button).toHaveCSS("outline-style", "solid");
+    await page.keyboard.press("Enter");
+    await expect(form.locator("output")).toContainText("75.0% payload reduction");
+    await testInfo.attach(`calculator-${theme}`, { body: await section.screenshot(), contentType: "image/png" });
+  });
+}
+
 test("answers remain available without JavaScript", async ({ browser }) => {
   const context = await browser.newContext({ javaScriptEnabled: false });
   try {

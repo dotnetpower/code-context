@@ -39,7 +39,8 @@ same policy with the configured canonical sitemap URLs.
 Node tests include negative contract mutations and alternating HTML/Markdown HTTP
 requests. Chromium tests measure CLS session windows on every page at desktop
 and mobile sizes, require CLS < 0.10, check static answers with JavaScript disabled,
-and exercise the payload calculator. These are laboratory measurements, not
+and exercise the payload calculator, including light/dark theme styling,
+responsive controls and keyboard focus. These are laboratory measurements, not
 proof of field Core Web Vitals. Monitor production field data separately.
 
 ## HTTP hosting requirement
