@@ -83,6 +83,141 @@ export function classifyOutcome(error?: string): Outcome {
   return 'system_error';
 }
 
+function isCctxToolName(toolName: string): boolean {
+  return (
+    toolName.startsWith('cctxNative') ||
+    toolName.startsWith('code-context') ||
+    toolName.startsWith('mcp__code-context__') ||
+    toolName === 'code_files' ||
+    toolName === 'code_grep' ||
+    toolName === 'code_context' ||
+    toolName === 'code_read' ||
+    toolName === 'code_status' ||
+    toolName === 'code_sync' ||
+    toolName === 'code_workspaces'
+  );
+}
+
+function parseSessionTelemetryChunks(
+  chunks: ReadonlyArray<{ sessionId: string; raw: string }>,
+  nowMs: number,
+): SessionTelemetrySnapshot {
+  const byModel = new Map<string, {
+    model: string; displayName: string; effort: string; sessions: Set<string>;
+    turns: number; inputTokens: number; cacheReadTokens: number; outputTokens: number;
+    reasoningTokens: number; nanoAiu: number; cctxCalls: number; cctxMisses: number;
+  }>();
+  let totalTurns = 0;
+  let totalIn = 0;
+  let totalCache = 0;
+  let totalOut = 0;
+  let totalRsn = 0;
+  let totalNanoAiu = 0;
+  const activeSessions = new Set<string>();
+  for (const { sessionId, raw } of chunks) {
+    let lastModel = 'unknown';
+    const cctxCallModels = new Map<string, string>();
+    let lineStart = 0;
+    while (lineStart < raw.length) {
+      const nlIdx = raw.indexOf('\n', lineStart);
+      const lineEnd = nlIdx >= 0 ? nlIdx : raw.length;
+      const line = raw.slice(lineStart, lineEnd);
+      lineStart = lineEnd + 1;
+      if (!line.includes('"session.usage_record"') && !line.includes('"tool.execution_')) {
+        continue;
+      }
+      try {
+        const ev = JSON.parse(line) as Record<string, unknown>;
+        const type = ev.type;
+        const data = typeof ev.data === 'object' && ev.data !== null ? ev.data as Record<string, unknown> : undefined;
+        if (type === 'session.usage_record' && data) {
+          const u = typeof data.usage === 'object' && data.usage !== null ? data.usage as Record<string, unknown> : undefined;
+          if (!u) { continue; }
+          const model = typeof u.model === 'string' && u.model ? u.model : 'unknown';
+          const displayName = typeof u.modelDisplayName === 'string' && u.modelDisplayName ? u.modelDisplayName : model;
+          const effort = typeof u.reasoningEffort === 'string' && u.reasoningEffort ? u.reasoningEffort : '-';
+          lastModel = model;
+          activeSessions.add(sessionId);
+          const inTok = typeof u.inputTokens === 'number' ? u.inputTokens : 0;
+          const crTok = typeof u.cacheReadTokens === 'number' ? u.cacheReadTokens : 0;
+          const outTok = typeof u.outputTokens === 'number' ? u.outputTokens : 0;
+          const rsnTok = typeof u.reasoningTokens === 'number' ? u.reasoningTokens : 0;
+          const cu = typeof u.copilotUsage === 'object' && u.copilotUsage !== null ? u.copilotUsage as Record<string, unknown> : undefined;
+          const nanoAiu = typeof cu?.totalNanoAiu === 'number' ? cu.totalNanoAiu : 0;
+          totalTurns += 1;
+          totalIn += inTok;
+          totalCache += crTok;
+          totalOut += outTok;
+          totalRsn += rsnTok;
+          totalNanoAiu += nanoAiu;
+          let entry = byModel.get(model);
+          if (!entry) {
+            entry = {
+              model, displayName, effort, sessions: new Set(),
+              turns: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, reasoningTokens: 0,
+              nanoAiu: 0, cctxCalls: 0, cctxMisses: 0,
+            };
+            byModel.set(model, entry);
+          }
+          entry.sessions.add(sessionId);
+          entry.turns += 1;
+          entry.inputTokens += inTok;
+          entry.cacheReadTokens += crTok;
+          entry.outputTokens += outTok;
+          entry.reasoningTokens += rsnTok;
+          entry.nanoAiu += nanoAiu;
+        } else if (type === 'tool.execution_start' && data) {
+          const toolName = typeof data.toolName === 'string' ? data.toolName : '';
+          if (isCctxToolName(toolName)) {
+            const m = typeof data.model === 'string' && data.model ? data.model : lastModel;
+            const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
+            if (callId) { cctxCallModels.set(callId, m); }
+            const entry = byModel.get(m);
+            if (entry) { entry.cctxCalls += 1; }
+          }
+        } else if (type === 'tool.execution_complete' && data && line.includes('CACHE_MISS ')) {
+          const callId = typeof data.toolCallId === 'string' ? data.toolCallId : '';
+          const m = (callId ? cctxCallModels.get(callId) : undefined)
+            ?? (typeof data.model === 'string' && data.model ? data.model : lastModel);
+          const entry = byModel.get(m);
+          if (entry && entry.cctxMisses < entry.cctxCalls) {
+            entry.cctxMisses += 1;
+          }
+        }
+      } catch {
+        // Skip malformed JSONL lines.
+      }
+    }
+  }
+  const models: SessionModelSummary[] = Array.from(byModel.values())
+    .sort((a, b) => b.turns - a.turns || b.inputTokens - a.inputTokens)
+    .map((m) => ({
+      model: m.model,
+      displayName: m.displayName,
+      effort: m.effort,
+      sessions: m.sessions.size,
+      turns: m.turns,
+      inputTokens: m.inputTokens,
+      cacheReadTokens: m.cacheReadTokens,
+      outputTokens: m.outputTokens,
+      reasoningTokens: m.reasoningTokens,
+      usedAic: Math.round((m.nanoAiu / 1e9) * 100) / 100,
+      cctxCalls: m.cctxCalls,
+      cctxWarmHitPct: m.cctxCalls > 0 ? Math.round((1000 * (m.cctxCalls - m.cctxMisses)) / m.cctxCalls) / 10 : undefined,
+    }));
+  return {
+    updatedAt: nowMs,
+    sessions: activeSessions.size,
+    turns: totalTurns,
+    inputTokens: totalIn,
+    cacheReadTokens: totalCache,
+    outputTokens: totalOut,
+    reasoningTokens: totalRsn,
+    usedAic: Math.round((totalNanoAiu / 1e9) * 100) / 100,
+    models,
+  };
+}
+
 function renderAsciiBoxTable(
   title: string,
   headers: readonly string[],
@@ -119,6 +254,8 @@ export class UsageSummary {
   public estimatedTurnTokensSaved = 0;
   public readonly byOperation: Record<string, OperationMetrics> = {};
   public sessionTelemetry: SessionTelemetrySnapshot | undefined;
+  private lastTelemetryAttemptAt = 0;
+  private refreshingPromise: Promise<SessionTelemetrySnapshot | undefined> | undefined;
 
   public record(event: UsageEvent, at = Date.now()): void {
     const outcome = classifyOutcome(event.error);
@@ -189,9 +326,10 @@ export class UsageSummary {
     nowMs = Date.now(),
     force = false,
   ): SessionTelemetrySnapshot | undefined {
-    if (!force && this.sessionTelemetry && nowMs - this.sessionTelemetry.updatedAt < 10_000) {
+    if (!force && this.lastTelemetryAttemptAt > 0 && nowMs - this.lastTelemetryAttemptAt < 60_000) {
       return this.sessionTelemetry;
     }
+    this.lastTelemetryAttemptAt = nowMs;
     try {
       const baseHome = customHome ?? process.env.XDG_STATE_HOME ?? os.homedir();
       const sessionDir = path.join(baseHome, '.copilot', 'session-state');
@@ -212,23 +350,12 @@ export class UsageSummary {
       }
       candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
       const selected = candidates.slice(0, 6);
-      const byModel = new Map<string, {
-        model: string; displayName: string; effort: string; sessions: Set<string>;
-        turns: number; inputTokens: number; cacheReadTokens: number; outputTokens: number;
-        reasoningTokens: number; nanoAiu: number; cctxCalls: number; cctxMisses: number;
-      }>();
-      let totalTurns = 0;
-      let totalIn = 0;
-      let totalCache = 0;
-      let totalOut = 0;
-      let totalRsn = 0;
-      let totalNanoAiu = 0;
-      const activeSessions = new Set<string>();
+      const rawChunks: Array<{ sessionId: string; raw: string }> = [];
+      const maxBytes = 128 * 1024;
       for (const item of selected) {
-        let raw = '';
         try {
           const stat = fs.statSync(item.file);
-          const maxBytes = 512 * 1024;
+          let raw = '';
           if (stat.size <= maxBytes) {
             raw = fs.readFileSync(item.file, 'utf8');
           } else {
@@ -243,103 +370,86 @@ export class UsageSummary {
               fs.closeSync(fd);
             }
           }
+          rawChunks.push({ sessionId: item.sessionId, raw });
         } catch {
           continue;
         }
-        let lastModel = 'unknown';
-        let lineStart = 0;
-        while (lineStart < raw.length) {
-          const nlIdx = raw.indexOf('\n', lineStart);
-          const lineEnd = nlIdx >= 0 ? nlIdx : raw.length;
-          const line = raw.slice(lineStart, lineEnd);
-          lineStart = lineEnd + 1;
-          if (!line.includes('"session.usage_record"') && !line.includes('"tool.execution_')) {
-            continue;
-          }
-          try {
-            const ev = JSON.parse(line) as Record<string, unknown>;
-            const type = ev.type;
-            const data = typeof ev.data === 'object' && ev.data !== null ? ev.data as Record<string, unknown> : undefined;
-            if (type === 'session.usage_record' && data) {
-              const u = typeof data.usage === 'object' && data.usage !== null ? data.usage as Record<string, unknown> : undefined;
-              if (!u) { continue; }
-              const model = typeof u.model === 'string' && u.model ? u.model : 'unknown';
-              const displayName = typeof u.modelDisplayName === 'string' && u.modelDisplayName ? u.modelDisplayName : model;
-              const effort = typeof u.reasoningEffort === 'string' && u.reasoningEffort ? u.reasoningEffort : '-';
-              lastModel = model;
-              activeSessions.add(item.sessionId);
-              const inTok = typeof u.inputTokens === 'number' ? u.inputTokens : 0;
-              const crTok = typeof u.cacheReadTokens === 'number' ? u.cacheReadTokens : 0;
-              const outTok = typeof u.outputTokens === 'number' ? u.outputTokens : 0;
-              const rsnTok = typeof u.reasoningTokens === 'number' ? u.reasoningTokens : 0;
-              const cu = typeof u.copilotUsage === 'object' && u.copilotUsage !== null ? u.copilotUsage as Record<string, unknown> : undefined;
-              const nanoAiu = typeof cu?.totalNanoAiu === 'number' ? cu.totalNanoAiu : 0;
-              totalTurns += 1;
-              totalIn += inTok;
-              totalCache += crTok;
-              totalOut += outTok;
-              totalRsn += rsnTok;
-              totalNanoAiu += nanoAiu;
-              let entry = byModel.get(model);
-              if (!entry) {
-                entry = {
-                  model, displayName, effort, sessions: new Set(),
-                  turns: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, reasoningTokens: 0,
-                  nanoAiu: 0, cctxCalls: 0, cctxMisses: 0,
-                };
-                byModel.set(model, entry);
-              }
-              entry.sessions.add(item.sessionId);
-              entry.turns += 1;
-              entry.inputTokens += inTok;
-              entry.cacheReadTokens += crTok;
-              entry.outputTokens += outTok;
-              entry.reasoningTokens += rsnTok;
-              entry.nanoAiu += nanoAiu;
-            } else if (type === 'tool.execution_start' && data) {
-              const toolName = typeof data.toolName === 'string' ? data.toolName : '';
-              if (toolName.startsWith('cctxNative') || toolName.startsWith('code-context')) {
-                const m = typeof data.model === 'string' && data.model ? data.model : lastModel;
-                const entry = byModel.get(m);
-                if (entry) { entry.cctxCalls += 1; }
-              }
-            }
-          } catch {
-            // Skip malformed JSONL lines.
-          }
-        }
       }
-      const models: SessionModelSummary[] = Array.from(byModel.values())
-        .sort((a, b) => b.turns - a.turns || b.inputTokens - a.inputTokens)
-        .map((m) => ({
-          model: m.model,
-          displayName: m.displayName,
-          effort: m.effort,
-          sessions: m.sessions.size,
-          turns: m.turns,
-          inputTokens: m.inputTokens,
-          cacheReadTokens: m.cacheReadTokens,
-          outputTokens: m.outputTokens,
-          reasoningTokens: m.reasoningTokens,
-          usedAic: Math.round((m.nanoAiu / 1e9) * 100) / 100,
-          cctxCalls: m.cctxCalls,
-          cctxWarmHitPct: m.cctxCalls > 0 ? Math.round((1000 * (m.cctxCalls - m.cctxMisses)) / m.cctxCalls) / 10 : undefined,
-        }));
-      this.sessionTelemetry = {
-        updatedAt: nowMs,
-        sessions: activeSessions.size,
-        turns: totalTurns,
-        inputTokens: totalIn,
-        cacheReadTokens: totalCache,
-        outputTokens: totalOut,
-        reasoningTokens: totalRsn,
-        usedAic: Math.round((totalNanoAiu / 1e9) * 100) / 100,
-        models,
-      };
+      this.sessionTelemetry = parseSessionTelemetryChunks(rawChunks, nowMs);
     } catch {
       // Ignore file-system telemetry errors in restricted environments.
     }
     return this.sessionTelemetry;
+  }
+
+  public refreshSessionTelemetryAsync(
+    customHome?: string,
+    nowMs = Date.now(),
+    force = false,
+  ): Promise<SessionTelemetrySnapshot | undefined> {
+    if (!force && this.lastTelemetryAttemptAt > 0 && nowMs - this.lastTelemetryAttemptAt < 60_000) {
+      return Promise.resolve(this.sessionTelemetry);
+    }
+    if (this.refreshingPromise) {
+      return this.refreshingPromise;
+    }
+    const run = (async (): Promise<SessionTelemetrySnapshot | undefined> => {
+      try {
+        const baseHome = customHome ?? process.env.XDG_STATE_HOME ?? os.homedir();
+        const sessionDir = path.join(baseHome, '.copilot', 'session-state');
+        const entries = await fs.promises.readdir(sessionDir, { withFileTypes: true });
+        const cutoffMs = nowMs - 12 * 3600 * 1000;
+        const candidates: Array<{ file: string; mtimeMs: number; sessionId: string }> = [];
+        for (const entry of entries) {
+          if (!entry.isDirectory()) { continue; }
+          const eventsFile = path.join(sessionDir, entry.name, 'events.jsonl');
+          try {
+            const stat = await fs.promises.stat(eventsFile);
+            if (stat.mtimeMs >= cutoffMs) {
+              candidates.push({ file: eventsFile, mtimeMs: stat.mtimeMs, sessionId: entry.name });
+            }
+          } catch {
+            // Ignore rotated or inaccessible session files.
+          }
+        }
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        const selected = candidates.slice(0, 6);
+        const rawChunks: Array<{ sessionId: string; raw: string }> = [];
+        const maxBytes = 128 * 1024;
+        for (const item of selected) {
+          try {
+            const stat = await fs.promises.stat(item.file);
+            let raw = '';
+            if (stat.size <= maxBytes) {
+              raw = await fs.promises.readFile(item.file, 'utf8');
+            } else {
+              const handle = await fs.promises.open(item.file, 'r');
+              try {
+                const buf = Buffer.allocUnsafe(maxBytes);
+                const { bytesRead } = await handle.read(buf, 0, maxBytes, stat.size - maxBytes);
+                raw = buf.subarray(0, bytesRead).toString('utf8');
+                const firstNl = raw.indexOf('\n');
+                if (firstNl >= 0) { raw = raw.slice(firstNl + 1); }
+              } finally {
+                await handle.close();
+              }
+            }
+            rawChunks.push({ sessionId: item.sessionId, raw });
+          } catch {
+            continue;
+          }
+        }
+        this.sessionTelemetry = parseSessionTelemetryChunks(rawChunks, nowMs);
+      } catch {
+        // Missing ~/.copilot/session-state (e.g. Windows UI client) stays cached for 60s.
+      }
+      return this.sessionTelemetry;
+    })().finally(() => {
+      this.lastTelemetryAttemptAt = nowMs;
+      this.refreshingPromise = undefined;
+    });
+    this.refreshingPromise = run;
+    return run;
   }
 
   public get avgLatencyMs(): number | undefined {

@@ -139,7 +139,7 @@ void test('manifest contributes exactly the seven registered native tools', asyn
   assert.match(contributedInstructions, /description: "Use when:/);
   assert.match(contributedInstructions, /applyTo: "\*\*"/);
   assert.match(contributedInstructions, /#cctxNativeContext/);
-  assert.match(contributedInstructions, /Do not choose MCP when the matching Native tool is callable/);
+  assert.match(contributedInstructions, /Running on another client\.\.\. Skip\?/);
   assert.match(contributedInstructions, /prefer backend MCP/);
   assert.match(contributedInstructions, /cctx --backend shared --root/);
   assert.match(contributedInstructions, /Do not duplicate a still-pending lookup/);

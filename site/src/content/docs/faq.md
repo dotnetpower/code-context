@@ -25,9 +25,9 @@ Vector RAG requires chunking, embedding models (often cloud APIs or heavy local 
 
 ## Do I need MCP if I install the VS Code extension?
 
-For foreground VS Code Copilot sessions (VS Code 1.140+), **no MCP configuration is required**—the Marketplace extension (`dotnetpower.code-context-native`) registers native Language Model Tools directly.
+For foreground VS Code Editor Copilot Chat sessions (VS Code 1.140+), **no MCP configuration is required**—the Marketplace extension (`dotnetpower.code-context-native`) registers native Language Model Tools directly.
 
-Adding `cctx shared-mcp` is recommended when you also run **background/unattended subagents** without UI extension-host dispatch, or external MCP clients such as **Claude Code, Cursor, or custom CLI agents**. Both surfaces share the exact same background Rust daemon and warm cache.
+Adding `cctx shared-mcp` is strongly recommended for **VS Code Agents Window / AgentHost (`ahp-session`)** and **background/unattended subagents** (so `Developer: Reload Window` and multi-window switches never stall on UI client relay), as well as external MCP clients such as **Claude Code, Cursor, or custom CLI agents**. Both surfaces share the exact same background Rust daemon and warm cache.
 
 ---
 

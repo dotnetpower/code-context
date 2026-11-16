@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 The installer builds a locked release and installs:
 
-- `~/.local/bin/cctx` (plus `~/.local/bin/pctx -> cctx` multi-call symlink for declarative probes)
+- `~/.local/bin/cctx` (plus `~/.local/bin/pctx -> cctx` multi-call symlink for declarative probes, and on WSL2 hosts a `~/.local/bin/wsl.exe` same-distro `exec` fast-path shim so Linux `copilot-runtime` MCP launches bypass Win32 `wsl.exe` re-entry)
 - `~/.config/systemd/user/code-context.service`
 - private state in `~/.local/state/code-context/`
 
@@ -171,9 +171,13 @@ Search patterns are case-sensitive literals unless `--regex` or
 Matching-line counts and truncation are explicit. A zero-match success differs
 from a refusal, unavailable cache, or system failure.
 
-For Copilot CLI, subagents without UI client dispatch, or disconnected-turn
-fallback, register the existing backend as an MCP server (do not choose MCP in
-VS Code when `#cctxNative*` is callable):
+For VS Code Agent Host / Copilot SDK (`ahp-session`), background autopilot,
+subagent, and Copilot CLI sessions, register the existing backend as a direct
+server-side MCP server (`code-context-code_*` / `mcp__code-context__*`) and
+prefer it FIRST so `Reload Window`, multi-window switches, and passive views
+never stall on `"Running cctxNative* on another client... Skip?"` or fail on UI
+client disconnects (in foreground Editor Copilot Chat without backend MCP,
+prefer `#cctxNative*` first):
 
 ```sh
 copilot mcp add code-context --timeout 30000 -- "$HOME/.local/bin/cctx" shared-mcp

@@ -55,10 +55,12 @@ pub fn detail(error: Option<&str>) -> &'static str {
     } else if message.contains("TARGET_NOT_INDEXED") || message.contains("reason=not_yet_indexed") {
         "target_not_indexed"
     } else if message.contains("No matching client connected")
+        || message.contains("no connected client")
         || message.contains("advertised tool definition")
         || message.contains("disconnected")
         || message.contains("reconnect failed")
         || message.contains("skipped from another client")
+        || message.contains("on another client")
         || message.contains("not available on this client")
         || message.contains("clientUnavailable")
     {
@@ -110,6 +112,18 @@ mod tests {
         );
         assert_eq!(
             detail(Some("Tool \"cctxNativeRead\" is not available on this client")),
+            "client_disconnected"
+        );
+        assert_eq!(
+            detail(Some(
+                "Client 008a6d5a-57e3-40dc-a176-296e71a2b3ad disconnected before completing cctxNativeRead"
+            )),
+            "client_disconnected"
+        );
+        assert_eq!(
+            detail(Some(
+                "Client tool 'cctxNativeGrep' started with no connected client matching its advertised definition"
+            )),
             "client_disconnected"
         );
         assert_eq!(detail(Some("request timed out")), "timeout_or_cancelled");

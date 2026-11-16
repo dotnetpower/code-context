@@ -1285,5 +1285,62 @@ fn compaction_journal_state_budget_recall_and_multi_agent_hooks() {
         .output()
         .unwrap();
     assert!(show_pinned.status.success());
+
+    // 8. Client-disconnect PostToolUse failure records a deduplicated pinned Decision note
+    for _ in 0..2 {
+        let mut child = Command::new(cctx_bin())
+            .env("CCTX_HOME", &cctx_home)
+            .args([
+                "--root",
+                repo.to_str().unwrap(),
+                "journal",
+                "hook",
+                "--agent",
+                "copilot-cli",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({
+                    "hook_event_name": "postToolUse",
+                    "sessionId": "reload-win-sess",
+                    "cwd": repo,
+                    "toolName": "cctxNativeRead",
+                    "toolResult": {
+                        "resultType": "failure",
+                        "textResultForLlm": "Client 008a6d5a-57e3-40dc-a176-296e71a2b3ad disconnected before completing cctxNativeRead"
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+    }
+    let resume_after_disconnect = Command::new(cctx_bin())
+        .env("CCTX_HOME", &cctx_home)
+        .args([
+            "--root",
+            repo.to_str().unwrap(),
+            "journal",
+            "resume",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(resume_after_disconnect.status.success());
+    let resume_text = String::from_utf8_lossy(&resume_after_disconnect.stdout);
+    assert_eq!(
+        resume_text.matches("UI client relay disconnected on cctxNativeRead").count(),
+        1
+    );
 }
 

@@ -32,18 +32,18 @@ fn build_tools() -> Value {
         }
         let prefix = match tool["name"].as_str() {
             Some("code_files") => {
-                "MCP fallback for sessions where the matching Native tool (cctxNativeFiles) is unavailable: filename/path glob (!content)."
+                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeFiles is unavailable): filename/path glob (!content)."
             }
             Some("code_grep") => {
-                "MCP fallback for sessions where the matching Native tool (cctxNativeGrep) is unavailable: saved-source search. Set regex=true for a|b."
+                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeGrep is unavailable): saved-source search. Set regex=true for a|b."
             }
             Some("code_context") => {
-                "MCP fallback for sessions where the matching Native tool (cctxNativeContext) is unavailable: symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
+                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeContext is unavailable): symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
             }
-            _ => "MCP fallback for sessions where the matching Native tool (cctxNativeRead) is unavailable: batched ranges (<=150L, <8KiB).",
+            _ => "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeRead is unavailable): batched ranges (<=150L, <8KiB).",
         };
         tool["description"] = json!(format!(
-            "{prefix} Do not choose MCP when cctxNative* is callable. CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch when no UI client is connected. Do not duplicate a pending native call."
+            "{prefix} Prefer this FIRST in AgentHost / Copilot SDK / background sessions so Reload Window or multi-window never stalls ('Running on another client... Skip?') or fails client dispatch; in foreground Editor Chat without backend MCP, use cctxNative* first. CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch when no UI client is connected. Do not duplicate a pending native call."
         ));
     }
     for (name, description) in [

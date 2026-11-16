@@ -118,6 +118,7 @@ export class NativeToolBridge implements vscode.Disposable {
     private readonly output: vscode.LogOutputChannel,
     private readonly registerMissingRoot?: (path: string) => Promise<void>,
     private readonly onUsage?: (event: UsageEvent) => void,
+    private readonly onPayload?: (operation: string, deliveredChars: number) => void,
   ) {
     this.registry = new WorkspaceRegistry(client);
   }
@@ -155,6 +156,7 @@ export class NativeToolBridge implements vscode.Disposable {
     definition: ToolDefinition<T>,
     input: T,
     token: vscode.CancellationToken,
+    options?: { skipPayloadMeasure?: boolean },
   ): Promise<{ value: JsonValue; trace: ClientTrace }> {
     ensureTrustedWorkspace();
     const started = performance.now();
@@ -209,7 +211,7 @@ export class NativeToolBridge implements vscode.Disposable {
         operation: definition.operation,
         root,
         totalMs: result.trace.total_ms,
-        deliveredChars: JSON.stringify(result.value).length,
+        deliveredChars: options?.skipPayloadMeasure ? 0 : JSON.stringify(result.value).length,
         turnCompressed,
       });
       if (definition.operation === 'code_sync') {
@@ -251,6 +253,10 @@ export class NativeToolBridge implements vscode.Disposable {
     void this.client.request(request(null, 'code_trace', trace), token).catch((error: unknown) => {
       this.output.warn(`CCTX_TRACE_REPORT_FAILED trace=${trace.trace_id}: ${singleLine(String(error))}`);
     });
+  }
+
+  public recordFormattedPayload(operation: string, deliveredChars: number): void {
+    this.onPayload?.(operation, deliveredChars);
   }
 
   public async listWorkspaces(token: vscode.CancellationToken): Promise<WorkspaceSpec[]> {
@@ -346,12 +352,18 @@ class NativeTool<T> implements vscode.LanguageModelTool<T> {
     options: vscode.LanguageModelToolInvocationOptions<T>,
     token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelToolResult> {
-    const result = await this.bridge.invokeTraced(this.definition, options.input, token);
+    const result = await this.bridge.invokeTraced(
+      this.definition,
+      options.input,
+      token,
+      { skipPayloadMeasure: true },
+    );
     const started = performance.now();
     const text = formatToolResult(this.definition.operation, result.value);
     result.trace.serialize_ms = performance.now() - started;
     result.trace.total_ms += result.trace.serialize_ms;
     result.trace.completed_unix_ms = Date.now();
+    this.bridge.recordFormattedPayload(this.definition.operation, text.length);
     this.bridge.recordTrace(result.trace, token);
     // Timing lets `cctx usage` separate host dispatch delay from extension and daemon time.
     const compactTrace = {

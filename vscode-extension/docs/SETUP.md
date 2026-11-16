@@ -131,19 +131,22 @@ with a 4GiB ceiling. Manual limits are documented in the
 | `READ_UNAVAILABLE` | The file may be absent or unstable. Discover the current filename before another read. |
 | `READ_RANGE_OUT_OF_BOUNDS` | Use the reported line count or locate the current lines. |
 | No native tools in a chat | Check the extension host and agent tool settings. Registration is not proof of per-chat exposure. |
-| `No matching client connected` / `Client ... disconnected before completing cctxNative*` | The agent host lost its native-tool client, not the source index. Use MCP for this user turn; reconnect the Agents window, then rediscover native tools on the next foreground user turn. |
-| `Running cctxNative* on another client... Skip?` / `cctxNative* was skipped from another client` | Another or stale VS Code window client owns client-tool routing for that chat. Click **Skip?** once if prompted; the agent switches to `code-context-code_*` MCP for that chat so later lookups do not block. |
+| `No matching client connected` / `Client ... disconnected before completing cctxNative*` | The agent host lost its native-tool UI client (for example during `Developer: Reload Window`), not the source index. AgentHost / Copilot SDK sessions with `cctx shared-mcp` configured prefer `code-context-code_*` backend MCP first so reloads never interrupt active turns. |
+| `Running cctxNative* on another client... Skip?` / `cctxNative* was skipped from another client` | A previous or separate VS Code window client owned client-tool routing before a reload or window switch. Click **Skip?** once if an older turn is waiting; sessions with `cctx shared-mcp` use `code-context-code_*` backend MCP directly on the runtime and avoid UI client stalls. |
 | No WSL log updates | Windows Agents calls are logged in the Windows output channel. |
 
-MCP remains available independently of the foreground native-tool client. A
-successful MCP lookup does not mean native tools are disabled or unsupported.
-After reconnecting, verify recovery with one needed `cctxNativeContext` or
-`cctxNativeRead` lookup using the explicit root, rather than a Status polling
-loop. Success restores native-first selection; another dispatch error keeps
-MCP fallback for that user turn. Background/unattended sessions without native
-dispatch continue to use MCP. `CACHE_MISS` is a cold-cache response from a
-working tool, not a client-disconnection error; do not switch transports for it.
-Do not restart the shared daemon or run `code_sync` to repair a client connection.
+MCP remains available independently of the foreground native-tool client. In
+AgentHost / Copilot SDK (`ahp-session`) sessions with `cctx shared-mcp`
+configured, `code-context-code_*` backend MCP stays the primary path across
+turns and window reloads so active chats never block on UI client dispatch. In
+foreground Editor Copilot Chat without backend MCP, verify recovery after
+reconnecting with one needed `cctxNativeContext` or `cctxNativeRead` lookup
+using the explicit root, rather than a Status polling loop: success restores
+native-first selection; another dispatch error keeps MCP/CLI fallback for that
+user turn. Background/unattended sessions without native dispatch continue to
+use MCP. `CACHE_MISS` is a cold-cache response from a working tool, not a
+client-disconnection error; do not switch transports for it. Do not restart the
+shared daemon or run `code_sync` to repair a client connection.
 
 Open **Output → Code Context Native** for bounded native trace details.
 `cctx --root /project doctor` compares installed/client/daemon builds without

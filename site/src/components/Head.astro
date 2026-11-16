@@ -95,7 +95,7 @@ const verifiedDateStr = data.verified instanceof Date && !Number.isNaN(data.veri
   ? data.verified.toISOString().slice(0, 10)
   : "2026-11-14";
 const publishedIso = `${verifiedDateStr}T00:00:00Z`;
-const modifiedIso = "2026-11-14T03:00:00Z";
+const modifiedIso = "2026-11-16T03:00:00Z";
 
 const orgNode = {
   "@type": "Organization",
@@ -154,6 +154,7 @@ const softwareNode = {
     "Fast local file discovery, trigram-indexed source search, smart block-clamped context cache, declarative probes (pctx), and compaction continuity journal for AI coding agents.",
   applicationCategory: "DeveloperApplication",
   operatingSystem: "Linux, Windows, WSL, SSH",
+  softwareVersion: "0.26.1",
   url: SITE_ROOT_URL,
   downloadUrl: "https://marketplace.visualstudio.com/items?itemName=dotnetpower.code-context-native",
   codeRepository: "https://github.com/dotnetpower/code-context",

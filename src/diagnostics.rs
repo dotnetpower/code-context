@@ -314,21 +314,36 @@ fn inspect_subagent_definitions() -> Value {
     let mut checked = 0usize;
     let mut configured = 0usize;
     let mut unconfigured: Vec<String> = Vec::new();
-    let bin_root = home.join(".vscode-server/bin");
-    if let Ok(entries) = std::fs::read_dir(&bin_root) {
-        for entry in entries.flatten() {
-            for rel in [
+    for (parent_rel, rels) in [
+        (
+            ".vscode-server/bin",
+            &[
                 "node_modules/@github/copilot-sdk-linux-x64/definitions/explore.agent.yaml",
                 "extensions/copilot/node_modules/@github/copilot/sdk/definitions/explore.agent.yaml",
                 "extensions/copilot/node_modules/@github/copilot/sdk/definitions/research.agent.yaml",
-            ] {
-                let candidate = entry.path().join(rel);
-                if let Ok(text) = std::fs::read_to_string(&candidate) {
-                    checked += 1;
-                    if text.contains("cctxNativeContext") && text.contains("code-context/*") {
-                        configured += 1;
-                    } else if unconfigured.len() < 8 {
-                        unconfigured.push(candidate.to_string_lossy().into_owned());
+            ][..],
+        ),
+        (
+            ".vscode-server/cli/servers",
+            &[
+                "server/node_modules/@github/copilot-sdk-linux-x64/definitions/explore.agent.yaml",
+                "server/extensions/copilot/node_modules/@github/copilot/sdk/definitions/explore.agent.yaml",
+                "server/extensions/copilot/node_modules/@github/copilot/sdk/definitions/research.agent.yaml",
+            ][..],
+        ),
+    ] {
+        let root = home.join(parent_rel);
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                for rel in rels {
+                    let candidate = entry.path().join(rel);
+                    if let Ok(text) = std::fs::read_to_string(&candidate) {
+                        checked += 1;
+                        if text.contains("cctxNativeContext") && text.contains("code-context/*") {
+                            configured += 1;
+                        } else if unconfigured.len() < 8 {
+                            unconfigured.push(candidate.to_string_lossy().into_owned());
+                        }
                     }
                 }
             }

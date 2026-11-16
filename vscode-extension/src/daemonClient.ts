@@ -263,7 +263,11 @@ export class DaemonClient {
         return value as T;
       } catch (error: unknown) {
         const failure = asError(error);
+        if (cancellation.isCancellationRequested) {
+          throw new RequestCancelledError();
+        }
         if (
+          this.disposed ||
           failure instanceof RequestCancelledError ||
           failure instanceof DaemonResponseError
         ) {
@@ -285,7 +289,10 @@ export class DaemonClient {
   }
 
   private async startServiceCoalesced(): Promise<void> {
-    if (Date.now() - this.lastServiceStartAt < 2_000 && !this.startingService) {
+    if (
+      this.disposed ||
+      (Date.now() - this.lastServiceStartAt < 2_000 && !this.startingService)
+    ) {
       return;
     }
     this.startingService ??= this.serviceStarter(this.settings()).finally(() => {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.26.1
+
+- Fix `Reload Window` and multi-window client-dispatch stalls (`"Running
+  cctxNativeRead on another client... Skip?"`) and `"Client ... disconnected
+  before completing cctxNative*"` / `"No matching client connected"` failures in
+  VS Code AgentHost / Copilot SDK (`ahp-session`) sessions:
+  - Prefer server-side backend MCP (`code-context-code_*` / `code_*`) FIRST in
+    AgentHost / Copilot SDK, background autopilot, subagent, and CLI sessions
+    whenever backend MCP is callable, avoiding UI renderer / `wsl.exe`
+    extension-host round-trips and surviving window reloads seamlessly.
+  - Preserve `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and
+    `#cctxNativeFiles` as the primary path in foreground Editor Copilot Chat and
+    in AgentHost sessions where backend MCP is not configured or disabled.
+
 ## 0.26.0
 
 - Eliminate inventory-exceeded `CACHE_LOAD_FAILED` cliffs and host-tool fallback

@@ -489,6 +489,29 @@ void test('stale close events cannot tear down a replacement socket', async () =
   }
 });
 
+void test('disposing client during an in-flight request aborts without starting service', async () => {
+  const testServer = await fixture(() => undefined);
+  let serviceStarts = 0;
+  const client = new DaemonClient(
+    () => ({ ...settings(testServer.path), autoStartService: true }),
+    (): Promise<void> => {
+      serviceStarts += 1;
+      return Promise.resolve();
+    },
+  );
+  try {
+    const started = performance.now();
+    const pending = client.request(request(), uncancelled());
+    setTimeout(() => client.dispose(), 15);
+    await assert.rejects(pending, /disposed/);
+    assert.equal(serviceStarts, 0);
+    assert.ok(performance.now() - started < 150);
+  } finally {
+    client.dispose();
+    await testServer.cleanup();
+  }
+});
+
 function attachFramedHandler(
   socket: Socket,
   handler: (requestValue: unknown, socket: Socket) => void,

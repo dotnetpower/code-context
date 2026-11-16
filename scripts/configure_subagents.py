@@ -64,43 +64,43 @@ YAML_PROMPT_BLOCK = """\
   # [cctx-subagent-instructions]
   **Code Context (`cctx`) & Test Context (`tctx`) Priority (MANDATORY FIRST PATH):**
   - For locating or reading saved source in a registered workspace, ALWAYS use Code Context FIRST before `view`, `grep`, `rg`, `glob`, or `bash`:
-    1. Prefer native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles` FIRST when callable; otherwise (when no UI client is connected) use MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__*`).
-    2. Always pass the explicit absolute `root` parameter (shown in `<environment_context>` or your task prompt). Keep `cctxNativeContext` / `code_context` `limit <= 64` (`radius 0..100`) and keep `cctxNativeRead` / `code_read` batches `<= 120` total lines (`<8KiB`) so responses stay inline.
+    1. Prefer backend MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__*`) FIRST when callable so `Reload Window` or headless execution never stalls on UI client dispatch; otherwise use native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles`.
+    2. Always pass the explicit absolute `root` parameter (shown in `<environment_context>` or your task prompt). Keep `code_context` / `cctxNativeContext` `limit <= 64` (`radius 0..100`) and keep `code_read` / `cctxNativeRead` batches `<= 120` total lines (`<8KiB`) so responses stay inline.
     3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` files to Code Context; use `view` directly for those.
-    4. If Code Context or Test Context tools are deferred or not visible in your active tool list, call `tool_search` (`tool_search_tool`) FIRST with at most 4 exact names per call (`tool_search_tool` caps results at 5): `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"` (fallback `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"`; tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"`).
+    4. If Code Context or Test Context tools are deferred or not visible in your active tool list, call `tool_search` (`tool_search_tool`) FIRST with at most 4 exact names per call (`tool_search_tool` caps results at 5): `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` (fallback `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"`; tests `"test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected"`).
     5. If a native `cctxNative*` or `tctxNative*` call fails with `"No client with the advertised tool definition"`, `"No matching client connected"`, or `"skipped from another client"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root <root>` / `tctx --root <root> run` CLI).
     6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.
-    7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use native `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` (or MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph` when native dispatch is unavailable) FIRST before `bash`, passing the explicit absolute `root`.
+    7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use backend MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph` (or native `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph` when MCP is unavailable) FIRST before `bash`, passing the explicit absolute `root`.
 """
 
 MD_PROMPT_BLOCK = """
 <!-- [cctx-subagent-instructions] -->
 ## Code Context (`cctx`) & Test Context (`tctx`) Priority (Mandatory First Path)
 
-- For locating or reading saved source in a registered workspace, ALWAYS use `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` (or MCP `code-context-code_*` when native dispatch is unavailable) FIRST before built-in search/read tools.
-- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` (or MCP `test-context-test_*` when native dispatch is unavailable) FIRST before shell test/lint commands.
-- Always pass the explicit absolute `root` parameter when known, keep `cctxNativeContext` `limit <= 64`, and keep read batches `<= 120` lines (`<8KiB`). Never send `.github/*`, `.vscode/*`, or `/tmp/*` paths to Code Context.
-- If tools are deferred, discover them with `tool_search` using `<= 4` exact names per call: `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"` (fallback `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"`; tests `"tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected"`).
+- For locating or reading saved source in a registered workspace, ALWAYS use MCP `code-context-code_*` (or `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` when backend MCP is unavailable) FIRST before built-in search/read tools.
+- For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use MCP `test-context-test_*` (or `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` when backend MCP is unavailable) FIRST before shell test/lint commands.
+- Always pass the explicit absolute `root` parameter when known, keep `code_context` / `cctxNativeContext` `limit <= 64`, and keep read batches `<= 120` lines (`<8KiB`). Never send `.github/*`, `.vscode/*`, or `/tmp/*` paths to Code Context.
+- If tools are deferred, discover them with `tool_search` using `<= 4` exact names per call: `"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files"` (fallback `"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles"`; tests `"test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected"`).
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.
 """
 
 YAML_FORMULA_PROMPT_BLOCK = """\
   # [cctx-subagent-instructions]
   CCTX & TCTX Formula Rules:
-  - Source: cctxNative*{Context,Read,Grep,Files} > MCP(code-context-code_* | mcp__code-context__*) > cctx --backend shared --root <root> > Host(view,rg,glob)
-  - Tests & Probes: tctxNative*{Run,Affected,Graph,Status} > MCP(test-context-test_* | mcp__test-context__*) > tctx --root <root> run > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
-  - Guards: pass explicit root; symbol+context => cctxNativeContext/code-context-code_context(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 cctxNativeRead/code-context-code_read(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).
-  - Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST: "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" (<=5 cap) | MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" | tests "tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected" (regex: "cctxNative|code-context|tctxNative|test-context").
+  - Source: MCP(code-context-code_* | mcp__code-context__*) > cctxNative*{Context,Read,Grep,Files} > cctx --backend shared --root <root> > Host(view,rg,glob)
+  - Tests & Probes: MCP(test-context-test_* | mcp__test-context__*) > tctxNative*{Run,Affected,Graph,Status} > tctx --root <root> run > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
+  - Guards: pass explicit root; symbol+context => code-context-code_context/cctxNativeContext(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 code-context-code_read/cctxNativeRead(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).
+  - Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST: MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" (<=5 cap) | Native "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" | tests "test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected" (regex: "code-context|cctxNative|test-context|tctxNative").
   - Transitions: Error("No client with the advertised tool definition"|"No matching client connected"|"skipped from another client") => code-context-code_* / test-context-test_* MCP | CLI ; CACHE_MISS => 1 Host read -> resume CCTX.
 """
 
 MD_FORMULA_PROMPT_BLOCK = """
 <!-- [cctx-subagent-instructions] -->
 ## CCTX & TCTX Formula Rules
-- Source: #cctxNative*{Context,Read,Grep,Files} > MCP(code-context-code_* | mcp__code-context__*) > Host(rg,view,glob)
-- Tests & Probes: #tctxNative*{Run,Affected,Graph,Status} > MCP(test-context-test_* | mcp__test-context__*) > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
+- Source: MCP(code-context-code_* | mcp__code-context__*) > #cctxNative*{Context,Read,Grep,Files} > Host(rg,view,glob)
+- Tests & Probes: MCP(test-context-test_* | mcp__test-context__*) > #tctxNative*{Run,Affected,Graph,Status} > bash ; pctx {http|json|table|image} > python3 -c/curl/jq
 - Guards: pass root; limit<=64; Read(ranges,<=120L,<8KiB); .github/*,.vscode/*,/tmp/*,/dev/shm/* => Host view.
-- Deferred: call tool_search_tool (tool_search) FIRST: "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" | MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" | tests "tctxNativeRun tctxNativeAffected test-context-test_run test-context-test_affected" (regex "cctxNative|code-context|tctxNative|test-context").
+- Deferred: call tool_search_tool (tool_search) FIRST: MCP "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" | Native "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" | tests "test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected" (regex "code-context|cctxNative|test-context|tctxNative").
 - CACHE_MISS => 1 Host read -> resume CCTX.
 """
 
@@ -177,7 +177,7 @@ def patch_yaml_agent(path: Path, style: str = "formula") -> bool:
             elif "\nprompt: |\n" in updated:
                 updated = updated.replace("\nprompt: |\n", "\n" + block + "prompt: |\n", 1)
 
-    if MARKER in updated:
+    if f"  {MARKER}" in updated:
         head, _sep, tail = updated.partition(f"  {MARKER}")
         if "\nsidekick:\n" in tail:
             _old_block, _, after_sidekick = tail.partition("\nsidekick:\n")

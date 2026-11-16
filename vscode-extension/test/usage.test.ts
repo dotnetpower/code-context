@@ -101,3 +101,47 @@ void test('usage aggregates session model telemetry, markdown tooltip, and statu
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
 });
+
+void test('async session telemetry tracks MCP calls, cache misses, and missing-directory cooldown', async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cctx-usage-async-'));
+  try {
+    const usage = new UsageSummary();
+    // Missing ~/.copilot/session-state caches the attempt for 60s without throwing
+    const missing = await usage.refreshSessionTelemetryAsync(tmpHome, 1_000, false);
+    assert.equal(missing, undefined);
+
+    const sessDir = path.join(tmpHome, '.copilot', 'session-state', 'sess-mcp');
+    fs.mkdirSync(sessDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessDir, 'events.jsonl'),
+      [
+        JSON.stringify({
+          type: 'session.usage_record',
+          data: { usage: { model: 'gemini-4-carbon', modelDisplayName: 'Gemini 4 Carbon', inputTokens: 50_000 } },
+        }),
+        JSON.stringify({
+          type: 'tool.execution_start',
+          data: { toolCallId: 'c1', toolName: 'code-context-code_read', model: 'gemini-4-carbon' },
+        }),
+        JSON.stringify({
+          type: 'tool.execution_complete',
+          data: { toolCallId: 'c1', result: { content: 'CACHE_MISS root=/repo state=queued' } },
+        }),
+        JSON.stringify({
+          type: 'tool.execution_start',
+          data: { toolCallId: 'c2', toolName: 'mcp__code-context__code_context', model: 'gemini-4-carbon' },
+        }),
+      ].join('\n'),
+      'utf8',
+    );
+    // Within 60s cooldown without force=true, returns cached undefined
+    assert.equal(await usage.refreshSessionTelemetryAsync(tmpHome, 10_000, false), undefined);
+    // After 60s (or with force=true), parses MCP calls + CACHE_MISS warm-hit pct (1/2 = 50.0%)
+    const snap = await usage.refreshSessionTelemetryAsync(tmpHome, 70_000, false);
+    assert.ok(snap);
+    assert.equal(snap.models[0]?.cctxCalls, 2);
+    assert.equal(snap.models[0]?.cctxWarmHitPct, 50);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});

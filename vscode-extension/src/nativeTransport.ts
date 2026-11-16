@@ -138,13 +138,24 @@ export async function connectNativeTransport(
         resources.listener?.dispose();
         child.stdout.off('data', onReady);
       };
+      const terminateChild = (): void => {
+        try {
+          child.stdin.end();
+          child.stdin.destroy();
+        } catch {
+          // Ignore pipe teardown errors while closing the bridge child.
+        }
+        if (child.exitCode === null) {
+          child.kill();
+        }
+      };
       const fail = (error: Error): void => {
         if (transport) {
           transport.destroy(error);
         } else if (!settled) {
           settled = true;
           cleanup();
-          child.kill();
+          terminateChild();
           rejectConnect(error);
         }
       };
@@ -161,9 +172,7 @@ export async function connectNativeTransport(
           child.stdout.pause();
           transport = Duplex.from({ readable: child.stdout, writable: child.stdin });
           transport.once('close', () => {
-            if (child.exitCode === null) {
-              child.kill();
-            }
+            terminateChild();
           });
           resolveConnect(transport);
         }

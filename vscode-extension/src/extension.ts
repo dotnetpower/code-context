@@ -75,6 +75,8 @@ export function activate(context: vscode.ExtensionContext): void {
   }, (event) => {
     usage.record(event);
     renderUsage();
+  }, (operation, deliveredChars) => {
+    usage.recordPayload(operation, deliveredChars, false);
   });
   bridge.register();
 
@@ -87,16 +89,29 @@ export function activate(context: vscode.ExtensionContext): void {
   status.text = '$(database) CCTX Native';
   status.tooltip = 'Show Code Context native tool status';
   status.show();
+  let renderTimer: NodeJS.Timeout | undefined;
+  const applyTooltip = (): void => {
+    if (!usage.last) { return; }
+    status.text = usage.text();
+    if (typeof vscode.MarkdownString === 'function') {
+      const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
+      md.isTrusted = true;
+      status.tooltip = md;
+    } else {
+      status.tooltip = usage.tooltip();
+    }
+  };
   renderUsage = (): void => {
     if (usage.last) {
-      usage.refreshSessionTelemetry();
       status.text = usage.text();
-      if (typeof vscode.MarkdownString === 'function') {
-        const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
-        md.isTrusted = true;
-        status.tooltip = md;
-      } else {
-        status.tooltip = usage.tooltip();
+      if (!renderTimer) {
+        renderTimer = setTimeout(() => {
+          renderTimer = undefined;
+          void usage.refreshSessionTelemetryAsync().finally(() => {
+            applyTooltip();
+          });
+        }, 250);
+        renderTimer.unref?.();
       }
     }
   };
@@ -111,6 +126,7 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   context.subscriptions.push(
+    { dispose: () => { if (renderTimer) { clearTimeout(renderTimer); renderTimer = undefined; } } },
     output,
     status,
     bridge,
@@ -222,6 +238,7 @@ async function showStatus(
         { root },
         source.token,
       );
+      await usage.refreshSessionTelemetryAsync();
       output.info(usage.formatDashboard(value));
       output.info(formatLogDetails('Code Context status', value));
       output.show(true);

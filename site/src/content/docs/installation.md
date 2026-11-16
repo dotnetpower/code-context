@@ -107,7 +107,7 @@ A WSL-only extension installation cannot expose client tools inside a separate W
 }
 ```
 
-Discover your distribution name with `wsl --list --quiet` and your Linux binary path inside WSL with `realpath ~/.local/bin/cctx`. Leave `codeContextNative.socketPath` empty in this mode.
+Discover your distribution name with `wsl --list --quiet` and your Linux binary path inside WSL with `realpath ~/.local/bin/cctx`. Leave `codeContextNative.socketPath` empty in this mode. For persistent Agents Window (`AgentHost`) sessions, also configure `cctx shared-mcp` in your MCP settings so in-progress turns run directly against the Linux daemon without stalling if you reload or switch VS Code windows.
 
 ---
 
