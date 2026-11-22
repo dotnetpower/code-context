@@ -68,7 +68,9 @@ cctx --backend shared --root /path/to/project context 'create_service' --radius 
 cctx --backend shared --root /path/to/project read src/lib.rs 1 40
 cctx --backend shared --root /path/to/project status
 cctx usage --hours 24
-cctx --root /path/to/project prompt --style formula --target instructions
+cctx usage --window 7d --details
+cctx --root /path/to/project prompt --style formula --target instructions --tokenizer claude-4-7
+cctx --root /path/to/project prompt --style formula --target codex-agents-md
 cctx --root /path/to/project prompt --compress "Which function calculates retry delay, and what caps the result?" --json
 pctx http "https://openapi.example.org/{svc}?Type=json&pSize=2" --var svc=CityPark,ParkingPlace
 pctx json /path/to/collection.json --bbox 125.5,33.1,131.0,38.6 --count-by properties.category
@@ -78,23 +80,24 @@ pctx batch -c "git log -n 200 --stat" -c "docker logs app" -q "timeout" -q "retr
 pctx log @s1 -q "fatal"
 cctx --root /path/to/project journal record --kind decision --pin -s "Keep <8KiB inline cap"
 cctx --root /path/to/project journal resume -q "inline cap"
+cctx --root /path/to/project journal hook-config --agent codex
 ```
 
-`pctx` (`cctx probe {http|json|table|image|log|batch|journal}`) replaces ad-hoc `python3 -c`, `curl`, `jq`, and `sqlite3` inspection scripts with zero-schema-tax Rust primitives: concurrent `{var}` matrix HTTP probing with automatic query/env secret redaction, streaming JSON/JSONL/GeoJSON/STAC/`/tmp` offload schema & `--bbox` filtering, pure-Rust Parquet Thrift footer + read-only SQLite + CSV inspection, PNG scanline Rec.709 luminance/exposure + JPEG/WebP/GIF/SVG verification, spooled unstructured log & multi-command batch retrieval (`pctx batch` / `pctx log @sN` with fence/stacktrace-aware chunking and Okapi BM25 + Trigram RRF), and a per-workspace compaction continuity journal (`cctx journal` / `pctx journal`) that restores a secret-scrubbed `<=2 KiB` `<cctx_journal_state>` block + BM25 prompt recall across context compactions via fail-open, zero-`PreToolUse`-deny hooks (`cctx journal hook-config`), bounded strictly inside `<8 KiB`.
+`pctx` (`cctx probe {http|json|table|image|log|batch|journal}`) replaces ad-hoc `python3 -c`, `curl`, `jq`, and `sqlite3` inspection scripts with zero-schema-tax Rust primitives: concurrent `{var}` matrix HTTP probing with automatic query/env secret redaction, streaming JSON/JSONL/GeoJSON/STAC/`/tmp` offload schema & `--bbox` filtering, pure-Rust Parquet Thrift footer + read-only SQLite + CSV inspection, PNG scanline Rec.709 luminance/exposure + JPEG/WebP/GIF/SVG verification, spooled unstructured log & multi-command batch retrieval (`pctx batch` / `pctx log @sN` with fence/stacktrace-aware chunking and Okapi BM25 + Trigram RRF), and a per-workspace compaction continuity journal (`cctx journal` / `pctx journal`) that restores a secret-scrubbed `<=2 KiB` `<cctx_journal_state>` block + BM25 prompt recall across context compactions via fail-open, zero-`PreToolUse`-deny hooks (`cctx journal hook-config --agent vscode|copilot-cli|claude-code|codex|gemini`), bounded strictly inside `<8 KiB`.
 
 `cctx prompt` renders BPE-aligned symbolic formula (`formula`), contract-compatible
 hybrid (`hybrid`), or prose (`prose`) instructions for `.instructions.md`, MCP
-`initialize`, or subagent definitions, and `--compress` converts natural-language
+`initialize`, subagent definitions, `CLAUDE.md` (`claude-md`), or OpenAI Codex `AGENTS.md` (`codex-agents-md`), supports generation-aware tokenizer profiles (`--tokenizer o200k|claude-4-6|claude-4-7` for English, code, and Korean Hangul BPE calibration), and `--compress` converts natural-language
 code-lookup task prompts into symbolic formula prompts with token-savings telemetry.
 
-`cctx usage` also reports per-tool failure causes (`client_disconnected`,
+`cctx usage` ingests GitHub Copilot (`session-state`), Claude Code (`projects/*.jsonl` including `1h` vs `5m` cache writes and `thinking` blocks), and OpenAI Codex (`sessions`/`archived_sessions` `.jsonl` & `.jsonl.zst` rollouts plus live `5h`/`7d` server quota gauges), supports `--window 5h|24h|7d|30d|month` (`mtd` UTC calendar month reset), and separates **3-axis token load** (`Fresh + CacheWrite`, `CacheRead`, `Output + Reasoning`) with a cache-illusion inflation guard, subscription quota sensitivity band, official GitHub AI Credits (`$0.01/credit`) & legacy Premium Request multiplier estimates, per-tool failure causes (`client_disconnected`,
 `cache_miss`, `range_out_of_bounds`, `response_budget_exceeded`, `file_unavailable`, ...),
-P95/P99 latency, offloaded outputs, built-in fallbacks with the CCTX tool to use
+P95/P99 latency, offloaded outputs, built-in and shell (`Bash`/`exec_command` `rg`/`sed`/`cat`) fallbacks with the CCTX tool to use
 instead, per-workspace adoption, shared-stall detection (slow calls from several
 sessions finishing at the same instant), host-dispatch delay from the native
 `CCTX_TRACE` timing footer, and optimization advisories (`long_session`,
 `spend_concentration`, `model_without_cctx`, `unregistered_workspace`,
-`low_context_share`, `sequential_slicing`, `offload_rate`,
+`low_context_share`, `sequential_slicing`, `shell_lookup_bypass`, `mid_session_config_cache_bust`, `ttl_cache_expiry`, `premature_compaction`, `subagent_cold_cache`, `offload_rate`,
 `other_tool_offload`, `cache_miss_rate`, `client_disconnected`). Cost and token savings are trace-replayed per
 `(session, agent)` stream using each turn's `copilotUsage.tokenDetails` rates,
 pre-compaction history re-reads, and warm-turn context sizes; `--json` adds
@@ -211,9 +214,13 @@ The extension rejects untrusted activation and rechecks trust on every call.
 
 ## Optional cache and freshness
 
-- Startup, registration, and status inspect metadata only.
-- A cold/loading/syncing ordinary lookup returns `CACHE_MISS` immediately and
-  schedules only the requested root for bounded background loading.
+- Daemon startup, registration, and status inspect metadata only; MCP `initialize`
+  hints background warmup only for an already-registered session workspace.
+- On a cold/loading registered root, `code_read` serves verified live-disk ranges
+  immediately under the same scope/glob/ignore/exclusion policy while queueing
+  background index warmup. Cold search/discovery lookups (`code_files`, `code_grep`,
+  `code_context`), unprepared roots, and active `code_sync` barriers return
+  `CACHE_MISS` immediately and schedule bounded background loading.
 - Continue that lookup with permitted host tools. Do not poll, change transport,
   or call sync merely to wait for warmup. A later independent lookup may hit.
 - Inactive source roots expire after 15 minutes; memory pressure also evicts
@@ -266,6 +273,7 @@ requested roots and tool diagnostics. Do not publish them without redaction.
 The daemon is not a sandbox against other processes running as the same user.
 
 ```sh
+cctx --root /path/to/project init
 cctx --root /path/to/project doctor
 cctx --root /path/to/project coverage
 systemctl --user status code-context.service

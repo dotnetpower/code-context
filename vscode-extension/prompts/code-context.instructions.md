@@ -11,10 +11,11 @@ Dispatch:
 - filename|glob(!content) => code_files / #cctxNativeFiles (glob=G) ; content(a|b=>regex=true) => code_grep / #cctxNativeGrep (max_matches_per_file:1..64)
 - range|anchor(path:line,path#Lstart-Lend,doc.md#slug,@/) => code_read / #cctxNativeRead (<=150L,<8KiB; >150=>page=true->next_ranges->complete=true)
 - Swap: view|read_file=>code_read/#cctxNativeRead ; rg|grep=>code_grep/#cctxNativeGrep ; glob|find=>code_files/#cctxNativeFiles ; 한글 요청 => 동일 디스패치 & 한글 답변
+- Shell: bash|run_in_terminal grep|rg|sed -n|cat|head|tail|find|ls on saved source => same Swap (bash is NOT exempt; 1 code_context > grep+sed -n chain) ; bash only for build|test|git|non-source
 - Probe & Continuity: API/STAC/tiles | JSON/JSONL/GeoJSON//tmp offload | SQLite/Parquet/CSV | PNG/WebP/SVG | large logs/CLI batch | compaction journal => pctx {http|json|table|image|log|batch|journal} (cctx probe / cctx journal) & !(python3 -c | raw curl/jq)
 Guards:
 - known(R) => root=R ; before(edit) => Context(radius>=8)|Read(around_line) ; multi-edit => 1 Read(ranges=[...]) (!parallel view)
-- deferred (even if rg/view/glob visible on turn 0) => tool_search_tool FIRST: AgentHost/SDK/subagent "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files" (<=5 cap; do not combine 8+ tools) | Editor Chat "cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles" (regex: "code-context|cctxNative")
+- deferred (ONLY when CCTX tools are absent/hidden from active declarations, even if rg/view/glob visible on turn 0; skip if already declared, and invoke whichever of tool_search_tool / tool_search is declared) => <=2 names/call in 2 parallel calls (4 names drop code_read/code_files: result cap 5 incl. GitHub-* noise): AgentHost/SDK/subagent "code-context-code_context code-context-code_grep" + "code-context-code_read code-context-code_files" | Editor Chat "cctxNativeContext cctxNativeGrep" + "cctxNativeRead cctxNativeFiles" ; all 4 loaded before 1st lookup, else re-search the missing name
 - subagent(explore,general-purpose,code-review,rubber-duck,research,security-review,task) => pass root=R & require code-context-code_* | #cctxNative* (via tool_search_tool if hidden) first
 Transitions:
 - CACHE_MISS != (0 matches|missing) -> 1 Host read -> resume CCTX next turn & !(poll|repeat|switch transport|code_sync) ; CACHE_LOAD_FAILED => Host ; STALE_INDEX => Read|Host ; TARGET_NOT_INDEXED != absent

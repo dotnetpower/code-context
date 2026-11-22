@@ -30,12 +30,13 @@ pub struct CallFacts {
     pub host_delay_ms: Option<f64>,
     pub workspace: String,
     pub tool: String,
-    /// `native`, `mcp`, `builtin_search_read` or `other`.
+    /// `native`, `mcp`, `builtin_search_read`, `shell_search_read` or `other`.
     pub group: &'static str,
     pub success: Option<bool>,
     pub offloaded: bool,
     pub error_detail: &'static str,
     pub duration_ms: Option<f64>,
+    pub trace_total_ms: Option<f64>,
     pub payload_tokens: u64,
     pub eligible_lookup: bool,
     pub sequential_slice: bool,
@@ -64,6 +65,18 @@ pub struct ModelFacts {
     pub reasoning_tokens: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CacheLifecycleFacts {
+    pub config_bust_turns: usize,
+    pub config_bust_aic: f64,
+    pub ttl_5m_subagent_turns: usize,
+    pub ttl_long_main_turns: usize,
+    pub premature_compactions: usize,
+    pub premature_compaction_write_tokens: u64,
+    pub subagent_short_cold_spawns: usize,
+    pub subagent_cold_write_tokens: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Advisory {
     pub code: &'static str,
@@ -78,23 +91,42 @@ impl Advisory {
                 1,
                 "Native client disconnected; prefer direct code-context-code_* MCP in Agent Host/SDK sessions and keep Windows profiles synced.",
             ),
-            "cold_cache_spike" => (2, "Reduce cold-cache costs; compact long sessions and avoid idle gaps."),
-            "host_dispatch_delay" => (3, "Host dispatch is slow; check the extension host or use MCP."),
-            "unregistered_workspace" => (4, "Register missing workspaces before source lookups."),
-            "cache_miss_rate" => (5, "Frequent cache misses; check root admission and memory limits."),
+            "mid_session_config_cache_bust" => (
+                2,
+                "Avoid mid-session reasoningEffort or model switches; delegate or start a new session to preserve prompt cache.",
+            ),
+            "cold_cache_spike" | "ttl_cache_expiry" => (
+                2,
+                "Reduce cold-cache costs; compact long sessions and avoid 5m/1h idle TTL gaps.",
+            ),
+            "premature_compaction" => (
+                3,
+                "Avoid habitual /compact; record decisions with cctx journal and /clear when switching tasks.",
+            ),
+            "host_dispatch_delay" => (4, "Host dispatch is slow; check the extension host or use MCP."),
+            "unregistered_workspace" => (5, "Register missing workspaces before source lookups."),
+            "cache_miss_rate" => (6, "Frequent cache misses; check root admission and memory limits."),
+            "shell_lookup_bypass" => (
+                7,
+                "Replace shell rg/grep/sed/cat source lookups with code_context, code_grep, or code_read.",
+            ),
             "low_adoption_workspace" | "model_without_cctx" => {
-                (6, "Prefer cctx for source lookups; check loaded instructions.")
+                (7, "Prefer cctx for source lookups; check loaded instructions.")
             }
-            "sequential_slicing" => (7, "Avoid sequential reads; request relevant ranges in one call."),
-            "low_context_share" => (8, "Use cctxNativeContext to combine source search and reading."),
+            "sequential_slicing" => (8, "Avoid sequential reads; request relevant ranges in one call."),
+            "low_context_share" => (9, "Use cctxNativeContext to combine source search and reading."),
+            "subagent_cold_cache" => (
+                10,
+                "Avoid spawning cold-cache subagents for log filtering; use pctx log / pctx batch.",
+            ),
             "offload_rate" | "other_tool_offload" => {
-                (9, "Reduce output offloads; narrow queries and response sizes.")
+                (11, "Reduce output offloads; narrow queries and response sizes.")
             }
-            "long_session" => (10, "Compact long sessions to reduce repeated context costs."),
-            "spend_concentration" => (11, "Review the highest-spend session for repeated work."),
-            "reasoning_share" => (12, "Review reasoning effort for routine tasks."),
-            "model_efficiency" => (13, "Review per-model efficiency and warm-cache costs in --details."),
-            _ => (14, &self.message),
+            "long_session" => (12, "Compact long sessions to reduce repeated context costs."),
+            "spend_concentration" => (13, "Review the highest-spend session for repeated work."),
+            "reasoning_share" => (14, "Review reasoning effort for routine tasks."),
+            "model_efficiency" => (15, "Review per-model efficiency and warm-cache costs in --details."),
+            _ => (16, &self.message),
         }
     }
 }
@@ -106,6 +138,7 @@ pub struct ToolStat {
     pub offloads: usize,
     pub payload_tokens: u64,
     pub durations: Vec<f64>,
+    pub trace_durations: Vec<f64>,
     pub causes: BTreeMap<&'static str, usize>,
 }
 
@@ -181,7 +214,16 @@ pub struct Insights {
 /// CCTX tool that should replace a built-in search/read tool.
 pub fn cctx_replacement(tool: &str) -> &'static str {
     let lowered = tool.to_ascii_lowercase();
-    if lowered.contains("usages") {
+    if lowered == "bash"
+        || lowered == "exec_command"
+        || lowered == "shell"
+        || lowered == "local_shell"
+        || lowered == "run_in_terminal"
+        || lowered == "shell_command"
+        || lowered.starts_with("shell:")
+    {
+        "code_context / code_grep / code_read"
+    } else if lowered.contains("usages") {
         "cctxNativeContext"
     } else if lowered.contains("glob")
         || lowered.contains("file_search")
@@ -220,6 +262,24 @@ pub fn analyze(
     total_output_tokens: u64,
     total_reasoning_tokens: u64,
 ) -> Insights {
+    analyze_with_lifecycle(
+        calls,
+        sessions,
+        models,
+        total_output_tokens,
+        total_reasoning_tokens,
+        &CacheLifecycleFacts::default(),
+    )
+}
+
+pub fn analyze_with_lifecycle(
+    calls: &[CallFacts],
+    sessions: &[SessionFacts],
+    models: &[ModelFacts],
+    total_output_tokens: u64,
+    total_reasoning_tokens: u64,
+    lifecycle: &CacheLifecycleFacts,
+) -> Insights {
     let mut insights = Insights::default();
     for call in calls {
         match call.group {
@@ -235,12 +295,20 @@ pub fn analyze(
                 if let Some(ms) = call.duration_ms {
                     stat.durations.push(ms);
                 }
+                if let Some(tms) = call.trace_total_ms {
+                    stat.trace_durations.push(tms);
+                }
                 if call.eligible_lookup {
                     insights.workspaces.entry(call.workspace.clone()).or_default().cctx += 1;
                 }
             }
-            "builtin_search_read" if call.eligible_lookup => {
-                let stat = insights.fallbacks.entry(call.tool.clone()).or_default();
+            "builtin_search_read" | "shell_search_read" if call.eligible_lookup => {
+                let label = if call.group == "shell_search_read" && !call.tool.starts_with("shell:") {
+                    format!("shell:{}", call.tool)
+                } else {
+                    call.tool.clone()
+                };
+                let stat = insights.fallbacks.entry(label).or_default();
                 stat.calls += 1;
                 stat.payload_tokens += call.payload_tokens;
                 insights.workspaces.entry(call.workspace.clone()).or_default().builtin += 1;
@@ -250,9 +318,19 @@ pub fn analyze(
     }
     for stat in insights.tools.values_mut() {
         stat.durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        stat.trace_durations
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
     insights.stalls = detect_stalls(calls);
-    insights.advisories = advisories(&insights, calls, sessions, models, total_output_tokens, total_reasoning_tokens);
+    insights.advisories = advisories(
+        &insights,
+        calls,
+        sessions,
+        models,
+        total_output_tokens,
+        total_reasoning_tokens,
+        lifecycle,
+    );
     insights
 }
 
@@ -263,6 +341,7 @@ fn advisories(
     models: &[ModelFacts],
     total_output_tokens: u64,
     total_reasoning_tokens: u64,
+    lifecycle: &CacheLifecycleFacts,
 ) -> Vec<Advisory> {
     let mut out = Vec::new();
     let total_aic: f64 = sessions.iter().map(|s| s.used_aic).sum();
@@ -368,7 +447,9 @@ fn advisories(
         }
     }
     let mut unreg_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for call in calls.iter().filter(|c| c.group == "builtin_search_read" && c.eligible_lookup) {
+    for call in calls.iter().filter(|c| {
+        matches!(c.group, "builtin_search_read" | "shell_search_read") && c.eligible_lookup
+    }) {
         if let Some(ref root) = call.unregistered_root {
             *unreg_counts.entry(root.as_str()).or_default() += 1;
         }
@@ -524,6 +605,62 @@ fn advisories(
             }
         }
     }
+    let shell_lookups: Vec<&CallFacts> = calls
+        .iter()
+        .filter(|c| c.group == "shell_search_read" && c.eligible_lookup)
+        .collect();
+    if shell_lookups.len() >= 3 {
+        let shell_tok: u64 = shell_lookups.iter().map(|c| c.payload_tokens).sum();
+        out.push(Advisory {
+            code: "shell_lookup_bypass",
+            message: format!(
+                "{} eligible source lookups bypassed CCTX via shell commands (~{} payload tok): replace Bash/exec_command rg/grep/sed -n/cat/find with code_context, code_grep, or code_read.",
+                shell_lookups.len(),
+                shell_tok
+            ),
+        });
+    }
+    if lifecycle.config_bust_turns > 0 {
+        out.push(Advisory {
+            code: "mid_session_config_cache_bust",
+            message: format!(
+                "{} large-context turns dropped prompt cache (<50% hit) immediately after a mid-session reasoningEffort or model change (+~{:.1} AIC / ${:.2}): keep model and effort stable inside long threads or delegate via subagents.",
+                lifecycle.config_bust_turns,
+                lifecycle.config_bust_aic,
+                lifecycle.config_bust_aic * 0.001,
+            ),
+        });
+    }
+    if lifecycle.ttl_5m_subagent_turns + lifecycle.ttl_long_main_turns >= 2 {
+        out.push(Advisory {
+            code: "ttl_cache_expiry",
+            message: format!(
+                "Idle TTL cache expirations detected: {} subagent turns (>5m gap) and {} main-session turns (>30m/1h gap) rebuilt cold prefixes; batch subagent work within 5m and record state with `cctx journal` before long breaks.",
+                lifecycle.ttl_5m_subagent_turns,
+                lifecycle.ttl_long_main_turns,
+            ),
+        });
+    }
+    if lifecycle.premature_compactions > 0 {
+        out.push(Advisory {
+            code: "premature_compaction",
+            message: format!(
+                "{} compactions ran with <5 follow-up turns or repeated within <30 turns (~{} cache-write tok rebuilt at 1.25x-2.0x): avoid habitual `/compact`; use `cctx journal record` + `/clear` when switching to unrelated work.",
+                lifecycle.premature_compactions,
+                lifecycle.premature_compaction_write_tokens,
+            ),
+        });
+    }
+    if lifecycle.subagent_short_cold_spawns >= 2 {
+        out.push(Advisory {
+            code: "subagent_cold_cache",
+            message: format!(
+                "{} short subagent runs (<=4 turns) wrote ~{} fresh cache tokens on separate 5m caches: use `pctx batch` + `pctx log` in the main session for log/JSON filtering instead of spawning subagents.",
+                lifecycle.subagent_short_cold_spawns,
+                lifecycle.subagent_cold_write_tokens,
+            ),
+        });
+    }
     let thinking = total_output_tokens + total_reasoning_tokens;
     if thinking > 0 && total_reasoning_tokens as f64 / thinking as f64 >= REASONING_SHARE_ALERT {
         out.push(Advisory {
@@ -537,14 +674,76 @@ fn advisories(
     out
 }
 
+fn canonical_cctx_operation(tool: &str) -> Option<&'static str> {
+    let lower = tool.trim().to_ascii_lowercase();
+    if lower.ends_with("code_context")
+        || lower.ends_with("cctxnativecontext")
+        || lower.ends_with("_codecontext")
+    {
+        Some("code_context")
+    } else if lower.ends_with("code_read")
+        || lower.ends_with("cctxnativeread")
+        || lower.ends_with("_coderead")
+    {
+        Some("code_read")
+    } else if lower.ends_with("code_grep")
+        || lower.ends_with("cctxnativegrep")
+        || lower.ends_with("_codegrep")
+    {
+        Some("code_grep")
+    } else if lower.ends_with("code_files")
+        || lower.ends_with("cctxnativefiles")
+        || lower.ends_with("_codefiles")
+    {
+        Some("code_files")
+    } else if lower.ends_with("code_workspaces")
+        || lower.ends_with("cctxnativeworkspaces")
+        || lower.ends_with("_codeworkspaces")
+    {
+        Some("code_workspaces")
+    } else if lower.ends_with("code_status")
+        || lower.ends_with("cctxnativestatus")
+        || lower.ends_with("_codestatus")
+    {
+        Some("code_status")
+    } else if lower.ends_with("code_sync")
+        || lower.ends_with("cctxnativesync")
+        || lower.ends_with("_codesync")
+    {
+        Some("code_sync")
+    } else {
+        None
+    }
+}
+
 impl Insights {
     pub fn to_json(&self) -> Value {
-        let tools: Vec<Value> = self
-            .tools
-            .iter()
+        self.to_json_bounded(false)
+    }
+
+    pub fn to_json_bounded(&self, compact_bounds: bool) -> Value {
+        let trunc_label = |s: &str| -> String {
+            if compact_bounds && s.len() > 256 {
+                let mut end = 256;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &s[..end])
+            } else {
+                s.to_owned()
+            }
+        };
+        let tool_limit = if compact_bounds { 64 } else { usize::MAX };
+        let mut sorted_tools: Vec<(&String, &ToolStat)> = self.tools.iter().collect();
+        if compact_bounds {
+            sorted_tools.sort_by_key(|(_, s)| std::cmp::Reverse(s.calls));
+        }
+        let tools: Vec<Value> = sorted_tools
+            .into_iter()
+            .take(tool_limit)
             .map(|(tool, s)| {
                 json!({
-                    "tool": tool,
+                    "tool": trunc_label(tool),
                     "calls": s.calls,
                     "failures": s.failures,
                     "failure_causes": s.causes,
@@ -552,16 +751,79 @@ impl Insights {
                     "median_ms": percentile(&s.durations, 0.5),
                     "p95_ms": percentile(&s.durations, 0.95),
                     "p99_ms": percentile(&s.durations, 0.99),
+                    "trace_median_ms": percentile(&s.trace_durations, 0.5),
+                    "trace_p95_ms": percentile(&s.trace_durations, 0.95),
                     "avg_payload_tokens": if s.calls == 0 { 0 } else { s.payload_tokens / s.calls as u64 },
                 })
             })
             .collect();
+
+        // Pool raw duration samples per canonical CCTX operation so medians & P95s across
+        // MCP (`code-context-code_*`) and Native (`cctxNative*`) aliases are mathematically exact.
+        let mut op_buckets: BTreeMap<&'static str, ToolStat> = BTreeMap::new();
+        let mut pooled_source_trace: Vec<f64> = Vec::new();
+        let mut pooled_source_wall: Vec<f64> = Vec::new();
+        for (tool, s) in &self.tools {
+            let Some(op) = canonical_cctx_operation(tool) else {
+                continue;
+            };
+            let b = op_buckets.entry(op).or_default();
+            b.calls += s.calls;
+            b.failures += s.failures;
+            b.offloads += s.offloads;
+            b.payload_tokens += s.payload_tokens;
+            b.durations.extend_from_slice(&s.durations);
+            b.trace_durations.extend_from_slice(&s.trace_durations);
+            for (&cause, &cnt) in &s.causes {
+                *b.causes.entry(cause).or_default() += cnt;
+            }
+            if matches!(op, "code_context" | "code_read" | "code_grep" | "code_files") {
+                pooled_source_trace.extend_from_slice(&s.trace_durations);
+                pooled_source_wall.extend_from_slice(&s.durations);
+            }
+        }
+        pooled_source_trace.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        pooled_source_wall.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cctx_operations: Vec<Value> = op_buckets
+            .into_iter()
+            .map(|(op, mut b)| {
+                b.durations
+                    .sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
+                b.trace_durations
+                    .sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
+                let med = percentile(&b.trace_durations, 0.5).or_else(|| percentile(&b.durations, 0.5));
+                let p95 = percentile(&b.trace_durations, 0.95).or_else(|| percentile(&b.durations, 0.95));
+                json!({
+                    "operation": op,
+                    "calls": b.calls,
+                    "failures": b.failures,
+                    "failure_causes": b.causes,
+                    "offloads": b.offloads,
+                    "median_ms": med,
+                    "p95_ms": p95,
+                    "wall_median_ms": percentile(&b.durations, 0.5),
+                    "wall_p95_ms": percentile(&b.durations, 0.95),
+                    "avg_payload_tokens": if b.calls == 0 { 0 } else { b.payload_tokens / b.calls as u64 },
+                })
+            })
+            .collect();
+        cctx_operations.sort_by_key(|v| std::cmp::Reverse(v["calls"].as_u64().unwrap_or(0)));
+        let source_median_ms = percentile(&pooled_source_trace, 0.5)
+            .or_else(|| percentile(&pooled_source_wall, 0.5));
+        let source_p95_ms = percentile(&pooled_source_trace, 0.95)
+            .or_else(|| percentile(&pooled_source_wall, 0.95));
+
+        let fb_limit = if compact_bounds { 32 } else { usize::MAX };
+        let ws_limit = if compact_bounds { 32 } else { usize::MAX };
+        let stall_limit = if compact_bounds { 16 } else { usize::MAX };
+        let adv_limit = if compact_bounds { 16 } else { usize::MAX };
         let fallbacks: Vec<Value> = self
             .fallbacks
             .iter()
+            .take(fb_limit)
             .map(|(tool, s)| {
                 json!({
-                    "tool": tool,
+                    "tool": trunc_label(tool),
                     "calls": s.calls,
                     "avg_payload_tokens": if s.calls == 0 { 0 } else { s.payload_tokens / s.calls as u64 },
                     "replace_with": cctx_replacement(tool),
@@ -571,9 +833,10 @@ impl Insights {
         let workspaces: Vec<Value> = self
             .workspaces
             .iter()
+            .take(ws_limit)
             .map(|(workspace, s)| {
                 json!({
-                    "workspace": workspace,
+                    "workspace": trunc_label(workspace),
                     "cctx": s.cctx,
                     "builtin": s.builtin,
                     "adoption_percent": 100.0 * ratio(s.cctx, s.cctx + s.builtin),
@@ -582,12 +845,15 @@ impl Insights {
             .collect();
         json!({
             "tool_reliability": tools,
+            "cctx_operations": cctx_operations,
+            "cctx_source_median_ms": source_median_ms,
+            "cctx_source_p95_ms": source_p95_ms,
             "builtin_fallbacks": fallbacks,
             "workspace_adoption": workspaces,
-            "stalls": self.stalls.iter().map(|s| json!({
+            "stalls": self.stalls.iter().take(stall_limit).map(|s| json!({
                 "ended_at_unix": s.ended_at, "calls": s.calls, "sessions": s.sessions, "max_ms": s.max_ms,
             })).collect::<Vec<_>>(),
-            "advisories": self.advisories.iter().map(|a| json!({"code": a.code, "message": a.message})).collect::<Vec<_>>(),
+            "advisories": self.advisories.iter().take(adv_limit).map(|a| json!({"code": a.code, "message": trunc_label(&a.message)})).collect::<Vec<_>>(),
         })
     }
 

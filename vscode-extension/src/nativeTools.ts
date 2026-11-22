@@ -112,6 +112,8 @@ export class NativeToolBridge implements vscode.Disposable {
   private readonly registry: WorkspaceRegistry;
   private readonly disposables: vscode.Disposable[] = [];
   private lastResolvedRoot: { root: string; at: number } | undefined;
+  private readonly invocationCallers = new WeakMap<object, number>();
+  private nextCallerId = Math.floor(Math.random() * 1_000_000) * 1024 + 1;
 
   public constructor(
     private readonly client: DaemonClient,
@@ -121,6 +123,22 @@ export class NativeToolBridge implements vscode.Disposable {
     private readonly onPayload?: (operation: string, deliveredChars: number) => void,
   ) {
     this.registry = new WorkspaceRegistry(client);
+  }
+
+  public callerIdForToken(invocationToken: unknown): number {
+    if (typeof invocationToken === 'object' && invocationToken !== null) {
+      const existing = this.invocationCallers.get(invocationToken);
+      if (existing !== undefined) {
+        return existing;
+      }
+      const assigned = this.nextCallerId;
+      this.nextCallerId += 1;
+      this.invocationCallers.set(invocationToken, assigned);
+      return assigned;
+    }
+    const ephemeral = this.nextCallerId;
+    this.nextCallerId += 1;
+    return ephemeral;
   }
 
   public register(): void {
@@ -156,7 +174,7 @@ export class NativeToolBridge implements vscode.Disposable {
     definition: ToolDefinition<T>,
     input: T,
     token: vscode.CancellationToken,
-    options?: { skipPayloadMeasure?: boolean },
+    options?: { skipPayloadMeasure?: boolean; callerId?: number },
   ): Promise<{ value: JsonValue; trace: ClientTrace }> {
     ensureTrustedWorkspace();
     const started = performance.now();
@@ -186,6 +204,7 @@ export class NativeToolBridge implements vscode.Disposable {
         token,
         traceId,
         performance.now() - started,
+        options?.callerId,
       );
       if (definition.operation === 'code_workspaces' && Array.isArray(result.value)) {
         try {
@@ -213,6 +232,8 @@ export class NativeToolBridge implements vscode.Disposable {
         totalMs: result.trace.total_ms,
         deliveredChars: options?.skipPayloadMeasure ? 0 : JSON.stringify(result.value).length,
         turnCompressed,
+        startedAt: startedUnixMs,
+        isCommand: definition.name.startsWith('command_'),
       });
       if (definition.operation === 'code_sync') {
         this.registry.invalidate();
@@ -226,6 +247,8 @@ export class NativeToolBridge implements vscode.Disposable {
         root,
         error: message,
         totalMs: elapsed,
+        startedAt: startedUnixMs,
+        isCommand: definition.name.startsWith('command_'),
       });
       const trace: ClientTrace = error instanceof TracedRequestError ? error.trace : {
         trace_id: traceId, origin: 'native', operation: definition.operation,
@@ -356,7 +379,10 @@ class NativeTool<T> implements vscode.LanguageModelTool<T> {
       this.definition,
       options.input,
       token,
-      { skipPayloadMeasure: true },
+      {
+        skipPayloadMeasure: true,
+        callerId: this.bridge.callerIdForToken(options.toolInvocationToken),
+      },
     );
     const started = performance.now();
     const text = formatToolResult(this.definition.operation, result.value);

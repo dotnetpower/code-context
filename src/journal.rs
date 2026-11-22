@@ -64,6 +64,8 @@ pub enum HookAgent {
     Vscode,
     CopilotCli,
     ClaudeCode,
+    #[value(alias = "openai-codex")]
+    Codex,
     Gemini,
 }
 
@@ -222,8 +224,40 @@ struct JournalStore {
     next_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_compact: Option<PendingCompact>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_compacts: BTreeMap<String, PendingCompact>,
     #[serde(default)]
     entries: Vec<JournalEntry>,
+}
+
+impl JournalStore {
+    fn normalize_pending_compacts(&mut self, now: u64) {
+        if let Some(legacy) = self.pending_compact.take() {
+            let key = if legacy.session_id.trim().is_empty() {
+                "local".to_string()
+            } else {
+                legacy.session_id.clone()
+            };
+            self.pending_compacts.entry(key).or_insert(legacy);
+        }
+        self.pending_compacts
+            .retain(|_, pc| now.saturating_sub(pc.triggered_unix) <= 86_400);
+        while self.pending_compacts.len() > 64 {
+            let Some(oldest_key) = self
+                .pending_compacts
+                .iter()
+                .min_by_key(|(_, pc)| pc.triggered_unix)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.pending_compacts.remove(&oldest_key);
+        }
+    }
+
+    fn has_pending_compact(&self) -> bool {
+        self.pending_compact.is_some() || !self.pending_compacts.is_empty()
+    }
 }
 
 fn now_unix() -> u64 {
@@ -866,6 +900,11 @@ fn run_status(root: &Path, as_json: bool) -> Result<String> {
         }
         let upto = store.entries.last().map_or(0, |e| e.seq);
         if as_json {
+            let latest_pending = store
+                .pending_compacts
+                .values()
+                .max_by_key(|p| p.triggered_unix)
+                .or(store.pending_compact.as_ref());
             return clamp_json_budget(json!({
                 "root": norm_root.display().to_string(),
                 "entries": store.entries.len(),
@@ -873,7 +912,8 @@ fn run_status(root: &Path, as_json: bool) -> Result<String> {
                 "upto_seq": upto,
                 "disk_bytes": disk_bytes,
                 "by_kind": by_kind,
-                "pending_compact": store.pending_compact,
+                "pending_compact": latest_pending,
+                "pending_compact_sessions": store.pending_compacts.len(),
             }));
         }
         Ok(format!(
@@ -883,7 +923,7 @@ fn run_status(root: &Path, as_json: bool) -> Result<String> {
             pinned_count,
             upto,
             disk_bytes,
-            store.pending_compact.is_some(),
+            store.has_pending_compact(),
             by_kind
         ))
     })
@@ -901,6 +941,7 @@ fn run_purge(root: &Path, args: &PurgeArgs) -> Result<String> {
         if args.all {
             store.entries.clear();
             store.pending_compact = None;
+            store.pending_compacts.clear();
             return Ok((before, 0usize));
         }
         if args.resolve_blockers {
@@ -908,6 +949,7 @@ fn run_purge(root: &Path, args: &PurgeArgs) -> Result<String> {
         }
         if let Some(sess) = &args.session {
             store.entries.retain(|e| &e.session_id != sess);
+            store.pending_compacts.remove(sess);
         }
         if let Some(keep_n) = args.keep_last
             && store.entries.len() > keep_n
@@ -973,9 +1015,10 @@ fn decode_hook_stdin(raw: &Value) -> Option<DecodedHookEvent> {
     };
 
     let canonical_event = match raw_event.as_str() {
-        "PreCompact" | "preCompact" | "PreCompress" | "compaction" => "PreCompact",
-        "PostToolUse" | "postToolUse" | "AfterTool" | "tool_result" | "execute.after" => "PostToolUse",
-        "UserPromptSubmit" | "userPromptSubmitted" | "BeforeAgent" | "prompt" => "UserPromptSubmit",
+        "PreCompact" | "preCompact" | "pre_compact" | "PreCompress" | "compaction" => "PreCompact",
+        "PostCompact" | "postCompact" | "post_compact" => "PostCompact",
+        "PostToolUse" | "postToolUse" | "post_tool_use" | "AfterTool" | "tool_result" | "execute.after" => "PostToolUse",
+        "UserPromptSubmit" | "userPromptSubmit" | "userPromptSubmitted" | "user_prompt_submit" | "BeforeAgent" | "prompt" => "UserPromptSubmit",
         "SessionStart" | "sessionStart" | "session_start" | "context" => "SessionStart",
         _ => "Other",
     };
@@ -1078,6 +1121,26 @@ fn relativize_path(root: &Path, raw_path: &str) -> String {
     raw_path.replace('\\', "/")
 }
 
+fn normalize_rel_candidate(root: &Path, raw_path: &str) -> Option<String> {
+    let trimmed = raw_path.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() || trimmed == "/dev/null" {
+        return None;
+    }
+    let rel = relativize_path(root, trimmed);
+    if rel.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(rel)
+}
+
+fn push_unique_file(files: &mut Vec<String>, candidate: Option<String>) {
+    if let Some(c) = candidate
+        && !files.contains(&c)
+    {
+        files.push(c);
+    }
+}
+
 fn extract_edited_files(root: &Path, tool_name: &str, input: &Value) -> Vec<String> {
     let lower = tool_name.to_ascii_lowercase();
     let is_edit = matches!(
@@ -1088,17 +1151,40 @@ fn extract_edited_files(root: &Path, tool_name: &str, input: &Value) -> Vec<Stri
         return Vec::new();
     }
     let mut files = Vec::new();
+    if lower == "apply_patch" {
+        let patch_text = input.as_str().or_else(|| {
+            input.as_object().and_then(|o| {
+                o.get("patch")
+                    .or_else(|| o.get("input"))
+                    .or_else(|| o.get("rawText"))
+                    .and_then(Value::as_str)
+            })
+        });
+        if let Some(patch) = patch_text {
+            for line in patch.lines() {
+                for prefix in [
+                    "*** Update File: ",
+                    "*** Add File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                    "+++ b/",
+                ] {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        push_unique_file(&mut files, normalize_rel_candidate(root, rest));
+                    }
+                }
+            }
+        }
+    }
     if let Some(obj) = input.as_object() {
         for key in ["path", "file_path", "filePath", "notebook_path"] {
-            if let Some(p) = obj.get(key).and_then(Value::as_str)
-                && !p.is_empty()
-            {
-                files.push(relativize_path(root, p));
+            if let Some(p) = obj.get(key).and_then(Value::as_str) {
+                push_unique_file(&mut files, normalize_rel_candidate(root, p));
             }
         }
         if let Some(arr) = obj.get("filePaths").and_then(Value::as_array) {
             for item in arr.iter().filter_map(Value::as_str) {
-                files.push(relativize_path(root, item));
+                push_unique_file(&mut files, normalize_rel_candidate(root, item));
             }
         }
     }
@@ -1108,7 +1194,7 @@ fn extract_edited_files(root: &Path, tool_name: &str, input: &Value) -> Vec<Stri
 fn encode_additional_context(ev: &DecodedHookEvent, agent: HookAgent, context: &str) -> String {
     let use_camel_top = match agent {
         HookAgent::CopilotCli => true,
-        HookAgent::ClaudeCode | HookAgent::Vscode | HookAgent::Gemini => false,
+        HookAgent::ClaudeCode | HookAgent::Codex | HookAgent::Vscode | HookAgent::Gemini => false,
         HookAgent::Auto => ev.camel_style && ev.raw_event_name.chars().next().is_some_and(char::is_lowercase),
     };
     if use_camel_top {
@@ -1117,9 +1203,17 @@ fn encode_additional_context(ev: &DecodedHookEvent, agent: HookAgent, context: &
         }))
         .unwrap_or_else(|_| "{}".to_string())
     } else {
+        // Normalize PascalCase wire event name (`SessionStart` / `UserPromptSubmit`) required by
+        // Claude and Codex strict `HookEventNameWire` schemas even if stdin used camelCase.
+        let wire_event = match ev.canonical_event {
+            "SessionStart" => "SessionStart",
+            "UserPromptSubmit" => "UserPromptSubmit",
+            "PostToolUse" => "PostToolUse",
+            _ => ev.raw_event_name.as_str(),
+        };
         serde_json::to_string(&json!({
             "hookSpecificOutput": {
-                "hookEventName": ev.raw_event_name,
+                "hookEventName": wire_event,
                 "additionalContext": context,
             }
         }))
@@ -1145,15 +1239,29 @@ pub fn handle_hook_payload(explicit_root: &Path, agent: HookAgent, raw_stdin: &[
     };
 
     match ev.canonical_event {
-        "PreCompact" => {
+        "PreCompact" | "PostCompact" => {
             with_locked_store(effective_root, true, |_, store, _| {
-                store.pending_compact = Some(PendingCompact {
-                    triggered_unix: now_unix(),
-                    session_id: clean_single_line(&ev.session_id, 64),
-                    agent: format!("{agent:?}").to_ascii_lowercase(),
-                });
+                let now = now_unix();
+                store.normalize_pending_compacts(now);
+                let sess_id = clean_single_line(&ev.session_id, 64);
+                let sess_key = if sess_id.is_empty() {
+                    "local".to_string()
+                } else {
+                    sess_id.clone()
+                };
+                store.pending_compacts.insert(
+                    sess_key.clone(),
+                    PendingCompact {
+                        triggered_unix: now,
+                        session_id: sess_key,
+                        agent: format!("{agent:?}").to_ascii_lowercase(),
+                    },
+                );
                 Ok(())
             })?;
+            // Both Claude and Codex `PreCompact`/`PostCompact` schemas (`deny_unknown_fields`)
+            // accept `{}` (`HookUniversalOutputWire` with `continue = true`); context injection
+            // occurs cleanly on the subsequent `SessionStart(source="compact")` or `UserPromptSubmit`.
             Ok("{}".to_string())
         }
         "PostToolUse" => {
@@ -1244,15 +1352,33 @@ pub fn handle_hook_payload(explicit_root: &Path, agent: HookAgent, raw_stdin: &[
                 .as_deref()
                 .is_some_and(|s| s.eq_ignore_ascii_case("compact") || s.eq_ignore_ascii_case("resume"));
             let injected = with_locked_store(effective_root, true, |norm_root, store, _| {
-                let should_inject = store.pending_compact.is_some()
-                    || (ev.canonical_event == "SessionStart" && is_compact_source);
-                if !should_inject || store.entries.is_empty() {
-                    if should_inject {
-                        store.pending_compact = None;
+                let now = now_unix();
+                store.normalize_pending_compacts(now);
+                let raw_sess = clean_single_line(&ev.session_id, 64);
+                let sess_key = if raw_sess.is_empty() {
+                    "local".to_string()
+                } else {
+                    raw_sess
+                };
+                let matched_own = store.pending_compacts.remove(&sess_key).is_some();
+                let should_inject = if matched_own {
+                    true
+                } else if ev.canonical_event == "SessionStart" && is_compact_source {
+                    // If a harness rotates session_id on compact resume, consume only a fresh (<120s) orphan entry.
+                    if store.pending_compacts.len() == 1
+                        && let Some((only_k, only_v)) = store.pending_compacts.iter().next()
+                        && now.saturating_sub(only_v.triggered_unix) <= 120
+                    {
+                        let k = only_k.clone();
+                        store.pending_compacts.remove(&k);
                     }
+                    true
+                } else {
+                    false
+                };
+                if !should_inject || store.entries.is_empty() {
                     return Ok(None);
                 }
-                store.pending_compact = None;
                 let block = render_state_block(
                     &norm_root.display().to_string(),
                     &store.entries,
@@ -1297,6 +1423,7 @@ fn run_hook_config(root: &Path, agent: HookAgent, output: Option<&Path>) -> Resu
     let agent_flag = match agent {
         HookAgent::CopilotCli => "copilot-cli",
         HookAgent::ClaudeCode => "claude-code",
+        HookAgent::Codex => "codex",
         HookAgent::Gemini => "gemini",
         HookAgent::Vscode | HookAgent::Auto => "vscode",
     };
@@ -1310,6 +1437,15 @@ fn run_hook_config(root: &Path, agent: HookAgent, output: Option<&Path>) -> Resu
                 "userPromptSubmitted": [{"type": "command", "bash": cmd, "timeoutSec": 5}],
                 "postToolUse": [{"type": "command", "bash": cmd, "timeoutSec": 5}],
                 "preCompact": [{"type": "command", "bash": cmd, "timeoutSec": 5}]
+            }
+        }),
+        HookAgent::Codex => json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}],
+                "PostToolUse": [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}],
+                "PostCompact": [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]
             }
         }),
         _ => json!({
@@ -1389,5 +1525,80 @@ mod tests {
         assert!(block.contains("#3 [blocker]"));
         assert!(block.contains("#5* [decision]"));
         assert!(block.contains("busy_timeout=5000ms"));
+    }
+
+    #[test]
+    fn codex_hooks_post_compact_and_apply_patch_preserve_wire_and_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let cfg_raw = run(
+            root,
+            &JournalCommand::HookConfig {
+                agent: HookAgent::Codex,
+                output: None,
+            },
+        )
+        .unwrap();
+        let cfg: Value = serde_json::from_str(&cfg_raw).unwrap();
+        assert!(cfg["hooks"]["PostCompact"].is_array());
+        assert!(cfg["hooks"]["PreCompact"].is_array());
+
+        // 1. Codex `apply_patch` PostToolUse records edited files automatically.
+        let post_tool_in = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "codex-t1",
+            "cwd": root.display().to_string(),
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "patch": "*** Begin Patch\n*** Update File: src/planner.rs\n@@\n-old\n+new\n*** Add File: src/codex.rs\n+mod x;\n*** End Patch"
+            }
+        });
+        let post_out = handle_hook_payload(
+            root,
+            HookAgent::Codex,
+            post_tool_in.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(post_out, "{}");
+
+        // 2. Codex `PostCompact` returns `{}` (valid under `deny_unknown_fields`) and arms continuity.
+        let post_compact_in = json!({
+            "hook_event_name": "PostCompact",
+            "session_id": "codex-t1",
+            "cwd": root.display().to_string(),
+            "trigger": "auto"
+        });
+        let pc_out = handle_hook_payload(
+            root,
+            HookAgent::Codex,
+            post_compact_in.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(pc_out, "{}");
+
+        // 3. Subsequent `SessionStart(source="compact")` injects `<cctx_journal_state>` in `hookSpecificOutput`.
+        let start_in = json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "codex-t1",
+            "cwd": root.display().to_string(),
+            "source": "compact"
+        });
+        let start_out = handle_hook_payload(
+            root,
+            HookAgent::Codex,
+            start_in.to_string().as_bytes(),
+        )
+        .unwrap();
+        let parsed_out: Value = serde_json::from_str(&start_out).unwrap();
+        assert_eq!(
+            parsed_out["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("SessionStart")
+        );
+        let ctx = parsed_out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("src/planner.rs"));
+        assert!(ctx.contains("src/codex.rs"));
     }
 }

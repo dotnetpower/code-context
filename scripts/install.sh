@@ -6,6 +6,43 @@ mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
 install -m 0755 target/release/cctx "$HOME/.local/bin/cctx.next"
 mv "$HOME/.local/bin/cctx.next" "$HOME/.local/bin/cctx"
 ln -sfn cctx "$HOME/.local/bin/pctx"
+if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    for win_bin_dir in /mnt/c/Users/*/.local/bin; do
+        if [[ -f "$win_bin_dir/cctx.exe" ]]; then
+            win_built=""
+            if command -v x86_64-pc-windows-gnu-gcc >/dev/null 2>&1 \
+                && cargo build --locked --release --target x86_64-pc-windows-gnu; then
+                win_built="target/x86_64-pc-windows-gnu/release/cctx.exe"
+            elif command -v clang >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+                rust_sysroot="$(rustc --print sysroot)"
+                rust_lld_dir="$rust_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+                win_extra_flags=""
+                cached_mingw="$HOME/.cache/code-context-win-sysroot/root"
+                if [[ -d "$cached_mingw/usr/x86_64-w64-mingw32/lib" ]]; then
+                    win_extra_flags="-L native=$cached_mingw/usr/x86_64-w64-mingw32/lib"
+                    gcc_eh_file="$(find "$cached_mingw/usr/lib/gcc/x86_64-w64-mingw32" -name "libgcc_eh.a" 2>/dev/null | head -n 1 || true)"
+                    if [[ -n "$gcc_eh_file" ]]; then
+                        win_extra_flags="$win_extra_flags -L native=$(dirname "$gcc_eh_file")"
+                    fi
+                fi
+                if [[ -x "$rust_lld_dir/gcc-ld/ld.lld" ]] \
+                    && PATH="$rust_lld_dir/gcc-ld:$rust_lld_dir:$PATH" \
+                       CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=clang \
+                       CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUSTFLAGS="$win_extra_flags -C link-arg=--target=x86_64-pc-windows-gnu -C link-arg=-fuse-ld=lld" \
+                       cargo build --locked --release --target x86_64-pc-windows-gnullvm; then
+                    win_built="target/x86_64-pc-windows-gnullvm/release/cctx.exe"
+                fi
+            fi
+            if [[ -n "$win_built" && -f "$win_built" ]]; then
+                cp "$win_built" "$win_bin_dir/cctx.exe.next"
+                mv -f "$win_bin_dir/cctx.exe.next" "$win_bin_dir/cctx.exe"
+                cp "$win_built" "$win_bin_dir/pctx.exe.next"
+                mv -f "$win_bin_dir/pctx.exe.next" "$win_bin_dir/pctx.exe"
+            fi
+            break
+        fi
+    done
+fi
 if [[ -n "${WSL_DISTRO_NAME:-}" && -x /mnt/c/WINDOWS/system32/wsl.exe ]]; then
     cat > "$HOME/.local/bin/wsl.exe.next" <<'SHIM'
 #!/bin/sh
@@ -88,6 +125,7 @@ systemctl --user enable code-context.service
 systemctl --user restart code-context.service
 for attempt in $(seq 1 500); do
     if "$HOME/.local/bin/cctx" ping; then
+        "$HOME/.local/bin/cctx" --root "$(pwd)" prune-worktrees --apply >/dev/null 2>&1 || true
         python3 scripts/configure_subagents.py || true
         exit 0
     fi

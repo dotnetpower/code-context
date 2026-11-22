@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.26.2
+
+- Unify 24h cross-harness usage & Time Saved dashboard across WSL and Windows UI
+  Extension Hosts:
+  - Add non-blocking singleflight-cached `code_usage` & `code_daemon_summary`
+    daemon RPCs on a dedicated `usageLane` so Windows UI Extension Hosts display
+    real-time 24h Backend MCP, Native, and CLI telemetry across GitHub Copilot,
+    Claude Code, and OpenAI Codex without `os.homedir()` or `XDG_STATE_HOME`
+    isolation gaps.
+  - Add burst-deduplicated **Time Saved** telemetry (avoided LLM round-trips +
+    reduced context prefill + resident RAM index I/O speedup) alongside Cost
+    and Token savings, with a concise Status Bar (`+$saved · ~time · ~tok · %`)
+    and a clip-free 5-column Hover Popover featuring low-adoption warnings and
+    pooled p50/p95 tool latency.
+- Harden initialization, MCP wire framing, and subagent YAML patching:
+  - Support `Content-Length` + `JSONL` framing, `protocolVersion` negotiation,
+    zero pre-`initialize` daemon blocking, atomic `d.sock` -> `daemon.sock`
+    publish, idempotent `cctx init`, comment-preserving JSONC profile updates,
+    and YAML 1.2 block/inline subagent patching with lock-guarded writes.
+
 ## 0.26.1
 
 - Fix `Reload Window` and multi-window client-dispatch stalls (`"Running

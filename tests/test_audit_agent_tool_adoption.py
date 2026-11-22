@@ -734,6 +734,73 @@ class AdoptionAuditTests(unittest.TestCase):
             self.assertEqual(prof_entries[0]["version"], "0.25.9")
             self.assertEqual(prof_entries[0]["relativeLocation"], "dotnetpower.code-context-native-0.25.9")
 
+            # JSONC settings with property-like comments, trailing commas, and inline comments must preserve comments untouched
+            jsonc_settings = user_data / "jsonc-settings.json"
+            jsonc_settings.write_text(
+                '{\n'
+                '    // Example: "codeContextNative.wslDistribution": "DO_NOT_TOUCH"\n'
+                '    "remote.extensionKind": {\n'
+                '        "other.ext": ["workspace"], // keep comment\n'
+                '    },\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(win_mod.configure_settings(jsonc_settings, "Ubuntu-22.04", "/bin/cctx"))
+            raw_after = jsonc_settings.read_text(encoding="utf-8")
+            self.assertIn('// Example: "codeContextNative.wslDistribution": "DO_NOT_TOUCH"', raw_after)
+            self.assertIn("// keep comment", raw_after)
+            parsed_jsonc = win_mod.load_jsonc(jsonc_settings)
+            self.assertEqual(parsed_jsonc["codeContextNative.wslDistribution"], "Ubuntu-22.04")
+            self.assertEqual(parsed_jsonc["remote.extensionKind"]["dotnetpower.code-context-native"], ["ui"])
+
+    def test_shell_source_lookup_detection_codex_mcp_and_five_metric_ab_summary(self):
+        self.assertTrue(MODULE.is_shell_source_lookup("Bash", {"command": "rg Planner src"}))
+        self.assertTrue(MODULE.is_shell_source_lookup("exec_command", {"cmd": "sed -n '1,60p' src/lib.rs"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "cargo test --locked"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "cat /tmp/out.log"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "cat .github/workflows/ci.yml"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "find src -name '*.bak' | xargs rm -f"}))
+        self.assertTrue(MODULE.is_shell_source_lookup("Bash", {"command": "find src -name '*.rs' | xargs rg fn"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "bash -c 'rg foo src' && rm -rf 'bar'"}))
+        self.assertFalse(MODULE.is_shell_source_lookup("Bash", {"command": "rg foo src > out.txt"}))
+
+        cfg_script = Path(__file__).parents[1] / "scripts" / "configure_subagents.py"
+        cfg_spec = importlib.util.spec_from_file_location("configure_subagents", cfg_script)
+        cfg_mod = importlib.util.module_from_spec(cfg_spec)
+        assert cfg_spec.loader is not None
+        cfg_spec.loader.exec_module(cfg_mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex" / "agents").mkdir(parents=True)
+            (home / ".codex" / "agents" / "reviewer.md").write_text("# Reviewer\n", encoding="utf-8")
+            win_exe = Path(r"C:\Users\dev\.local\bin\cctx.exe")
+            self.assertTrue(cfg_mod.configure_codex_mcp(home, executable=win_exe))
+            toml_body = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+            self.assertIn(r'command = "C:\\Users\\dev\\.local\\bin\\cctx.exe"', toml_body)
+            res = cfg_mod.configure_all(home, style="formula", codex_mcp=True)
+            self.assertEqual(res["patched_md"], 1)
+            self.assertFalse(res["codex_mcp_configured"])
+
+        ab_script = Path(__file__).parents[1] / "scripts" / "agent_ab.py"
+        ab_spec = importlib.util.spec_from_file_location("agent_ab", ab_script)
+        ab_mod = importlib.util.module_from_spec(ab_spec)
+        assert ab_spec.loader is not None
+        ab_spec.loader.exec_module(ab_mod)
+        five = ab_mod.summarize_five_metrics([
+            {
+                "arm": "mcp",
+                "fresh_and_cache_write_tokens": 12_000,
+                "cache_read_tokens": 88_000,
+                "output_and_reasoning_tokens": 900,
+                "wall_seconds": 14.5,
+                "total_nano_aiu": 3_500_000_000,
+                "score": {"all_correct": True},
+            }
+        ])
+        self.assertEqual(five["mcp"]["pass_rate_percent"], 100.0)
+        self.assertEqual(five["mcp"]["fresh_and_cache_write_tokens_mean"], 12_000.0)
+        self.assertEqual(five["mcp"]["cache_read_tokens_mean"], 88_000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

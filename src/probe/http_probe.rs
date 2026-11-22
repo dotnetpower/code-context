@@ -245,6 +245,171 @@ fn strip_sensitive_redirect_headers(headers: &[(String, String)]) -> Vec<(String
         .collect()
 }
 
+pub(crate) fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (oct[0] == 100 && (oct[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_non_public_ip(std::net::IpAddr::V4(mapped));
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00
+                || (seg0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn split_authority_host_port(authority: &str, default_port: u16) -> (&str, u16) {
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((host, after)) = rest.split_once(']')
+    {
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return (host, port);
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':')
+        && !host.contains(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return (host, port);
+    }
+    (authority, default_port)
+}
+
+struct VerifiedAuthority {
+    host: String,
+    port: u16,
+    public_ips: Vec<std::net::IpAddr>,
+    is_non_public: bool,
+    is_ip_literal: bool,
+}
+
+fn resolve_verified_authority(authority: &str, default_port: u16) -> Result<VerifiedAuthority> {
+    let (host, port) = split_authority_host_port(authority, default_port);
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".internal")
+        || lower == "metadata.google.internal"
+    {
+        return Ok(VerifiedAuthority {
+            host: host.to_string(),
+            port,
+            public_ips: Vec::new(),
+            is_non_public: true,
+            is_ip_literal: false,
+        });
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let non_pub = is_non_public_ip(ip);
+        return Ok(VerifiedAuthority {
+            host: host.to_string(),
+            port,
+            public_ips: if non_pub { Vec::new() } else { vec![ip] },
+            is_non_public: non_pub,
+            is_ip_literal: true,
+        });
+    }
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| invalid(format!("DNS/socket resolve failed for {authority}: {e}")))?
+        .collect();
+    let any_non_public = addrs.iter().any(|a| is_non_public_ip(a.ip()));
+    let mut public_ips = Vec::new();
+    if !any_non_public {
+        for addr in &addrs {
+            if !public_ips.contains(&addr.ip()) {
+                public_ips.push(addr.ip());
+            }
+        }
+    }
+    Ok(VerifiedAuthority {
+        host: host.to_string(),
+        port,
+        public_ips,
+        is_non_public: any_non_public,
+        is_ip_literal: false,
+    })
+}
+
+fn authority_resolves_to_non_public(authority: &str, default_port: u16) -> Result<bool> {
+    Ok(resolve_verified_authority(authority, default_port)?.is_non_public)
+}
+
+fn has_explicit_proxy_env() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
+fn format_curl_resolve_pin(verified: &VerifiedAuthority) -> Option<String> {
+    if verified.is_ip_literal
+        || verified.is_non_public
+        || verified.public_ips.is_empty()
+        || has_explicit_proxy_env()
+    {
+        return None;
+    }
+    let ips = verified
+        .public_ips
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{}:{}:{ips}", verified.host, verified.port))
+}
+
+fn enforce_safe_redirect_hop(
+    initial_is_non_public: bool,
+    orig_authority: &str,
+    next_authority: &str,
+    default_port: u16,
+) -> Result<()> {
+    if initial_is_non_public || orig_authority.eq_ignore_ascii_case(next_authority) {
+        return Ok(());
+    }
+    if authority_resolves_to_non_public(next_authority, default_port)? {
+        return Err(invalid(format!(
+            "SSRF_REDIRECT_BLOCKED: refusing cross-origin redirect from public host `{orig_authority}` to internal/private target `{next_authority}`"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn connect_any_socket_addr(addrs: &[SocketAddr], timeout: Duration) -> Result<TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err
+        .map(Into::into)
+        .unwrap_or_else(|| invalid("no reachable socket address").into()))
+}
+
 /// Pure-Rust HTTP/1.1 client for loopback endpoints and offline integration tests.
 fn fetch_via_rust_tcp(
     url: &str,
@@ -260,11 +425,16 @@ fn fetch_via_rust_tcp(
     let mut cur_headers: Vec<(String, String)> = headers.to_vec();
     let mut cur_body: Option<&[u8]> = body;
     let mut initial_authority: Option<String> = None;
+    let mut initial_is_non_public = false;
     let timeout = Duration::from_secs(timeout_secs.clamp(1, 60));
 
     for _hop in 0..=5 {
         let (scheme, rest) = validate_http_url(&current_url)?;
         if scheme != "http" {
+            let next_auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+            if let Some(ref orig) = initial_authority {
+                enforce_safe_redirect_hop(initial_is_non_public, orig, next_auth, 443)?;
+            }
             let safe_headers = strip_sensitive_redirect_headers(&cur_headers);
             return fetch_via_curl(
                 &current_url,
@@ -284,9 +454,11 @@ fn fetch_via_rust_tcp(
         };
         if let Some(ref orig) = initial_authority {
             if !orig.eq_ignore_ascii_case(authority) {
+                enforce_safe_redirect_hop(initial_is_non_public, orig, authority, 80)?;
                 cur_headers = strip_sensitive_redirect_headers(&cur_headers);
             }
         } else {
+            initial_is_non_public = authority_resolves_to_non_public(authority, 80)?;
             initial_authority = Some(authority.to_string());
         }
         let path_no_frag = path_and_query.split('#').next().unwrap_or("/");
@@ -296,13 +468,15 @@ fn fetch_via_rust_tcp(
             format!("{authority}:80")
         };
 
-        let addr: SocketAddr = host_port
+        let addrs: Vec<SocketAddr> = host_port
             .to_socket_addrs()
             .map_err(|e| invalid(format!("DNS/socket resolve failed for {authority}: {e}")))?
-            .next()
-            .ok_or_else(|| invalid(format!("no socket address for {authority}")))?;
+            .collect();
+        if addrs.is_empty() {
+            return Err(invalid(format!("no socket address for {authority}")).into());
+        }
 
-        let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let mut stream = connect_any_socket_addr(&addrs, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
@@ -484,18 +658,28 @@ fn fetch_via_curl(
     let mut cur_headers: Vec<(String, String)> = headers.to_vec();
     let mut cur_body: Option<&[u8]> = body;
     let mut initial_authority: Option<String> = None;
+    let mut initial_is_non_public = false;
 
     let connect_timeout = timeout_secs.clamp(1, 30);
     let max_time = timeout_secs.clamp(1, 60);
 
     for _hop in 0..=5 {
         let (scheme, rest) = validate_http_url(&current_url)?;
+        let default_port = if scheme == "https" { 443 } else { 80 };
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let verified_hop = resolve_verified_authority(authority, default_port)?;
         if let Some(ref orig) = initial_authority {
             if !orig.eq_ignore_ascii_case(authority) {
+                if !initial_is_non_public && verified_hop.is_non_public {
+                    return Err(invalid(format!(
+                        "SSRF_REDIRECT_BLOCKED: refusing cross-origin redirect from public host `{orig}` to internal/private target `{authority}`"
+                    ))
+                    .into());
+                }
                 cur_headers = strip_sensitive_redirect_headers(&cur_headers);
             }
         } else {
+            initial_is_non_public = verified_hop.is_non_public;
             initial_authority = Some(authority.to_string());
         }
 
@@ -510,6 +694,12 @@ fn fetch_via_curl(
         };
 
         let mut cfg = String::new();
+        if let Some(pin_entry) = format_curl_resolve_pin(&verified_hop) {
+            cfg.push_str(&format!(
+                "resolve = \"{}\"\n",
+                escape_curl_config_value(&pin_entry)
+            ));
+        }
         cfg.push_str(&format!(
             "url = \"{}\"\n",
             escape_curl_config_value(&current_url)
@@ -1161,5 +1351,78 @@ pub fn run(args: &HttpProbeArgs) -> Result<String> {
         }))
     } else {
         Ok(render_http_batch_text(&ordered, wall_ms))
+    }
+}
+
+#[cfg(test)]
+mod ssrf_and_dualstack_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn blocks_public_to_private_or_metadata_redirects_while_allowing_local_to_local() {
+        for blocked in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "localhost:3000",
+            "169.254.169.254",
+            "10.0.0.5:80",
+            "192.168.1.1",
+            "100.64.1.2",
+            "metadata.google.internal",
+        ] {
+            let err = enforce_safe_redirect_hop(false, "93.184.216.34", blocked, 80)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("SSRF_REDIRECT_BLOCKED"), "{blocked}: {err}");
+        }
+        assert!(enforce_safe_redirect_hop(false, "93.184.216.34", "93.184.216.35:443", 443).is_ok());
+        assert!(enforce_safe_redirect_hop(true, "localhost:8080", "127.0.0.1:8081", 80).is_ok());
+    }
+
+    #[test]
+    fn connect_any_falls_back_past_unreachable_first_socket_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let closed_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let handle = std::thread::spawn(move || listener.accept().unwrap());
+        let stream =
+            connect_any_socket_addr(&[closed_addr, live_addr], Duration::from_secs(2)).unwrap();
+        drop(stream);
+        let _ = handle.join().unwrap();
+    }
+
+    #[test]
+    fn curl_resolve_pin_binds_verified_public_domain_ips_only() {
+        let domain_hop = VerifiedAuthority {
+            host: "api.example.test".into(),
+            port: 443,
+            public_ips: vec!["93.184.216.34".parse().unwrap()],
+            is_non_public: false,
+            is_ip_literal: false,
+        };
+        if !has_explicit_proxy_env() {
+            assert_eq!(
+                format_curl_resolve_pin(&domain_hop).as_deref(),
+                Some("api.example.test:443:93.184.216.34")
+            );
+        }
+        let literal_hop = VerifiedAuthority {
+            host: "93.184.216.34".into(),
+            port: 443,
+            public_ips: vec!["93.184.216.34".parse().unwrap()],
+            is_non_public: false,
+            is_ip_literal: true,
+        };
+        assert_eq!(format_curl_resolve_pin(&literal_hop), None);
+        let local_hop = VerifiedAuthority {
+            host: "localhost".into(),
+            port: 8080,
+            public_ips: Vec::new(),
+            is_non_public: true,
+            is_ip_literal: false,
+        };
+        assert_eq!(format_curl_resolve_pin(&local_hop), None);
     }
 }

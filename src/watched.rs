@@ -558,6 +558,7 @@ mod io_tests {
 }
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const DEGRADED_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const READ_RECOVERY_DELAY: Duration = Duration::from_millis(8);
 pub(crate) const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
 
@@ -592,6 +593,7 @@ pub struct Watched {
     watcher: RecommendedWatcher,
     watched_dirs: BTreeSet<std::path::PathBuf>,
     watched_dir_bytes: usize,
+    watch_degraded: bool,
     events: Receiver<notify::Result<Event>>,
     overflow: Arc<AtomicBool>,
     stamps: BTreeMap<String, Stamp>,
@@ -619,8 +621,9 @@ pub struct Watched {
         crate::workspace::Workspace,
         crate::workspace::CandidatePolicy,
     )>,
-    file_read_streaks: BTreeMap<String, (usize, usize, u32, Instant)>,
-    recent_read_history: std::collections::VecDeque<(String, String, usize, usize)>,
+    active_caller_id: u64,
+    file_read_streaks: BTreeMap<(u64, String), (usize, usize, u32, Instant)>,
+    recent_read_history: std::collections::VecDeque<(u64, String, String, usize, usize)>,
 }
 
 impl Watched {
@@ -765,6 +768,7 @@ impl Watched {
             Config::default(),
         )?;
         let mut active_watched_dirs = BTreeSet::new();
+        let mut watch_degraded = false;
         for directory in watched_dirs {
             let absolute = workspace.root.join(&directory);
             match watcher.watch(&absolute, RecursiveMode::NonRecursive) {
@@ -772,6 +776,14 @@ impl Watched {
                     active_watched_dirs.insert(directory);
                 }
                 Err(error) if Self::is_missing_watch_target_error(&error, &absolute) => {}
+                Err(error) if Self::is_watch_limit_error(&error) => {
+                    eprintln!(
+                        "CCTX_WATCH_LIMIT_DEGRADED root={}: {error}; falling back to periodic metadata reconciliation",
+                        workspace.root.display()
+                    );
+                    watch_degraded = true;
+                    break;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -800,6 +812,7 @@ impl Watched {
             watcher,
             watched_dirs,
             watched_dir_bytes,
+            watch_degraded,
             events,
             overflow,
             stamps,
@@ -826,8 +839,9 @@ impl Watched {
             cached_workspace,
             watcher_policy,
             read_policy: None,
+            active_caller_id: 0,
             file_read_streaks: BTreeMap::new(),
-            recent_read_history: std::collections::VecDeque::with_capacity(64),
+            recent_read_history: std::collections::VecDeque::with_capacity(128),
         };
         let overflowed = watched.overflow.load(Ordering::Acquire);
         watched.synchronize(overflowed)?;
@@ -950,6 +964,14 @@ impl Watched {
             )
     }
 
+    fn is_watch_limit_error(error: &notify::Error) -> bool {
+        matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
+            || matches!(
+                &error.kind,
+                notify::ErrorKind::Io(io_err) if io_err.raw_os_error() == Some(28)
+            )
+    }
+
     fn record_affected_directory(
         root: &Path,
         directories: &mut BTreeMap<PathBuf, bool>,
@@ -1018,6 +1040,9 @@ impl Watched {
     }
 
     fn needs_watch_refresh(&self, workspace: &crate::workspace::Workspace) -> bool {
+        if self.watch_degraded {
+            return false;
+        }
         self.watched_dirs
             .iter()
             .any(|dir| !workspace.root.join(dir).is_dir())
@@ -1046,6 +1071,25 @@ impl Watched {
                 Ok(()) => added.push(directory.clone()),
                 Err(error) if Self::is_missing_watch_target_error(&error, &absolute) => {
                     vanished.push(directory.clone());
+                }
+                Err(error) if Self::is_watch_limit_error(&error) => {
+                    eprintln!(
+                        "CCTX_WATCH_LIMIT_DEGRADED root={}: {error}; retaining {} watches and enabling periodic metadata scan",
+                        workspace.root.display(),
+                        self.watched_dirs.len() + added.len()
+                    );
+                    self.watch_degraded = true;
+                    let mut retained = self.watched_dirs.clone();
+                    for dir in added {
+                        retained.insert(dir);
+                    }
+                    retained.retain(|dir| workspace.root.join(dir).is_dir());
+                    self.watched_dir_bytes = retained
+                        .iter()
+                        .map(|path| path.as_os_str().len() + 64)
+                        .sum::<usize>();
+                    self.watched_dirs = retained;
+                    return Ok(());
                 }
                 Err(error) => {
                     for added in added {
@@ -1541,7 +1585,12 @@ impl Watched {
     }
 
     pub fn schedule_maintenance(&mut self) {
-        if self.last_reconcile.elapsed() < RECONCILE_INTERVAL
+        let interval = if self.watch_degraded {
+            DEGRADED_RECONCILE_INTERVAL
+        } else {
+            RECONCILE_INTERVAL
+        };
+        if self.last_reconcile.elapsed() < interval
             || self.maintenance_active.swap(true, Ordering::AcqRel)
         {
             return;
@@ -1721,6 +1770,10 @@ impl Watched {
             },
             inventory_capped_files: self.capped_files_count,
         }
+    }
+
+    pub(crate) fn set_caller_id(&mut self, caller_id: u64) {
+        self.active_caller_id = caller_id;
     }
 
     pub(crate) fn call_raw_json(
@@ -2279,15 +2332,25 @@ impl Watched {
         let mut seen_in_call: std::collections::HashSet<usize> =
             std::collections::HashSet::with_capacity(planned.len());
         let mut notices: Vec<Option<String>> = Vec::with_capacity(planned.len());
-        for &(doc_id, start, clamped_end) in &planned {
+        let mut approx_bytes = 64usize;
+        for (idx, &(doc_id, start, clamped_end)) in planned.iter().enumerate() {
             let first_in_call = seen_in_call.insert(doc_id);
-            let path_rc = self.resident.documents[doc_id].path.clone();
-            let sha_rc = self.resident.documents[doc_id].sha256_hex.clone();
+            let doc_ref = &self.resident.documents[doc_id];
+            let mut item_bytes = 80 + doc_ref.path.len();
+            for line_idx in (start - 1)..clamped_end {
+                item_bytes = item_bytes.saturating_add(doc_ref.line(line_idx).len() + 4);
+            }
+            approx_bytes = approx_bytes.saturating_add(item_bytes);
+            let line_count = clamped_end - start + 1;
+            let record_history =
+                approx_bytes <= crate::inline_budget::INLINE_BUDGET || (idx == 0 && line_count <= 40);
+            let path_rc = doc_ref.path.clone();
+            let sha_rc = doc_ref.sha256_hex.clone();
             notices.push(self.compute_single_snippet_notice(
                 &path_rc,
                 &sha_rc,
                 (start, clamped_end),
-                (is_batch_call, first_in_call),
+                (is_batch_call, first_in_call, record_history),
                 None,
             ));
         }
@@ -2990,6 +3053,7 @@ impl Watched {
                     "blocked":self.blocked,"last_query_profile":self.last_profile,
                     "query_cache":self.query_cache.stats(),
                     "watched_directories":self.watched_dirs.len(),
+                    "watch_degraded":self.watch_degraded,
                     "root_admission_estimated_bytes":self.estimated_bytes(),
                     "runtime_headroom_bytes":ROOT_RUNTIME_HEADROOM,
                     "transparent_read_recoveries":self.transparent_read_recoveries,
@@ -3360,6 +3424,24 @@ impl Watched {
                         .unwrap_or("not_admitted");
                     self.io_profile.read_policy_rejections += 1;
                     self.transparent_read_recovery_failures += 1;
+                    if reason == "unsupported_glob" {
+                        let rel = crate::workspace::normalize(Path::new(&range.path));
+                        if std::fs::symlink_metadata(self.spec.root.join(&rel))
+                            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                        {
+                            let dir_glob = if rel.as_os_str().is_empty() || rel == Path::new(".") {
+                                "*".to_owned()
+                            } else {
+                                format!("{}/**", rel.display())
+                            };
+                            return Err(invalid(format!(
+                                "READ_TARGET_IS_DIRECTORY root={} path={}: code_read reads files, not directories. Use code_files(glob=\"{dir_glob}\") to list files under this directory.",
+                                self.spec.root.display(),
+                                range.path,
+                            ))
+                            .into());
+                        }
+                    }
                     let suggestions = self.suggest_similar_paths(&range.path);
                     let suggest_hint = if suggestions.is_empty() {
                         String::new()
@@ -3930,64 +4012,7 @@ impl Watched {
     }
 
     fn plan_read_ranges(&self, request: &ReadRequest) -> Result<Vec<crate::context::ReadRange>> {
-        if !request.split_ranges {
-            return Ok(request.ranges.clone());
-        }
-        let mut planned: Vec<crate::context::ReadRange> = Vec::new();
-        let mut reached_eof_paths: BTreeSet<String> = BTreeSet::new();
-        for range in &request.ranges {
-            let path = crate::workspace::normalize(std::path::Path::new(&range.path));
-            let path_key = path.to_string_lossy().into_owned();
-            let doc_lines = self
-                .resident
-                .paths
-                .get(path_key.as_str())
-                .map(|id| self.resident.documents[*id].starts.len());
-            if doc_lines == Some(0) && range.start == 1 {
-                if reached_eof_paths.insert(path_key) {
-                    if planned.len() >= 64 {
-                        return Err(invalid(format!("READ_PLAN_TOO_LARGE path={}: more than64segments required; split the request into fewer ranges. No partial result returned.",range.path)).into());
-                    }
-                    planned.push(crate::context::ReadRange {
-                        path: range.path.clone(),
-                        start: 1,
-                        end: 1,
-                    });
-                }
-                continue;
-            }
-            if let Some(lines) = doc_lines
-                && range.start > lines
-                && reached_eof_paths.contains(&path_key)
-            {
-                continue;
-            }
-            let end = doc_lines
-                .filter(|lines| *lines >= range.start)
-                .map_or(range.end.min(range.start.saturating_add(499)), |lines| {
-                    if range.end >= lines {
-                        reached_eof_paths.insert(path_key);
-                    }
-                    range.end.min(lines)
-                });
-            let mut start = range.start;
-            while start <= end {
-                if planned.len() >= 64 {
-                    return Err(invalid(format!("READ_PLAN_TOO_LARGE path={}: more than64segments required; split the request into fewer ranges. No partial result returned.",range.path)).into());
-                }
-                let stop = end.min(start.saturating_add(499));
-                planned.push(crate::context::ReadRange {
-                    path: range.path.clone(),
-                    start,
-                    end: stop,
-                });
-                if stop == usize::MAX {
-                    break;
-                }
-                start = stop + 1;
-            }
-        }
-        Ok(planned)
+        plan_read_ranges_for_resident(&self.resident, request)
     }
 
     fn synchronize_or_block(&mut self, strict: bool) -> Result<()> {
@@ -4003,11 +4028,11 @@ impl Watched {
         path: &str,
         sha256: &str,
         bounds: (usize, usize),
-        flags: (bool, bool),
+        flags: (bool, bool, bool),
         clamped_req: Option<(usize, usize, usize)>,
     ) -> Option<String> {
         let (start, end) = bounds;
-        let (is_batch_call, first_in_call) = flags;
+        let (is_batch_call, first_in_call, record_history) = flags;
         if sha256 == "READ_UNAVAILABLE" {
             return None;
         }
@@ -4027,9 +4052,10 @@ impl Watched {
                 "EOF: total_lines={total_lines} (no lines beyond {total_lines})"
             ));
         }
+        let caller = self.active_caller_id;
         let mut overlap_found = None;
-        for (p, h, pst, pen) in &self.recent_read_history {
-            if p == path && h == sha256 {
+        for (cid, p, h, pst, pen) in &self.recent_read_history {
+            if *cid == caller && p == path && h == sha256 {
                 let ov_s = start.max(*pst);
                 let ov_e = end.min(*pen);
                 if ov_e >= ov_s && (ov_e - ov_s + 1) >= 20 {
@@ -4043,24 +4069,28 @@ impl Watched {
                 "OVERLAP_READ: lines {ov_s}..{ov_e} already read in {pst}..{pen} (sha256 unchanged); reuse context"
             ));
         }
-        if self.recent_read_history.len() >= 64 {
-            self.recent_read_history.pop_front();
+        if record_history {
+            if self.recent_read_history.len() >= 128 {
+                self.recent_read_history.pop_front();
+            }
+            self.recent_read_history
+                .push_back((caller, path.to_owned(), sha256.to_owned(), start, end));
         }
-        self.recent_read_history
-            .push_back((path.to_owned(), sha256.to_owned(), start, end));
 
-        if self.file_read_streaks.len() >= 128 && !self.file_read_streaks.contains_key(path) {
+        let streak_key = (caller, path.to_owned());
+        if self.file_read_streaks.len() >= 256 && !self.file_read_streaks.contains_key(&streak_key)
+        {
             self.file_read_streaks.clear();
         }
         let now_inst = Instant::now();
         let streak = if is_batch_call {
             self.file_read_streaks
-                .insert(path.to_owned(), (start, end, 1, now_inst));
+                .insert(streak_key, (start, end, 1, now_inst));
             1
         } else if !first_in_call {
             1
         } else {
-            let next_streak = match self.file_read_streaks.get(path) {
+            let next_streak = match self.file_read_streaks.get(&streak_key) {
                 Some(&(prev_s, prev_e, prev_streak, last_at))
                     if last_at.elapsed() <= Duration::from_secs(300)
                         && start <= prev_e.saturating_add(25)
@@ -4071,7 +4101,7 @@ impl Watched {
                 _ => 1,
             };
             self.file_read_streaks
-                .insert(path.to_owned(), (start, end, next_streak, now_inst));
+                .insert(streak_key, (start, end, next_streak, now_inst));
             next_streak
         };
         if streak >= 2
@@ -4113,13 +4143,21 @@ impl Watched {
         let mut seen_in_call: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(snippets.len());
         let mut out = Vec::with_capacity(snippets.len());
-        for s in snippets {
+        let mut approx_bytes = 64usize;
+        for (idx, s) in snippets.iter().enumerate() {
+            let item_bytes = 80
+                + s.path.len()
+                + s.lines.iter().map(|l| l.len() + 4).sum::<usize>();
+            approx_bytes = approx_bytes.saturating_add(item_bytes);
+            // Snippets beyond INLINE_BUDGET get deferred to `next_ranges`; do not mark them read yet.
+            let record_history = approx_bytes <= crate::inline_budget::INLINE_BUDGET
+                || (idx == 0 && s.lines.len() <= 40);
             let first_in_call = seen_in_call.insert(s.path.as_str());
             out.push(self.compute_single_snippet_notice(
                 &s.path,
                 &s.sha256,
                 (s.start, s.end),
-                (is_batch_call, first_in_call),
+                (is_batch_call, first_in_call, record_history),
                 clamped_req,
             ));
         }
@@ -4136,7 +4174,8 @@ impl Watched {
         };
         let is_batch_call = items.len() > 1;
         let mut seen_in_call: BTreeSet<String> = BTreeSet::new();
-        for item in items.iter_mut() {
+        let mut approx_bytes = 64usize;
+        for (idx, item) in items.iter_mut().enumerate() {
             let Some(obj) = item.as_object_mut() else {
                 continue;
             };
@@ -4151,12 +4190,27 @@ impl Watched {
                 .get("end")
                 .and_then(Value::as_u64)
                 .unwrap_or(start as u64) as usize;
+            let line_count = obj
+                .get("lines")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let line_bytes: usize = obj
+                .get("lines")
+                .and_then(Value::as_array)
+                .map_or(0, |arr| {
+                    arr.iter()
+                        .map(|v| v.as_str().map_or(4, |s| s.len() + 4))
+                        .sum()
+                });
+            approx_bytes = approx_bytes.saturating_add(80 + path.len() + line_bytes);
+            let record_history =
+                approx_bytes <= crate::inline_budget::INLINE_BUDGET || (idx == 0 && line_count <= 40);
             let first_in_call = seen_in_call.insert(path.clone());
             if let Some(joined) = self.compute_single_snippet_notice(
                 &path,
                 &sha256,
                 (start, end),
-                (is_batch_call, first_in_call),
+                (is_batch_call, first_in_call, record_history),
                 clamped_req,
             ) {
                 obj.insert("notice".into(), Value::String(joined));
@@ -4273,5 +4327,811 @@ fn append_regex_hint(freshness: &mut Value) {
             "{notice} (Pattern contains regex syntax with regex=false; set regex=true if a regular expression was intended.)"
         );
         freshness["notice"] = Value::String(updated);
+    }
+}
+
+fn plan_read_ranges_for_resident(
+    resident: &Resident,
+    request: &ReadRequest,
+) -> Result<Vec<crate::context::ReadRange>> {
+    if !request.split_ranges {
+        return Ok(request.ranges.clone());
+    }
+    let mut planned: Vec<crate::context::ReadRange> = Vec::new();
+    let mut reached_eof_paths: BTreeSet<String> = BTreeSet::new();
+    for range in &request.ranges {
+        let path = crate::workspace::normalize(std::path::Path::new(&range.path));
+        let path_key = path.to_string_lossy().into_owned();
+        let doc_lines = resident
+            .paths
+            .get(path_key.as_str())
+            .map(|id| resident.documents[*id].starts.len());
+        if doc_lines == Some(0) && range.start == 1 {
+            if reached_eof_paths.insert(path_key) {
+                if planned.len() >= 64 {
+                    return Err(invalid(format!("READ_PLAN_TOO_LARGE path={}: more than64segments required; split the request into fewer ranges. No partial result returned.", range.path)).into());
+                }
+                planned.push(crate::context::ReadRange {
+                    path: range.path.clone(),
+                    start: 1,
+                    end: 1,
+                });
+            }
+            continue;
+        }
+        if let Some(lines) = doc_lines
+            && range.start > lines
+            && reached_eof_paths.contains(&path_key)
+        {
+            continue;
+        }
+        let end = doc_lines
+            .filter(|lines| *lines >= range.start)
+            .map_or(range.end.min(range.start.saturating_add(499)), |lines| {
+                if range.end >= lines {
+                    reached_eof_paths.insert(path_key);
+                }
+                range.end.min(lines)
+            });
+        let mut start = range.start;
+        while start <= end {
+            if planned.len() >= 64 {
+                return Err(invalid(format!("READ_PLAN_TOO_LARGE path={}: more than64segments required; split the request into fewer ranges. No partial result returned.", range.path)).into());
+            }
+            let stop = end.min(start.saturating_add(499));
+            planned.push(crate::context::ReadRange {
+                path: range.path.clone(),
+                start,
+                end: stop,
+            });
+            if stop == usize::MAX {
+                break;
+            }
+            start = stop + 1;
+        }
+    }
+    Ok(planned)
+}
+
+pub(crate) type ColdReadPolicyCache = BTreeMap<
+    PathBuf,
+    (
+        Spec,
+        crate::workspace::Workspace,
+        crate::workspace::CandidatePolicy,
+    ),
+>;
+
+struct ColdReadLoader<'a> {
+    spec: &'a Spec,
+    workspace: &'a crate::workspace::Workspace,
+    policy: &'a crate::workspace::CandidatePolicy,
+    dir_admitted: BTreeMap<String, std::collections::HashSet<PathBuf>>,
+    checked_dirs: std::collections::HashSet<PathBuf>,
+    docs: BTreeMap<String, crate::resident::Document>,
+}
+
+impl<'a> ColdReadLoader<'a> {
+    fn new(
+        spec: &'a Spec,
+        workspace: &'a crate::workspace::Workspace,
+        policy: &'a crate::workspace::CandidatePolicy,
+    ) -> Self {
+        Self {
+            spec,
+            workspace,
+            policy,
+            dir_admitted: BTreeMap::new(),
+            checked_dirs: std::collections::HashSet::new(),
+            docs: BTreeMap::new(),
+        }
+    }
+
+    fn is_admitted_in_parent(&mut self, rel: &Path) -> Result<bool> {
+        let parent = rel.parent().unwrap_or(Path::new(""));
+        let target = if parent.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            parent.to_string_lossy().into_owned()
+        };
+        if !self.dir_admitted.contains_key(&target) {
+            let inventory = self.workspace.files_limited_at_skip_oversized(
+                &self.spec.policy,
+                std::slice::from_ref(&target),
+                true,
+            )?;
+            self.dir_admitted.insert(target.clone(), inventory.files);
+        }
+        Ok(self.dir_admitted[&target].contains(rel))
+    }
+
+    fn ensure_loaded_or_reason(&mut self, raw_path: &str) -> Result<Option<&'static str>> {
+        match self.policy.candidate_path(raw_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = self
+                    .policy
+                    .rejection_reason(raw_path)?
+                    .unwrap_or("not_admitted");
+                if reason == "unsupported_glob" {
+                    let rel = crate::workspace::normalize(Path::new(raw_path));
+                    if std::fs::symlink_metadata(self.spec.root.join(&rel))
+                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                    {
+                        let dir_glob = if rel.as_os_str().is_empty() || rel == Path::new(".") {
+                            "*".to_owned()
+                        } else {
+                            format!("{}/**", rel.display())
+                        };
+                        return Err(invalid(format!(
+                            "READ_TARGET_IS_DIRECTORY root={} path={raw_path}: code_read reads files, not directories. Use code_files(glob=\"{dir_glob}\") to list files under this directory.",
+                            self.spec.root.display(),
+                        ))
+                        .into());
+                    }
+                }
+                let migrate_hint = if reason == "unsupported_glob" {
+                    format!(
+                        " (To admit standard source/config globs on a legacy registration, run: cctx --root {} migrate --apply)",
+                        self.spec.root.display()
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(invalid(format!(
+                    "READ_POLICY_DENIED root={} path={raw_path} reason={reason}: no source was read. Do not retry this target with context/search/read or switch CCTX transports. Use a host policy-aware read only if allowed; do not widen access automatically.{migrate_hint}",
+                    self.spec.root.display(),
+                ))
+                .into());
+            }
+            Err(error) => return Err(error),
+        }
+        let rel = crate::workspace::normalize(Path::new(raw_path));
+        let key = rel
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF8 path"))?
+            .to_owned();
+        if self.docs.contains_key(&key) {
+            return Ok(None);
+        }
+        match std::fs::symlink_metadata(self.workspace.root.join(&rel)) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(Some("symlink_not_allowed")),
+            Ok(meta) if meta.len() > self.spec.policy.max_file_bytes as u64 => {
+                return Ok(Some("exceeds_max_file_bytes"));
+            }
+            Ok(meta) if !meta.is_file() => return Ok(Some("ignored_by_discovery")),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some("missing_on_disk"));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(err) = self
+            .workspace
+            .check_parent_symlinks_cached(&rel, &mut self.checked_dirs)
+        {
+            if err.to_string().contains("symlinks are unsupported") {
+                return Ok(Some("symlink_not_allowed"));
+            }
+            return Err(err);
+        }
+        if !self.is_admitted_in_parent(&rel)? {
+            return Ok(Some("ignored_by_discovery"));
+        }
+        let bytes = match self
+            .workspace
+            .read_known_with_limit(&rel, self.spec.policy.max_file_bytes)
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("max_file_bytes") {
+                    return Ok(Some("exceeds_max_file_bytes"));
+                }
+                if msg.contains("binary file") {
+                    return Err(err);
+                }
+                return Ok(Some("missing_on_disk"));
+            }
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Err(invalid(format!(
+                "binary file or file larger than configured limit is unsupported: {}",
+                rel.display()
+            ))
+            .into());
+        };
+        use sha2::{Digest, Sha256};
+        let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let sha256_hex = crate::resident::digest_hex_arc(&sha256);
+        let starts = crate::resident::build_line_starts(&text)?;
+        self.docs.insert(
+            key.clone(),
+            crate::resident::Document {
+                path: Arc::from(key.as_str()),
+                text,
+                starts,
+                sha256,
+                sha256_hex,
+            },
+        );
+        Ok(None)
+    }
+
+    fn read_verified_ranges(
+        &mut self,
+        ranges: &[crate::context::ReadRange],
+        split_ranges: bool,
+    ) -> Result<Vec<Snippet>> {
+        if split_ranges {
+            if ranges.is_empty()
+                || ranges.len() > 64
+                || ranges.iter().any(|r| r.start == 0 || r.end < r.start)
+            {
+                return Err(invalid(
+                    "READ_RANGE_LIMIT: provide1..64 valid1-based inclusive ranges",
+                )
+                .into());
+            }
+        } else {
+            crate::context::validate_ranges(ranges)?;
+        }
+        let mut requested = BTreeSet::new();
+        for range in ranges {
+            if !self.policy.candidate_path(&range.path)? {
+                let _ = self.ensure_loaded_or_reason(&range.path)?;
+            }
+            let norm = crate::workspace::normalize(Path::new(&range.path));
+            requested.insert(norm.to_string_lossy().into_owned());
+        }
+        let mut reasons = Vec::new();
+        for path in &requested {
+            if let Some(reason) = self.ensure_loaded_or_reason(path)?
+                && reasons.len() < 8
+            {
+                reasons.push(format!("path={path} reason={reason}"));
+            }
+        }
+        if !reasons.is_empty() {
+            let valid_loaded: Vec<&str> = requested
+                .iter()
+                .filter(|p| self.docs.contains_key(p.as_str()))
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            let valid_hint = if valid_loaded.is_empty() {
+                String::new()
+            } else {
+                format!(" Valid indexed members in this batch: [{}].", valid_loaded.join(", "))
+            };
+            return Err(invalid(format!(
+                "READ_UNAVAILABLE root={}: file is unavailable after automatic recovery; {}. Batch failed atomically; no partial success. Discover actual paths with code_files/code_context; use a host policy-aware read for permitted non-indexed files. Do not repeat missing/excluded paths.{}{}",
+                self.spec.root.display(),
+                reasons.join("; "),
+                valid_hint,
+                if requested.len() > 8 {
+                    " Additional requested paths omitted from this diagnostic."
+                } else {
+                    ""
+                }
+            ))
+            .into());
+        }
+        let docs: Vec<crate::resident::Document> = requested
+            .iter()
+            .filter_map(|p| self.docs.get(p).cloned())
+            .collect();
+        let temp_resident = Resident::from_admitted_documents(self.spec.policy.clone(), docs);
+        let planned = plan_read_ranges_for_resident(
+            &temp_resident,
+            &ReadRequest {
+                ranges: ranges.to_vec(),
+                split_ranges,
+                page: false,
+            },
+        )?;
+        temp_resident.read_many(&planned)
+    }
+
+    fn annotate_cold_snippets(
+        &self,
+        snippets_val: &mut Value,
+        clamped_req: Option<(usize, usize, usize)>,
+    ) {
+        let Some(items) = snippets_val.as_array_mut() else {
+            return;
+        };
+        let is_batch_call = items.len() > 1;
+        for item in items.iter_mut() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(path) = obj.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(sha256) = obj.get("sha256").and_then(Value::as_str) else {
+                continue;
+            };
+            if sha256 == "READ_UNAVAILABLE" {
+                continue;
+            }
+            let start = obj.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let end = obj
+                .get("end")
+                .and_then(Value::as_u64)
+                .unwrap_or(start as u64) as usize;
+            let doc = self.docs.get(path);
+            let total_lines = doc.map_or(end, |d| d.starts.len());
+            let mut notes = Vec::new();
+            if let Some((req_s, req_e, tot)) = clamped_req {
+                notes.push(format!(
+                    "EOF_CLAMPED: requested {req_s}..{req_e} exceeds total_lines={tot}; returned valid_tail {start}..{end} (EOF)"
+                ));
+            } else if end >= total_lines && total_lines > 1 {
+                notes.push(format!(
+                    "EOF: total_lines={total_lines} (no lines beyond {total_lines})"
+                ));
+            } else if !is_batch_call
+                && start <= 5
+                && end < total_lines
+                && total_lines > 120
+                && let Some(doc) = doc
+            {
+                let outline = extract_unread_outline(doc, end, 8);
+                if !outline.is_empty() {
+                    notes.push(format!(
+                        "PARTIAL_READ ({start}..{end} of {total_lines}): unread_outline=[{}] — jump via around_line/ranges or code_context(paths=[\"{path}\"], pattern=\"...\") instead of sequential slicing",
+                        outline.join(", ")
+                    ));
+                }
+            }
+            if !notes.is_empty() {
+                obj.insert("notice".into(), Value::String(notes.join(" | ")));
+            }
+        }
+    }
+}
+
+fn normalize_cold_read_arguments(loader: &mut ColdReadLoader<'_>, arguments: &mut Value) {
+    let Some(root_str) = loader.spec.root.to_str().map(str::to_owned) else {
+        return;
+    };
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+    let root_basename_prefix = loader
+        .spec
+        .root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("{n}/"));
+    let root_path = loader.spec.root.clone();
+    let strip_one = |raw: &mut String| {
+        let trimmed = raw.trim();
+        if trimmed.len() >= 2
+            && ((trimmed.starts_with('`') && trimmed.ends_with('`'))
+                || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+        {
+            *raw = trimmed[1..trimmed.len() - 1].trim().to_owned();
+        }
+        if raw.starts_with('[')
+            && let Some((_, rest)) = raw.split_once("](")
+            && let Some(target) = rest.strip_suffix(')')
+        {
+            let mut target = target.trim();
+            if target.starts_with('<') && target.ends_with('>') && target.len() >= 2 {
+                target = target[1..target.len() - 1].trim();
+            }
+            *raw = target.to_owned();
+        }
+        if let Some(rest) = raw.strip_prefix("file://") {
+            *raw = rest.to_owned();
+        }
+        if raw.contains("%20") {
+            *raw = raw.replace("%20", " ");
+        }
+        if !raw.starts_with('/') && !raw.starts_with("\\\\") && raw.contains('\\') {
+            *raw = raw.replace('\\', "/");
+        }
+        if *raw == root_str {
+            *raw = ".".into();
+            return;
+        }
+        if let Some(rest) = raw.strip_prefix(&root_prefix)
+            && !rest.is_empty()
+        {
+            *raw = rest.to_owned();
+        }
+        while let Some(rest) = raw.strip_prefix("./") {
+            if !rest.is_empty() {
+                *raw = rest.to_owned();
+            } else {
+                break;
+            }
+        }
+        if !root_path.join(raw.as_str()).exists() {
+            if let Some(ref b_prefix) = root_basename_prefix
+                && let Some(rest) = raw.strip_prefix(b_prefix.as_str())
+                && !rest.is_empty()
+                && root_path.join(rest).exists()
+            {
+                *raw = rest.to_owned();
+            } else if let Some(rest) = raw
+                .strip_prefix("@/")
+                .or_else(|| raw.strip_prefix("~/"))
+                .or_else(|| raw.strip_prefix('#'))
+                && !rest.is_empty()
+            {
+                let candidate = format!("src/{rest}");
+                if root_path.join(&candidate).exists() {
+                    *raw = candidate;
+                }
+            } else if let Some(rest) = raw.strip_prefix("a/").or_else(|| raw.strip_prefix("b/"))
+                && !rest.is_empty()
+                && root_path.join(rest).exists()
+            {
+                *raw = rest.to_owned();
+            }
+        }
+    };
+    let Some(ranges) = arguments.get_mut("ranges").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let initial_len = ranges.len();
+    let mut expanded_ranges = Vec::with_capacity(initial_len);
+    for (idx, mut range) in ranges.drain(..).enumerate() {
+        let mut md_anchor: Option<String> = None;
+        if let Some(path_val) = range.get_mut("path")
+            && let Some(text) = path_val.as_str()
+        {
+            let mut owned = text.to_owned();
+            if let Some((base, frag)) = owned.rsplit_once('#') {
+                let frag = frag.trim_end_matches(')').trim_end_matches('>');
+                if !base.is_empty()
+                    && !frag.is_empty()
+                    && !frag.contains('/')
+                    && !frag
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'L' | b'C'))
+                {
+                    md_anchor = Some(frag.to_owned());
+                    owned = base.to_owned();
+                }
+            }
+            strip_one(&mut owned);
+            if owned != text {
+                *path_val = Value::String(owned);
+            }
+        }
+        if let Some(anchor) = md_anchor
+            && let Some(path_str) = range.get("path").and_then(Value::as_str).map(str::to_owned)
+            && crate::document::is_document_path(&path_str)
+            && range.get("start").and_then(Value::as_u64).unwrap_or(1) == 1
+            && loader.ensure_loaded_or_reason(&path_str).ok() == Some(None)
+        {
+            let norm_key = crate::workspace::normalize(Path::new(&path_str))
+                .to_string_lossy()
+                .into_owned();
+            if let Some(doc) = loader.docs.get(&norm_key) {
+                if anchor.eq_ignore_ascii_case("toc") || anchor.eq_ignore_ascii_case("outline") {
+                    let remaining_after = initial_len.saturating_sub(idx + 1);
+                    let budget = 64usize
+                        .saturating_sub(expanded_ranges.len() + remaining_after)
+                        .max(1);
+                    let toc_ranges = crate::document::resolve_toc_ranges(&doc.text, budget);
+                    if !toc_ranges.is_empty() {
+                        for (s, e) in toc_ranges {
+                            expanded_ranges.push(json!({
+                                "path": path_str,
+                                "start": s,
+                                "end": e,
+                            }));
+                        }
+                        continue;
+                    }
+                } else if let Some((sec_start, sec_end)) =
+                    crate::document::resolve_markdown_anchor_range(&doc.text, &anchor)
+                    && let Some(obj) = range.as_object_mut()
+                {
+                    obj.insert("start".into(), json!(sec_start));
+                    obj.insert("end".into(), json!(sec_end));
+                }
+            }
+        }
+        expanded_ranges.push(range);
+    }
+    *ranges = expanded_ranges;
+}
+
+/// Serves `code_read` directly from verified live disk for a registered cold root while
+/// background index loading proceeds asynchronously, preserving identical scope, glob,
+/// exclusion, `.gitignore`, symlink, size, UTF-8/document, and paging contracts.
+pub(crate) fn call_cold_direct_read(
+    spec: &Spec,
+    cache: &mut ColdReadPolicyCache,
+    arguments: &mut Value,
+    compact: bool,
+    envelope_root: Option<&Path>,
+) -> Result<Box<serde_json::value::RawValue>> {
+    let needs_compile = cache
+        .get(&spec.root)
+        .is_none_or(|(saved_spec, _, _)| saved_spec != spec);
+    if needs_compile {
+        let workspace = spec.workspace()?;
+        let policy = crate::workspace::CandidatePolicy::compile(workspace.candidate_policy_key())?;
+        if cache.len() >= 16 && !cache.contains_key(&spec.root)
+            && let Some(first_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&first_key);
+        }
+        cache.insert(spec.root.clone(), (spec.clone(), workspace, policy));
+    }
+    let (_, workspace, policy) = cache.get(&spec.root).expect("compiled cold read policy");
+    let mut loader = ColdReadLoader::new(spec, workspace, policy);
+    normalize_cold_read_arguments(&mut loader, arguments);
+    let request: ReadRequest = serde::Deserialize::deserialize(&*arguments)?;
+    if request.page {
+        crate::context::validate_ranges(
+            &request
+                .ranges
+                .iter()
+                .map(|r| crate::context::ReadRange {
+                    path: r.path.clone(),
+                    start: r.start,
+                    end: r.start,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let mut valid_ranges = Vec::with_capacity(request.ranges.len());
+        let mut unavailable_snippets = Vec::new();
+        let mut first_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        for range in &request.ranges {
+            if range.end < range.start {
+                return Err(invalid("read range end precedes start").into());
+            }
+            let probe = [crate::context::ReadRange {
+                path: range.path.clone(),
+                start: range.start,
+                end: range.start,
+            }];
+            match loader.read_verified_ranges(&probe, false) {
+                Ok(_) => valid_ranges.push(range.clone()),
+                Err(err) if compact => {
+                    let norm = crate::workspace::normalize(Path::new(&range.path));
+                    let key = norm.to_string_lossy().into_owned();
+                    let empty_sha = loader
+                        .docs
+                        .get(&key)
+                        .filter(|d| d.starts.is_empty())
+                        .map(|d| d.sha256_hex.to_string());
+                    if let Some(sha) = empty_sha
+                        && range.start == 1
+                    {
+                        unavailable_snippets.push(Snippet {
+                            path: key,
+                            start: 1,
+                            end: 1,
+                            sha256: sha,
+                            lines: vec![String::new()],
+                        });
+                    } else if request.ranges.len() > 1 {
+                        let line_no = range.start.max(1);
+                        unavailable_snippets.push(Snippet {
+                            path: range.path.clone(),
+                            start: line_no,
+                            end: line_no,
+                            sha256: "READ_UNAVAILABLE".into(),
+                            lines: vec![format!(
+                                "[CCTX_READ_UNAVAILABLE: {}]",
+                                err.to_string().replace('\n', " ")
+                            )],
+                        });
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if valid_ranges.is_empty()
+            && !unavailable_snippets
+                .iter()
+                .any(|s| s.sha256 != "READ_UNAVAILABLE")
+        {
+            return Err(first_err.expect("at least one error recorded"));
+        }
+        let docs: Vec<crate::resident::Document> = loader.docs.values().cloned().collect();
+        let temp_resident = Resident::from_admitted_documents(spec.policy.clone(), docs);
+        let mut pending: std::collections::VecDeque<_> = plan_read_ranges_for_resident(
+            &temp_resident,
+            &ReadRequest {
+                ranges: valid_ranges,
+                split_ranges: request.split_ranges,
+                page: request.page,
+            },
+        )?
+        .into();
+        let mut snippets = Vec::new();
+        let mut splits = 0;
+        while let Some(range) = pending.pop_front() {
+            let mut read = match temp_resident.read_many(std::slice::from_ref(&range)) {
+                Ok(read) => read,
+                Err(error)
+                    if crate::context::is_response_budget(error.as_ref())
+                        && range.end > range.start =>
+                {
+                    splits += 1;
+                    if splits > 64 {
+                        return Err(invalid(
+                            "READ_PAGE_LIMIT: too many page splits; request fewer lines",
+                        )
+                        .into());
+                    }
+                    let middle = range.start + (range.end - range.start) / 2;
+                    pending.push_front(crate::context::ReadRange {
+                        path: range.path.clone(),
+                        start: middle + 1,
+                        end: range.end,
+                    });
+                    pending.push_front(crate::context::ReadRange {
+                        path: range.path,
+                        start: range.start,
+                        end: middle,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            snippets.append(&mut read);
+            if let Err(error) = crate::context::check_snippets_size(&snippets) {
+                if !crate::context::is_response_budget(error.as_ref()) {
+                    return Err(error);
+                }
+                snippets.pop();
+                pending.push_front(range);
+                break;
+            }
+        }
+        for diag in unavailable_snippets {
+            snippets.push(diag);
+            if crate::context::check_snippets_size(&snippets).is_err() {
+                snippets.pop();
+                break;
+            }
+        }
+        let mut snippets_value = serde_json::to_value(&snippets)?;
+        if compact {
+            loader.annotate_cold_snippets(&mut snippets_value, None);
+        }
+        let value = json!({
+            "root": spec.root,
+            "snippets": snippets_value,
+            "complete": pending.is_empty(),
+            "next_ranges": pending,
+            "page": true,
+            "notice": "Explicit read page, not an implicit complete batch. Continue with page=true and next_ranges. Compare whole-file hashes across pages; if they differ restart the read. No atomic multi-page filesystem view."
+        });
+        if serde_json::to_vec(&value)?.len() > crate::workspace::MAX_RESPONSE {
+            return Err(invalid(
+                "READ_PAGE_LIMIT: page metadata exceeds256KiB; request fewer ranges",
+            )
+            .into());
+        }
+        return serialize_wire_json(&value, envelope_root, 1024);
+    }
+
+    match loader.read_verified_ranges(&request.ranges, request.split_ranges) {
+        Ok(snippets) => {
+            if !compact {
+                return serialize_wire_json(&snippets, envelope_root, 256 + snippets.len() * 512);
+            }
+            let mut val = serde_json::to_value(snippets)?;
+            loader.annotate_cold_snippets(&mut val, None);
+            serialize_wire_json(&val, envelope_root, 256)
+        }
+        Err(single_error)
+            if compact
+                && request.ranges.len() == 1
+                && single_error
+                    .to_string()
+                    .contains("READ_RANGE_OUT_OF_BOUNDS") =>
+        {
+            let range = &request.ranges[0];
+            let norm = crate::workspace::normalize(Path::new(&range.path));
+            let key = norm.to_string_lossy().into_owned();
+            if let Some(doc) = loader.docs.get(&key) {
+                let lines = doc.starts.len();
+                let sha = doc.sha256_hex.to_string();
+                if lines == 0 && range.start == 1 {
+                    let val = json!([{
+                        "path": key,
+                        "start": 1,
+                        "end": 1,
+                        "sha256": sha,
+                        "lines": [""],
+                        "notice": "EMPTY_FILE: total_lines=0 (0 bytes)"
+                    }]);
+                    return serialize_wire_json(&val, envelope_root, 256);
+                }
+                if lines > 0 && range.start > lines {
+                    let tail_start = lines.saturating_sub(79).max(1);
+                    let clamped_range = [crate::context::ReadRange {
+                        path: range.path.clone(),
+                        start: tail_start,
+                        end: lines,
+                    }];
+                    if let Ok(snippets) = loader.read_verified_ranges(&clamped_range, false) {
+                        let mut val = serde_json::to_value(snippets)?;
+                        loader.annotate_cold_snippets(
+                            &mut val,
+                            Some((range.start, range.end, lines)),
+                        );
+                        return serialize_wire_json(&val, envelope_root, 256);
+                    }
+                }
+            }
+            Err(single_error)
+        }
+        Err(batch_error)
+            if compact
+                && request.ranges.len() > 1
+                && !crate::context::is_response_budget(batch_error.as_ref()) =>
+        {
+            let mut partial = Vec::with_capacity(request.ranges.len());
+            let mut any_valid = false;
+            for range in &request.ranges {
+                let single = [range.clone()];
+                match loader.read_verified_ranges(&single, request.split_ranges) {
+                    Ok(mut snippets) => {
+                        any_valid = true;
+                        partial.append(&mut snippets);
+                    }
+                    Err(err) => {
+                        let norm = crate::workspace::normalize(Path::new(&range.path));
+                        let key = norm.to_string_lossy().into_owned();
+                        let empty_sha = loader
+                            .docs
+                            .get(&key)
+                            .filter(|d| d.starts.is_empty())
+                            .map(|d| d.sha256_hex.to_string());
+                        if let Some(sha) = empty_sha
+                            && range.start == 1
+                        {
+                            any_valid = true;
+                            partial.push(Snippet {
+                                path: key,
+                                start: 1,
+                                end: 1,
+                                sha256: sha,
+                                lines: vec![String::new()],
+                            });
+                        } else {
+                            let line_no = range.start.max(1);
+                            partial.push(Snippet {
+                                path: range.path.clone(),
+                                start: line_no,
+                                end: line_no,
+                                sha256: "READ_UNAVAILABLE".into(),
+                                lines: vec![format!(
+                                    "[CCTX_READ_UNAVAILABLE: {}]",
+                                    err.to_string().replace('\n', " ")
+                                )],
+                            });
+                        }
+                    }
+                }
+            }
+            if any_valid && crate::context::check_snippets_size(&partial).is_ok() {
+                let mut val = serde_json::to_value(partial)?;
+                loader.annotate_cold_snippets(&mut val, None);
+                serialize_wire_json(&val, envelope_root, 512)
+            } else {
+                Err(batch_error)
+            }
+        }
+        Err(err) => Err(err),
     }
 }

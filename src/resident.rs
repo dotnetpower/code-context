@@ -285,6 +285,7 @@ mod admission_tests {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Document {
     pub path: Arc<str>,
     pub text: String,
@@ -342,7 +343,7 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub files: usize,
     pub source_bytes: usize,
@@ -376,6 +377,25 @@ pub struct Resident {
 }
 
 impl Resident {
+    pub(crate) fn from_admitted_documents(policy: MemoryPolicy, documents: Vec<Document>) -> Self {
+        let mut paths = BTreeMap::new();
+        for (idx, doc) in documents.iter().enumerate() {
+            paths.insert(doc.path.clone(), idx);
+        }
+        Self {
+            documents,
+            paths,
+            postings: None,
+            free_ids: Vec::new(),
+            max_owned_bytes: policy.max_source_bytes,
+            policy,
+            ids_are_path_sorted: true,
+            doc_owned_bytes: 0,
+            posting_heap_bytes: 0,
+            stats: Stats::default(),
+        }
+    }
+
     pub fn load(workspace: &Workspace, indexed: bool, generation: u64) -> Result<Self> {
         Self::load_with_policy(
             workspace,

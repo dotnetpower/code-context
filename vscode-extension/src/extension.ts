@@ -27,8 +27,13 @@ export function activate(context: vscode.ExtensionContext): void {
     return;
   }
   client = new DaemonClient(readSettings);
+  const activeClient = client;
   const pending = new Map<string, Promise<void>>();
   const usage = new UsageSummary();
+  const hasBackendUsageQuery = typeof (activeClient as { queryUsage?: unknown }).queryUsage === 'function';
+  if (hasBackendUsageQuery) {
+    usage.setBackendQuery((hours, force) => activeClient.queryUsage(hours, force));
+  }
   let renderUsage = (): void => {};
   const preparationFailures = new Map<string, { at: number; message: string }>();
   const bridge = new NativeToolBridge(client, output, (path) => {
@@ -90,31 +95,57 @@ export function activate(context: vscode.ExtensionContext): void {
   status.tooltip = 'Show Code Context native tool status';
   status.show();
   let renderTimer: NodeJS.Timeout | undefined;
-  const applyTooltip = (): void => {
-    if (!usage.last) { return; }
-    status.text = usage.text();
+  let periodicUsageTimer: NodeJS.Timeout | undefined;
+  const applyStatusBarUsage = (target: vscode.StatusBarItem): void => {
+    if (!usage.hasRenderableData) { return; }
+    target.text = usage.text();
     if (typeof vscode.MarkdownString === 'function') {
       const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
       md.isTrusted = true;
-      status.tooltip = md;
+      target.tooltip = md;
     } else {
-      status.tooltip = usage.tooltip();
+      target.tooltip = usage.tooltip();
+    }
+  };
+  const applyTooltip = (): void => {
+    applyStatusBarUsage(status);
+  };
+  const scheduleUsageRefresh = (force = false): void => {
+    if (typeof setTimeout !== 'function') {
+      void usage.refreshSessionTelemetryAsync(undefined, Date.now(), force).finally(() => {
+        applyTooltip();
+      });
+      return;
+    }
+    if (!renderTimer) {
+      renderTimer = setTimeout(() => {
+        renderTimer = undefined;
+        void usage.refreshSessionTelemetryAsync(undefined, Date.now(), force).finally(() => {
+          applyTooltip();
+        });
+      }, 250);
+      renderTimer.unref?.();
     }
   };
   renderUsage = (): void => {
-    if (usage.last) {
+    if (usage.hasRenderableData) {
       status.text = usage.text();
-      if (!renderTimer) {
-        renderTimer = setTimeout(() => {
-          renderTimer = undefined;
-          void usage.refreshSessionTelemetryAsync().finally(() => {
-            applyTooltip();
-          });
-        }, 250);
-        renderTimer.unref?.();
-      }
+    }
+    if (usage.last || hasBackendUsageQuery) {
+      scheduleUsageRefresh(false);
     }
   };
+  if (hasBackendUsageQuery && typeof setInterval === 'function') {
+    periodicUsageTimer = setInterval(() => {
+      if (!vscode.workspace.isTrusted) { return; }
+      const winState = (vscode.window as { state?: { focused?: boolean } }).state;
+      if (winState && winState.focused === false) { return; }
+      void usage.refreshSessionTelemetryAsync().finally(() => {
+        applyTooltip();
+      });
+    }, 60_000);
+    periodicUsageTimer.unref?.();
+  }
 
   let probing: Promise<void> | undefined;
   const probe = (): Promise<void> => {
@@ -126,7 +157,18 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   context.subscriptions.push(
-    { dispose: () => { if (renderTimer) { clearTimeout(renderTimer); renderTimer = undefined; } } },
+    {
+      dispose: () => {
+        if (renderTimer && typeof clearTimeout === 'function') {
+          clearTimeout(renderTimer);
+          renderTimer = undefined;
+        }
+        if (periodicUsageTimer && typeof clearInterval === 'function') {
+          clearInterval(periodicUsageTimer);
+          periodicUsageTimer = undefined;
+        }
+      },
+    },
     output,
     status,
     bridge,
@@ -186,6 +228,15 @@ export function activate(context: vscode.ExtensionContext): void {
         void probe();
       }
     }),
+    ...(typeof (vscode.window as { onDidChangeWindowState?: unknown }).onDidChangeWindowState === 'function'
+      ? [
+          vscode.window.onDidChangeWindowState((state) => {
+            if (state.focused && vscode.workspace.isTrusted && (usage.last || hasBackendUsageQuery)) {
+              scheduleUsageRefresh(false);
+            }
+          }),
+        ]
+      : []),
   );
 
   output.appendLine(
@@ -238,7 +289,17 @@ async function showStatus(
         { root },
         source.token,
       );
-      await usage.refreshSessionTelemetryAsync();
+      await usage.refreshSessionTelemetryAsync(undefined, Date.now(), true);
+      if (usage.hasRenderableData) {
+        statusBar.text = usage.text();
+        if (typeof vscode.MarkdownString === 'function') {
+          const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
+          md.isTrusted = true;
+          statusBar.tooltip = md;
+        } else {
+          statusBar.tooltip = usage.tooltip();
+        }
+      }
       output.info(usage.formatDashboard(value));
       output.info(formatLogDetails('Code Context status', value));
       output.show(true);

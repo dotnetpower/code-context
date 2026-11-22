@@ -114,9 +114,33 @@ def parse_events(stdout: bytes) -> dict:
         elif kind == "assistant.message" and data.get("content"):
             answer = data["content"]
         elif kind == "session.usage_checkpoint":
-            usage.append(data)
+            usage.append({"_kind": "checkpoint", **data})
+        elif kind == "session.usage_record":
+            usage.append({"_kind": "record", **data})
         elif kind == "result":
             answer = data.get("content") or data.get("result") or answer
+    in_tok = 0
+    cache_read_tok = 0
+    cache_write_tok = 0
+    out_tok = 0
+    rsn_tok = 0
+    nano_aiu = 0
+    records_only = [x for x in usage if x.get("_kind") == "record"]
+    checkpoints_only = [x for x in usage if x.get("_kind") == "checkpoint"]
+    effective_usage = records_only if records_only else checkpoints_only[-1:]
+    for item in effective_usage:
+        u = item.get("usage", item) if isinstance(item, dict) else {}
+        if not isinstance(u, dict):
+            continue
+        in_tok += int(u.get("inputTokens") or u.get("input_tokens") or 0)
+        cache_read_tok += int(u.get("cacheReadTokens") or u.get("cached_input_tokens") or u.get("cache_read_input_tokens") or 0)
+        cache_write_tok += int(u.get("cacheWriteTokens") or u.get("cache_write_input_tokens") or u.get("cache_creation_input_tokens") or 0)
+        out_tok += int(u.get("outputTokens") or u.get("output_tokens") or 0)
+        rsn_tok += int(u.get("reasoningTokens") or u.get("reasoning_output_tokens") or 0)
+        cu = u.get("copilotUsage") if isinstance(u.get("copilotUsage"), dict) else {}
+        nano_aiu += int(cu.get("totalNanoAiu") or 0)
+    uncached_tok = max(0, in_tok - cache_read_tok - cache_write_tok)
+    billed_out_tok = max(out_tok, rsn_tok)
     return {
         "model": model,
         "tools": tools,
@@ -126,10 +150,38 @@ def parse_events(stdout: bytes) -> dict:
         "model_dispatch_ms": model_dispatch_ms,
         "tool_result_bytes": tool_result_bytes,
         "tool_result_tokens": tool_result_tokens,
+        "fresh_and_cache_write_tokens": uncached_tok + cache_write_tok,
+        "uncached_input_tokens": uncached_tok,
+        "cache_write_tokens": cache_write_tok,
+        "cache_read_tokens": cache_read_tok,
+        "output_and_reasoning_tokens": billed_out_tok,
+        "output_tokens": out_tok,
+        "reasoning_tokens": rsn_tok,
+        "total_nano_aiu": nano_aiu,
         "answer": answer,
         "usage_checkpoints": usage,
         "event_types": sorted({event.get("type") for event in events if event.get("type")}),
     }
+
+
+def summarize_five_metrics(trials: list[dict]) -> dict[str, dict]:
+    by_arm: dict[str, list[dict]] = {}
+    for trial in trials:
+        by_arm.setdefault(str(trial.get("arm", "unknown")), []).append(trial)
+    summary: dict[str, dict] = {}
+    for arm, items in by_arm.items():
+        n = max(1, len(items))
+        passed = sum(1 for t in items if t.get("score", {}).get("all_correct"))
+        summary[arm] = {
+            "runs": len(items),
+            "fresh_and_cache_write_tokens_mean": round(sum(t.get("fresh_and_cache_write_tokens", 0) for t in items) / n, 1),
+            "cache_read_tokens_mean": round(sum(t.get("cache_read_tokens", 0) for t in items) / n, 1),
+            "output_and_reasoning_tokens_mean": round(sum(t.get("output_and_reasoning_tokens", 0) for t in items) / n, 1),
+            "wall_seconds_mean": round(sum(t.get("wall_seconds", 0.0) for t in items) / n, 3),
+            "pass_rate_percent": round(100.0 * passed / n, 1),
+            "total_nano_aiu_mean": round(sum(t.get("total_nano_aiu", 0) for t in items) / n, 1),
+        }
+    return summary
 
 
 def score(answer: str) -> dict:
@@ -313,6 +365,7 @@ def main() -> None:
                     "daemon_warmed": True,
                     "not_measured": ["cold index construction", "editing", "real private repository"],
                 },
+                "five_metric_summary": summarize_five_metrics(trials),
                 "trials": trials,
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)

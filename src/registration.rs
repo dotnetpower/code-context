@@ -654,15 +654,72 @@ fn inherited(parent: &Spec, root: &Path) -> Spec {
     }
 }
 
+pub(crate) fn verify_authorized_worktree_spec(target: &Path, specs: &[Spec]) -> Option<Spec> {
+    let has_git_file = target
+        .ancestors()
+        .take_while(|a| !a.as_os_str().is_empty() && *a != Path::new("/"))
+        .any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok_and(|m| m.is_file()));
+    if !has_git_file {
+        return None;
+    }
+    for parent in specs
+        .iter()
+        .filter(|s| s.allow_worktrees && s.managed_parent.is_none())
+    {
+        if let Ok(root) = verify(parent, target)
+            && root == target
+        {
+            return Some(inherited(parent, &root));
+        }
+    }
+    None
+}
+
+pub fn sync_managed_worktrees() -> Result<usize> {
+    let mut updated = 0usize;
+    catalog::mutate(|specs| {
+        let snapshot = specs.clone();
+        for entry in specs.iter_mut() {
+            if entry.managed_parent.is_some()
+                && let Ok(fresh) = registered_policy(entry, &snapshot)
+                && *entry != fresh
+            {
+                *entry = fresh;
+                updated += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(updated)
+}
+
 pub fn prune(apply: bool) -> Result<Value> {
     let mut removed = Vec::new();
+    let mut synced = Vec::new();
     catalog::mutate(|specs| {
         removed = catalog::missing_managed_roots(specs)?;
+        let snapshot = specs.clone();
+        for entry in specs.iter_mut() {
+            if entry.managed_parent.is_some()
+                && !removed.contains(&entry.root)
+                && let Ok(fresh) = registered_policy(entry, &snapshot)
+                && *entry != fresh
+            {
+                synced.push(entry.root.clone());
+                if apply {
+                    *entry = fresh;
+                }
+            }
+        }
         if apply {
             specs.retain(|s| !removed.contains(&s.root));
         }
         Ok(())
     })?;
-    Ok(json!({"applied":apply,"missing_managed_roots":removed,
-        "policy":"only nonexistent managed roots; existing, active and manual roots are retained"}))
+    Ok(json!({
+        "applied": apply,
+        "missing_managed_roots": removed,
+        "synced_managed_roots": synced,
+        "policy": "only nonexistent managed roots are removed; existing managed roots sync parent policy; manual roots are retained"
+    }))
 }

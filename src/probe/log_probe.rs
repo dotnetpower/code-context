@@ -616,6 +616,46 @@ struct CapturedShellOutput {
     duration_ms: u64,
 }
 
+fn spawn_bounded_pipe_reader<R: Read + Send + 'static>(
+    mut stream: R,
+    cap: usize,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(cap.min(8192))));
+    let writer = std::sync::Arc::clone(&shared);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        let mut captured = 0usize;
+        let limit = cap + 1;
+        while captured < limit {
+            let want = (limit - captured).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    let _ = done_tx.send(());
+                    return;
+                }
+                Ok(n) => {
+                    if let Ok(mut guard) = writer.lock() {
+                        guard.extend_from_slice(&chunk[..n]);
+                    }
+                    captured += n;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+        }
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        let _ = done_tx.send(());
+    });
+    (shared, done_rx)
+}
+
 fn execute_bounded_shell(cmd_str: &str, cwd: Option<&Path>, timeout: Duration) -> Result<CapturedShellOutput> {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
@@ -666,20 +706,8 @@ fn execute_bounded_shell(cmd_str: &str, cwd: Option<&Path>, timeout: Duration) -
         .take()
         .ok_or_else(|| invalid("missing child stderr"))?;
 
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(8192);
-        let _ = stdout
-            .take((MAX_CMD_CAPTURE_BYTES as u64) + 1)
-            .read_to_end(&mut buf);
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(4096);
-        let _ = stderr
-            .take(((MAX_CMD_CAPTURE_BYTES / 2) as u64) + 1)
-            .read_to_end(&mut buf);
-        buf
-    });
+    let (out_shared, out_done) = spawn_bounded_pipe_reader(stdout, MAX_CMD_CAPTURE_BYTES);
+    let (err_shared, err_done) = spawn_bounded_pipe_reader(stderr, MAX_CMD_CAPTURE_BYTES / 2);
 
     let mut sleep_ms = 2u64;
     let (status, timed_out) = loop {
@@ -711,8 +739,17 @@ fn execute_bounded_shell(cmd_str: &str, cwd: Option<&Path>, timeout: Duration) -
         sleep_ms = (sleep_ms * 2).min(25);
     };
 
-    let mut out_bytes = out_handle.join().unwrap_or_default();
-    let mut err_bytes = err_handle.join().unwrap_or_default();
+    let drain_grace = Duration::from_millis(if timed_out { 150 } else { 500 });
+    let _ = out_done.recv_timeout(drain_grace);
+    let _ = err_done.recv_timeout(drain_grace);
+    let mut out_bytes = out_shared
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    let mut err_bytes = err_shared
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
     let mut truncated_capture = false;
     if out_bytes.len() > MAX_CMD_CAPTURE_BYTES {
         out_bytes.truncate(MAX_CMD_CAPTURE_BYTES);
@@ -740,10 +777,15 @@ fn execute_bounded_shell(cmd_str: &str, cwd: Option<&Path>, timeout: Duration) -
 }
 
 pub fn run_batch(args: &BatchProbeArgs) -> Result<String> {
-    if args.commands.is_empty() {
-        return Err(invalid("at least one --cmd is required for `pctx batch`").into());
+    let mut merged_commands = args.commands.clone();
+    merged_commands.extend(args.positional_commands.iter().cloned());
+    if merged_commands.is_empty() {
+        return Err(invalid(
+            "at least one command is required for `pctx batch` (pass `<COMMAND>` or `--cmd <COMMAND>`)",
+        )
+        .into());
     }
-    if args.commands.len() > MAX_BATCH_COMMANDS {
+    if merged_commands.len() > MAX_BATCH_COMMANDS {
         return Err(invalid(format!(
             "`pctx batch` accepts at most {MAX_BATCH_COMMANDS} commands per call"
         ))
@@ -759,7 +801,7 @@ pub fn run_batch(args: &BatchProbeArgs) -> Result<String> {
     let mut total_raw_bytes = 0usize;
     let mut total_lines = 0usize;
 
-    for (idx, raw_cmd) in args.commands.iter().enumerate() {
+    for (idx, raw_cmd) in merged_commands.iter().enumerate() {
         let captured = execute_bounded_shell(raw_cmd, cwd, timeout)?;
         let raw_len = captured.combined_text.len();
         total_raw_bytes = total_raw_bytes.saturating_add(raw_len);

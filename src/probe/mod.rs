@@ -194,8 +194,11 @@ pub struct LogProbeArgs {
 #[derive(Clone, Debug, Args)]
 pub struct BatchProbeArgs {
     /// One or more shell commands to run, spool, and search (`1..=16`, repeatable)
-    #[arg(long = "cmd", short = 'c', required = true)]
+    #[arg(long = "cmd", short = 'c')]
     pub commands: Vec<String>,
+    /// Positional shell commands (merged with `--cmd`, e.g. `pctx batch "cargo check"`)
+    #[arg(value_name = "COMMAND")]
+    pub positional_commands: Vec<String>,
     /// One or more search queries ranked with Okapi BM25 + Trigram RRF across captured output (repeatable)
     #[arg(long = "query", short = 'q')]
     pub queries: Vec<String>,

@@ -32,15 +32,15 @@ fn build_tools() -> Value {
         }
         let prefix = match tool["name"].as_str() {
             Some("code_files") => {
-                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeFiles is unavailable): filename/path glob (!content)."
+                "Find workspace files by filename, path, or glob pattern (!content). Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeFiles is unavailable)."
             }
             Some("code_grep") => {
-                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeGrep is unavailable): saved-source search. Set regex=true for a|b."
+                "Search workspace code lines for exact text or regex matches. Set regex=true for a|b. Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeGrep is unavailable)."
             }
             Some("code_context") => {
-                "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeContext is unavailable): symbol + nearby source in 1 call (!1..150 slicing). Set regex=true for a|b."
+                "Find symbol definition, references, callers, and surrounding function body in 1 call (!1..150 slicing). Set regex=true for a|b. Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeContext is unavailable)."
             }
-            _ => "Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeRead is unavailable): batched ranges (<=150L, <8KiB).",
+            _ => "Read file lines, batched 1-based line ranges, or markdown heading sections (<=150L, <8KiB). Primary in AgentHost / Copilot SDK / background / subagent / CLI sessions (and fallback when cctxNativeRead is unavailable).",
         };
         tool["description"] = json!(format!(
             "{prefix} Prefer this FIRST in AgentHost / Copilot SDK / background sessions so Reload Window or multi-window never stalls ('Running on another client... Skip?') or fails client dispatch; in foreground Editor Chat without backend MCP, use cctxNative* first. CACHE_MISS -> 1 host read; backend MCP tools avoid native extension-host dispatch when no UI client is connected. Do not duplicate a pending native call."
@@ -67,8 +67,16 @@ fn build_tools() -> Value {
 }
 
 pub fn dispatch(request: Value) -> Option<Value> {
+    let mut default_root = None;
+    let mut client = None;
     let mut pending_traces = std::collections::VecDeque::new();
-    dispatch_with_root(request, None, None, &mut pending_traces)
+    dispatch_with_root(
+        request,
+        &mut default_root,
+        &mut client,
+        false,
+        &mut pending_traces,
+    )
 }
 
 fn compact_mcp_snippet_payload(_name: &str, text: String) -> String {
@@ -137,6 +145,25 @@ fn compact_mcp_snippet_payload(_name: &str, text: String) -> String {
     }
 }
 
+fn mcp_caller_id() -> u64 {
+    static CALLER_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CALLER_ID.get_or_init(|| {
+        if let Some(inherited) = std::env::var("CCTX_MCP_CALLER_ID")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&id| id != 0)
+        {
+            return inherited;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1_u64, |d| d.as_nanos() as u64);
+        let pid = u64::from(std::process::id());
+        let mixed = nanos.rotate_left(17) ^ (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        (mixed & ((1_u64 << 53) - 1)).max(1)
+    })
+}
+
 fn flush_pending_traces(
     client: &mut daemon::Client,
     pending_traces: &mut std::collections::VecDeque<Value>,
@@ -150,6 +177,16 @@ fn flush_pending_traces(
         }) {
             eprintln!("CCTX_TRACE_REPORT_FAILED: {error}");
         }
+    }
+}
+
+fn flush_pending_traces_opt(
+    client: Option<&mut daemon::Client>,
+    pending_traces: &mut std::collections::VecDeque<Value>,
+) {
+    match client {
+        Some(client) => flush_pending_traces(client, pending_traces),
+        None => pending_traces.clear(),
     }
 }
 
@@ -202,7 +239,166 @@ fn clean_target_candidate(raw: &str) -> &str {
     s
 }
 
-fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Option<PathBuf> {
+fn percent_decode_utf8(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_owned();
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_mcp_root_candidate(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut path_part = if let Some(rest) = trimmed.strip_prefix("file://localhost") {
+        percent_decode_utf8(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("file:///") {
+        format!("/{}", percent_decode_utf8(rest))
+    } else if let Some(_rest) = trimmed.strip_prefix("file://") {
+        #[cfg(windows)]
+        {
+            format!("\\\\{}", percent_decode_utf8(_rest).replace('/', "\\"))
+        }
+        #[cfg(not(windows))]
+        {
+            return None;
+        }
+    } else if let Some(scheme_end) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_end];
+        if matches!(
+            scheme,
+            "vscode-remote"
+                | "vscode-agent-host"
+                | "vscode-file"
+                | "vscode-insiders"
+                | "cursor"
+                | "windsurf"
+                | "vscodium"
+        ) {
+            let after_scheme = &trimmed[scheme_end + 3..];
+            let slash = after_scheme.find('/')?;
+            let with_query = &after_scheme[slash..];
+            let without_query = with_query.split(['?', '#']).next().unwrap_or(with_query);
+            percent_decode_utf8(without_query)
+        } else {
+            return None;
+        }
+    } else {
+        trimmed.to_owned()
+    };
+    #[cfg(unix)]
+    {
+        let bytes = path_part.as_bytes();
+        if bytes.len() >= 4
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && (bytes[3] == b'/' || bytes[3] == b'\\')
+        {
+            let drive = (bytes[1] as char).to_ascii_lowercase();
+            let mnt_drive = format!("/mnt/{drive}");
+            if std::path::Path::new(&mnt_drive).is_dir() {
+                let tail = path_part[3..].replace('\\', "/");
+                path_part = format!("{mnt_drive}{tail}");
+            }
+        } else if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\')
+        {
+            let drive = (bytes[0] as char).to_ascii_lowercase();
+            let mnt_drive = format!("/mnt/{drive}");
+            if std::path::Path::new(&mnt_drive).is_dir() {
+                let tail = path_part[2..].replace('\\', "/");
+                path_part = format!("{mnt_drive}{tail}");
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let bytes = path_part.as_bytes();
+        if bytes.len() >= 4
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && (bytes[3] == b'/' || bytes[3] == b'\\')
+        {
+            path_part.remove(0);
+        }
+    }
+    let candidate = PathBuf::from(&path_part);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    Some(
+        crate::catalog::canonicalize(&candidate)
+            .unwrap_or_else(|_| clean_lexical_absolute_path(&candidate)),
+    )
+}
+
+fn find_git_root_upwards(path: &std::path::Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut cur = Some(path);
+    for _ in 0..8 {
+        let Some(dir) = cur else {
+            break;
+        };
+        if dir.parent().is_none() || home.as_deref() == Some(dir) {
+            break;
+        }
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn normalize_workspace_root_candidate(
+    path: &std::path::Path,
+    specs: &[crate::catalog::Spec],
+) -> Option<PathBuf> {
+    let matched_spec = specs
+        .iter()
+        .filter(|spec| path.starts_with(&spec.root))
+        .max_by_key(|spec| spec.root.components().count());
+    let git_root = find_git_root_upwards(path);
+    if let Some(spec) = matched_spec {
+        if let Some(ref git) = git_root
+            && git.starts_with(&spec.root)
+            && git != &spec.root
+            && spec.allow_worktrees
+        {
+            return Some(git.clone());
+        }
+        return Some(spec.root.clone());
+    }
+    git_root
+}
+
+fn infer_root_from_arguments(
+    arguments: &serde_json::Map<String, Value>,
+    default_root: Option<&PathBuf>,
+) -> Option<PathBuf> {
     let mut raw_candidates: Vec<&str> = Vec::new();
     if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
         raw_candidates.extend(paths.iter().filter_map(Value::as_str));
@@ -239,15 +435,30 @@ fn infer_root_from_arguments(arguments: &serde_json::Map<String, Value>) -> Opti
         let cleaned = clean_target_candidate(raw);
         if cleaned.starts_with('/') {
             let target = std::path::Path::new(cleaned);
-            if let Some(root) = specs
+            let matched_spec_root = specs
                 .iter()
                 .filter(|spec| target.starts_with(&spec.root))
                 .max_by_key(|spec| spec.root.components().count())
-                .map(|spec| spec.root.clone())
+                .map(|spec| spec.root.clone());
+            if let Some(def) = default_root
+                && let Some(norm_def) = normalize_workspace_root_candidate(def, &specs)
+                && target.starts_with(&norm_def)
+                && norm_def.join(".git").exists()
+                && matched_spec_root
+                    .as_ref()
+                    .is_none_or(|sr| norm_def.components().count() > sr.components().count())
             {
+                return Some(norm_def);
+            }
+            if let Some(root) = matched_spec_root {
                 return Some(root);
             }
         }
+    }
+    if let Some(def) = default_root
+        && let Some(norm_def) = normalize_workspace_root_candidate(def, &specs)
+    {
+        return Some(norm_def);
     }
     if !specs.is_empty() {
         for raw in &raw_candidates {
@@ -415,10 +626,32 @@ fn clean_lexical_absolute_path(path: &std::path::Path) -> PathBuf {
     out
 }
 
+fn sanitize_object_keys(map: &mut serde_json::Map<String, Value>) {
+    let dirty_keys: Vec<String> = map
+        .keys()
+        .filter(|k| {
+            let trimmed = k.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
+            !trimmed.is_empty() && trimmed != k.as_str()
+        })
+        .cloned()
+        .collect();
+    for dirty in dirty_keys {
+        if let Some(val) = map.remove(&dirty) {
+            let clean = dirty
+                .trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .to_owned();
+            if !map.contains_key(&clean) {
+                map.insert(clean, val);
+            }
+        }
+    }
+}
+
 fn normalize_single_range_map(
     map: &mut serde_json::Map<String, Value>,
     default_span: u64,
 ) {
+    sanitize_object_keys(map);
     if !map.contains_key("path")
         && let Some(path) = take_first_alias(
             map,
@@ -541,6 +774,7 @@ pub(crate) fn normalize_mcp_argument_aliases(
     name: &str,
     arguments: &mut serde_json::Map<String, Value>,
 ) {
+    sanitize_object_keys(arguments);
     // Strip null or empty-string optional parameters commonly emitted by LLMs
     for optional_key in [
         "root",
@@ -1101,8 +1335,9 @@ pub(crate) fn normalize_mcp_argument_aliases(
 
 fn dispatch_with_root(
     request: Value,
-    default_root: Option<&PathBuf>,
-    client: Option<&mut daemon::Client>,
+    default_root: &mut Option<PathBuf>,
+    client: &mut Option<daemon::Client>,
+    allow_connect: bool,
     pending_traces: &mut std::collections::VecDeque<Value>,
 ) -> Option<Value> {
     if !request.is_object() || request["jsonrpc"] != "2.0" || !request["method"].is_string() {
@@ -1118,19 +1353,94 @@ fn dispatch_with_root(
     }
     let method = request["method"].as_str()?;
     let result = match method {
-        "initialize" => Ok(
-            json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},
-            "serverInfo":{"name":"code-context","version":env!("CARGO_PKG_VERSION")},
-            "instructions": crate::prompt_formula::render(
-                crate::prompt_formula::PromptStyle::from_env().unwrap_or_default(),
-                crate::prompt_formula::PromptTarget::Mcp,
-                default_root.map(PathBuf::as_path),
-            )}),
-        ),
+        "initialize" => {
+            let params = &request["params"];
+            let requested_version = params["protocolVersion"].as_str().unwrap_or("");
+            let supported_versions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+            let protocol_version = if supported_versions.contains(&requested_version) {
+                requested_version
+            } else {
+                "2025-06-18"
+            };
+            let specs = crate::catalog::load().unwrap_or_default();
+            let mut init_roots: Vec<PathBuf> = Vec::with_capacity(4);
+            for key in ["workspaceFolders", "roots"] {
+                if let Some(items) = params[key].as_array() {
+                    for item in items {
+                        if let Some(raw) = item["uri"]
+                            .as_str()
+                            .or_else(|| item["path"].as_str())
+                            .or_else(|| item.as_str())
+                            && let Some(decoded) = decode_mcp_root_candidate(raw)
+                            && !init_roots.contains(&decoded)
+                        {
+                            init_roots.push(decoded);
+                        }
+                    }
+                }
+            }
+            for key in ["rootUri", "rootPath"] {
+                if let Some(raw) = params[key].as_str()
+                    && let Some(decoded) = decode_mcp_root_candidate(raw)
+                    && !init_roots.contains(&decoded)
+                {
+                    init_roots.push(decoded);
+                }
+            }
+            if let Some(explicit_root) = init_roots
+                .iter()
+                .find_map(|cand| normalize_workspace_root_candidate(cand, &specs))
+            {
+                *default_root = Some(explicit_root);
+            }
+            let mut warm_candidates: Vec<PathBuf> = Vec::with_capacity(2);
+            for cand in &init_roots {
+                if let Some(norm) = normalize_workspace_root_candidate(cand, &specs)
+                    && !warm_candidates.contains(&norm)
+                {
+                    warm_candidates.push(norm);
+                    if warm_candidates.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+            if warm_candidates.len() < 2
+                && let Some(def) = default_root.as_ref()
+                && let Some(norm_def) = normalize_workspace_root_candidate(def, &specs)
+                && !warm_candidates.contains(&norm_def)
+            {
+                warm_candidates.push(norm_def);
+            }
+            if !warm_candidates.is_empty() && allow_connect {
+                let _ = std::thread::Builder::new()
+                    .name("cctx-mcp-warm".into())
+                    .stack_size(128 * 1024)
+                    .spawn(move || {
+                        for candidate in warm_candidates {
+                            let _ = daemon::send_warm_hint_nonblocking(candidate);
+                        }
+                    });
+            }
+            let instruction_root = default_root
+                .as_deref()
+                .and_then(|def| normalize_workspace_root_candidate(def, &specs));
+            Ok(
+                json!({"protocolVersion":protocol_version,"capabilities":{"tools":{"listChanged":false}},
+                "serverInfo":{"name":"code-context","version":env!("CARGO_PKG_VERSION")},
+                "instructions": crate::prompt_formula::render(
+                    crate::prompt_formula::PromptStyle::from_env().unwrap_or_default(),
+                    crate::prompt_formula::PromptTarget::Mcp,
+                    instruction_root.as_deref(),
+                )}),
+            )
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools()),
         "tools/call" => {
             let started = Instant::now();
+            if client.is_none() && allow_connect {
+                *client = daemon::Client::connect_or_start_traced().ok();
+            }
             let mut trace = client.as_ref().filter(|c| c.supports_tracing()).map(|_| json!({
                 "trace_id":daemon::new_trace_id(),"origin":"mcp",
                 "started_unix_ms":daemon::trace_unix_ms(),"completed_unix_ms":null,
@@ -1141,8 +1451,9 @@ fn dispatch_with_root(
             }));
             let outcome = tool_call(
                 &request["params"],
-                default_root,
+                default_root.as_ref(),
                 client,
+                allow_connect,
                 &mut trace,
                 pending_traces,
             );
@@ -1163,6 +1474,19 @@ fn dispatch_with_root(
                 }
             };
             if let Some(mut trace) = trace {
+                if let Some(first_text) = result["content"]
+                    .get_mut(0)
+                    .and_then(|item| item.get_mut("text"))
+                {
+                    let needs_nl = first_text
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && !s.ends_with('\n'));
+                    if needs_nl {
+                        let mut owned = first_text.as_str().unwrap_or_default().to_owned();
+                        owned.push('\n');
+                        *first_text = Value::String(owned);
+                    }
+                }
                 trace["serialize_ms"] = json!(formatting.elapsed().as_secs_f64() * 1000.0);
                 trace["total_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
                 trace["completed_unix_ms"] = json!(daemon::trace_unix_ms());
@@ -1171,6 +1495,7 @@ fn dispatch_with_root(
                     "trace_id": trace["trace_id"],
                     "operation": trace["operation"],
                     "success": trace["success"],
+                    "total_ms": (trace["total_ms"].as_f64().unwrap_or(0.0) * 100.0).round() / 100.0,
                 });
                 result["content"]
                     .as_array_mut()
@@ -1195,7 +1520,8 @@ fn dispatch_with_root(
 fn tool_call(
     params: &Value,
     default_root: Option<&PathBuf>,
-    client: Option<&mut daemon::Client>,
+    client: &mut Option<daemon::Client>,
+    allow_connect: bool,
     trace: &mut Option<Value>,
     pending_traces: &mut std::collections::VecDeque<Value>,
 ) -> Result<String> {
@@ -1241,29 +1567,92 @@ fn tool_call(
     let root = if name == "code_workspaces" {
         None
     } else {
-        Some(match root {
+        let mut resolved = match root {
             Some(explicit_root) => {
                 if !explicit_root.exists()
-                    && let Some(inferred) = infer_root_from_arguments(&arguments)
+                    && let Some(inferred) = infer_root_from_arguments(&arguments, None)
                 {
                     inferred
                 } else {
                     explicit_root
                 }
             }
-            None => infer_root_from_arguments(&arguments)
+            None => infer_root_from_arguments(&arguments, default_root)
                 .or_else(|| default_root.cloned())
                 .ok_or_else(|| invalid("current directory is not inside a registered workspace"))?,
-        })
+        };
+        if std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+            let canonical_file =
+                crate::catalog::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+            let matched_spec = crate::catalog::load()
+                .ok()
+                .and_then(|specs| {
+                    specs
+                        .into_iter()
+                        .filter(|s| canonical_file.starts_with(&s.root))
+                        .max_by_key(|s| s.root.components().count())
+                });
+            if let Some(spec) = matched_spec
+                && let Ok(rel) = canonical_file.strip_prefix(&spec.root)
+            {
+                let rel_str = rel.to_string_lossy().into_owned();
+                if name == "code_read" && !arguments.contains_key("ranges") {
+                    arguments.insert(
+                        "ranges".into(),
+                        json!([{"path": rel_str, "start": 1, "end": 120}]),
+                    );
+                } else if matches!(name, "code_grep" | "code_context")
+                    && !arguments.contains_key("paths")
+                {
+                    arguments.insert("paths".into(), json!([rel_str]));
+                }
+                resolved = spec.root;
+            } else {
+                return Err(invalid(format!(
+                    "UNREGISTERED_FILE_ROOT root={}: root must be a registered workspace directory, not a standalone file outside registered workspaces. Use a permitted host read/view tool directly without retrying CCTX.",
+                    resolved.display()
+                ))
+                .into());
+            }
+        } else {
+            let lossy = resolved.to_string_lossy();
+            let is_host_scratch = [
+                "/.copilot/",
+                "/.claude/",
+                "/.vscode/",
+                "/.vscode-server/",
+            ]
+            .iter()
+            .any(|seg| lossy.contains(seg) || lossy.ends_with(seg.trim_end_matches('/')));
+            if is_host_scratch {
+                let is_registered = crate::catalog::load()
+                    .ok()
+                    .is_some_and(|specs| specs.iter().any(|s| resolved.starts_with(&s.root)));
+                if !is_registered {
+                    return Err(invalid(format!(
+                        "UNREGISTERED_SCRATCH_ROOT root={}: agent session-state/instructions/config directories are outside registered source workspaces. Use permitted host view/grep/glob tools directly; do not retry with CCTX.",
+                        resolved.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+        Some(resolved)
     };
     if arguments.contains_key(daemon::TRACE_ARGUMENT)
         || arguments.contains_key(daemon::PREV_TRACE_ARGUMENT)
+        || arguments.contains_key(daemon::CALLER_ARGUMENT)
     {
         return Err(invalid("reserved internal trace argument").into());
     }
     if !pending_traces.is_empty() {
         let items: Vec<Value> = pending_traces.drain(..).collect();
         arguments.insert(daemon::PREV_TRACE_ARGUMENT.into(), Value::Array(items));
+    }
+    if client.as_ref().is_some_and(|c| c.supports_caller_session())
+        && matches!(name, "code_files" | "code_grep" | "code_read" | "code_context")
+    {
+        arguments.insert(daemon::CALLER_ARGUMENT.into(), json!(mcp_caller_id()));
     }
     if let Some(trace) = trace.as_mut() {
         trace["root"] = json!(root);
@@ -1278,17 +1667,20 @@ fn tool_call(
         compact: true,
     };
     let ipc_started = Instant::now();
-    if let Some(client) = client {
-        let raw_result = match client.call_raw(&request) {
+    if client.is_none() && allow_connect {
+        *client = Some(daemon::Client::connect_or_start_traced()?);
+    }
+    if let Some(active_client) = client.as_mut() {
+        let raw_result = match active_client.call_raw(&request) {
             Ok(bytes) => Ok(bytes),
             Err(error) if daemon::is_application_error(error.as_ref()) => Err(error),
             Err(first) => {
-                *client = daemon::Client::connect_traced().map_err(|reconnect| {
+                *active_client = daemon::Client::connect_or_start_traced().map_err(|reconnect| {
                     invalid(format!(
                         "daemon request failed ({first}); reconnect failed ({reconnect})"
                     ))
                 })?;
-                client.call_raw(&request)
+                active_client.call_raw(&request)
             }
         };
         if let Some(trace) = trace.as_mut() {
@@ -1328,33 +1720,202 @@ fn tool_call(
     Ok(crate::inline_budget::fit_inline(name, root_text.as_deref(), serde_json::to_string(&value)?))
 }
 
-pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
+pub fn serve_stdio() -> Result<()> {
+    #[cfg(unix)]
+    {
+        struct RawStdin;
+        impl std::io::Read for RawStdin {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                loop {
+                    let rc = unsafe {
+                        libc::read(
+                            libc::STDIN_FILENO,
+                            buf.as_mut_ptr().cast::<libc::c_void>(),
+                            buf.len(),
+                        )
+                    };
+                    if rc >= 0 {
+                        return Ok(rc as usize);
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        let reader = std::io::BufReader::new(RawStdin);
+        serve_inner(reader, std::io::stdout().lock(), Some(|r| r.buffer().is_empty()))
+    }
+    #[cfg(not(unix))]
+    {
+        serve(std::io::stdin().lock(), std::io::stdout().lock())
+    }
+}
+
+pub fn serve<R: BufRead>(input: R, output: impl Write) -> Result<()> {
+    serve_inner::<R>(input, output, None)
+}
+
+#[cfg(unix)]
+struct SelfExecWatch {
+    disk_exe: PathBuf,
+    self_dev: u64,
+    self_ino: u64,
+    last_check: Instant,
+    disabled: bool,
+}
+
+#[cfg(unix)]
+impl SelfExecWatch {
+    fn capture() -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        if std::env::var_os("CCTX_DISABLE_MCP_REEXEC").is_some() {
+            return None;
+        }
+        let link = std::fs::read_link("/proc/self/exe").ok()?;
+        let cleaned = PathBuf::from(
+            link.to_string_lossy()
+                .trim_end_matches(" (deleted)")
+                .to_owned(),
+        );
+        if !cleaned.is_absolute() {
+            return None;
+        }
+        let self_meta = std::fs::metadata("/proc/self/exe").ok()?;
+        Some(Self {
+            disk_exe: cleaned,
+            self_dev: self_meta.dev(),
+            self_ino: self_meta.ino(),
+            last_check: Instant::now(),
+            disabled: false,
+        })
+    }
+
+    fn maybe_reexec(
+        &mut self,
+        default_root: Option<&PathBuf>,
+        client: Option<&mut daemon::Client>,
+        pending_traces: &mut std::collections::VecDeque<Value>,
+        output: &mut impl Write,
+    ) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+        if self.disabled || self.last_check.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.last_check = Instant::now();
+        let Ok(disk_meta) = std::fs::metadata(&self.disk_exe) else {
+            return;
+        };
+        if !disk_meta.is_file()
+            || disk_meta.permissions().mode() & 0o111 == 0
+            || (disk_meta.dev() == self.self_dev && disk_meta.ino() == self.self_ino)
+        {
+            return;
+        }
+        flush_pending_traces_opt(client, pending_traces);
+        let _ = output.flush();
+        let mut cmd = std::process::Command::new(&self.disk_exe);
+        cmd.arg("shared-mcp")
+            .env("CCTX_MCP_CALLER_ID", mcp_caller_id().to_string());
+        if let Some(root) = default_root {
+            cmd.env("CCTX_MCP_DEFAULT_ROOT", root);
+        }
+        let _ = cmd.exec();
+        self.disabled = true;
+    }
+}
+
+#[cfg(unix)]
+fn stdin_has_pending_bytes() -> bool {
+    let mut avail: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut avail) };
+    rc == 0 && avail > 0
+}
+
+fn serve_inner<R: BufRead>(
+    input: R,
+    mut output: impl Write,
+    _is_buffer_empty: Option<fn(&R) -> bool>,
+) -> Result<()> {
     let mut input = input;
-    let default_root = Some(crate::catalog::canonicalize(&std::env::current_dir()?)?);
-    let mut client = daemon::Client::connect_traced()?;
+    let mut default_root = match std::env::var_os("CCTX_MCP_DEFAULT_ROOT") {
+        Some(inherited) => {
+            let path = PathBuf::from(inherited);
+            Some(crate::catalog::canonicalize(&path).unwrap_or(path))
+        }
+        None => std::env::current_dir()
+            .ok()
+            .map(|cwd| crate::catalog::canonicalize(&cwd).unwrap_or(cwd)),
+    };
+    let mut client: Option<daemon::Client> = None;
     let mut pending_traces: std::collections::VecDeque<Value> =
         std::collections::VecDeque::with_capacity(64);
     let trace_stderr = std::env::var_os("CCTX_TRACE_STDERR").is_some();
+    #[cfg(unix)]
+    let mut reexec_watch = if _is_buffer_empty.is_some() {
+        SelfExecWatch::capture()
+    } else {
+        None
+    };
     let mut bytes = Vec::with_capacity(512);
     let mut out_buf = Vec::with_capacity(4096);
     loop {
-        bytes.clear();
-        let count = std::io::Read::take(&mut input, MAX_MESSAGE as u64 + 1)
-            .read_until(b'\n', &mut bytes)?;
-        if count == 0 {
-            flush_pending_traces(&mut client, &mut pending_traces);
-            return Ok(());
+        #[cfg(unix)]
+        if let (Some(watch), Some(is_empty)) = (reexec_watch.as_mut(), _is_buffer_empty)
+            && is_empty(&input)
+        {
+            let mut ready_input = false;
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if rc >= 0 {
+                    ready_input = (pfd.revents & libc::POLLIN) != 0
+                        && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) == 0
+                        && stdin_has_pending_bytes();
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+            if ready_input {
+                watch.maybe_reexec(
+                    default_root.as_ref(),
+                    client.as_mut(),
+                    &mut pending_traces,
+                    &mut output,
+                );
+            }
         }
-        if count > MAX_MESSAGE {
-            flush_pending_traces(&mut client, &mut pending_traces);
-            return Err(invalid("MCP input exceeds 1 MiB").into());
-        }
+        let framing = match crate::mcp::read_mcp_frame(
+            &mut input,
+            &mut bytes,
+            MAX_MESSAGE,
+            "MCP input exceeds 1 MiB",
+        ) {
+            Ok(Some(framing)) => framing,
+            Ok(None) => {
+                flush_pending_traces_opt(client.as_mut(), &mut pending_traces);
+                return Ok(());
+            }
+            Err(error) => {
+                flush_pending_traces_opt(client.as_mut(), &mut pending_traces);
+                return Err(error);
+            }
+        };
         let started = Instant::now();
         let response = match serde_json::from_slice(&bytes) {
             Ok(value) => dispatch_with_root(
                 value,
-                default_root.as_ref(),
-                Some(&mut client),
+                &mut default_root,
+                &mut client,
+                true,
                 &mut pending_traces,
             ),
             Err(error) => Some(
@@ -1363,9 +1924,7 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
         };
         if let Some(response) = response {
             let ser_started = Instant::now();
-            out_buf.clear();
-            serde_json::to_writer(&mut out_buf, &response)?;
-            out_buf.push(b'\n');
+            crate::mcp::encode_mcp_frame(framing, &response, &mut out_buf)?;
             let serialize_ms = ser_started.elapsed().as_secs_f64() * 1000.0;
             let write_started = Instant::now();
             output.write_all(&out_buf)?;
@@ -1388,6 +1947,18 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
                     pending_traces.pop_front();
                 }
                 pending_traces.push_back(trace);
+            }
+            #[cfg(unix)]
+            if let (Some(watch), Some(is_empty)) = (reexec_watch.as_mut(), _is_buffer_empty)
+                && is_empty(&input)
+                && stdin_has_pending_bytes()
+            {
+                watch.maybe_reexec(
+                    default_root.as_ref(),
+                    client.as_mut(),
+                    &mut pending_traces,
+                    &mut output,
+                );
             }
         }
     }

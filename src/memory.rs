@@ -114,6 +114,8 @@ pub struct Controller {
     last_sample: Instant,
     last_growth: Instant,
     shrink_streak: u8,
+    applied_kernel_limits: std::cell::Cell<Option<(usize, usize)>>,
+    last_guard_log: std::cell::Cell<Option<Instant>>,
     pub last_error: Option<String>,
 }
 
@@ -123,6 +125,8 @@ impl Default for Controller {
             limits: Limits::fixed(4 * GIB), policy: None, group: None, managed: false,
             wsl: false, windows_host: None,
             last_sample: Instant::now(), last_growth: Instant::now(), shrink_streak: 0,
+            applied_kernel_limits: std::cell::Cell::new(None),
+            last_guard_log: std::cell::Cell::new(None),
             last_error: None,
         }
     }
@@ -341,6 +345,13 @@ impl Controller {
         let current = std::fs::read_to_string(group.join("memory.current"))?.trim().parse::<usize>()?;
         let old = std::fs::read_to_string(group.join("memory.max"))?;
         let old = if old.trim() == "max" { usize::MAX } else { old.trim().parse()? };
+        // Cooperate when an external cgroup governor caps memory.max stricter than our already-applied ceiling.
+        if self.applied_kernel_limits.get() == Some((self.limits.high, self.limits.max))
+            && old < self.limits.max
+            && old >= RUNTIME_FLOOR
+        {
+            return Ok(());
+        }
         if self.limits.max < old && !can_shrink {
             return Ok(());
         }
@@ -350,6 +361,13 @@ impl Controller {
         } else if current < self.limits.high {
             changes.push(("memory.max", self.limits.max));
         }
+        let target_pair = (self.limits.high, self.limits.max);
+        let should_log = self.applied_kernel_limits.get() != Some(target_pair)
+            || self
+                .last_guard_log
+                .get()
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(900));
+        let mut wrote_any = false;
         for (name, expected) in changes {
             let path = group.join(name);
             let value = std::fs::read_to_string(&path)?;
@@ -358,8 +376,15 @@ impl Controller {
                 if std::fs::read_to_string(&path)?.trim() != expected.to_string() {
                     return Err(invalid(format!("{name} kernel verification failed")).into());
                 }
-                eprintln!("CCTX_MEMORY_GUARD {name}={expected}");
+                wrote_any = true;
+                if should_log {
+                    eprintln!("CCTX_MEMORY_GUARD {name}={expected}");
+                }
             }
+        }
+        self.applied_kernel_limits.set(Some(target_pair));
+        if wrote_any && should_log {
+            self.last_guard_log.set(Some(Instant::now()));
         }
         Ok(())
     }
@@ -451,6 +476,11 @@ mod tests {
         std::fs::write(directory.path().join("memory.current"), GIB.to_string()).unwrap();
         controller.apply_kernel_limits(true).unwrap();
         assert_eq!(std::fs::read_to_string(directory.path().join("memory.max")).unwrap(), (4 * GIB).to_string());
+
+        // External cgroup governor capping memory.max lower (>= RUNTIME_FLOOR) is respected without tug-of-war overwrite.
+        std::fs::write(directory.path().join("memory.max"), (2 * GIB).to_string()).unwrap();
+        controller.apply_kernel_limits(true).unwrap();
+        assert_eq!(std::fs::read_to_string(directory.path().join("memory.max")).unwrap(), (2 * GIB).to_string());
     }
 
     #[test]

@@ -117,8 +117,10 @@ fn trim_value(name: &str, data: &mut Value, excess: usize) -> usize {
 }
 
 /// Returns `text` unchanged when it fits or cannot be safely trimmed.
+/// Reserves 1 byte (`INLINE_BUDGET - 1`) so MCP can append a trailing newline before `CCTX_TRACE`.
 pub fn fit_inline(name: &str, root: Option<&str>, text: String) -> String {
-    if text.len() <= INLINE_BUDGET || !matches!(name, "code_files" | "code_grep" | "code_context" | "code_read") {
+    const TARGET_BUDGET: usize = INLINE_BUDGET - 1;
+    if text.len() <= TARGET_BUDGET || !matches!(name, "code_files" | "code_grep" | "code_context" | "code_read") {
         return text;
     }
     let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
@@ -134,7 +136,7 @@ pub fn fit_inline(name: &str, root: Option<&str>, text: String) -> String {
     let mut best = text.clone();
     for _ in 0..5 {
         let mut value = original.clone();
-        let excess = text.len().saturating_sub(INLINE_BUDGET) + extra;
+        let excess = text.len().saturating_sub(TARGET_BUDGET) + extra;
         if trim_value(name, &mut value, excess) == excess {
             break;
         }
@@ -148,10 +150,10 @@ pub fn fit_inline(name: &str, root: Option<&str>, text: String) -> String {
         if size < best.len() {
             best = out;
         }
-        if size <= INLINE_BUDGET {
+        if size <= TARGET_BUDGET {
             break;
         }
-        extra += size - INLINE_BUDGET + 16;
+        extra += size - TARGET_BUDGET + 16;
     }
     best
 }

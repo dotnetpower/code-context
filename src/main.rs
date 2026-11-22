@@ -4,7 +4,7 @@ use code_context::engine::{Backend, Engine};
 use code_context::journal::JournalCommand;
 use code_context::policy::MemoryPolicy;
 use code_context::probe::ProbeCommand;
-use code_context::prompt_formula::{PromptStyle, PromptTarget};
+use code_context::prompt_formula::{PromptStyle, PromptTarget, TokenizerProfile};
 use code_context::search::Search;
 use code_context::workspace::Workspace;
 use code_context::{Result, catalog, daemon, experiment, mcp, resident_experiment, shared_mcp};
@@ -66,6 +66,11 @@ struct PctxArgs {
 enum Action {
     Daemon,
     Ping,
+    Init {
+        /// Explicitly patch local Copilot SDK subagent YAML definitions as part of initialization.
+        #[arg(long)]
+        patch_subagents: bool,
+    },
     Register,
     Plan,
     Unregister,
@@ -87,6 +92,9 @@ enum Action {
     Usage {
         #[arg(long, default_value_t = 24.0)]
         hours: f64,
+        /// Preset quota window: 5h (rolling burst), 24h, 7d/weekly (Ultra/Codex), 30d, or month/mtd (UTC month for Copilot AI Credits).
+        #[arg(long)]
+        window: Option<String>,
         #[arg(long)]
         json: bool,
         /// Show all statistics and advisory evidence instead of the compact summary.
@@ -98,6 +106,8 @@ enum Action {
         style: PromptStyle,
         #[arg(long, value_enum, default_value_t = PromptTarget::Instructions)]
         target: PromptTarget,
+        #[arg(long, value_enum, default_value_t = TokenizerProfile::O200k)]
+        tokenizer: TokenizerProfile,
         #[arg(long, help = "Convert a natural-language task prompt into a compact symbolic formula prompt")]
         compress: Option<String>,
         #[arg(long)]
@@ -207,7 +217,7 @@ fn run() -> Result<()> {
     let args = Args::parse();
     match &args.command {
         Action::Daemon => return daemon::serve(),
-        Action::SharedMcp => return shared_mcp::serve(io::stdin().lock(), io::stdout().lock()),
+        Action::SharedMcp => return shared_mcp::serve_stdio(),
         Action::NativeBridge => return daemon::native_bridge(io::stdin().lock(), io::stdout().lock()),
         Action::Doctor => return print(&code_context::diagnostics::doctor(&args.root)?),
         Action::Coverage => return print(&code_context::diagnostics::coverage()?),
@@ -218,8 +228,19 @@ fn run() -> Result<()> {
             stdout.write_all(output.as_bytes())?;
             return stdout.write_all(b"\n").map_err(Into::into);
         }
-        Action::Usage { hours, json, details } => {
-            let output = code_context::diagnostics::usage(&args.root, *hours, *json, *details)?;
+        Action::Usage {
+            hours,
+            window,
+            json,
+            details,
+        } => {
+            let output = code_context::diagnostics::usage_with_window(
+                &args.root,
+                *hours,
+                window.as_deref(),
+                *json,
+                *details,
+            )?;
             let mut stdout = io::stdout().lock();
             stdout.write_all(output.as_bytes())?;
             return stdout.write_all(b"\n").map_err(Into::into);
@@ -227,16 +248,18 @@ fn run() -> Result<()> {
         Action::Prompt {
             style,
             target,
+            tokenizer,
             compress,
             json,
         } => {
             let root_opt = (args.root.as_os_str() != ".")
                 .then(|| catalog::canonicalize(&args.root).unwrap_or_else(|_| args.root.clone()));
-            let report = code_context::prompt_formula::build_report(
+            let report = code_context::prompt_formula::build_report_with_tokenizer(
                 *style,
                 *target,
                 root_opt.as_deref(),
                 compress.as_deref(),
+                *tokenizer,
             );
             if *json {
                 return print(&report);
@@ -249,6 +272,162 @@ fn run() -> Result<()> {
         Action::Prepare => {
             return print(&serde_json::json!({
                 "root":code_context::registration::prepare_root(&args.root)?
+            }));
+        }
+        Action::Init { patch_subagents } => {
+            let canonical = catalog::canonicalize(&args.root)?;
+            let home_canonical = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| catalog::canonicalize(&h).unwrap_or(h));
+            if !args.allow_root_scope
+                && (canonical.parent().is_none()
+                    || home_canonical.as_ref().is_some_and(|h| h == &canonical))
+            {
+                return Err(code_context::invalid(
+                    "refusing to initialize filesystem root or user home directory; pass --root <workspace>",
+                )
+                .into());
+            }
+            let existing = catalog::load()?;
+            let is_linked_worktree = std::fs::symlink_metadata(canonical.join(".git"))
+                .is_ok_and(|meta| meta.is_file());
+            let governing_ancestor = existing
+                .iter()
+                .filter(|spec| canonical.starts_with(&spec.root))
+                .max_by_key(|spec| spec.root.components().count());
+            let (effective_root, registration_state) =
+                if existing.iter().any(|spec| spec.root == canonical) {
+                    (canonical, "existing")
+                } else if let Some(ancestor) = governing_ancestor {
+                    let mut nested_git: Option<PathBuf> = None;
+                    let mut cur: &std::path::Path = &canonical;
+                    while cur != ancestor.root && cur.starts_with(&ancestor.root) {
+                        if cur.join(".git").exists() {
+                            nested_git = Some(cur.to_path_buf());
+                            break;
+                        }
+                        match cur.parent() {
+                            Some(parent) => cur = parent,
+                            None => break,
+                        }
+                    }
+                    if let Some(nested) = nested_git
+                        && !ancestor.allow_worktrees
+                    {
+                        return Err(code_context::invalid(format!(
+                            "nested Git repository or worktree {} beneath registered root {} is not authorized; run `cctx --root {} authorize-worktrees` first",
+                            nested.display(),
+                            ancestor.root.display(),
+                            ancestor.root.display(),
+                        ))
+                        .into());
+                    }
+                    let prepared = code_context::registration::prepare_root(&canonical)?;
+                    (prepared, "prepared")
+                } else if existing.iter().any(|spec| spec.root.starts_with(&canonical)) {
+                    return Err(code_context::invalid(format!(
+                        "cannot automatically initialize parent directory {} above an existing registration; use explicit `cctx register` or `cctx migrate`",
+                        canonical.display(),
+                    ))
+                    .into());
+                } else if is_linked_worktree {
+                    let prepared = code_context::registration::prepare_root(&canonical)?;
+                    (prepared, "prepared")
+                } else {
+                    let mut policy = MemoryPolicy {
+                        max_files: args.max_files,
+                        max_source_bytes: args
+                            .max_source_mib
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| code_context::invalid("max_source_mib overflow"))?,
+                        max_file_bytes: args
+                            .max_file_mib
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| code_context::invalid("max_file_mib overflow"))?,
+                        max_total_lines: args.max_total_lines,
+                        max_total_path_bytes: args
+                            .max_path_mib
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| code_context::invalid("max_path_mib overflow"))?,
+                        max_watch_dirs: args.max_watch_dirs,
+                        ..MemoryPolicy::default()
+                    };
+                    policy.max_staged_bytes = policy.max_staged_bytes.min(policy.max_source_bytes);
+                    policy.validate().map_err(code_context::invalid)?;
+                    let scopes = if args.scope.is_empty() {
+                        vec![".".into()]
+                    } else {
+                        args.scope.clone()
+                    };
+                    let globs = if args.glob.is_empty() {
+                        code_context::registration::DEFAULT_SOURCE_GLOBS
+                            .iter()
+                            .map(|s| (*s).into())
+                            .collect()
+                    } else {
+                        args.glob.clone()
+                    };
+                    let spec = catalog::Spec {
+                        root: canonical,
+                        scopes,
+                        globs,
+                        excludes: args.exclude.clone(),
+                        default_excludes: !args.no_default_excludes,
+                        prewarm: false,
+                        policy,
+                        allow_worktrees: false,
+                        managed_parent: None,
+                    };
+                    let workspace = spec.workspace()?;
+                    let inventory = workspace.files_limited_skip_oversized(&spec.policy)?;
+                    let _ = workspace.watch_directories_for(
+                        inventory.files.iter().map(PathBuf::as_path),
+                        &spec.policy,
+                    )?;
+                    let root = workspace.root;
+                    let inserted = catalog::register_if_absent(spec)?;
+                    (root, if inserted { "registered" } else { "existing" })
+                };
+            if daemon::auto_start_allowed() {
+                let _ = daemon::ensure_daemon_started();
+            }
+            let ping = daemon::request(&daemon::Request {
+                root: None,
+                name: "ping".into(),
+                arguments: serde_json::json!({}),
+                compact: true,
+            })
+            .ok();
+            let warm_hint = if ping.is_some() {
+                daemon::request(&daemon::Request {
+                    root: Some(effective_root.clone()),
+                    name: "code_warm_hint".into(),
+                    arguments: serde_json::json!({}),
+                    compact: true,
+                })
+                .ok()
+            } else {
+                None
+            };
+            let subagents_patched = if *patch_subagents {
+                std::env::var_os("HOME")
+                    .filter(|_| std::env::var_os("CCTX_HOME").is_none())
+                    .map(|home| {
+                        code_context::prompt_formula::ensure_subagents_configured(
+                            std::path::Path::new(&home),
+                        )
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            return print(&serde_json::json!({
+                "initialized": true,
+                "root": effective_root,
+                "registration": registration_state,
+                "daemon_ready": ping.is_some(),
+                "warm_hint": warm_hint,
+                "subagents_patched": subagents_patched,
             }));
         }
         Action::Migrate {
@@ -445,7 +624,7 @@ fn run() -> Result<()> {
             ),
             Action::Sync => ("code_sync", serde_json::json!({})),
             Action::Status => ("code_status", serde_json::json!({})),
-            Action::Mcp => return shared_mcp::serve(io::stdin().lock(), io::stdout().lock()),
+            Action::Mcp => return shared_mcp::serve_stdio(),
             _ => return Err(code_context::invalid("unsupported shared command").into()),
         };
         return print(&daemon::request(&daemon::Request {

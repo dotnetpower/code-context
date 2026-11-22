@@ -88,6 +88,126 @@ def is_lookup_tool(name: str) -> bool:
     )
 
 
+_SHELL_TOOLS = {
+    "bash", "Bash", "run_in_terminal", "exec_command", "shell",
+    "local_shell", "shell_command", "container.exec", "mcp__acp__Bash",
+}
+_DISQUALIFYING_SHELL_BINS = {
+    "cargo", "rustc", "rustup", "pytest", "python", "python3", "uv", "pip",
+    "npm", "npx", "pnpm", "yarn", "bun", "node", "deno", "tsc", "eslint",
+    "ruff", "vitest", "jest", "go", "make", "cmake", "git", "gh", "curl",
+    "wget", "ssh", "docker", "kubectl", "systemctl", "ps", "kill", "cctx",
+    "tctx", "pctx", "rm", "mv", "cp", "mkdir", "touch", "chmod", "tee", "perl",
+}
+_PRIMARY_SHELL_LOOKUPS = {
+    "rg", "ripgrep", "grep", "egrep", "fgrep", "ag", "ack",
+    "cat", "nl", "bat", "head", "tail", "find", "fd", "fdfind", "tree", "ls",
+}
+_NON_SOURCE_PREFIXES = (
+    "/tmp", "/var/tmp", "/dev/shm", "/proc", "/sys", "/etc", "copilot-tool-output",
+)
+_NON_SOURCE_SEGMENTS = {
+    ".github", ".vscode", ".copilot", ".claude", ".codex", ".git", "node_modules", "target",
+}
+_NON_SOURCE_EXTS = (
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".vsix", ".jsonl", ".zst",
+)
+_SAFE_XARGS_SUBCMDS = {
+    "rg", "ripgrep", "grep", "egrep", "fgrep", "cat", "head", "tail", "nl", "wc", "ls", "stat",
+}
+
+
+def _is_non_source_arg(arg: str) -> bool:
+    norm = arg.strip("\"'").replace("\\", "/").split("#", 1)[0]
+    if any(norm.startswith(p) or ("copilot-tool-output" in norm) for p in _NON_SOURCE_PREFIXES):
+        return True
+    if any(seg in _NON_SOURCE_SEGMENTS for seg in norm.split("/") if seg and seg not in {".", ".."}):
+        return True
+    return norm.lower().endswith(_NON_SOURCE_EXTS)
+
+
+def _unwrap_outer_shell(text: str) -> str:
+    parts = text.split(None, 2)
+    if len(parts) < 3 or Path(parts[0]).name not in {"sh", "bash", "zsh", "dash"}:
+        return text
+    if not parts[1].startswith("-") or "c" not in parts[1]:
+        return text
+    rest = parts[2].strip()
+    if len(rest) >= 2 and rest[0] in {"'", '"'} and rest[-1] == rest[0]:
+        q = rest[0]
+        i = 1
+        while i + 1 < len(rest):
+            if q == '"' and rest[i] == "\\":
+                i += 2
+                continue
+            if rest[i] == q:
+                return rest
+            i += 1
+        if i == len(rest) - 1:
+            return rest[1:-1]
+    return rest
+
+
+def is_shell_source_lookup(tool: str, arguments: dict) -> bool:
+    if tool not in _SHELL_TOOLS or not isinstance(arguments, dict):
+        return False
+    raw = arguments.get("command") or arguments.get("cmd") or arguments.get("script")
+    if isinstance(raw, list):
+        parts = [str(x) for x in raw if isinstance(x, str)]
+        if len(parts) >= 3 and Path(parts[0]).name in {"sh", "bash", "zsh"} and "c" in parts[1]:
+            raw = " ".join(parts[2:])
+        else:
+            raw = " ".join(parts)
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    text = _unwrap_outer_shell(raw.strip())
+    if "$(" in text or "`" in text:
+        return False
+    # Reject file-writing redirections while allowing 2>&1 and /dev/null.
+    scrub = re.sub(r"[12]?>&\d|[12]?>>?\s*/dev/null", "", text)
+    if ">" in scrub:
+        return False
+    segments = [seg.strip() for seg in re.split(r"(?:&&|\|\||[;|\n])", scrub) if seg.strip()]
+    if not segments:
+        return False
+    saw_lookup = False
+    for seg in segments:
+        words = [w.strip("\"'") for w in seg.split() if w.strip("\"'")]
+        while words and ("=" in words[0] and not words[0].startswith("-")):
+            words.pop(0)
+        if not words:
+            continue
+        cmd = Path(words[0]).name
+        rest = words[1:]
+        if cmd in {"cd", "true", "echo", "printf", "pwd"}:
+            if cmd == "cd" and any(_is_non_source_arg(a) for a in rest):
+                return False
+            continue
+        if cmd in _DISQUALIFYING_SHELL_BINS:
+            return False
+        if cmd == "sed" and any(a == "-i" or a.startswith("-i") or a.startswith("--in-place") for a in rest):
+            return False
+        if cmd == "awk" and any(a in {"-i", "inplace"} for a in rest):
+            return False
+        if cmd == "find" and any(a in {"-delete", "-exec", "-execdir", "-ok"} for a in rest):
+            return False
+        if cmd == "xargs":
+            sub_args = [a for a in rest if not a.startswith("-")]
+            if not sub_args or Path(sub_args[0]).name not in _SAFE_XARGS_SUBCMDS:
+                return False
+            continue
+        pos = [a for a in rest if not a.startswith("-")]
+        has_expr = any(a in {"-e", "--regexp", "-f", "--file"} or a.startswith(("--regexp=", "--file=")) for a in rest)
+        path_args = pos[1:] if (cmd in {"rg", "ripgrep", "grep", "egrep", "fgrep", "ag", "ack", "sed", "awk"} and not has_expr) else pos
+        if any(_is_non_source_arg(a) for a in path_args):
+            return False
+        if cmd in _PRIMARY_SHELL_LOOKUPS or (cmd in {"sed", "awk"} and sum(not a.startswith("-") for a in rest) >= 2):
+            saw_lookup = True
+        elif cmd not in {"wc", "sort", "uniq", "cut", "tr", "sed", "awk", "column"}:
+            return False
+    return saw_lookup
+
+
 def event_timestamp(event: dict) -> float | None:
     metadata = event.get("_ahpLog", {})
     if not isinstance(metadata, dict):
@@ -839,6 +959,7 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
                     call["cctx_cli_fallback"] = call["tool"] in {"bash", "run_in_terminal"} and (
                         "cctx --backend shared" in str(arguments.get("command") or "")
                     )
+                    call["shell_source_lookup"] = is_shell_source_lookup(call["tool"], arguments)
                 elif action_type == "chat/toolCallComplete":
                     call = calls.setdefault(
                         key,
@@ -982,11 +1103,23 @@ def build_report(paths: list[Path], hours: float, now: float | None = None,
     ]
     cctx_calls = [call for call in lookup_calls if classify(call["tool"]) in {"native", "mcp"}]
     builtin_lookup_calls = [call for call in lookup_calls if classify(call["tool"]) == "builtin_search_read"]
+    shell_bypass_calls = [
+        call for call in calls.values()
+        if call.get("shell_source_lookup") and not call.get("cctx_cli_fallback")
+    ]
+    denom_with_shell = len(lookup_calls) + len(shell_bypass_calls)
     report["lookup_adoption"] = {
         "lookup_calls": len(lookup_calls),
         "code_context_calls": len(cctx_calls),
         "selection_percent": round(100 * len(cctx_calls) / len(lookup_calls), 2) if lookup_calls else None,
         **outcome_counts(cctx_calls),
+    }
+    report["shell_lookup_bypasses"] = {
+        "calls": len(shell_bypass_calls),
+        "payload_tokens": sum(call.get("payload_tokens", 0) for call in shell_bypass_calls),
+        "selection_percent_including_shell": (
+            round(100 * len(cctx_calls) / denom_with_shell, 2) if denom_with_shell else None
+        ),
     }
 
     # Build per-model usage & token accounting

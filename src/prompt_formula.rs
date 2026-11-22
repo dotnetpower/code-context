@@ -53,6 +53,9 @@ pub enum PromptTarget {
     SubagentMd,
     /// Claude Code / Claude Agent Host instructions (`CLAUDE.md`).
     ClaudeMd,
+    /// OpenAI Codex project/user instructions (`AGENTS.md`, `<=32 KiB` doc cap).
+    #[value(alias = "agents-md", alias = "codex")]
+    CodexAgentsMd,
 }
 
 impl PromptTarget {
@@ -63,6 +66,70 @@ impl PromptTarget {
             Self::SubagentYaml => "subagent-yaml",
             Self::SubagentMd => "subagent-md",
             Self::ClaudeMd => "claude-md",
+            Self::CodexAgentsMd => "codex-agents-md",
+        }
+    }
+}
+
+/// Model-generation BPE tokenizer profile for English, code, and Korean Hangul token estimation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenizerProfile {
+    /// OpenAI `tiktoken` (`o200k_base` / `cl100k_base`) baseline.
+    #[default]
+    #[value(name = "o200k", alias = "tiktoken", alias = "openai", alias = "codex")]
+    O200k,
+    /// Anthropic Claude 4.5 / 4.6 tokenizer profile.
+    #[value(
+        name = "claude-4-6",
+        alias = "claude46",
+        alias = "claude-4.6",
+        alias = "opus-4-6",
+        alias = "sonnet-4-6"
+    )]
+    Claude46,
+    /// Anthropic Claude 4.7+ newer tokenizer profile (~1.30x-1.46x denser splits on system prompts/code & Korean).
+    #[value(
+        name = "claude-4-7",
+        alias = "claude47",
+        alias = "claude-4.7",
+        alias = "opus-4-7",
+        alias = "claude"
+    )]
+    Claude47,
+}
+
+impl TokenizerProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::O200k => "o200k",
+            Self::Claude46 => "claude-4-6",
+            Self::Claude47 => "claude-4-7",
+        }
+    }
+
+    pub fn for_model(model: &str) -> Self {
+        let lower = model.to_ascii_lowercase();
+        if lower.contains("opus-4-7")
+            || lower.contains("opus-4.7")
+            || lower.contains("sonnet-4-7")
+            || lower.contains("sonnet-4.7")
+            || lower.contains("haiku-4-7")
+            || lower.contains("haiku-4.7")
+            || lower.contains("claude-5")
+            || lower.contains("opus-5")
+            || lower.contains("sonnet-5")
+            || lower.contains("haiku-5")
+        {
+            Self::Claude47
+        } else if lower.contains("claude")
+            || lower.contains("opus")
+            || lower.contains("sonnet")
+            || lower.contains("haiku")
+        {
+            Self::Claude46
+        } else {
+            Self::O200k
         }
     }
 }
@@ -71,6 +138,11 @@ impl PromptTarget {
 /// Accumulates quarter-token units (`1 token = 4 units`) to capture newline/punctuation merging,
 /// camelCase identifier splits, and Korean Hangul syllable density (~2.8% MAPE).
 pub fn estimate_bpe_tokens(text: &str) -> usize {
+    estimate_bpe_tokens_for(text, TokenizerProfile::O200k)
+}
+
+/// Estimates token count under a specific model-generation tokenizer profile (`o200k`, `claude-4-6`, `claude-4-7`).
+pub fn estimate_bpe_tokens_for(text: &str, profile: TokenizerProfile) -> usize {
     if text.is_empty() {
         return 0;
     }
@@ -78,7 +150,10 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\n' {
-            quarter_tokens += 2;
+            quarter_tokens += match profile {
+                TokenizerProfile::Claude47 => 3,
+                _ => 2,
+            };
             continue;
         }
         if ch.is_whitespace() {
@@ -92,7 +167,11 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                 }
             }
             if run > 1 {
-                quarter_tokens += 4 * run.div_ceil(8);
+                let stride = match profile {
+                    TokenizerProfile::Claude47 => 6,
+                    _ => 8,
+                };
+                quarter_tokens += 4 * run.div_ceil(stride);
             }
             continue;
         }
@@ -112,14 +191,42 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            if case_splits > 0 {
-                let segs = case_splits + 1;
-                let extra = if len > segs * 8 { segs } else { 0 };
-                quarter_tokens += 4 * (segs + extra);
-            } else if len <= 9 {
-                quarter_tokens += 4;
-            } else {
-                quarter_tokens += 4 * len.div_ceil(8);
+            match profile {
+                TokenizerProfile::O200k => {
+                    if case_splits > 0 {
+                        let segs = case_splits + 1;
+                        let extra = if len > segs * 8 { segs } else { 0 };
+                        quarter_tokens += 4 * (segs + extra);
+                    } else if len <= 9 {
+                        quarter_tokens += 4;
+                    } else {
+                        quarter_tokens += 4 * len.div_ceil(8);
+                    }
+                }
+                TokenizerProfile::Claude46 => {
+                    if case_splits > 0 {
+                        let segs = case_splits + 1;
+                        let extra = if len > segs * 7 { segs } else { 0 };
+                        quarter_tokens += 4 * (segs + extra);
+                    } else if len <= 8 {
+                        quarter_tokens += 4;
+                    } else {
+                        quarter_tokens += 4 * len.div_ceil(7);
+                    }
+                }
+                TokenizerProfile::Claude47 => {
+                    // Anthropic's newer tokenizer splits compound words, camelCase identifiers,
+                    // and technical prefixes ~1.30x-1.46x more finely than legacy vocabularies.
+                    if case_splits > 0 {
+                        let segs = case_splits + 1;
+                        let extra = len.saturating_sub(segs * 5).div_ceil(5);
+                        quarter_tokens += 5 * segs + 4 * extra;
+                    } else if len <= 5 {
+                        quarter_tokens += 5;
+                    } else {
+                        quarter_tokens += 5 * len.div_ceil(6);
+                    }
+                }
             }
         } else if ch.is_ascii_digit() {
             let mut len = 1usize;
@@ -131,7 +238,11 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            quarter_tokens += 4 * len.div_ceil(3);
+            let group = match profile {
+                TokenizerProfile::Claude47 => 2,
+                _ => 3,
+            };
+            quarter_tokens += 4 * len.div_ceil(group);
         } else if ch.is_ascii_punctuation() {
             let mut run = String::from(ch);
             while let Some(&next) = chars.peek() {
@@ -142,12 +253,16 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            quarter_tokens += match run.as_str() {
+            let base = match run.as_str() {
                 "->" | "=>" | "<=>" | "<=" | ">=" | "!=" | "==" | ".." | "..." | "--" | "::"
                 | "//" | "/*" | "*/" | "**" | "||" | "&&" => 4,
                 "," | "." | ":" | ";" | "_" | "-" | "/" => 3,
                 _ if run.len() == 1 => 4,
                 _ => 3 * run.len(),
+            };
+            quarter_tokens += match profile {
+                TokenizerProfile::Claude47 => base + usize::from(run.len() >= 2),
+                _ => base,
             };
         } else if ('\u{AC00}'..='\u{D7A3}').contains(&ch) {
             let mut syllables = 1usize;
@@ -159,7 +274,13 @@ pub fn estimate_bpe_tokens(text: &str) -> usize {
                     break;
                 }
             }
-            quarter_tokens += syllables * 3;
+            // Hangul syllable density varies across BPE vocabularies:
+            // o200k (~0.75 tok/syl), Claude 4.6 (~0.95 tok/syl), Claude 4.7 (~1.20 tok/syl).
+            quarter_tokens += match profile {
+                TokenizerProfile::O200k => syllables * 3,
+                TokenizerProfile::Claude46 => (syllables * 19).div_ceil(5),
+                TokenizerProfile::Claude47 => (syllables * 24).div_ceil(5),
+            };
         } else {
             quarter_tokens += 4 * ch.len_utf8().div_ceil(2);
         }
@@ -178,7 +299,7 @@ AgentHost/CopilotSDK/bg/subagent/CLI (MCP callable) => MCP(code-context-code_* /
 - symbol+context => code_context / #cctxNativeContext (root={root_binding}, radius:0..100, limit:1..64; !1..150 slicing)\n\
 - glob(!content) => code_files / #cctxNativeFiles ; a|b(regex=true) => code_grep / #cctxNativeGrep (max_matches_per_file:1..64)\n\
 - ranges(:line,#Lstart-Lend,.md#slug,@/) => 1 code_read / #cctxNativeRead (<=150L,<8KiB; >150=>page=true->next_ranges)\n\
-- pre-edit => Context(radius>=8)|Read(around_line) ; hidden => tool_search_tool(\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" | Editor \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\") FIRST ; subagents => pass root={root_binding} & require CCTX\n\
+- pre-edit => Context(radius>=8)|Read(around_line) ; hidden => tool_search_tool <=2 names/call, 2 parallel calls (\"code-context-code_context code-context-code_grep\" + \"code-context-code_read code-context-code_files\" | Editor \"cctxNativeContext cctxNativeGrep\" + \"cctxNativeRead cctxNativeFiles\") FIRST, all 4 loaded before lookup ; bash grep|rg|sed -n|cat|head|find on source => same swap ; subagents => pass root={root_binding} & require CCTX\n\
 - CACHE_MISS != (0|missing) -> 1 Host read -> resume CCTX & !(poll|repeat|code_sync) ; CACHE_LOAD_FAILED => Host ; STALE_INDEX => Read/Host ; OUT_OF_BOUNDS(N) => clamp(1..N) ; code_sync <=> absence claims\n\
 - .github,.vscode,ignored,secrets,/tmp => Host only. Never use another transport to bypass exclusions/trust/denials.\n\
 - Error(\"No client with the advertised tool definition\"|\"No matching client connected\"|\"skipped from another client\"|disconnected) => code-context-code_* MCP | cctx --backend shared --root {root_binding} ; AgentHost/unattended => prefer backend MCP. Do not duplicate a still-pending lookup."
@@ -196,10 +317,11 @@ Dispatch:\n\
 - filename|glob(!content) => code_files / #cctxNativeFiles (glob=G) ; content(a|b=>regex=true) => code_grep / #cctxNativeGrep (max_matches_per_file:1..64)\n\
 - range|anchor(path:line,path#Lstart-Lend,doc.md#slug,@/) => code_read / #cctxNativeRead (<=150L,<8KiB; >150=>page=true->next_ranges->complete=true)\n\
 - Swap: view|read_file=>code_read/#cctxNativeRead ; rg|grep=>code_grep/#cctxNativeGrep ; glob|find=>code_files/#cctxNativeFiles ; 한글 요청 => 동일 디스패치 & 한글 답변\n\
+- Shell: bash|run_in_terminal grep|rg|sed -n|cat|head|tail|find|ls on saved source => same Swap (bash is NOT exempt; 1 code_context > grep+sed -n chain) ; bash only for build|test|git|non-source\n\
 - Probe & Continuity: API/STAC/tiles | JSON/JSONL/GeoJSON//tmp offload | SQLite/Parquet/CSV | PNG/WebP/SVG | large logs/CLI batch | compaction journal => pctx {{http|json|table|image|log|batch|journal}} (cctx probe / cctx journal) & !(python3 -c | raw curl/jq)\n\
 Guards:\n\
 - known(R) => root={root_binding} ; before(edit) => Context(radius>=8)|Read(around_line) ; multi-edit => 1 Read(ranges=[...]) (!parallel view)\n\
-- deferred (even if rg/view/glob visible on turn 0) => tool_search_tool FIRST: AgentHost/SDK/subagent \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" (<=5 cap; do not combine 8+ tools) | Editor Chat \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" (regex: \"code-context|cctxNative\")\n\
+- deferred (ONLY when CCTX tools are absent/hidden from active declarations, even if rg/view/glob visible on turn 0; skip if already declared, and invoke whichever of tool_search_tool / tool_search is declared) => <=2 names/call in 2 parallel calls (4 names drop code_read/code_files: result cap 5 incl. GitHub-* noise): AgentHost/SDK/subagent \"code-context-code_context code-context-code_grep\" + \"code-context-code_read code-context-code_files\" | Editor Chat \"cctxNativeContext cctxNativeGrep\" + \"cctxNativeRead cctxNativeFiles\" ; all 4 loaded before 1st lookup, else re-search the missing name\n\
 - subagent(explore,general-purpose,code-review,rubber-duck,research,security-review,task) => pass root={root_binding} & require code-context-code_* | #cctxNative* (via tool_search_tool if hidden) first\n\
 Transitions:\n\
 - CACHE_MISS != (0 matches|missing) -> 1 Host read -> resume CCTX next turn & !(poll|repeat|switch transport|code_sync) ; CACHE_LOAD_FAILED => Host ; STALE_INDEX => Read|Host ; TARGET_NOT_INDEXED != absent\n\
@@ -224,11 +346,12 @@ Harness-aware routing: in AgentHost / Copilot SDK sessions (`Copilot SDK in VS C
 | Structured data, HTTP/OpenAPI/STAC batch probes, `/tmp` offloaded JSON/logs, SQLite/Parquet/CSV schemas, PNG/WebP/SVG assets, noisy CLI batch logs, or compaction continuity journal | `pctx http` / `pctx json` / `pctx table` / `pctx image` / `pctx log` / `pctx batch` / `pctx journal` (`cctx probe ...` / `cctx journal ...`) |\n\n\
 - For structured data, noisy command logs, and long-session continuity, prefer declarative `pctx` (`cctx probe`) and `cctx journal` commands (`pctx http \"https://api.example/{{svc}}\" --var svc=a,b`, `pctx json data.geojson --bbox minx,miny,maxx,maxy`, `pctx table db.sqlite`, `pctx image render.png`, `pctx batch -c \"git log -n 200 --stat\" -q \"retry\"`, `pctx log @s1 -q \"fatal\"`, `cctx --root {root_binding} journal resume`) instead of writing multi-line `python3 -c`, `urllib.request`, `jq`, or `sqlite3` scripts: `pctx` runs in Rust, spools large logs outside context (`@sN`), redacts secrets automatically, and bounds replies within `<8KiB` (`<=2KiB` for compaction state).\n\
 - Swap, do not fall back: `view`/`read_file` on a known path or range -> `#cctxNativeRead` (`path:start-end`); `rg`/`grep` -> `#cctxNativeGrep`; `glob`/`find` -> `#cctxNativeFiles`. Keep using them after the first lookup. Never slice a file across turns (`1..150` -> `151..300`) or chain `grep` -> `read` when `#cctxNativeContext` (`paths=[file]`, `radius=25..50`) or batched `ranges` can answer in one turn.\n\
+- Shell is not exempt: `bash` / `run_in_terminal` commands such as `grep`, `rg`, `sed -n`, `cat`, `head`, `tail`, `find` or `ls` on saved source get the same swap (`grep`/`rg` -> `code_grep`, `sed -n`/`cat`/`head`/`tail` -> `code_read`, `find`/`ls` -> `code_files`, grep+`sed -n` chains -> one `code_context`). Use `bash` for builds, tests, git and non-source work.\n\
 - Pass the absolute `root` (`{root_binding}`) when the workspace or worktree is known (WSL, subagents, multi-root).\n\
 - Keep each read to `<=150` lines (`<8KiB`) and set `max_matches_per_file` on broad searches so output stays inline; context radius is 0..100, limit 1..64. For large reads use `page=true` and follow `next_ranges` until `complete=true`. Responses that hit the inline budget report `inline_notice` and `next_ranges`.\n\
 - Before editing, use `#cctxNativeContext` (`radius >= 8`) or `#cctxNativeRead` (`around_line` + `radius`) so the first edit has exact indentation, full signatures and 3+ unique context lines; before a multi-hunk or multi-file edit, batch all needed line ranges into one `#cctxNativeRead(ranges=[...])` call rather than parallel `view` calls.\n\
 - Subagents (`explore`, `general-purpose`, `code-review`, `rubber-duck`, `research`, `security-review`, `task`): built-in subagents may run different models (such as Opus, Sonnet, Haiku, or Terra) without custom workspace instructions, so always include the absolute `root` in the delegation prompt and instruct them to use `#cctxNative*` or `code-context-code_*` (loading them with `tool_search_tool` first if hidden) before `view`, `rg`, or `grep`.\n\
-- Deferred tools (Claude, GPT, and subagent sessions where built-in `grep`/`view`/`glob` appear on turn 0 while CCTX tools are hidden): call `tool_search_tool` (`tool_search`) FIRST before any host search/read — query `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"` first (at most 4 names per call because `tool_search_tool` caps results at 5 tools), or `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` when native dispatch is unavailable (regex `\"cctxNative|code-context\"`).\n\n\
+- Deferred tools (Claude, GPT, and subagent sessions where built-in `grep`/`view`/`glob` appear on turn 0 while CCTX tools are hidden): call `tool_search_tool` (`tool_search`) FIRST before any host search/read. Use at most 2 exact names per call and issue two calls in parallel, because results cap at 5 tools and GitHub-* tools or native twins crowd out the rest (a 4-name query was observed to drop `code_read` and `code_files`, after which Claude fell back to `view`/`bash`): `\"code-context-code_context code-context-code_grep\"` and `\"code-context-code_read code-context-code_files\"` (native: `\"cctxNativeContext cctxNativeGrep\"` and `\"cctxNativeRead cctxNativeFiles\"`). Confirm all four tools loaded before the first lookup; re-search any missing name.\n\n\
 ## Cache and freshness\n\n\
 - CCTX is an optional accelerator, not a prerequisite: a nonblocking root cache. `CACHE_MISS` returns immediately and queues only that root; it is never zero matches or a missing file. Continue that single lookup with a permitted host search/read. Do not poll, repeat, switch transports, change roots or run `code_sync` to wait. `CACHE_LOAD_FAILED` reports the real failure and retry cooldown.\n\
 - `STALE_INDEX` means a checked file differs from the index: do not trust old matches or line numbers; use `#cctxNativeRead` or a host live read. `TARGET_NOT_INDEXED` is not proof of absence.\n\
@@ -252,27 +375,38 @@ Do not duplicate pending lookups. Never switch transport to bypass exclusions/tr
         (PromptTarget::Mcp, PromptStyle::Prose) => format!(
             "CCTX is an optional nonblocking root cache (root={root_binding}). CACHE_MISS returns immediately and queues only the requested root; continue that lookup with permitted host search/read. Do not poll/repeat, switch CCTX transports or run code_sync to wait for warmup. CACHE_LOAD_FAILED reports the load failure. Neither means zero matches or a missing disk file. Startup and legacy prewarm flags do not load/pin source. Inactive roots expire after 15 minutes and may be evicted earlier by LRU/memory limits. Do not enumerate sibling worktrees speculatively. Explicitly needed code_sync remains a waiting barrier. Use these tools before shell search/read for saved files in a registered workspace. In AgentHost / Copilot SDK, background, subagent, or CLI sessions, prefer these backend MCP tools FIRST so Reload Window or multi-window switches never stall or fail native client dispatch; in foreground Editor Chat without backend MCP, use #cctxNativeContext/#cctxNativeRead/#cctxNativeGrep/#cctxNativeFiles FIRST. Use code_files for filename/path glob discovery, not a content pattern. Pass explicit absolute root when known (or omit for the current workspace); keep read batches <=150 lines (<8KiB) to stay inline. Prefer code_context for surrounding source, code_grep for content, code_read for known files, and pctx (cctx probe) instead of ad-hoc python3 -c, curl, jq, or sqlite3 inspection scripts. Do not duplicate pending lookups or run code_sync to repair host dispatch. If both client surfaces are unavailable but a backend terminal is usable, use cctx --backend shared with the same authorized root, except CACHE_MISS requires a permitted host read instead. Never switch transport to bypass content exclusions, trust decisions or access denials. Empty results do not cover files outside registered scopes/globs. Hidden/ignored/excluded targets require policy-aware host tools. No editor buffers or cross-root search."
         ),
-        (PromptTarget::SubagentYaml, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
-            "  # [cctx-subagent-instructions]\n\
-  CCTX & TCTX Formula Rules (root={root_binding}):\n\
-  - Source: MCP(code-context-code_* | mcp__code-context__*) > cctxNative*{{Context,Read,Grep,Files}} > cctx --backend shared --root {root_binding} > Host(view,rg,glob)\n\
-  - Tests & Probes: MCP(test-context-test_* | mcp__test-context__*) > tctxNative*{{Run,Affected,Graph,Status}} > tctx --root {root_binding} run > bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
-  - Guards: pass root={root_binding}; symbol+context => code-context-code_context/cctxNativeContext(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 code-context-code_read/cctxNativeRead(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).\n\
-  - Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST: MCP \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" (<=5 cap) | Native \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | tests \"test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected\" (regex: \"code-context|cctxNative|test-context|tctxNative\").\n\
-  - Transitions: Error(\"No client with the advertised tool definition\"|\"No matching client connected\"|\"skipped from another client\") => code-context-code_* / test-context-test_* MCP | CLI ; CACHE_MISS => 1 Host read -> resume CCTX.\n"
-        ),
-        (PromptTarget::SubagentYaml, PromptStyle::Prose) => format!(
-            "  # [cctx-subagent-instructions]\n\
-  **Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) Priority (MANDATORY FIRST PATH):**\n\
-  - For locating or reading saved source in a registered workspace, ALWAYS use Code Context FIRST before `view`, `grep`, `rg`, `glob`, or `bash`:\n\
-    1. Prefer backend MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__code_*`) FIRST when callable so `Reload Window` or headless execution never stalls on UI client dispatch; otherwise use native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles`.\n\
-    2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Prefer `code-context-code_context` / `cctxNativeContext` (`limit <= 64`, `radius 0..100`) over sequential slicing, and batch multiple line ranges into one `code-context-code_read` / `cctxNativeRead` call (`<= 120` total lines, `<8KiB`).\n\
-    3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` / `/dev/shm/*` files to Code Context; use `view` directly for those.\n\
-    4. Even when `grep`/`view`/`glob` are visible on turn 0, if Code Context or Test Context tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` (4 tools <= 5 cap; fallback `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"`; regex `\"code-context|cctxNative|test-context|tctxNative\"`).\n\
-    5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No client with the advertised tool definition\"`, `\"No matching client connected\"`, or `\"skipped from another client\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
-    6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n\
-    7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph` (or native `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph`) FIRST before `bash`, passing the explicit absolute `root`.\n\
-    8. For HTTP/OpenAPI/STAC checks, JSON/JSONL/GeoJSON/`/tmp` offload schemas, SQLite/Parquet/CSV inspection, or PNG/SVG checks, prefer `pctx {{http|json|table|image}}` (`cctx probe ...`) over ad-hoc `python3 -c`, `curl`, `jq`, or `sqlite3` scripts.\n"
+        (PromptTarget::SubagentYaml, PromptStyle::Formula | PromptStyle::Hybrid) => {
+            indent_yaml_block(
+                &format!(
+                    "# [cctx-subagent-instructions]\n\
+CCTX & TCTX Formula Rules (root={root_binding}):\n\
+- Source: MCP(code-context-code_* | mcp__code-context__*) > cctxNative*{{Context,Read,Grep,Files}} > cctx --backend shared --root {root_binding} > Host(view,rg,glob)\n\
+- Tests & Probes: MCP(test-context-test_* | mcp__test-context__*) > tctxNative*{{Run,Affected,Graph,Status}} > tctx --root {root_binding} run > bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
+- Guards: pass root={root_binding}; symbol+context => code-context-code_context/cctxNativeContext(paths=[file],radius:25..50,limit<=64) (!1..150 slicing); multi-range => 1 code-context-code_read/cctxNativeRead(ranges,<=120L,<8KiB); .github/*,.vscode/*,.gitignore,/tmp/*,/dev/shm/* => view(!CCTX).\n\
+- Deferred (even if grep/view visible on turn 0): call tool_search_tool (tool_search) FIRST, <=2 names/call in 2 parallel calls (4 names drop code_read/code_files: result cap 5 incl. GitHub-* noise): MCP \"code-context-code_context code-context-code_grep\" + \"code-context-code_read code-context-code_files\" | Native \"cctxNativeContext cctxNativeGrep\" + \"cctxNativeRead cctxNativeFiles\" | tests \"test-context-test_run test-context-test_affected\" + \"tctxNativeRun tctxNativeAffected\"; all 4 loaded before lookup. bash grep|rg|sed -n|cat|head|find on source => same swap.\n\
+- Transitions: Error(\"No client with the advertised tool definition\"|\"No matching client connected\"|\"skipped from another client\") => code-context-code_* / test-context-test_* MCP | CLI ; CACHE_MISS => 1 Host read -> resume CCTX.\n\
+# [/cctx-subagent-instructions]"
+                ),
+                "  ",
+            )
+        }
+        (PromptTarget::SubagentYaml, PromptStyle::Prose) => indent_yaml_block(
+            &format!(
+                "# [cctx-subagent-instructions]\n\
+**Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) Priority (MANDATORY FIRST PATH):**\n\
+- For locating or reading saved source in a registered workspace, ALWAYS use Code Context FIRST before `view`, `grep`, `rg`, `glob`, or `bash`:\n\
+  1. Prefer backend MCP `code-context-code_context`, `code-context-code_read`, `code-context-code_grep`, `code-context-code_files` (or `mcp__code-context__code_*`) FIRST when callable so `Reload Window` or headless execution never stalls on UI client dispatch; otherwise use native `cctxNativeContext`, `cctxNativeRead`, `cctxNativeGrep`, `cctxNativeFiles`.\n\
+  2. Always pass the explicit absolute `root` parameter (`{root_binding}`). Prefer `code-context-code_context` / `cctxNativeContext` (`limit <= 64`, `radius 0..100`) over sequential slicing, and batch multiple line ranges into one `code-context-code_read` / `cctxNativeRead` call (`<= 120` total lines, `<8KiB`).\n\
+  3. Do NOT pass hidden paths (`.github/*`, `.vscode/*`, `.gitignore`) or `/tmp/*` / `/dev/shm/*` files to Code Context; use `view` directly for those.\n\
+  4. Even when `grep`/`view`/`glob` are visible on turn 0, if Code Context or Test Context tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST with at most 2 exact names per call, in two parallel calls (results cap at 5 and GitHub-* tools crowd out the rest; a 4-name query dropped `code_read`/`code_files`): `\"code-context-code_context code-context-code_grep\"` and `\"code-context-code_read code-context-code_files\"` (fallback `\"cctxNativeContext cctxNativeGrep\"` and `\"cctxNativeRead cctxNativeFiles\"`). Confirm all four loaded before the first lookup.\n\
+  4b. `bash` is not exempt: `grep`, `rg`, `sed -n`, `cat`, `head`, `tail`, `find`, `ls` on saved source map to `code_grep`, `code_read`, `code_files` (or one `code_context`); keep `bash` for builds, tests and git.\n\
+  5. If a native `cctxNative*` or `tctxNative*` call fails with `\"No client with the advertised tool definition\"`, `\"No matching client connected\"`, or `\"skipped from another client\"`, immediately switch to `code-context-code_*` / `test-context-test_*` MCP tools (or `cctx --backend shared --root {root_binding}` / `tctx --root {root_binding} run` CLI).\n\
+  6. On `CACHE_MISS`, use a permitted host read/search for that single lookup only, then resume using Code Context on subsequent turns.\n\
+  7. For running or inspecting tests/lints (`pytest`, `cargo test`, `vitest`, `jest`, `node --test`, `ruff`, `eslint`) or AST test dependency graphs in a registered workspace, ALWAYS use MCP `test-context-test_run`, `test-context-test_affected`, `test-context-test_graph` (or native `tctxNativeRun`, `tctxNativeAffected`, `tctxNativeGraph`) FIRST before `bash`, passing the explicit absolute `root`.\n\
+  8. For HTTP/OpenAPI/STAC checks, JSON/JSONL/GeoJSON/`/tmp` offload schemas, SQLite/Parquet/CSV inspection, or PNG/SVG checks, prefer `pctx {{http|json|table|image}}` (`cctx probe ...`) over ad-hoc `python3 -c`, `curl`, `jq`, or `sqlite3` scripts.\n\
+# [/cctx-subagent-instructions]"
+            ),
+            "  ",
         ),
         (PromptTarget::SubagentMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
             "\n<!-- [cctx-subagent-instructions] -->\n\
@@ -280,7 +414,7 @@ Do not duplicate pending lookups. Never switch transport to bypass exclusions/tr
 - Source: MCP(code-context-code_* | mcp__code-context__*) > #cctxNative*{{Context,Read,Grep,Files}} > Host(rg,view,glob)\n\
 - Tests & Probes: MCP(test-context-test_* | mcp__test-context__*) > #tctxNative*{{Run,Affected,Graph,Status}} > bash ; pctx {{http|json|table|image}} > python3 -c/curl/jq\n\
 - Guards: root={root_binding}; limit<=64; Read(ranges,<=120L,<8KiB); .github/*,.vscode/*,/tmp/*,/dev/shm/* => Host view.\n\
-- Deferred: call tool_search_tool (tool_search) FIRST: MCP \"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\" | Native \"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\" | tests \"test-context-test_run test-context-test_affected tctxNativeRun tctxNativeAffected\" (regex \"code-context|cctxNative|test-context|tctxNative\").\n\
+- Deferred: call tool_search_tool (tool_search) FIRST, <=2 names/call in 2 parallel calls (4 names drop code_read/code_files): MCP \"code-context-code_context code-context-code_grep\" + \"code-context-code_read code-context-code_files\" | Native \"cctxNativeContext cctxNativeGrep\" + \"cctxNativeRead cctxNativeFiles\" | tests \"test-context-test_run test-context-test_affected\" + \"tctxNativeRun tctxNativeAffected\"; all 4 loaded before lookup. bash grep|rg|sed -n|cat|head|find on source => same swap.\n\
 - CACHE_MISS => 1 Host read -> resume CCTX.\n"
         ),
         (PromptTarget::SubagentMd, PromptStyle::Prose) => format!(
@@ -289,7 +423,7 @@ Do not duplicate pending lookups. Never switch transport to bypass exclusions/tr
 - For locating or reading saved source in a registered workspace, ALWAYS use MCP `code-context-code_*` / `mcp__code-context__code_*` (or `#cctxNativeContext`, `#cctxNativeRead`, `#cctxNativeGrep`, and `#cctxNativeFiles` when backend MCP is unavailable) FIRST before built-in search/read tools.\n\
 - For running or inspecting tests/lints or AST test dependency graphs in a registered workspace, ALWAYS use MCP `test-context-test_*` / `mcp__test-context__test_*` (or `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, and `#tctxNativeStatus` when backend MCP is unavailable) FIRST before shell test/lint commands, and use `pctx {{http|json|table|image}}` instead of ad-hoc `python3 -c` / `curl` / `jq` inspection scripts.\n\
 - Always pass the explicit absolute `root` parameter (`{root_binding}`) when known, keep `code_context` / `cctxNativeContext` `limit <= 64`, and batch multiple ranges into one read (`<= 120` lines, `<8KiB`). Never send `.github/*`, `.vscode/*`, `/tmp/*`, or `/dev/shm/*` paths to Code Context.\n\
-- Even when built-in `grep`/`view` are visible on turn 0, if CCTX/TCTX tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST: `\"code-context-code_context code-context-code_read code-context-code_grep code-context-code_files\"` (fallback `\"cctxNativeContext cctxNativeRead cctxNativeGrep cctxNativeFiles\"`; regex `\"code-context|cctxNative|test-context|tctxNative\"`).\n\
+- Even when built-in `grep`/`view` are visible on turn 0, if CCTX/TCTX tools are deferred/hidden, call `tool_search_tool` (`tool_search`) FIRST with at most 2 exact names per call in two parallel calls (4 names drop `code_read`/`code_files`): `\"code-context-code_context code-context-code_grep\"` and `\"code-context-code_read code-context-code_files\"` (fallback `\"cctxNativeContext cctxNativeGrep\"` and `\"cctxNativeRead cctxNativeFiles\"`). `bash` `grep`/`rg`/`sed -n`/`cat`/`head`/`find` on saved source gets the same swap.\n\
 - On `CACHE_MISS`, use a permitted host search/read for that single lookup only, then resume using Code Context on subsequent turns.\n"
         ),
         (PromptTarget::ClaudeMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
@@ -307,6 +441,20 @@ Do not duplicate pending lookups. Never switch transport to bypass exclusions/tr
 - Pass the explicit absolute `root` (`{root_binding}`), use `code_context` (`radius: 25..50`, `limit <= 64`) instead of sequential `1..150` line slicing, use `code_files` for filename globs, set `regex: true` on `code_grep` (`max_matches_per_file: 1..64`) for alternation, and batch multiple ranges into one `code_read` call (`<= 150` lines).\n\
 - When tools are deferred behind tool search (`ToolSearch` / `tool_search_tool`), search for `\"cctxNative|code-context|tctxNative|test-context\"` on turn 0 before calling built-in `Read`/`Grep`/`Glob`. When spawning `Task`/`Agent` subagents, pass `root` (`{root_binding}`) and require `code-context` and `test-context` tools first.\n\
 - On `CACHE_MISS`, use a permitted host read/search for that single lookup only and resume Code Context next turn; keep `.github/*`, `.vscode/*`, ignored files, `/tmp/*`, and `/dev/shm/*` on host tools only.\n"
+        ),
+        (PromptTarget::CodexAgentsMd, PromptStyle::Formula | PromptStyle::Hybrid) => format!(
+            "# CCTX, TCTX & PCTX Formula — Codex AGENTS.md (root={root_binding})\n\
+- Priority: mcp__code-context__code_context/code_read/code_grep/code_files > cctx --backend shared --root {root_binding} > exec_command/shell(rg,sed,cat,nl,find)\n\
+- Swap (exec_command/shell is NOT exempt!): symbol+nearby => code_context(root={root_binding},radius:25..50,limit<=64,!1..150 slicing) ; glob => code_files ; a|b(regex:true) => code_grep(max_matches_per_file:1..64) ; ranges => 1 code_read(<=150L,<8KiB)\n\
+- Tests & Logs: mcp__test-context__test_run/test_affected | tctx --root {root_binding} run > shell runners ; pctx {{http|json|table|image|log|batch}} > python3 -c/curl/jq ; cctx --root {root_binding} journal {{record|resume}} before /compact or task switch\n\
+- Guards: keep model & reasoning_effort stable mid-session (preserves 30m/24h prefix cache) ; CACHE_MISS => 1 shell rg/sed -> resume CCTX ; .github/*,.vscode/*,.codex/*,ignored,/tmp/* => shell/host only.\n"
+        ),
+        (PromptTarget::CodexAgentsMd, PromptStyle::Prose) => format!(
+            "# Code Context (`cctx`), Test Context (`tctx`), and Probe (`pctx`) for OpenAI Codex\n\n\
+- For saved source in `{root_binding}`, always use `mcp__code-context__code_context`, `mcp__code-context__code_read`, `mcp__code-context__code_grep`, and `mcp__code-context__code_files` (or `cctx --backend shared --root {root_binding}`) FIRST before running `rg`, `grep`, `sed -n`, `nl`, `cat`, or `find` via `exec_command`/`shell`.\n\
+- Combine symbol search and block-clamped reading in one `code_context` call (`radius: 25..50`, `limit <= 64`) instead of sequential `sed -n` slicing, and batch known ranges into one `code_read` call (`<= 150` lines, `<8 KiB`).\n\
+- Run incremental tests via `mcp__test-context__test_run` or `tctx --root {root_binding} run`, filter large logs/JSON with `pctx batch` + `pctx log` instead of spawning cold-cache subagents, and record state via `cctx --root {root_binding} journal record` before `/compact` or switching tasks.\n\
+- Keep model and `reasoning_effort` stable within a thread to preserve prompt-cache prefixes (`5h`/`7d` Codex quota efficiency). On `CACHE_MISS`, perform one `rg`/`sed` read for that lookup only and resume Code Context next turn; keep `.github/*`, `.vscode/*`, `.codex/*`, ignored files, and `/tmp/*` on host commands.\n"
         ),
     };
     if matches!(target, PromptTarget::Instructions | PromptTarget::Mcp) {
@@ -912,11 +1060,21 @@ pub fn build_report(
     root: Option<&Path>,
     compress: Option<&str>,
 ) -> Value {
+    build_report_with_tokenizer(style, target, root, compress, TokenizerProfile::O200k)
+}
+
+pub fn build_report_with_tokenizer(
+    style: PromptStyle,
+    target: PromptTarget,
+    root: Option<&Path>,
+    compress: Option<&str>,
+    tokenizer: TokenizerProfile,
+) -> Value {
     if let Some(raw_task) = compress {
         let (_, unicode_replaced, backticks_removed) = normalize_bpe_operators(raw_task);
         let compressed = compress_task_prompt(raw_task, root);
-        let prose_tokens = estimate_bpe_tokens(raw_task);
-        let formula_tokens = estimate_bpe_tokens(&compressed);
+        let prose_tokens = estimate_bpe_tokens_for(raw_task, tokenizer);
+        let formula_tokens = estimate_bpe_tokens_for(&compressed, tokenizer);
         let saved = prose_tokens.saturating_sub(formula_tokens);
         let pct = if prose_tokens > 0 {
             (1000.0 * saved as f64 / prose_tokens as f64).round() / 10.0
@@ -926,6 +1084,7 @@ pub fn build_report(
         return json!({
             "mode": "compress",
             "style": style.as_str(),
+            "tokenizer": tokenizer.as_str(),
             "language": if contains_hangul(raw_task) { "ko" } else { "en" },
             "root": root.map(|p| p.display().to_string()),
             "input_bytes": raw_task.len(),
@@ -934,6 +1093,20 @@ pub fn build_report(
             "output_estimated_tokens": formula_tokens,
             "tokens_saved": saved,
             "savings_percent": pct,
+            "tokenizer_comparison": {
+                "o200k": {
+                    "input": estimate_bpe_tokens_for(raw_task, TokenizerProfile::O200k),
+                    "output": estimate_bpe_tokens_for(&compressed, TokenizerProfile::O200k),
+                },
+                "claude_4_6": {
+                    "input": estimate_bpe_tokens_for(raw_task, TokenizerProfile::Claude46),
+                    "output": estimate_bpe_tokens_for(&compressed, TokenizerProfile::Claude46),
+                },
+                "claude_4_7": {
+                    "input": estimate_bpe_tokens_for(raw_task, TokenizerProfile::Claude47),
+                    "output": estimate_bpe_tokens_for(&compressed, TokenizerProfile::Claude47),
+                },
+            },
             "unicode_math_symbols_replaced": unicode_replaced,
             "backtick_wrappers_removed": backticks_removed,
             "prompt": compressed,
@@ -941,8 +1114,8 @@ pub fn build_report(
     }
     let rendered = render(style, target, root);
     let prose_baseline = render(PromptStyle::Prose, target, root);
-    let rendered_tokens = estimate_bpe_tokens(&rendered);
-    let baseline_tokens = estimate_bpe_tokens(&prose_baseline);
+    let rendered_tokens = estimate_bpe_tokens_for(&rendered, tokenizer);
+    let baseline_tokens = estimate_bpe_tokens_for(&prose_baseline, tokenizer);
     let saved = baseline_tokens.saturating_sub(rendered_tokens);
     let pct = if baseline_tokens > 0 {
         (1000.0 * saved as f64 / baseline_tokens as f64).round() / 10.0
@@ -953,6 +1126,7 @@ pub fn build_report(
         "mode": "render",
         "style": style.as_str(),
         "target": target.as_str(),
+        "tokenizer": tokenizer.as_str(),
         "root": root.map(|p| p.display().to_string()),
         "bytes": rendered.len(),
         "lines": rendered.lines().count(),
@@ -960,6 +1134,11 @@ pub fn build_report(
         "prose_baseline_tokens": baseline_tokens,
         "tokens_saved_vs_prose": saved,
         "savings_percent_vs_prose": pct,
+        "tokenizer_comparison": {
+            "o200k": estimate_bpe_tokens_for(&rendered, TokenizerProfile::O200k),
+            "claude_4_6": estimate_bpe_tokens_for(&rendered, TokenizerProfile::Claude46),
+            "claude_4_7": estimate_bpe_tokens_for(&rendered, TokenizerProfile::Claude47),
+        },
         "prompt": rendered,
     })
 }
@@ -1016,7 +1195,7 @@ const SUBAGENT_EXTRA_TOOLS: &[&str] = &[
     "mcp__test-context__*",
 ];
 
-const TARGET_YAML_AGENTS: &[&str] = &[
+pub const TARGET_YAML_AGENTS: &[&str] = &[
     "explore.agent.yaml",
     "code-review.agent.yaml",
     "rubber-duck.agent.yaml",
@@ -1027,66 +1206,815 @@ const TARGET_YAML_AGENTS: &[&str] = &[
     "sidekick/github-context-memory.yaml",
 ];
 
+fn indent_yaml_block(body: &str, indent: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 64);
+    for line in body.lines() {
+        if !line.trim().is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_literal_block_header(header_line: &str) -> Option<Option<usize>> {
+    let rest = header_line
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("prompt:")?
+        .trim_start_matches([' ', '\t']);
+    let after_pipe = rest.strip_prefix('|')?;
+    let mut chars = after_pipe.chars().peekable();
+    let mut chomp_seen = false;
+    let mut explicit_indent: Option<usize> = None;
+    for _ in 0..2 {
+        match chars.peek().copied() {
+            Some('-' | '+') if !chomp_seen => {
+                chomp_seen = true;
+                chars.next();
+            }
+            Some(d @ '1'..='9') if explicit_indent.is_none() => {
+                explicit_indent = Some((d as usize) - ('0' as usize));
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    let tail: String = chars.collect();
+    if !tail.is_empty() {
+        if !tail.starts_with([' ', '\t']) {
+            return None;
+        }
+        let trimmed_tail = tail.trim_start_matches([' ', '\t']);
+        if !trimmed_tail.is_empty() && !trimmed_tail.starts_with('#') {
+            return None;
+        }
+    }
+    Some(explicit_indent)
+}
+
+fn locate_prompt_literal_block(yaml_text: &str) -> Option<(usize, usize, String, bool)> {
+    let prompt_idx = yaml_text
+        .find("\nprompt:")
+        .map(|i| i + 1)
+        .or_else(|| yaml_text.starts_with("prompt:").then_some(0))?;
+    let nl = yaml_text[prompt_idx..].find('\n')?;
+    let header_line = &yaml_text[prompt_idx..prompt_idx + nl];
+    let explicit = parse_literal_block_header(header_line)?;
+    let body_start = prompt_idx + nl + 1;
+    let after_header = &yaml_text[body_start..];
+    let body_end = match find_first_top_level_yaml_key_offset(after_header) {
+        Some(pos) => body_start + pos,
+        None => yaml_text.len(),
+    };
+    if let Some(n) = explicit {
+        return Some((body_start, body_end, " ".repeat(n), true));
+    }
+    let body = &yaml_text[body_start..body_end];
+    let mut max_leading_blank_spaces = 0usize;
+    for line in body.lines() {
+        let clean = line.trim_end_matches('\r');
+        if clean.trim_matches(' ').is_empty() {
+            if clean.bytes().all(|b| b == b' ') {
+                max_leading_blank_spaces = max_leading_blank_spaces.max(clean.len());
+            } else {
+                return None;
+            }
+            continue;
+        }
+        let spaces = clean.bytes().take_while(|&b| b == b' ').count();
+        if spaces >= 1 && max_leading_blank_spaces <= spaces {
+            return Some((body_start, body_end, " ".repeat(spaces), false));
+        }
+        return None;
+    }
+    Some((
+        body_start,
+        body_end,
+        " ".repeat(max_leading_blank_spaces.max(2)),
+        false,
+    ))
+}
+
+fn reindent_yaml_block(default_two_space_block: &str, target_indent: &str) -> String {
+    if target_indent == "  " {
+        return default_two_space_block.to_owned();
+    }
+    let mut out = String::with_capacity(default_two_space_block.len() + 32);
+    for line in default_two_space_block.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+        } else {
+            let stripped = line.strip_prefix("  ").unwrap_or(line);
+            out.push_str(target_indent);
+            out.push_str(stripped);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn is_top_level_yaml_mapping_key(line: &str) -> bool {
+    let trimmed = line.trim_end_matches('\r');
+    if trimmed.is_empty() || trimmed.starts_with(' ') || trimmed.starts_with('#') {
+        return false;
+    }
+    let Some((key, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && (rest.is_empty() || rest.starts_with(' '))
+}
+
+fn find_first_top_level_yaml_key_offset(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for raw_line in text.split_inclusive('\n') {
+        if is_top_level_yaml_mapping_key(raw_line.trim_end_matches('\n')) {
+            return Some(offset);
+        }
+        offset += raw_line.len();
+    }
+    None
+}
+
+fn legacy_cctx_line(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return true;
+    }
+    s.starts_with("CCTX & TCTX Formula Rules")
+        || s.starts_with("**Code Context (`cctx`)")
+        || s.starts_with("- Source:")
+        || s.starts_with("- Tests & Probes:")
+        || s.starts_with("- Guards:")
+        || s.starts_with("- Deferred")
+        || s.starts_with("- Transitions:")
+        || s.starts_with("- For locating or reading saved source")
+        || s.starts_with("1. Prefer ")
+        || s.starts_with("2. Always pass ")
+        || s.starts_with("3. Do NOT pass ")
+        || s.starts_with("4. If Code Context or Test Context tools")
+        || s.starts_with("4. Even when `grep`/`view`/`glob`")
+        || s.starts_with("4b. ")
+        || s.starts_with("5. If a native ")
+        || s.starts_with("6. On `CACHE_MISS`")
+        || s.starts_with("7. For running or inspecting tests")
+        || s.starts_with("8. For HTTP/OpenAPI")
+}
+
+fn find_yaml_tools_section(text: &str) -> Option<(usize, usize)> {
+    let key_start = if text.starts_with("tools:\n") || text.starts_with("tools:\r\n") {
+        0
+    } else if let Some(pos) = text.find("\ntools:\n").or_else(|| text.find("\ntools:\r\n")) {
+        pos + 1
+    } else {
+        return None;
+    };
+    let nl = text[key_start..].find('\n')?;
+    let body_start = key_start + nl + 1;
+    let mut offset = body_start;
+    for raw_line in text[body_start..].split_inclusive('\n') {
+        let clean = raw_line.trim_end_matches(['\r', '\n']);
+        let leading = clean.bytes().take_while(|&b| b == b' ').count();
+        let stripped = clean.trim_start();
+        if stripped.is_empty()
+            || (leading >= 2 && (stripped.starts_with('#') || stripped.starts_with("- ")))
+        {
+            offset += raw_line.len();
+        } else {
+            break;
+        }
+    }
+    Some((body_start, offset))
+}
+
+fn is_plain_tool_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'*' | b'/' | b':' | b'@' | b'\'')
+}
+
+fn parse_yaml_tool_scalar(raw: &str, allow_trailing_comment: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes[0] == b'\'' || bytes[0] == b'"' {
+        let q = bytes[0];
+        let mut i = 1usize;
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut closed = false;
+        while i < bytes.len() {
+            if q == b'"' && bytes[i] == b'\\' {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                let esc = match bytes[i + 1] {
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'/' => b'/',
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'u' if i + 5 < bytes.len()
+                        && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit) =>
+                    {
+                        let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).ok()?;
+                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        let ch = char::from_u32(code)?;
+                        let mut utf8 = [0_u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+                        i += 6;
+                        continue;
+                    }
+                    _ => return None,
+                };
+                out.push(esc);
+                i += 2;
+                continue;
+            }
+            if q == b'\'' && bytes[i] == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                out.push(b'\'');
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                closed = true;
+                i += 1;
+                break;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        if !closed {
+            return None;
+        }
+        let rest = trimmed[i..].trim();
+        if !(rest.is_empty() || allow_trailing_comment && rest.starts_with('#')) {
+            return None;
+        }
+        let s = String::from_utf8(out).ok()?;
+        return (!s.is_empty()).then_some(s);
+    }
+    let body = if allow_trailing_comment && let Some((head, _)) = trimmed.split_once(" #") {
+        head.trim_end()
+    } else {
+        trimmed
+    };
+    if body.is_empty()
+        || matches!(body.as_bytes()[0], b'-' | b'@' | b'*' | b':' | b'?')
+        || body.contains(": ")
+        || body.ends_with(':')
+        || !body.bytes().all(is_plain_tool_char)
+    {
+        return None;
+    }
+    Some(body.to_owned())
+}
+
+fn parse_inline_tools_brackets(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("tools:")?;
+    let prefix_len = "tools:".len();
+    let trimmed_start = rest.len() - rest.trim_start().len();
+    let after_ws = &rest[trimmed_start..];
+    if !after_ws.starts_with('[') {
+        return None;
+    }
+    let open_idx = prefix_len + trimmed_start;
+    let bytes = line.as_bytes();
+    let mut i = open_idx + 1;
+    let mut quote: u8 = 0;
+    let mut at_item_start = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if b == b'\\' && quote == b'"' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if q_double_single(quote, bytes, i) {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            at_item_start = true;
+            i += 1;
+            continue;
+        }
+        if at_item_start && (b == b'\'' || b == b'"') {
+            quote = b;
+            at_item_start = false;
+            i += 1;
+            continue;
+        }
+        if b == b']' {
+            let tail = line[i + 1..].trim();
+            if tail.is_empty() || tail.starts_with('#') {
+                return Some((open_idx, i));
+            }
+            return None;
+        }
+        at_item_start = false;
+        i += 1;
+    }
+    None
+}
+
+fn q_double_single(quote: u8, bytes: &[u8], i: usize) -> bool {
+    quote == b'\'' && bytes[i] == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\''
+}
+
+fn find_yaml_inline_tools_span(text: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for raw_line in text.split_inclusive('\n') {
+        let clean = raw_line.trim_end_matches(['\r', '\n']);
+        if let Some((open_rel, close_rel)) = parse_inline_tools_brackets(clean) {
+            return Some((offset + open_rel, offset + close_rel));
+        }
+        offset += raw_line.len();
+    }
+    None
+}
+
+fn parse_inline_yaml_items(inner: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if bytes[i] == b',' {
+            return None;
+        }
+        let item_start = i;
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let mut closed = false;
+            while i < n {
+                if q == b'"' && bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if q_double_single(q, bytes, i) {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                return None;
+            }
+            while i < n && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let item_end = i;
+            if i < n {
+                if bytes[i] != b',' {
+                    return None;
+                }
+                i += 1;
+            }
+            items.push(parse_yaml_tool_scalar(&inner[item_start..item_end], false)?);
+        } else {
+            while i < n && bytes[i] != b',' {
+                i += 1;
+            }
+            items.push(parse_yaml_tool_scalar(&inner[item_start..i], false)?);
+            if i < n && bytes[i] == b',' {
+                i += 1;
+            }
+        }
+    }
+    Some(items)
+}
+
+fn parse_block_yaml_items(tools_body: &str) -> Option<Vec<String>> {
+    let mut expected_spaces: Option<usize> = None;
+    let mut items = Vec::new();
+    for line in tools_body.lines() {
+        let clean = line.trim_end_matches('\r');
+        if clean.trim().is_empty() {
+            continue;
+        }
+        let spaces = clean.bytes().take_while(|&b| b == b' ').count();
+        if spaces < 2 {
+            return None;
+        }
+        let rest = &clean[spaces..];
+        if rest.starts_with('#') {
+            continue;
+        }
+        let item = rest.strip_prefix("- ")?;
+        if let Some(exp) = expected_spaces {
+            if spaces != exp {
+                return None;
+            }
+        } else {
+            expected_spaces = Some(spaces);
+        }
+        items.push(parse_yaml_tool_scalar(item, true)?);
+    }
+    Some(items)
+}
+
+fn has_any_top_level_tools_key(text: &str) -> bool {
+    text.lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .any(|l| l == "tools:" || l.starts_with("tools: ") || l.starts_with("tools:\t"))
+}
+
+fn detect_tools_item_indent(tools_body: &str) -> String {
+    for line in tools_body.lines() {
+        let clean = line.trim_end_matches('\r');
+        let spaces = clean.bytes().take_while(|&b| b == b' ').count();
+        if spaces >= 2 && clean[spaces..].starts_with("- ") {
+            return " ".repeat(spaces);
+        }
+    }
+    String::from("  ")
+}
+
+fn has_top_level_strict_tools(text: &str) -> bool {
+    text.starts_with("strictToolsList: true") || text.contains("\nstrictToolsList: true")
+}
+
+fn yaml_top_level_structure_valid(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SectionKind {
+        None,
+        Container,
+        BlockScalar,
+        InlineScalar,
+    }
+    let mut state = SectionKind::None;
+    let mut seen_keys: Vec<&str> = Vec::with_capacity(8);
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            if line.starts_with('#') {
+                continue;
+            }
+            if !is_top_level_yaml_mapping_key(line) {
+                return false;
+            }
+            let (key, rest) = line.split_once(':').unwrap_or(("", ""));
+            if seen_keys.contains(&key) {
+                return false;
+            }
+            seen_keys.push(key);
+            let val = rest.trim();
+            state = if val.is_empty() {
+                SectionKind::Container
+            } else if val.starts_with('|') || val.starts_with('>') {
+                SectionKind::BlockScalar
+            } else {
+                SectionKind::InlineScalar
+            };
+        } else if matches!(state, SectionKind::None | SectionKind::InlineScalar) {
+            return false;
+        }
+    }
+    true
+}
+
+fn split_after_legacy_cctx_block(after_marker_line: &str) -> &str {
+    let mut cursor = 0usize;
+    let mut last_cctx_end = 0usize;
+    for raw_line in after_marker_line.split_inclusive('\n') {
+        let clean = raw_line.trim_end_matches(['\r', '\n']);
+        if is_top_level_yaml_mapping_key(clean) {
+            return &after_marker_line[cursor..];
+        }
+        if clean.trim().is_empty() {
+            cursor += raw_line.len();
+            continue;
+        }
+        if !legacy_cctx_line(clean) {
+            return &after_marker_line[last_cctx_end..];
+        }
+        cursor += raw_line.len();
+        last_cctx_end = cursor;
+    }
+    &after_marker_line[last_cctx_end..]
+}
+
+fn inject_yaml_extra_tools(updated: &mut String) {
+    if has_top_level_strict_tools(updated) {
+        return;
+    }
+    if let Some((open_abs, close_abs)) = find_yaml_inline_tools_span(updated) {
+        let inner = &updated[open_abs + 1..close_abs];
+        let Some(parsed_items) = parse_inline_yaml_items(inner) else {
+            return;
+        };
+        if parsed_items.iter().any(|s| s == "*") {
+            return;
+        }
+        let quote = if inner.contains('\'') {
+            "'"
+        } else if inner.contains('"') {
+            "\""
+        } else {
+            ""
+        };
+        let mut additions = Vec::new();
+        for &t in SUBAGENT_EXTRA_TOOLS {
+            if !parsed_items.iter().any(|existing| existing == t) {
+                if quote.is_empty() && t.contains('*') {
+                    additions.push(format!("'{t}'"));
+                } else {
+                    additions.push(format!("{quote}{t}{quote}"));
+                }
+            }
+        }
+        if !additions.is_empty() {
+            let joined = additions.join(", ");
+            let trimmed_end = inner.trim_end();
+            let prefix = if trimmed_end.is_empty() {
+                ""
+            } else if trimmed_end.ends_with(',') {
+                " "
+            } else {
+                ", "
+            };
+            updated.insert_str(close_abs, &format!("{prefix}{joined}"));
+        }
+        return;
+    }
+    let Some((tools_start, tools_end)) = find_yaml_tools_section(updated) else {
+        return;
+    };
+    let tools_body = &updated[tools_start..tools_end];
+    let Some(parsed_block_items) = parse_block_yaml_items(tools_body) else {
+        return;
+    };
+    if parsed_block_items.iter().any(|s| s == "*") {
+        return;
+    }
+    let item_indent = detect_tools_item_indent(tools_body);
+    let missing: Vec<&str> = SUBAGENT_EXTRA_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| !parsed_block_items.iter().any(|existing| existing == t))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut block = format!("{item_indent}# Code Context & Test Context tools (read-only)\n");
+    for t in missing {
+        block.push_str(&format!("{item_indent}- {t}\n"));
+    }
+    let lsp_needle = format!("{item_indent}- lsp\n");
+    if let Some(lsp_rel) = tools_body.find(&lsp_needle) {
+        let insert_at = tools_start + lsp_rel + lsp_needle.len();
+        updated.insert_str(insert_at, &block);
+    } else {
+        let mut insert_at = tools_end;
+        while insert_at > tools_start
+            && updated.as_bytes()[insert_at - 1].is_ascii_whitespace()
+            && updated[..insert_at].ends_with("\n\n")
+        {
+            insert_at -= 1;
+        }
+        if insert_at > tools_start && !updated[..insert_at].ends_with('\n') {
+            block.insert(0, '\n');
+        }
+        updated.insert_str(insert_at, &block);
+    }
+}
+
+pub fn yaml_subagent_is_valid(text: &str) -> bool {
+    if !text.contains(SUBAGENT_MARKER) || !yaml_top_level_structure_valid(text) {
+        return false;
+    }
+    let strict_tools = has_top_level_strict_tools(text);
+    if let Some((open_abs, close_abs)) = find_yaml_inline_tools_span(text) {
+        let inner = &text[open_abs + 1..close_abs];
+        let Some(parsed_items) = parse_inline_yaml_items(inner) else {
+            return false;
+        };
+        let is_wildcard = parsed_items.iter().any(|s| s == "*");
+        if !strict_tools
+            && !is_wildcard
+            && (!parsed_items.iter().any(|s| s == "cctxNativeContext")
+                || !parsed_items.iter().any(|s| s == "code-context/*"))
+        {
+            return false;
+        }
+    } else if let Some((tools_start, tools_end)) = find_yaml_tools_section(text) {
+        let tools_body = &text[tools_start..tools_end];
+        let Some(parsed_items) = parse_block_yaml_items(tools_body) else {
+            return false;
+        };
+        let is_wildcard = parsed_items.iter().any(|s| s == "*");
+        if !strict_tools
+            && !is_wildcard
+            && (!parsed_items.iter().any(|s| s == "cctxNativeContext")
+                || !parsed_items.iter().any(|s| s == "code-context/*"))
+        {
+            return false;
+        }
+    } else if has_any_top_level_tools_key(text) {
+        return false;
+    }
+    let Some((prompt_body_start, prompt_body_end, expected_indent, has_explicit_indent)) =
+        locate_prompt_literal_block(text)
+    else {
+        return false;
+    };
+    let prompt_body = &text[prompt_body_start..prompt_body_end];
+    let mut saw_first_content = false;
+    let mut saw_marker = false;
+    for line in prompt_body.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.trim_matches(' ').is_empty() {
+            if !trimmed.bytes().all(|b| b == b' ') {
+                return false;
+            }
+            if has_explicit_indent && trimmed.len() >= expected_indent.len() {
+                saw_first_content = true;
+                continue;
+            }
+            if !saw_first_content && !has_explicit_indent && trimmed.len() > expected_indent.len() {
+                return false;
+            }
+            continue;
+        }
+        saw_first_content = true;
+        if !trimmed.starts_with(&expected_indent) {
+            return false;
+        }
+        if trimmed.trim() == SUBAGENT_MARKER {
+            saw_marker = true;
+        }
+    }
+    saw_marker
+}
+
+fn find_standalone_marker_line(slice: &str, marker: &str, min_indent: usize) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for raw_line in slice.split_inclusive('\n') {
+        let clean = raw_line.trim_end_matches(['\r', '\n']);
+        let spaces = clean.bytes().take_while(|&b| b == b' ').count();
+        if spaces >= min_indent && clean[spaces..].trim_end() == marker {
+            return Some((offset, offset + raw_line.len()));
+        }
+        offset += raw_line.len();
+    }
+    None
+}
+
+fn write_file_atomic(path: &Path, contents: &[u8]) -> bool {
+    use std::io::Write;
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("agent.yaml"));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_u128, |d| d.as_nanos());
+    let tmp_path = parent.join(format!(".{file_name}.{}.{nonce}.tmp", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = file.set_permissions(meta.permissions());
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    true
+}
+
+const SUBAGENT_END_MARKER: &str = "# [/cctx-subagent-instructions]";
+
 fn patch_yaml_subagent_file(path: &Path, style: PromptStyle) -> bool {
+    use fs2::FileExt;
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(lock_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".cctx-subagent.lock"))
+    else {
+        return false;
+    };
+    if lock_file.lock_exclusive().is_err() {
+        return false;
+    }
     let Ok(original) = std::fs::read_to_string(path) else {
         return false;
     };
     let mut updated = original.clone();
-    let yaml_block = render(style, PromptTarget::SubagentYaml, None);
+    inject_yaml_extra_tools(&mut updated);
 
-    let has_explicit_tools = updated.contains("\ntools:\n")
-        && !updated.contains("  - \"*\"\n")
-        && !updated.contains("strictToolsList: true");
-    if has_explicit_tools {
-        let missing: Vec<&str> = SUBAGENT_EXTRA_TOOLS
-            .iter()
-            .copied()
-            .filter(|t| !updated.contains(&format!("  - {t}\n")))
-            .collect();
-        if !missing.is_empty() {
-            let mut block = String::from("  # Code Context & Test Context tools (read-only)\n");
-            for t in missing {
-                block.push_str(&format!("  - {t}\n"));
+    let Some((prompt_body_start, prompt_body_end, indent, _)) =
+        locate_prompt_literal_block(&updated)
+    else {
+        return false;
+    };
+    let yaml_block = reindent_yaml_block(&render(style, PromptTarget::SubagentYaml, None), &indent);
+    let prompt_slice = &updated[prompt_body_start..prompt_body_end];
+
+    if let Some((rel_line_start, rel_line_end)) =
+        find_standalone_marker_line(prompt_slice, SUBAGENT_MARKER, indent.len())
+    {
+        let line_start = prompt_body_start + rel_line_start;
+        let after_marker_abs = prompt_body_start + rel_line_end;
+        let mut head = updated[..line_start].trim_end_matches(['\r', '\n']);
+        while head.len() > prompt_body_start && head.ends_with("\n\n") {
+            head = &head[..head.len() - 1];
+        }
+        head = head.trim_end_matches(['\r', '\n']);
+        let prompt_after_marker = &updated[after_marker_abs..prompt_body_end];
+        if let Some((_, rel_end_line_end)) =
+            find_standalone_marker_line(prompt_after_marker, SUBAGENT_END_MARKER, indent.len())
+        {
+            let rest = &updated[after_marker_abs + rel_end_line_end..];
+            if rest.trim_matches(['\r', '\n']).is_empty() {
+                updated = format!("{head}\n\n{yaml_block}");
+            } else if is_top_level_yaml_mapping_key(rest.lines().next().unwrap_or("")) {
+                updated = format!("{head}\n\n{yaml_block}\n{rest}");
+            } else {
+                updated = format!("{head}\n\n{yaml_block}{rest}");
             }
-            if updated.contains("  - lsp\n") {
-                updated = updated.replacen("  - lsp\n", &format!("  - lsp\n{block}"), 1);
-            } else if updated.contains("\npromptParts:\n") {
-                updated =
-                    updated.replacen("\npromptParts:\n", &format!("\n{block}promptParts:\n"), 1);
-            } else if updated.contains("\nprompt: |\n") {
-                updated = updated.replacen("\nprompt: |\n", &format!("\n{block}prompt: |\n"), 1);
+        } else {
+            let after_marker_line = &updated[after_marker_abs..];
+            let rest = split_after_legacy_cctx_block(after_marker_line);
+            if rest.trim_matches(['\r', '\n']).is_empty() {
+                updated = format!("{head}\n\n{yaml_block}");
+            } else if is_top_level_yaml_mapping_key(rest.lines().next().unwrap_or("")) {
+                updated = format!("{head}\n\n{yaml_block}\n{rest}");
+            } else {
+                updated = format!("{head}\n\n{yaml_block}{rest}");
             }
         }
+    } else if prompt_body_end < updated.len() {
+        let before_key = updated[..prompt_body_end].trim_end_matches(['\r', '\n']);
+        let after_key = &updated[prompt_body_end..];
+        updated = format!("{before_key}\n\n{yaml_block}\n{after_key}");
+    } else {
+        let before_eof = updated.trim_end_matches(['\r', '\n']);
+        let sep = if prompt_body_start == updated.len() { "\n" } else { "\n\n" };
+        updated = format!("{before_eof}{sep}{yaml_block}");
     }
 
-    let marker_line = format!("  {SUBAGENT_MARKER}");
-    if let Some(pos) = updated.find(&marker_line) {
-        let head = updated[..pos].trim_end();
-        let tail = &updated[pos + marker_line.len()..];
-        if let Some(sk_pos) = tail.find("\nsidekick:\n") {
-            let after_sk = &tail[sk_pos + "\nsidekick:\n".len()..];
-            updated = format!("{head}\n\n{yaml_block}\nsidekick:\n{after_sk}");
-        } else {
-            updated = format!("{head}\n\n{yaml_block}");
-        }
-    } else if updated.contains("\nprompt: |\n") {
-        if let Some(sk_pos) = updated.find("\nsidekick:\n") {
-            let before_sk = updated[..sk_pos].trim_end();
-            let after_sk = &updated[sk_pos + "\nsidekick:\n".len()..];
-            updated = format!("{before_sk}\n\n{yaml_block}\nsidekick:\n{after_sk}");
-        } else {
-            updated = format!("{}\n\n{yaml_block}", updated.trim_end());
-        }
+    if !yaml_subagent_is_valid(&updated) {
+        return false;
     }
-
-    updated != original && std::fs::write(path, updated).is_ok()
+    if updated == original {
+        return false;
+    }
+    if std::fs::read_to_string(path).ok().as_deref() != Some(original.as_str()) {
+        return false;
+    }
+    write_file_atomic(path, updated.as_bytes())
 }
 
-/// Automatically patches any unconfigured Copilot SDK subagent YAML definitions under `home`
-/// (including standalone Copilot CLI caches and WSL-mounted Windows VS Code SDK bundles)
-/// using the active `PromptStyle` (default: `Formula`).
-pub fn ensure_subagents_configured(home: &Path) -> usize {
-    let style = PromptStyle::from_env().unwrap_or_default();
+/// Discovers all Copilot SDK subagent YAML definition directories under `home`
+/// (including standalone Copilot CLI caches and WSL-mounted Windows VS Code SDK bundles).
+pub fn discover_subagent_definition_dirs(home: &Path) -> Vec<PathBuf> {
     let mut def_dirs: Vec<PathBuf> = Vec::new();
     for parent_rel in [".vscode-server/bin", ".vscode-server/cli/servers"] {
         let parent = home.join(parent_rel);
@@ -1110,7 +2038,6 @@ pub fn ensure_subagents_configured(home: &Path) -> usize {
             }
         }
     }
-    // Standalone Copilot CLI auto-update cache (`~/.cache/copilot/pkg/<plat>/<ver>/definitions`)
     for cache_rel in [".cache/copilot/pkg", ".cache/github-copilot-sdk"] {
         let cache_parent = home.join(cache_rel);
         if let Ok(plat_entries) = std::fs::read_dir(&cache_parent) {
@@ -1134,7 +2061,6 @@ pub fn ensure_subagents_configured(home: &Path) -> usize {
             }
         }
     }
-    // WSL-mounted Windows VS Code local SDK definitions (only when scanning real host home)
     if home.starts_with("/home/")
         && let Ok(users) = std::fs::read_dir("/mnt/c/Users")
     {
@@ -1142,6 +2068,16 @@ pub fn ensure_subagents_configured(home: &Path) -> usize {
             let vscode_app = user
                 .path()
                 .join("AppData/Local/Programs/Microsoft VS Code");
+            for rel in [
+                "extensions/copilot/node_modules/@github/copilot/sdk/definitions",
+                "node_modules.asar.unpacked/@github/copilot-sdk-win32-x64/definitions",
+                "node_modules.asar.unpacked/@github/copilot-sdk-win32-arm64/definitions",
+            ] {
+                let direct_app_dir = vscode_app.join("resources/app").join(rel);
+                if direct_app_dir.is_dir() {
+                    def_dirs.push(direct_app_dir);
+                }
+            }
             let Ok(v_entries) = std::fs::read_dir(&vscode_app) else {
                 continue;
             };
@@ -1164,6 +2100,15 @@ pub fn ensure_subagents_configured(home: &Path) -> usize {
     }
     def_dirs.sort();
     def_dirs.dedup();
+    def_dirs
+}
+
+/// Automatically patches any unconfigured Copilot SDK subagent YAML definitions under `home`
+/// (including standalone Copilot CLI caches and WSL-mounted Windows VS Code SDK bundles)
+/// using the active `PromptStyle` (default: `Formula`).
+pub fn ensure_subagents_configured(home: &Path) -> usize {
+    let style = PromptStyle::from_env().unwrap_or_default();
+    let def_dirs = discover_subagent_definition_dirs(home);
     let mut patched = 0usize;
     for def_dir in def_dirs {
         for agent_name in TARGET_YAML_AGENTS {
@@ -1194,7 +2139,7 @@ pub struct BpeSurfaceStatus {
 }
 
 pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
-    let subagents_auto_patched = ensure_subagents_configured(home);
+    let subagents_auto_patched = 0usize;
     let active_style = PromptStyle::from_env().unwrap_or_default();
     let default_formula = !matches!(active_style, PromptStyle::Prose);
 
@@ -1338,13 +2283,20 @@ pub fn inspect_bpe_surfaces(home: &Path) -> BpeSurfaceStatus {
         0
     };
 
-    // 4. Global user instructions (~/.copilot/copilot-instructions.md) — dynamic operator-density delta
-    let global_path = home.join(".copilot/copilot-instructions.md");
-    let (global_instructions_bpe, global_tokens_saved) = if global_path.is_file() {
-        match std::fs::read_to_string(&global_path) {
+    // 4. Global user instructions (~/.copilot/copilot-instructions.md, ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md)
+    let global_candidates = [
+        home.join(".copilot/copilot-instructions.md"),
+        home.join(".claude/CLAUDE.md"),
+        home.join(".codex/AGENTS.md"),
+    ];
+    let global_path = global_candidates.into_iter().find(|p| p.is_file());
+    let (global_instructions_bpe, global_tokens_saved) = if let Some(gp) = global_path {
+        match std::fs::read_to_string(&gp) {
             Ok(t) => {
-                let is_bpe =
-                    t.contains("=>") && (t.contains("cctxNativeContext") || t.contains("Formula"));
+                let is_bpe = t.contains("=>")
+                    && (t.contains("cctxNativeContext")
+                        || t.contains("code_context")
+                        || t.contains("Formula"));
                 if is_bpe {
                     let actual_tok = estimate_bpe_tokens(&t);
                     let op_count = t.matches(" => ").count()
@@ -1425,6 +2377,30 @@ mod tests {
             "Do not enumerate or prepare sibling worktrees",
         ] {
             assert!(hybrid.contains(required), "hybrid missing {required}");
+        }
+    }
+
+    #[test]
+    fn deferred_discovery_uses_two_name_queries_and_covers_shell_lookups() {
+        let four_names = "code-context-code_context code-context-code_read code-context-code_grep code-context-code_files";
+        for style in [
+            PromptStyle::Formula,
+            PromptStyle::Hybrid,
+            PromptStyle::Prose,
+        ] {
+            let rendered = render(style, PromptTarget::Instructions, None);
+            assert!(
+                !rendered.contains(four_names),
+                "{style:?} still uses 4-name query"
+            );
+            assert!(
+                rendered.contains("code-context-code_read code-context-code_files"),
+                "{style:?} missing 2-name discovery query"
+            );
+            assert!(
+                rendered.contains("bash"),
+                "{style:?} missing shell lookup rule"
+            );
         }
     }
 
@@ -1558,6 +2534,89 @@ Q2. Which function calculates retry delay, what formula does it use, and what ca
         assert!(body.contains("tool_search_tool"));
         assert!(body.contains("mcp__code-context__*"));
         assert!(body.contains("CCTX & TCTX Formula Rules"));
+        assert!(yaml_subagent_is_valid(&body), "patched YAML invalid:\n{body}");
+
+        // Verify both Formula and Prose SubagentYaml preserve 2-space block-scalar indentation
+        // and automatically repair previously unindented/corrupted YAML & sidekick blocks.
+        for style in [PromptStyle::Formula, PromptStyle::Prose] {
+            let block = render(style, PromptTarget::SubagentYaml, Some(Path::new("/repo")));
+            for line in block.lines() {
+                assert!(
+                    line.trim().is_empty() || line.starts_with("  "),
+                    "unindented SubagentYaml line in {style:?}: {line:?}"
+                );
+            }
+        }
+        std::fs::create_dir_all(cli_defs.join("sidekick")).unwrap();
+        let corrupted_sidekick = "name: github-context\ntools:\n  - view\nprompt: |\n  Sidekick rules.\n\n  # [cctx-subagent-instructions]\nCCTX & TCTX Formula Rules:\n- Source: broken unindented line\n\nsidekick:\n  maxSendsPerTurn: 1\n";
+        assert!(!yaml_subagent_is_valid(corrupted_sidekick));
+        let sk_path = cli_defs.join("sidekick/github-context.yaml");
+        std::fs::write(&sk_path, corrupted_sidekick).unwrap();
+        assert_eq!(ensure_subagents_configured(home.path()), 1);
+        let repaired = std::fs::read_to_string(&sk_path).unwrap();
+        assert!(yaml_subagent_is_valid(&repaired), "repaired sidekick invalid:\n{repaired}");
+        assert!(repaired.ends_with("\nsidekick:\n  maxSendsPerTurn: 1\n"));
+
+        // Verify top-of-file `tools:` followed by scalar `reasoningEffort: low` before `prompt: |-`
+        // keeps injected tools inside `tools:` and preserves custom user `4. ...` rules after legacy marker.
+        let task_path = cli_defs.join("task.agent.yaml");
+        let tricky_yaml = "tools:\n  - view\nreasoningEffort: low\nprompt: |-\n  Base task rules.\n\n  # [cctx-subagent-instructions]\n  CCTX & TCTX Formula Rules:\n  - Source: old rule\n  4. Never expose user tokens.\n";
+        std::fs::write(&task_path, tricky_yaml).unwrap();
+        assert_eq!(ensure_subagents_configured(home.path()), 1);
+        let patched_tricky = std::fs::read_to_string(&task_path).unwrap();
+        assert!(yaml_subagent_is_valid(&patched_tricky), "tricky YAML invalid:\n{patched_tricky}");
+        let re_pos = patched_tricky.find("\nreasoningEffort: low\n").unwrap();
+        let tool_pos = patched_tricky.find("  - cctxNativeContext\n").unwrap();
+        assert!(tool_pos < re_pos, "tools must be inserted inside tools: before reasoningEffort");
+        assert!(
+            patched_tricky.contains("  4. Never expose user tokens."),
+            "custom user numbered rule must be preserved:\n{patched_tricky}"
+        );
+        // Misplaced sequence under scalar must be rejected by yaml_subagent_is_valid
+        let broken_scalar_seq = "name: explore\nreasoningEffort: low\n  - cctxNativeContext\nprompt: |\n  # [cctx-subagent-instructions]\n  ok\n";
+        assert!(!yaml_subagent_is_valid(broken_scalar_seq));
+
+        // 4-space indented tools list & inline flow-style `tools: [...]` preserve exact formatting
+        let four_space_path = cli_defs.join("research.agent.yaml");
+        std::fs::write(
+            &four_space_path,
+            "name: research\ntools:\n    - view\n    - grep\nprompt: |\n    Research rules.\n",
+        )
+        .unwrap();
+        let inline_path = cli_defs.join("code-review.agent.yaml");
+        std::fs::write(
+            &inline_path,
+            "name: code-review\ntools: [view, grep,] # trailing comma & comment\nprompt: |\n  Review rules.\n",
+        )
+        .unwrap();
+        assert_eq!(ensure_subagents_configured(home.path()), 2);
+        let four_body = std::fs::read_to_string(&four_space_path).unwrap();
+        assert!(yaml_subagent_is_valid(&four_body), "4-space YAML invalid:\n{four_body}");
+        assert!(four_body.contains("    - cctxNativeContext\n"));
+        assert!(!four_body.contains("\n  - cctxNativeContext\n"));
+        let inline_body = std::fs::read_to_string(&inline_path).unwrap();
+        assert!(yaml_subagent_is_valid(&inline_body), "inline YAML invalid:\n{inline_body}");
+        assert!(!inline_body.contains(",,"));
+        assert!(inline_body.contains("# trailing comma & comment"));
+        assert!(inline_body.contains("tools: [view, grep, tool_search_tool, cctxNativeFiles"));
+
+        // 4-space leading marker followed by 2-space comment outside block must be rejected
+        let mismatched_leading_marker = "name: explore\ntools: [\"*\"]\nprompt: |\n    # [cctx-subagent-instructions]\n  # 2-space comment outside 4-space scalar\n    body\n";
+        assert!(!yaml_subagent_is_valid(mismatched_leading_marker));
+
+        // Explicit `prompt:  |4-` with >4-space leading line, Unicode-ws malformed header, and 1-space `prompt: |`
+        let explicit_four_empty = cli_defs.join("security-review.agent.yaml");
+        std::fs::write(&explicit_four_empty, "name: security-review\ntools: [\"*\"]\nprompt:  |4-\n      \n    Rule.\n").unwrap();
+        let one_space_agent = cli_defs.join("rubber-duck.agent.yaml");
+        std::fs::write(&one_space_agent, "name: rubber-duck\ntools: [\"*\"]\nprompt: |\n One-space rule.\n").unwrap();
+        assert_eq!(ensure_subagents_configured(home.path()), 2);
+        let exp4_body = std::fs::read_to_string(&explicit_four_empty).unwrap();
+        assert!(yaml_subagent_is_valid(&exp4_body), "explicit |4- invalid:\n{exp4_body}");
+        assert!(exp4_body.contains("\n    # [cctx-subagent-instructions]\n"));
+        let one_body = std::fs::read_to_string(&one_space_agent).unwrap();
+        assert!(yaml_subagent_is_valid(&one_body), "1-space invalid:\n{one_body}");
+        assert!(one_body.contains("\n # [cctx-subagent-instructions]\n"));
+        assert!(!yaml_subagent_is_valid("name: x\ntools: [\"*\"]\nprompt: |\u{00A0}# bad unicode ws\n  # [cctx-subagent-instructions]\n"));
     }
 
     #[test]
@@ -1621,5 +2680,34 @@ Q2. Which function calculates retry delay, what formula does it use, and what ca
                 + status.subagent_tokens_saved
                 + status.global_tokens_saved
         );
+    }
+
+    #[test]
+    fn codex_agents_md_and_generation_tokenizer_profiles_calibrate_en_and_ko() {
+        let root = Path::new("/repo");
+        let codex_formula = render(PromptStyle::Formula, PromptTarget::CodexAgentsMd, Some(root));
+        let codex_prose = render(PromptStyle::Prose, PromptTarget::CodexAgentsMd, Some(root));
+        assert!(codex_formula.len() < 2048);
+        assert!(codex_formula.contains("exec_command/shell is NOT exempt"));
+        assert!(codex_formula.contains("mcp__code-context__code_context"));
+        assert!(estimate_bpe_tokens(&codex_formula) < estimate_bpe_tokens(&codex_prose));
+
+        // Tokenizer generation scaling: o200k < claude-4.6 < claude-4.7 (~1.25x-1.55x on system prompts & Korean)
+        let en_prompt = render(PromptStyle::Prose, PromptTarget::Instructions, Some(root));
+        let t_o200k = estimate_bpe_tokens_for(&en_prompt, TokenizerProfile::O200k);
+        let t_c46 = estimate_bpe_tokens_for(&en_prompt, TokenizerProfile::Claude46);
+        let t_c47 = estimate_bpe_tokens_for(&en_prompt, TokenizerProfile::Claude47);
+        assert!(t_o200k < t_c46 && t_c46 < t_c47, "{t_o200k} < {t_c46} < {t_c47}");
+        let ratio = t_c47 as f64 / t_o200k as f64;
+        assert!((1.20..=1.65).contains(&ratio), "unexpected ratio {ratio}");
+
+        let ko_sentence = "매번 다시 읽는 문맥과 프롬프트 캐시 가격, 주간 구독 한도를 함께 비교해야 정확한 비용이 드러납니다.";
+        let ko_o200k = estimate_bpe_tokens_for(ko_sentence, TokenizerProfile::O200k);
+        let ko_c46 = estimate_bpe_tokens_for(ko_sentence, TokenizerProfile::Claude46);
+        let ko_c47 = estimate_bpe_tokens_for(ko_sentence, TokenizerProfile::Claude47);
+        assert!(ko_o200k < ko_c46 && ko_c46 < ko_c47);
+        assert_eq!(TokenizerProfile::for_model("claude-opus-4-7"), TokenizerProfile::Claude47);
+        assert_eq!(TokenizerProfile::for_model("claude-sonnet-4-6"), TokenizerProfile::Claude46);
+        assert_eq!(TokenizerProfile::for_model("gpt-6.1-sol"), TokenizerProfile::O200k);
     }
 }

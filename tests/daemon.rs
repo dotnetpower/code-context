@@ -1002,3 +1002,223 @@ fn framed_raw_json_fast_path_preserves_borrowed_read_notices_and_live_edit_recov
     let ctx = framed_call("code_context", json!({"pattern": "item_1() -> usize { 999 }"}), true);
     assert_eq!(ctx["result"]["search"]["total_matches"], 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn code_usage_rpc_aggregates_multi_home_sessions_without_xdg_shadow() {
+    use std::io::{Read, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let cctx_home = temp.path().join("cctx-home");
+    let primary_home = temp.path().join("primary-home");
+    let xdg_home = temp.path().join("xdg-state-home");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn alpha() -> usize { 1 }\n").unwrap();
+
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    // Populate primary HOME with a Copilot SDK session using backend MCP `code-context-code_read`.
+    let copilot_sess = primary_home.join(".copilot/session-state/sess-copilot-1");
+    std::fs::create_dir_all(&copilot_sess).unwrap();
+    std::fs::write(
+        copilot_sess.join("events.jsonl"),
+        [
+            json!({
+                "type": "session.start",
+                "timestamp": now_sec - 60.0,
+                "data": { "context": { "cwd": repo.to_string_lossy() } }
+            })
+            .to_string(),
+            json!({
+                "type": "session.usage_record",
+                "timestamp": now_sec - 59.0,
+                "data": {
+                    "usage": {
+                        "model": "claude-opus-4.7",
+                        "modelDisplayName": "Claude Opus 4.7",
+                        "reasoningEffort": "xhigh",
+                        "inputTokens": 120_000,
+                        "cacheReadTokens": 110_000,
+                        "cacheWriteTokens": 5_000,
+                        "outputTokens": 900,
+                        "reasoningTokens": 300
+                    }
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "tool.execution_start",
+                "timestamp": now_sec - 58.9,
+                "data": {
+                    "toolCallId": "call-mcp-1",
+                    "toolName": "code-context-code_read",
+                    "arguments": {
+                        "root": repo.to_string_lossy(),
+                        "ranges": [
+                            {"path": "src/lib.rs", "start": 1, "end": 1},
+                            {"path": "src/lib.rs", "start": 1, "end": 1}
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "tool.execution_complete",
+                "timestamp": now_sec - 58.8,
+                "data": {
+                    "toolCallId": "call-mcp-1",
+                    "success": true,
+                    "result": {
+                        "content": "[{\"path\":\"src/lib.rs\",\"start\":1,\"end\":1,\"lines\":[\"pub fn alpha() -> usize { 1 }\"]}]\nCCTX_TRACE {\"trace_id\":\"t1\",\"operation\":\"code_read\",\"success\":true,\"total_ms\":0.64}"
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    // Populate XDG_STATE_HOME with a Claude Code session to prove XDG_STATE_HOME neither shadows HOME nor gets ignored.
+    let claude_proj = xdg_home.join(".claude/projects/demo");
+    std::fs::create_dir_all(&claude_proj).unwrap();
+    std::fs::write(
+        claude_proj.join("claude-sess-1.jsonl"),
+        json!({
+            "type": "assistant",
+            "timestamp": now_sec - 30.0,
+            "cwd": repo.to_string_lossy(),
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 2_000,
+                    "cache_creation_input_tokens": 10_000,
+                    "cache_read_input_tokens": 50_000,
+                    "output_tokens": 400
+                },
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu-1",
+                        "name": "mcp__code-context__code_context",
+                        "input": { "root": repo.to_string_lossy(), "pattern": "alpha" }
+                    }
+                ]
+            }
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_cctx");
+    let reg_out = Command::new(binary)
+        .env("CCTX_HOME", &cctx_home)
+        .args([
+            "--root",
+            repo.to_str().unwrap(),
+            "--scope",
+            "src",
+            "--glob",
+            "*.rs",
+            "register",
+        ])
+        .output()
+        .unwrap();
+    assert!(reg_out.status.success(), "{}", String::from_utf8_lossy(&reg_out.stderr));
+
+    let mut daemon_child = GuardedChild(
+        Command::new(binary)
+            .env("CCTX_HOME", &cctx_home)
+            .env("HOME", &primary_home)
+            .env("XDG_STATE_HOME", &xdg_home)
+            .env_remove("CCTX_IO_GUARD")
+            .env_remove("CCTX_MEMORY_GUARD")
+            .arg("daemon")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let wait_start = Instant::now();
+    loop {
+        if Command::new(binary)
+            .env("CCTX_HOME", &cctx_home)
+            .arg("ping")
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            break;
+        }
+        assert!(daemon_child.0.try_wait().unwrap().is_none());
+        assert!(wait_start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut stream = std::os::unix::net::UnixStream::connect(cctx_home.join("daemon.sock")).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"CCTXJ1\n").unwrap();
+
+    let mut framed_call = |name: &str, arguments: Value| -> Value {
+        let req = serde_json::to_vec(&json!({
+            "root": null,
+            "name": name,
+            "arguments": arguments,
+            "compact": true,
+        }))
+        .unwrap();
+        stream
+            .write_all(&u32::try_from(req.len()).unwrap().to_be_bytes())
+            .unwrap();
+        stream.write_all(&req).unwrap();
+        let mut len = [0_u8; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    };
+
+    let ping = framed_call("ping", json!({}));
+    assert_eq!(ping["result"]["capabilities"]["code_usage"], true);
+
+    let usage_resp = framed_call("code_usage", json!({"hours": 24, "force": true}));
+    let res = &usage_resp["result"];
+    assert_eq!(res["sessions"], 2, "both HOME and XDG_STATE_HOME sessions must be aggregated: {res}");
+    assert_eq!(res["daemon"]["ready"], true);
+    assert_eq!(res["daemon"]["registry_admission"]["registered_roots"], 1);
+    assert!(res["token_summary"]["estimated_total_tokens_saved"].as_u64().unwrap_or(0) > 0);
+    assert!(res["token_summary"]["saved_aic"].as_f64().unwrap_or(0.0) > 0.0);
+    assert!(
+        res["token_summary"]["estimated_time_saved_secs"].as_f64().unwrap_or(0.0) > 0.0,
+        "expected positive estimated_time_saved_secs in code_usage: {res}"
+    );
+    assert!(
+        res["model_usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["saved_secs"].as_f64().unwrap_or(0.0) > 0.0),
+        "expected per-model saved_secs > 0: {res}"
+    );
+    assert_eq!(res["model_usage"].as_array().unwrap().len(), 2);
+
+    let read_tool = res["insights"]["tool_reliability"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tool"] == "code-context-code_read")
+        .expect("expected code-context-code_read in tool_reliability");
+    assert!(
+        (read_tool["trace_median_ms"].as_f64().unwrap() - 0.64).abs() < 0.05,
+        "expected sub-ms trace_median_ms from CCTX_TRACE footer, got {read_tool}"
+    );
+
+    let invalid = framed_call("code_usage", json!({"hours": 0}));
+    assert!(invalid["error"].as_str().unwrap().contains("hours must be"));
+}

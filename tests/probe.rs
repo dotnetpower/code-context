@@ -1344,3 +1344,202 @@ fn compaction_journal_state_budget_recall_and_multi_agent_hooks() {
     );
 }
 
+#[test]
+fn batch_drains_pipes_above_8mib_without_sigpipe_and_journal_isolates_compact_by_session() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let cctx_home = dir.path().join("cctx_home");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // 1. >8 MiB output command exits 0 cleanly (no SIGPIPE / exit 141) with truncated_capture=true
+    let batch_out = Command::new(cctx_bin())
+        .env("CCTX_HOME", &cctx_home)
+        .args([
+            "probe",
+            "batch",
+            "--json",
+            "--cmd",
+            "python3 -c \"import sys; sys.stdout.write('A' * 9_200_000 + '\\n'); sys.stdout.flush()\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        batch_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&batch_out.stderr)
+    );
+    let batch_json: serde_json::Value = serde_json::from_slice(&batch_out.stdout).unwrap();
+    assert_eq!(batch_json["commands"][0]["exit_code"], 0, "{batch_json}");
+    assert_eq!(batch_json["commands"][0]["truncated_capture"], true);
+
+    // 2. Journal pending_compact is isolated per session_id across concurrent sessions
+    let rec = Command::new(cctx_bin())
+        .env("CCTX_HOME", &cctx_home)
+        .args([
+            "--root",
+            repo.to_str().unwrap(),
+            "journal",
+            "record",
+            "--kind",
+            "decision",
+            "--summary",
+            "Keep per-session compaction isolation intact",
+        ])
+        .output()
+        .unwrap();
+    assert!(rec.status.success());
+
+    let send_hook = |payload: serde_json::Value| -> serde_json::Value {
+        let mut child = Command::new(cctx_bin())
+            .env("CCTX_HOME", &cctx_home)
+            .args([
+                "--root",
+                repo.to_str().unwrap(),
+                "journal",
+                "hook",
+                "--agent",
+                "copilot-cli",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // Session A triggers PreCompact
+    let _ = send_hook(serde_json::json!({
+        "hook_event_name": "preCompact",
+        "sessionId": "sess-alpha",
+        "cwd": repo,
+    }));
+
+    // Unrelated Session B submits a prompt -> must NOT steal Session A's pending_compact
+    let beta_resp = send_hook(serde_json::json!({
+        "hook_event_name": "userPromptSubmit",
+        "sessionId": "sess-beta",
+        "cwd": repo,
+        "prompt": "unrelated prompt",
+    }));
+    assert_eq!(beta_resp, serde_json::json!({}));
+
+    // Session A submits its post-compaction prompt -> receives the continuity state block
+    let alpha_resp = send_hook(serde_json::json!({
+        "hook_event_name": "userPromptSubmit",
+        "sessionId": "sess-alpha",
+        "cwd": repo,
+        "prompt": "continue",
+    }));
+    assert!(
+        alpha_resp["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("Keep per-session compaction isolation intact"),
+        "{alpha_resp}"
+    );
+}
+
+#[test]
+fn positional_batch_detached_grandchild_timeout_and_sqlite_bounds_work_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cctx_home = dir.path().join("cctx_home");
+
+    // 1. Positional command works without `--cmd`
+    let pos_out = Command::new(cctx_bin())
+        .env("CCTX_HOME", &cctx_home)
+        .args(["probe", "batch", "--json", "echo positional_batch_ok"])
+        .output()
+        .unwrap();
+    assert!(pos_out.status.success(), "{}", String::from_utf8_lossy(&pos_out.stderr));
+    let pos_json: serde_json::Value = serde_json::from_slice(&pos_out.stdout).unwrap();
+    assert_eq!(pos_json["commands"][0]["exit_code"], 0);
+
+    // 2. Detached setsid grandchild keeping stdout open does not deadlock on timeout
+    #[cfg(unix)]
+    {
+        let pid_file = dir.path().join("detached.pid");
+        let started = std::time::Instant::now();
+        let det_cmd = format!(
+            "echo before_timeout; python3 -c 'import os,sys,time\npid = os.fork()\nif pid == 0:\n os.setsid()\n open(sys.argv[1], \"w\").write(str(os.getpid()))\n time.sleep(30)\nelse:\n time.sleep(30)' '{}'",
+            pid_file.display()
+        );
+        let det_out = Command::new(cctx_bin())
+            .env("CCTX_HOME", &cctx_home)
+            .args(["probe", "batch", "--json", "--timeout", "1", &det_cmd])
+            .output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = pid_str.trim().parse::<i32>()
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+        assert!(det_out.status.success());
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "detached grandchild hung batch timeout: {elapsed:?}"
+        );
+        let det_json: serde_json::Value = serde_json::from_slice(&det_out.stdout).unwrap();
+        assert_eq!(det_json["commands"][0]["timed_out"], true);
+    }
+
+    // 3. SQLite `[update]` / `` `delete` `` quoted columns pass validation and runaway recursive CTE hits timeout
+    if Command::new("sqlite3").arg("--version").output().is_ok() {
+        let db_path = dir.path().join("perm.db");
+        let init_db = Command::new("sqlite3")
+            .arg(&db_path)
+            .arg("CREATE TABLE perms ([update] INTEGER, `delete` INTEGER); INSERT INTO perms VALUES (1, 0);")
+            .status()
+            .unwrap();
+        assert!(init_db.success());
+
+        let ok_sql = Command::new(cctx_bin())
+            .env("CCTX_HOME", &cctx_home)
+            .args([
+                "probe",
+                "table",
+                db_path.to_str().unwrap(),
+                "--sql",
+                "SELECT [update], `delete` FROM perms;",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(ok_sql.status.success(), "{}", String::from_utf8_lossy(&ok_sql.stderr));
+        let ok_json: serde_json::Value = serde_json::from_slice(&ok_sql.stdout).unwrap();
+        assert_eq!(ok_json["query_rows"][0]["update"], 1);
+
+        let timeout_sql = Command::new(cctx_bin())
+            .env("CCTX_HOME", &cctx_home)
+            .args([
+                "probe",
+                "table",
+                db_path.to_str().unwrap(),
+                "--timeout",
+                "1",
+                "--sql",
+                "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r) SELECT sum(x) FROM r;",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!timeout_sql.status.success());
+        let stderr = String::from_utf8_lossy(&timeout_sql.stderr);
+        assert!(
+            stderr.contains("SQLITE_QUERY_TIMEOUT") || stderr.contains("SQLITE_OUTPUT_BUDGET_EXCEEDED"),
+            "unexpected sqlite timeout error: {stderr}"
+        );
+        assert!(!stderr.contains("not installed on PATH"), "{stderr}");
+    }
+}
+

@@ -77,15 +77,64 @@ export class DaemonClient {
   private tracingAvailable: boolean | undefined;
   private traceOutcomesAvailable = false;
   private hostMemoryReportingAvailable = false;
+  private callerSessionAvailable = false;
   private startingService: Promise<void> | undefined;
   private lastServiceStartAt = 0;
   private pendingWslTraces: Array<Record<string, JsonValue>> = [];
+  private lastHostMemorySentAt = 0;
+  private hostMemoryTimer: NodeJS.Timeout | undefined;
+  private hostMemorySeq = 0;
+  private barrierLane: DaemonClient | undefined;
+  private usageLane: DaemonClient | undefined;
 
   public constructor(
     private readonly settings: () => ClientSettings,
     private readonly serviceStarter: (settings: ClientSettings) => Promise<void> = startNativeService,
     private readonly connector = connectNativeTransport,
+    private readonly isBarrierLane = false,
+    private readonly onCapabilities?: (caps: {
+      tracing: boolean;
+      outcomes: boolean;
+      hostMemory: boolean;
+      callerSession: boolean;
+    }) => void,
   ) {}
+
+  private getBarrierLane(): DaemonClient {
+    this.barrierLane ??= new DaemonClient(
+      this.settings,
+      this.serviceStarter,
+      this.connector,
+      true,
+      (caps) => {
+        if (this.tracingAvailable === undefined) {
+          this.tracingAvailable = caps.tracing;
+          this.traceOutcomesAvailable = caps.outcomes;
+          this.hostMemoryReportingAvailable = caps.hostMemory;
+          this.callerSessionAvailable = caps.callerSession;
+        }
+      },
+    );
+    return this.barrierLane;
+  }
+
+  private getUsageLane(): DaemonClient {
+    this.usageLane ??= new DaemonClient(
+      this.settings,
+      this.serviceStarter,
+      this.connector,
+      true,
+      (caps) => {
+        if (this.tracingAvailable === undefined) {
+          this.tracingAvailable = caps.tracing;
+          this.traceOutcomesAvailable = caps.outcomes;
+          this.hostMemoryReportingAvailable = caps.hostMemory;
+          this.callerSessionAvailable = caps.callerSession;
+        }
+      },
+    );
+    return this.usageLane;
+  }
 
   public get usesWslBridge(): boolean {
     return usesWslTransport(this.settings());
@@ -106,13 +155,44 @@ export class DaemonClient {
     this.pendingWslTraces.push({ ...trace });
   }
 
+  public queryUsage(
+    hours = 24,
+    force = false,
+    cancellation: CancellationLike = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose(): void {} }),
+    },
+  ): Promise<JsonValue> {
+    return this.getUsageLane().request(
+      {
+        root: null,
+        name: 'code_usage',
+        arguments: force ? { hours, force: true } : { hours },
+        compact: true,
+      },
+      cancellation,
+    );
+  }
+
   public request<T = JsonValue>(
     request: DaemonRequest,
     cancellation: CancellationLike,
   ): Promise<T> {
     if (request.name === 'code_trace' && this.usesWslBridge) {
-      this.queueTraceForNextRequest(request.arguments as unknown as ClientTrace);
-      return Promise.resolve({ recorded: true } as unknown as T);
+      const needsImmediateHostMemory =
+        isRecord(request.arguments) &&
+        isRecord(request.arguments.host_memory) &&
+        (this.lastHostMemorySentAt === 0 || Date.now() - this.lastHostMemorySentAt >= 240_000);
+      if (!needsImmediateHostMemory) {
+        this.queueTraceForNextRequest(request.arguments as unknown as ClientTrace);
+        return Promise.resolve({ recorded: true } as unknown as T);
+      }
+    }
+    if (!this.isBarrierLane && request.name === 'code_sync') {
+      return this.getBarrierLane().request<T>(request, cancellation);
+    }
+    if (!this.isBarrierLane && request.name === 'code_usage') {
+      return this.getUsageLane().request<T>(request, cancellation);
     }
     return this.enqueue<T>(request, cancellation);
   }
@@ -122,7 +202,17 @@ export class DaemonClient {
     cancellation: CancellationLike,
     traceId: string,
     prepareMs = 0,
+    callerId?: number,
   ): Promise<{ value: T; trace: ClientTrace }> {
+    if (!this.isBarrierLane && request.name === 'code_sync') {
+      return this.getBarrierLane().requestTraced<T>(
+        request,
+        cancellation,
+        traceId,
+        prepareMs,
+        callerId,
+      );
+    }
     const started = performance.now();
     const trace: ClientTrace = {
       trace_id: traceId, origin: 'native', operation: request.name, root: request.root,
@@ -131,7 +221,7 @@ export class DaemonClient {
       started_unix_ms: Date.now(), completed_unix_ms: 0,
     };
     try {
-      const value = await this.enqueue<T>(request, cancellation, trace);
+      const value = await this.enqueue<T>(request, cancellation, trace, callerId);
       trace.total_ms = performance.now() - started + prepareMs;
       trace.success = true;
       trace.completed_unix_ms = Date.now();
@@ -147,13 +237,14 @@ export class DaemonClient {
     request: DaemonRequest,
     cancellation: CancellationLike,
     trace?: ClientTrace,
+    callerId?: number,
   ): Promise<T> {
     const queuedAt = performance.now();
     const execute = (): Promise<T> => {
       if (trace) {
         trace.queue_ms = performance.now() - queuedAt;
       }
-      return this.requestWithRetry<T>(request, cancellation, trace);
+      return this.requestWithRetry<T>(request, cancellation, trace, callerId);
     };
     const run = this.queue.then(execute, execute);
     this.queue = run.then(
@@ -165,11 +256,17 @@ export class DaemonClient {
 
   public dispose(): void {
     this.disposed = true;
+    this.barrierLane?.dispose();
+    this.barrierLane = undefined;
+    this.usageLane?.dispose();
+    this.usageLane = undefined;
     this.disconnect(new Error('Code Context native client was disposed.'));
   }
 
   public reset(): void {
     if (!this.disposed) {
+      this.barrierLane?.reset();
+      this.usageLane?.reset();
       this.disconnect(new Error('Code Context native connection was reset.'));
     }
   }
@@ -178,6 +275,7 @@ export class DaemonClient {
     request: DaemonRequest,
     cancellation: CancellationLike,
     trace?: ClientTrace,
+    callerId?: number,
   ): Promise<T> {
     if (this.disposed) {
       throw new Error('Code Context native client is disposed.');
@@ -191,7 +289,7 @@ export class DaemonClient {
       try {
         const preparing = performance.now();
         await this.ensureConnected(cancellation);
-        if (trace && this.tracingAvailable === undefined) {
+        if ((trace || request.name === 'code_trace') && this.tracingAvailable === undefined) {
           const ping = await this.send({
             root: null, name: 'ping', arguments: {}, compact: false,
           }, cancellation);
@@ -202,6 +300,14 @@ export class DaemonClient {
             && ping.capabilities.client_trace_outcomes === true;
           this.hostMemoryReportingAvailable = isRecord(ping) && isRecord(ping.capabilities)
             && ping.capabilities.host_memory_reporting === true;
+          this.callerSessionAvailable = isRecord(ping) && isRecord(ping.capabilities)
+            && ping.capabilities.caller_session_token === true;
+          this.onCapabilities?.({
+            tracing: this.tracingAvailable,
+            outcomes: this.traceOutcomesAvailable,
+            hostMemory: this.hostMemoryReportingAvailable,
+            callerSession: this.callerSessionAvailable,
+          });
         }
         if (trace) {
           trace.prepare_ms += performance.now() - preparing;
@@ -217,24 +323,61 @@ export class DaemonClient {
         const hasPiggybackTraces =
           this.pendingWslTraces.length > 0 &&
           request.name !== 'code_trace' &&
-          request.name !== 'ping' &&
-          request.name !== 'code_workspaces';
+          request.name !== 'ping';
+        const includeCallerToken =
+          typeof callerId === 'number' &&
+          callerId > 0 &&
+          this.callerSessionAvailable &&
+          (request.name === 'code_files' ||
+            request.name === 'code_grep' ||
+            request.name === 'code_context' ||
+            request.name === 'code_read');
         const needsArgMutation =
           request.name === 'code_trace' ||
           Boolean(trace && this.tracingAvailable) ||
-          hasPiggybackTraces;
+          hasPiggybackTraces ||
+          includeCallerToken;
         const argumentsForDaemon = needsArgMutation ? { ...request.arguments } : request.arguments;
+        if (includeCallerToken) {
+          argumentsForDaemon._cctx_caller = callerId;
+        }
+        let sentHostMemory = false;
         if (request.name === 'code_trace') {
           if (!this.traceOutcomesAvailable) { delete argumentsForDaemon.outcome; }
           if (!this.hostMemoryReportingAvailable) { delete argumentsForDaemon.host_memory; }
+          sentHostMemory = isRecord(argumentsForDaemon.host_memory);
         }
         if (hasPiggybackTraces) {
-          const drained = this.pendingWslTraces.splice(0, this.pendingWslTraces.length).map((item) => {
+          let latestPiggybackMemIdx = -1;
+          const drained = this.pendingWslTraces.splice(0, this.pendingWslTraces.length).map((item, idx) => {
             const copy = { ...item };
             if (!this.traceOutcomesAvailable) { delete copy.outcome; }
             if (!this.hostMemoryReportingAvailable) { delete copy.host_memory; }
+            if (isRecord(copy.host_memory)) {
+              const sampleAt = typeof copy.completed_unix_ms === 'number' ? copy.completed_unix_ms : 0;
+              if (sampleAt > 0 && sampleAt < this.lastHostMemorySentAt) {
+                delete copy.host_memory;
+              } else {
+                latestPiggybackMemIdx = idx;
+              }
+            }
             return copy;
           });
+          if (latestPiggybackMemIdx >= 0) {
+            for (let i = 0; i < drained.length; i += 1) {
+              if (i !== latestPiggybackMemIdx) {
+                delete drained[i]?.host_memory;
+              }
+            }
+            if (process.platform === 'win32' && this.hostMemoryReportingAvailable) {
+              drained[latestPiggybackMemIdx]!.host_memory = {
+                platform: 'win32',
+                total_bytes: totalmem(),
+                available_bytes: freemem(),
+              };
+            }
+            sentHostMemory = true;
+          }
           argumentsForDaemon._cctx_prev_trace = drained;
         }
         if (trace && this.tracingAvailable) {
@@ -252,6 +395,10 @@ export class DaemonClient {
             trace.ipc_ms += performance.now() - ipcStarted;
           }
         }
+        if (sentHostMemory) {
+          this.lastHostMemorySentAt = Date.now();
+        }
+        this.ensureHostMemoryKeepalive();
         if (trace && this.tracingAvailable) {
           if (!isRecord(value) || !isRecord(value._cctx_trace)
               || value._cctx_trace.trace_id !== trace.trace_id || value.value === undefined) {
@@ -515,13 +662,80 @@ export class DaemonClient {
     return pending;
   }
 
+  private ensureHostMemoryKeepalive(): void {
+    if (
+      this.isBarrierLane ||
+      this.disposed ||
+      process.platform !== 'win32' ||
+      !this.usesWslBridge ||
+      !this.hostMemoryReportingAvailable ||
+      this.hostMemoryTimer !== undefined
+    ) {
+      return;
+    }
+    const timer = setInterval(() => {
+      if (
+        this.disposed ||
+        !this.socket ||
+        this.socket.destroyed ||
+        this.pending ||
+        !this.hostMemoryReportingAvailable ||
+        Date.now() - this.lastHostMemorySentAt < 240_000
+      ) {
+        return;
+      }
+      this.hostMemorySeq += 1;
+      const now = Date.now();
+      const heartbeat: Record<string, JsonValue> = {
+        trace_id: `winmem_${process.pid}_${this.hostMemorySeq}`,
+        origin: 'native',
+        operation: 'host_memory_heartbeat',
+        root: null,
+        daemon: null,
+        queue_ms: 0,
+        prepare_ms: 0,
+        ipc_ms: 0,
+        serialize_ms: 0,
+        write_ms: 0,
+        total_ms: 0,
+        success: true,
+        available: true,
+        started_unix_ms: now,
+        completed_unix_ms: now,
+        host_memory: {
+          platform: 'win32',
+          total_bytes: totalmem(),
+          available_bytes: freemem(),
+        },
+      };
+      if (this.traceOutcomesAvailable) {
+        heartbeat.outcome = 'success';
+      }
+      void this.enqueue(
+        { root: null, name: 'code_trace', arguments: heartbeat, compact: true },
+        {
+          isCancellationRequested: false,
+          onCancellationRequested: (): DisposableLike => ({ dispose: (): void => undefined }),
+        },
+      ).catch(() => undefined);
+    }, 240_000);
+    timer.unref?.();
+    this.hostMemoryTimer = timer;
+  }
+
   private disconnect(error: Error): void {
+    if (this.hostMemoryTimer !== undefined) {
+      clearInterval(this.hostMemoryTimer);
+      this.hostMemoryTimer = undefined;
+    }
     const socket = this.socket;
     this.socket = undefined;
     this.socketPath = undefined;
     this.tracingAvailable = undefined;
     this.traceOutcomesAvailable = false;
     this.hostMemoryReportingAvailable = false;
+    this.callerSessionAvailable = false;
+    this.lastHostMemorySentAt = 0;
     this.receiveBuffer = EMPTY_BUFFER;
     this.receiveChunks = [];
     this.receiveBytes = 0;

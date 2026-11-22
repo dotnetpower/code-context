@@ -22,6 +22,9 @@ pub fn classify(error: Option<&str>) -> &'static str {
         "policy_denied"
     } else if message.starts_with("READ_RANGE_OUT_OF_BOUNDS ")
         || message.contains("READ_RANGE_OUT_OF_BOUNDS")
+        || message.contains("READ_TARGET_IS_DIRECTORY")
+        || message.contains("UNREGISTERED_SCRATCH_ROOT")
+        || message.contains("UNREGISTERED_FILE_ROOT")
         || message.contains("RESPONSE_BUDGET_EXCEEDED")
         || message.contains("reason=missing_on_disk")
         || message.contains("regex parse error")

@@ -59,6 +59,7 @@ const SERVICE_WRITE_BPS: u64 = 16_000_000;
 type WireResult = std::result::Result<Value, String>;
 pub(crate) const TRACE_ARGUMENT: &str = "_cctx_trace";
 pub(crate) const PREV_TRACE_ARGUMENT: &str = "_cctx_prev_trace";
+pub(crate) const CALLER_ARGUMENT: &str = "_cctx_caller";
 
 #[cfg(unix)]
 fn current_cgroup_dir()->Result<PathBuf> {
@@ -373,6 +374,7 @@ struct Envelope {
     reply: std::sync::mpsc::SyncSender<TimedReply>,
     queued_at: Instant,
     id: u64,
+    caller_id: u64,
     trace_id: Option<String>,
     prev_trace: Option<Value>,
     first_dispatch: bool,
@@ -486,15 +488,61 @@ impl Drop for ActiveConnection {
     }
 }
 
+#[cfg(any(unix, windows))]
+fn daemon_lock_actively_held(socket_path: &std::path::Path) -> bool {
+    let Some(dir) = socket_path.parent() else {
+        return false;
+    };
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir.join("daemon.lock"))
+    else {
+        return false;
+    };
+    match lock.try_lock_shared() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&lock);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 #[cfg(unix)]
 fn connect_rpc_stream() -> Result<RpcStream> {
-    Ok(UnixStream::connect(catalog::socket_path()?)?)
+    let socket = catalog::socket_path()?;
+    match UnixStream::connect(&socket) {
+        Ok(stream) => Ok(stream),
+        Err(first)
+            if matches!(
+                first.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) && daemon_lock_actively_held(&socket) =>
+        {
+            for wait_ms in [4_u64, 8, 16, 24, 32] {
+                std::thread::sleep(Duration::from_millis(wait_ms));
+                match UnixStream::connect(&socket) {
+                    Ok(stream) => return Ok(stream),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) && daemon_lock_actively_held(&socket) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(UnixStream::connect(&socket)?)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(windows)]
-fn connect_rpc_stream() -> Result<RpcStream> {
-    let path = catalog::socket_path()?;
-    let contents = std::fs::read_to_string(&path)?;
+fn connect_rpc_stream_once(path: &std::path::Path) -> Result<RpcStream> {
+    let contents = std::fs::read_to_string(path)?;
     let mut lines = contents.lines();
     let addr: std::net::SocketAddr = lines
         .next()
@@ -514,10 +562,31 @@ fn connect_rpc_stream() -> Result<RpcStream> {
     Ok(stream)
 }
 
+#[cfg(windows)]
+fn connect_rpc_stream() -> Result<RpcStream> {
+    let path = catalog::socket_path()?;
+    match connect_rpc_stream_once(&path) {
+        Ok(stream) => Ok(stream),
+        Err(_) if daemon_lock_actively_held(&path) => {
+            for wait_ms in [4_u64, 8, 16, 24, 32] {
+                std::thread::sleep(Duration::from_millis(wait_ms));
+                match connect_rpc_stream_once(&path) {
+                    Ok(stream) => return Ok(stream),
+                    Err(_) if daemon_lock_actively_held(&path) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            connect_rpc_stream_once(&path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub struct Client {
     stream: RpcStream,
     reader: BufReader<RpcStream>,
     tracing: bool,
+    caller_session: bool,
     write_buf: Vec<u8>,
     args_buf: Vec<u8>,
     read_buf: Vec<u8>,
@@ -535,6 +604,7 @@ impl Client {
             stream,
             reader,
             tracing: false,
+            caller_session: false,
             write_buf: Vec::with_capacity(512),
             args_buf: Vec::with_capacity(256),
             read_buf: Vec::with_capacity(4096),
@@ -551,11 +621,38 @@ impl Client {
         })?;
         client.tracing = ping["capabilities"]["request_tracing"] == true
             && ping["capabilities"]["trace_clock"] == "unix_ms";
+        client.caller_session = ping["capabilities"]["caller_session_token"] == true;
         Ok(client)
+    }
+
+    pub(crate) fn connect_or_start() -> Result<Self> {
+        match Self::connect() {
+            Ok(client) => Ok(client),
+            Err(_) if auto_start_allowed() => {
+                let _ = ensure_daemon_started();
+                Self::connect()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn connect_or_start_traced() -> Result<Self> {
+        match Self::connect_traced() {
+            Ok(client) => Ok(client),
+            Err(_) if auto_start_allowed() => {
+                let _ = ensure_daemon_started();
+                Self::connect_traced()
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn supports_tracing(&self) -> bool {
         self.tracing
+    }
+
+    pub(crate) fn supports_caller_session(&self) -> bool {
+        self.caller_session
     }
 
     fn call_into_read_buf(&mut self, request: &Request) -> Result<()> {
@@ -639,11 +736,23 @@ impl Client {
 }
 
 pub fn request(request: &Request) -> Result<Value> {
-    let mut stream = connect_rpc_stream().map_err(|e| {
-        invalid(format!(
-            "daemon unavailable: {e}; start cctx daemon or the user service"
-        ))
-    })?;
+    let mut stream = match connect_rpc_stream() {
+        Ok(stream) => stream,
+        Err(_) if request.name != "ping" && auto_start_allowed() => {
+            let _ = ensure_daemon_started();
+            connect_rpc_stream().map_err(|e| {
+                invalid(format!(
+                    "daemon unavailable: {e}; start cctx daemon or the user service"
+                ))
+            })?
+        }
+        Err(e) => {
+            return Err(invalid(format!(
+                "daemon unavailable: {e}; start cctx daemon or the user service"
+            ))
+            .into());
+        }
+    };
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let bytes = serde_json::to_vec(request)?;
@@ -673,6 +782,131 @@ fn decode_response(response: &[u8]) -> Result<Value> {
         .ok_or_else(|| invalid("missing daemon response result").into())
 }
 
+pub fn send_warm_hint_nonblocking(root: PathBuf) -> Result<()> {
+    let mut stream = match connect_rpc_stream() {
+        Ok(stream) => stream,
+        Err(_) if auto_start_allowed() => {
+            let _ = ensure_daemon_started();
+            connect_rpc_stream()?
+        }
+        Err(error) => return Err(error),
+    };
+    stream.set_read_timeout(Some(Duration::from_millis(1_500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(1_500)))?;
+    let bytes = serde_json::to_vec(&Request {
+        root: Some(root),
+        name: "code_warm_hint".into(),
+        arguments: json!({}),
+        compact: true,
+    })?;
+    stream.write_all(&bytes)?;
+    stream.write_all(b"\n")?;
+    let mut response = Vec::with_capacity(128);
+    std::io::Read::take(BufReader::new(stream), 4096).read_until(b'\n', &mut response)?;
+    Ok(())
+}
+
+pub fn auto_start_allowed() -> bool {
+    std::env::var_os("CCTX_NO_AUTO_START").is_none() && std::env::var_os("CCTX_HOME").is_none()
+}
+
+pub fn ensure_daemon_started() -> Result<()> {
+    if connect_rpc_stream().is_ok() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        start_windows_daemon()
+    }
+    #[cfg(unix)]
+    {
+        start_unix_daemon()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(invalid("automatic daemon startup is unsupported on this platform").into())
+    }
+}
+
+#[cfg(unix)]
+fn start_unix_daemon() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    if let Ok(mut child) = std::process::Command::new("systemctl")
+        .args(["--user", "start", "code-context.service"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let wait_started = Instant::now();
+        let mut reaped = false;
+        while wait_started.elapsed() < Duration::from_millis(1_500) {
+            if connect_rpc_stream().is_ok() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    reaped = true;
+                }
+                if !reaped {
+                    let _ = std::thread::Builder::new()
+                        .name("cctx-reap".into())
+                        .stack_size(64 * 1024)
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
+                }
+                return Ok(());
+            }
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            }
+        }
+        if !reaped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    if connect_rpc_stream().is_ok() {
+        return Ok(());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Double-fork so the intermediate child exits immediately and is reaped without zombies.
+        unsafe {
+            cmd.pre_exec(|| {
+                match libc::fork() {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    0 => {
+                        let _ = libc::setsid();
+                        Ok(())
+                    }
+                    _ => libc::_exit(0),
+                }
+            });
+        }
+        if let Ok(mut intermediate) = cmd.spawn() {
+            let _ = intermediate.wait();
+        }
+    }
+    let started = Instant::now();
+    let mut delay_ms = 4_u64;
+    while started.elapsed() < Duration::from_secs(3) {
+        if connect_rpc_stream().is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms * 2).min(25);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn start_windows_daemon() -> Result<()> {
     use std::os::windows::process::CommandExt;
@@ -699,15 +933,7 @@ fn start_windows_daemon() -> Result<()> {
 }
 
 pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> Result<()> {
-    let mut client = match Client::connect() {
-        Ok(client) => client,
-        #[cfg(windows)]
-        Err(_) if std::env::var_os("CCTX_NO_AUTO_START").is_none() => {
-            let _ = start_windows_daemon();
-            Client::connect()?
-        }
-        Err(error) => return Err(error),
-    };
+    let mut client = Client::connect_or_start()?;
     output.write_all(b"CCTXN1\n")?;
     output.flush()?;
     let mut magic = [0; 7];
@@ -726,26 +952,11 @@ pub fn native_bridge(mut input: impl std::io::Read, mut output: impl Write) -> R
             Err(error) if is_application_error(error.as_ref()) => Err(error),
             Err(_transport_error) => {
                 frame.truncate(4);
-                if let Ok(reconnected) = Client::connect() {
+                if let Ok(reconnected) = Client::connect_or_start() {
                     client = reconnected;
                     client.call_into_result_frame(&request, &mut frame)
                 } else {
-                    #[cfg(windows)]
-                    if std::env::var_os("CCTX_NO_AUTO_START").is_none() {
-                        let _ = start_windows_daemon();
-                        if let Ok(reconnected) = Client::connect() {
-                            client = reconnected;
-                            client.call_into_result_frame(&request, &mut frame)
-                        } else {
-                            Err(_transport_error)
-                        }
-                    } else {
-                        Err(_transport_error)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        Err(_transport_error)
-                    }
+                    Err(_transport_error)
                 }
             }
         };
@@ -816,6 +1027,8 @@ pub struct Server {
     cache_failures: BTreeMap<PathBuf, (Instant, String)>,
     cache_hits: u64,
     cache_misses: u64,
+    cold_direct_reads: u64,
+    cold_read_policies: crate::watched::ColdReadPolicyCache,
     background_results: BTreeMap<u64, WireResult>,
     last_pressure_check: Option<std::time::Instant>,
     pressure_shrink_streak: u8,
@@ -850,6 +1063,8 @@ impl Default for Server {
             cache_failures: BTreeMap::new(),
             cache_hits: 0,
             cache_misses: 0,
+            cold_direct_reads: 0,
+            cold_read_policies: BTreeMap::new(),
             background_results: BTreeMap::new(),
             last_pressure_check: None,
             pressure_shrink_streak: 0,
@@ -873,6 +1088,10 @@ impl Server {
     }
 
     fn call_wire(&mut self, request: Request) -> Result<WirePayload> {
+        self.call_wire_for_caller(request, 0)
+    }
+
+    fn call_wire_for_caller(&mut self, request: Request, caller_id: u64) -> Result<WirePayload> {
         if request.name == "code_trace" {
             if request.root.is_some() {
                 return Err(invalid("code_trace takes no root").into());
@@ -897,6 +1116,121 @@ impl Server {
                         value.load(std::sync::atomic::Ordering::Acquire))}),
                 ));
             }
+            "code_daemon_summary" => {
+                let source_samples: Vec<&RequestTiming> = self
+                    .request_timings
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.operation.as_str(),
+                            "code_context" | "code_grep" | "code_read" | "code_files"
+                        ) && s.success
+                    })
+                    .collect();
+                let recent_source_avg_ms = if source_samples.is_empty() {
+                    None
+                } else {
+                    let sum: f64 = source_samples
+                        .iter()
+                        .map(|s| s.queue_ms + s.execute_ms + s.response_ms)
+                        .sum();
+                    Some((sum / source_samples.len() as f64 * 100.0).round() / 100.0)
+                };
+                return Ok(WirePayload::Json(json!({
+                    "ready": true,
+                    "pid": std::process::id(),
+                    "index_state": if !self.roots.is_empty() { "ready" } else { "unloaded" },
+                    "cache": {
+                        "state": if !self.roots.is_empty() { "ready" } else { "unloaded" },
+                        "hits": self.cache_hits,
+                        "misses": self.cache_misses,
+                        "cold_direct_reads": self.cold_direct_reads,
+                    },
+                    "daemon_admission": {
+                        "loaded_roots": self.roots.len(),
+                        "estimated_bytes": self.roots.values().map(Watched::estimated_bytes).sum::<usize>(),
+                        "target_bytes": self.memory.limits.target,
+                        "resident_root_limit": self.memory.limits.root_limit(),
+                        "root_loads": self.root_loads,
+                    },
+                    "registry_admission": {
+                        "registered_roots": self.registry.len(),
+                    },
+                    "process_memory": self.process_memory(),
+                    "outcome_counts": self.outcome_counts,
+                    "protocol_calls": self.protocol_calls,
+                    "protocol_failures": self.protocol_failures,
+                    "recent_source_avg_ms": recent_source_avg_ms,
+                })));
+            }
+            "code_warm_hint" => {
+                let Some(requested_root) = request.root else {
+                    return Ok(WirePayload::Json(json!({"queued":false})));
+                };
+                let Ok(canonical) = catalog::canonicalize(&requested_root) else {
+                    return Ok(WirePayload::Json(json!({"queued":false})));
+                };
+                if let Ok(Some(spec)) = self.requested_registration(&canonical) {
+                    if self
+                        .roots
+                        .get(&spec.root)
+                        .is_some_and(|entry| entry.spec == spec)
+                    {
+                        return Ok(WirePayload::Json(json!({"queued":false,"warm":true})));
+                    }
+                    let queued = self.queue_root(spec.root).is_ok_and(|miss| miss.scheduled);
+                    return Ok(WirePayload::Json(json!({"queued":queued})));
+                }
+                let inside_registered = self
+                    .registry
+                    .iter()
+                    .filter(|spec| canonical.starts_with(&spec.root))
+                    .max_by_key(|spec| spec.root.components().count());
+                let candidate_target = if let Some(parent_spec) = inside_registered {
+                    let mut nested_git: Option<PathBuf> = None;
+                    let mut cur: &std::path::Path = &canonical;
+                    while cur != parent_spec.root && cur.starts_with(&parent_spec.root) {
+                        if cur.join(".git").exists() {
+                            nested_git = Some(cur.to_path_buf());
+                            break;
+                        }
+                        match cur.parent() {
+                            Some(p) => cur = p,
+                            None => break,
+                        }
+                    }
+                    Some(nested_git.unwrap_or_else(|| parent_spec.root.clone()))
+                } else if self.registry.iter().any(|spec| spec.allow_worktrees) {
+                    let mut git_root: Option<PathBuf> = None;
+                    let mut cur: &std::path::Path = &canonical;
+                    for _ in 0..8 {
+                        if cur.join(".git").exists() {
+                            git_root = Some(cur.to_path_buf());
+                            break;
+                        }
+                        match cur.parent() {
+                            Some(p) if p.as_os_str().len() > 1 => cur = p,
+                            _ => break,
+                        }
+                    }
+                    git_root
+                } else {
+                    None
+                };
+                if let Some(target_root) = candidate_target {
+                    if let Some(aliased) = self.root_aliases.get(&target_root).cloned()
+                        && self.roots.contains_key(&aliased)
+                    {
+                        return Ok(WirePayload::Json(json!({"queued":false,"warm":true})));
+                    }
+                    if self.roots.contains_key(&target_root) {
+                        return Ok(WirePayload::Json(json!({"queued":false,"warm":true})));
+                    }
+                    let queued = self.queue_root(target_root).is_ok_and(|miss| miss.scheduled);
+                    return Ok(WirePayload::Json(json!({"queued":queued})));
+                }
+                return Ok(WirePayload::Json(json!({"queued":false})));
+            }
             "code_workspaces" => {
                 if request.compact && self.registry.len() > 8 {
                     let many = self.registry.len() > 12;
@@ -905,17 +1239,24 @@ impl Server {
                         .iter()
                         .map(|spec| {
                             if spec.managed_parent.is_some() {
+                                let eff =
+                                    crate::registration::registered_policy(spec, &self.registry)
+                                        .ok();
+                                let globs = eff.as_ref().map_or(&spec.globs, |s| &s.globs);
+                                let scopes = eff.as_ref().map_or(&spec.scopes, |s| &s.scopes);
                                 if many {
                                     json!({
                                         "root": spec.root,
-                                        "scopes": spec.scopes,
-                                        "globs": spec.globs.iter().take(1).collect::<Vec<_>>(),
+                                        "scopes": scopes,
+                                        "globs": globs.iter().take(1).collect::<Vec<_>>(),
+                                        "globs_count": globs.len(),
                                     })
                                 } else {
                                     json!({
                                         "root": spec.root,
-                                        "scopes": spec.scopes,
-                                        "globs": spec.globs.iter().take(1).collect::<Vec<_>>(),
+                                        "scopes": scopes,
+                                        "globs": globs.iter().take(1).collect::<Vec<_>>(),
+                                        "globs_count": globs.len(),
                                         "managed_parent": spec.managed_parent,
                                     })
                                 }
@@ -1033,6 +1374,63 @@ impl Server {
                         self.cache_hits = self.cache_hits.saturating_add(1);
                         spec
                     }
+                    Some(spec)
+                        if request.name == "code_read"
+                            && self.background.as_ref().is_none_or(|job| {
+                                job.spec.root != spec.root || job.owner.is_none()
+                            })
+                            && self.cache_failures.get(&spec.root).is_none_or(
+                                |(at, error)| at.elapsed() >= failure_cooldown(error),
+                            ) =>
+                    {
+                        if self
+                            .roots
+                            .get(&spec.root)
+                            .is_some_and(|entry| entry.spec != spec)
+                        {
+                            self.evict(&spec.root, "registration_changed");
+                            release_allocator_memory();
+                        }
+                        let _ = self.queue_root(spec.root.clone());
+                        let mut arguments = request.arguments;
+                        let env_root = (!request.compact).then_some(spec.root.as_path());
+                        let raw = crate::watched::call_cold_direct_read(
+                            &spec,
+                            &mut self.cold_read_policies,
+                            &mut arguments,
+                            request.compact,
+                            env_root,
+                        )?;
+                        self.cold_direct_reads = self.cold_direct_reads.saturating_add(1);
+                        return Ok(WirePayload::RawJson(raw));
+                    }
+                    None if request.name == "code_read"
+                        && self.cache_failures.get(&canonical).is_none_or(
+                            |(at, error)| at.elapsed() >= failure_cooldown(error),
+                        ) =>
+                    {
+                        if let Some(worktree_spec) =
+                            crate::registration::verify_authorized_worktree_spec(
+                                &canonical,
+                                &self.registry,
+                            )
+                        {
+                            let _ = self.queue_root(canonical.clone());
+                            let mut arguments = request.arguments;
+                            let env_root =
+                                (!request.compact).then_some(worktree_spec.root.as_path());
+                            let raw = crate::watched::call_cold_direct_read(
+                                &worktree_spec,
+                                &mut self.cold_read_policies,
+                                &mut arguments,
+                                request.compact,
+                                env_root,
+                            )?;
+                            self.cold_direct_reads = self.cold_direct_reads.saturating_add(1);
+                            return Ok(WirePayload::RawJson(raw));
+                        }
+                        return Err(self.request_cache(canonical)?.into());
+                    }
                     other => {
                         let target = other.map_or(canonical, |spec| spec.root);
                         return Err(self.request_cache(target)?.into());
@@ -1061,6 +1459,10 @@ impl Server {
             .roots
             .get_mut(&root)
             .ok_or_else(|| invalid("missing registered root"))?;
+        entry.set_caller_id(caller_id);
+        let spec_snapshot = entry.spec.clone();
+        let read_recovery_args =
+            (is_fast_lookup && request.name == "code_read").then(|| request.arguments.clone());
         let previous = entry.restrict_admission(root_budget);
         let mut arguments = request.arguments;
         let wire_outcome: Result<WirePayload> = if is_fast_lookup {
@@ -1096,6 +1498,28 @@ impl Server {
                 })
         };
         entry.restore_admission(previous);
+        if is_fast_lookup
+            && wire_outcome
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("staged update exceeds resident admission peak"))
+        {
+            self.evict(&root, "staged_peak_reload");
+            release_allocator_memory();
+            if let Some(mut retry_args) = read_recovery_args {
+                let _ = self.queue_root(root.clone());
+                let env_root = (!compact).then_some(spec_snapshot.root.as_path());
+                let raw = crate::watched::call_cold_direct_read(
+                    &spec_snapshot,
+                    &mut self.cold_read_policies,
+                    &mut retry_args,
+                    compact,
+                    env_root,
+                )?;
+                self.cold_direct_reads = self.cold_direct_reads.saturating_add(1);
+                return Ok(WirePayload::RawJson(raw));
+            }
+            return Err(self.request_cache(root)?.into());
+        }
         let payload = wire_outcome?;
         if let Some(watched) = self.roots.get(&root) {
             let estimated = watched.estimated_bytes();
@@ -1154,7 +1578,7 @@ impl Server {
                 else if self.preparation.as_ref().is_some_and(|job|job.requested==spec.root) {"preparing"}
                 else if self.pending_roots.iter().any(|job|job.requested==spec.root) {"queued"}
                 else if self.cache_failures.contains_key(&spec.root) {"failed"}else{"unloaded"},
-            "hits":self.cache_hits,"misses":self.cache_misses,
+            "hits":self.cache_hits,"misses":self.cache_misses,"cold_direct_reads":self.cold_direct_reads,
             "pending_limit":MAX_PENDING_ROOTS,
             "load_retry_limit":MAX_COLD_LOAD_RETRIES,
             "pending_roots":self.pending_roots.iter().map(|job|&job.requested).collect::<Vec<_>>(),
@@ -1278,6 +1702,20 @@ impl Server {
         Self::cold_retry_budget_with_limit(spec, previous, required, retry, GLOBAL_RESIDENT_TARGET)
     }
 
+    fn has_nested_git_between(ancestor: &std::path::Path, descendant: &std::path::Path) -> bool {
+        let mut cur = descendant;
+        while cur != ancestor && cur.starts_with(ancestor) {
+            if cur.join(".git").exists() {
+                return true;
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        false
+    }
+
     fn requested_registration(&self, canonical: &std::path::Path) -> Result<Option<Spec>> {
         self.registry
             .iter()
@@ -1287,6 +1725,8 @@ impl Server {
                 canonical == spec.root
                     || !spec.allow_worktrees
                     || self.root_aliases.get(canonical) == Some(&spec.root)
+                    || (spec.root.join(".git").exists()
+                        && !Self::has_nested_git_between(&spec.root, canonical))
             })
             .map(|spec| crate::registration::registered_policy(spec, &self.registry))
             .transpose()
@@ -1412,6 +1852,28 @@ impl Server {
         self.finish_background_reply(job, Err(error));
     }
 
+    fn reschedule_after_registration_change(&mut self, job: &BackgroundRoot, reason: &str) {
+        self.cache_failures.remove(&job.spec.root);
+        if job.owner.is_some() {
+            self.finish_background_reply(job, Err(reason.to_owned()));
+        }
+        if self.registry.iter().any(|spec| spec.root == job.spec.root)
+            && job.spec.root.is_dir()
+            && job.retry < MAX_COLD_LOAD_RETRIES
+            && !self
+                .pending_roots
+                .iter()
+                .any(|pending| pending.requested == job.spec.root)
+            && self.pending_roots.len() < MAX_PENDING_ROOTS
+        {
+            self.pending_roots.push_front(PendingRoot {
+                requested: job.spec.root.clone(),
+                retry: job.retry + 1,
+                tier_trimmed: job.tier_trimmed,
+            });
+        }
+    }
+
     fn drive_lazy_loads(&mut self) {
         if let Some(job) = self.preparation.take() {
             if self.background.is_some() {
@@ -1445,6 +1907,9 @@ impl Server {
                     return;
                 }
             }
+            let requested_copy = job.requested.clone();
+            let retry_copy = job.retry;
+            let tier_copy = job.tier_trimmed;
             let outcome = outcome.and_then(|spec| {
                 self.refresh_registry()?;
                 if !self.registry.iter().any(|current| current == &spec) {
@@ -1465,7 +1930,25 @@ impl Server {
                 Ok(())
             });
             if let Err(error) = outcome {
-                self.record_cache_failure(job.requested, error.to_string());
+                let msg = error.to_string();
+                if msg.contains("registration changed during lazy preparation") {
+                    self.cache_failures.remove(&requested_copy);
+                    if retry_copy < MAX_COLD_LOAD_RETRIES
+                        && !self
+                            .pending_roots
+                            .iter()
+                            .any(|pending| pending.requested == requested_copy)
+                        && self.pending_roots.len() < MAX_PENDING_ROOTS
+                    {
+                        self.pending_roots.push_front(PendingRoot {
+                            requested: requested_copy,
+                            retry: retry_copy + 1,
+                            tier_trimmed: tier_copy,
+                        });
+                    }
+                } else {
+                    self.record_cache_failure(requested_copy, msg);
+                }
             }
         }
         if self.background.is_some() || self.preparation.is_some() {
@@ -1551,6 +2034,9 @@ impl Server {
     }
 
     fn evict(&mut self, root: &PathBuf, reason: &str) {
+        if matches!(reason, "root_missing" | "registration_changed") {
+            self.cold_read_policies.remove(root);
+        }
         if reason == "root_missing" {
             self.root_aliases
                 .retain(|alias, target| alias != root && target != root);
@@ -1790,18 +2276,18 @@ impl Server {
                     return;
                 }
                 if !self.registry.iter().any(|spec| spec == &job.spec) {
-                    self.fail_background_root(
+                    self.reschedule_after_registration_change(
                         &job,
-                        "registration changed during background work".into(),
+                        "registration changed during background work",
                     );
                     return;
                 }
                 match crate::registration::registered_policy(&job.spec, &self.registry) {
                     Ok(current) if current == job.spec => {}
                     Ok(_) => {
-                        self.fail_background_root(
+                        self.reschedule_after_registration_change(
                             &job,
-                            "parent policy changed during background work".into(),
+                            "parent policy changed during background work",
                         );
                         return;
                     }
@@ -1913,6 +2399,12 @@ impl Server {
                     } else {
                         self.fail_background_root(&job, error.to_string());
                     }
+                } else if error
+                    .to_string()
+                    .contains("registration or parent policy changed during root build")
+                {
+                    let _ = self.refresh_registry();
+                    self.reschedule_after_registration_change(&job, &error.to_string());
                 } else {
                     self.fail_background_root(&job, error.to_string());
                 }
@@ -2065,8 +2557,11 @@ impl Server {
             (Protocol::Bincode, "code_status") => "bincode:code_status",
             (Protocol::Bincode, "code_sync") => "bincode:code_sync",
             (Protocol::Bincode, "code_trace") => "bincode:code_trace",
+            (Protocol::Bincode, "code_warm_hint") => "bincode:code_warm_hint",
             (Protocol::Bincode, "code_profile") => "bincode:code_profile",
             (Protocol::Bincode, "code_profile_full") => "bincode:code_profile_full",
+            (Protocol::Bincode, "code_usage") => "bincode:code_usage",
+            (Protocol::Bincode, "code_daemon_summary") => "bincode:code_daemon_summary",
             (Protocol::Bincode, _) => "bincode:unknown",
             (Protocol::FramedJson, "ping") => "framed_json:ping",
             (Protocol::FramedJson, "code_workspaces") => "framed_json:code_workspaces",
@@ -2077,8 +2572,11 @@ impl Server {
             (Protocol::FramedJson, "code_status") => "framed_json:code_status",
             (Protocol::FramedJson, "code_sync") => "framed_json:code_sync",
             (Protocol::FramedJson, "code_trace") => "framed_json:code_trace",
+            (Protocol::FramedJson, "code_warm_hint") => "framed_json:code_warm_hint",
             (Protocol::FramedJson, "code_profile") => "framed_json:code_profile",
             (Protocol::FramedJson, "code_profile_full") => "framed_json:code_profile_full",
+            (Protocol::FramedJson, "code_usage") => "framed_json:code_usage",
+            (Protocol::FramedJson, "code_daemon_summary") => "framed_json:code_daemon_summary",
             (Protocol::FramedJson, _) => "framed_json:unknown",
             (Protocol::JsonLines, "ping") => "json_lines:ping",
             (Protocol::JsonLines, "code_workspaces") => "json_lines:code_workspaces",
@@ -2089,8 +2587,11 @@ impl Server {
             (Protocol::JsonLines, "code_status") => "json_lines:code_status",
             (Protocol::JsonLines, "code_sync") => "json_lines:code_sync",
             (Protocol::JsonLines, "code_trace") => "json_lines:code_trace",
+            (Protocol::JsonLines, "code_warm_hint") => "json_lines:code_warm_hint",
             (Protocol::JsonLines, "code_profile") => "json_lines:code_profile",
             (Protocol::JsonLines, "code_profile_full") => "json_lines:code_profile_full",
+            (Protocol::JsonLines, "code_usage") => "json_lines:code_usage",
+            (Protocol::JsonLines, "code_daemon_summary") => "json_lines:code_daemon_summary",
             (Protocol::JsonLines, _) => "json_lines:unknown",
         }
     }
@@ -2693,6 +3194,94 @@ fn respond_protocol_buf(
     Ok((serialize_ms, write_started.elapsed().as_secs_f64() * 1000.0))
 }
 
+fn next_daemon_request_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+struct UsageCacheState {
+    in_flight: bool,
+    generation: u64,
+    cached: Option<(u64, u64, Instant, String)>,
+}
+
+fn compute_cached_usage_raw(
+    hours: f64,
+    force_refresh: bool,
+    daemon_summary: Option<Value>,
+) -> Result<Box<serde_json::value::RawValue>> {
+    static CACHE: std::sync::OnceLock<(std::sync::Mutex<UsageCacheState>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    let (lock, cvar) = CACHE.get_or_init(|| {
+        (
+            std::sync::Mutex::new(UsageCacheState {
+                in_flight: false,
+                generation: 0,
+                cached: None,
+            }),
+            std::sync::Condvar::new(),
+        )
+    });
+    let hours_key = hours.to_bits();
+    let ttl = Duration::from_secs(15);
+    let isolate_env = std::env::var_os("CCTX_HOME").is_some();
+
+    let my_gen = {
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let min_gen = if force_refresh || isolate_env {
+            guard.generation.saturating_add(1)
+        } else {
+            0
+        };
+        loop {
+            if !isolate_env
+                && let Some((gen_id, k, at, ref payload)) = guard.cached
+                && gen_id >= min_gen
+                && k == hours_key
+                && at.elapsed() < ttl
+            {
+                return serde_json::value::RawValue::from_string(payload.clone())
+                    .map_err(Into::into);
+            }
+            if !guard.in_flight {
+                guard.in_flight = true;
+                guard.generation = guard.generation.saturating_add(1);
+                break guard.generation;
+            }
+            let (next_guard, timeout_res) = cvar
+                .wait_timeout(guard, Duration::from_secs(10))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(invalid("usage aggregation already in progress; retry shortly").into());
+            }
+        }
+    };
+
+    struct InFlightGuard<'a> {
+        lock: &'a std::sync::Mutex<UsageCacheState>,
+        cvar: &'a std::sync::Condvar,
+    }
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.in_flight = false;
+            self.cvar.notify_all();
+        }
+    }
+    let _reset = InFlightGuard { lock, cvar };
+
+    let json_str = crate::diagnostics::usage_compact_json_str(hours, None, daemon_summary)?;
+    if json_str.len().saturating_add(4096) > MAX_WIRE {
+        return Err(invalid("usage payload exceeds 2MiB wire budget").into());
+    }
+    if !isolate_env {
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.cached = Some((my_gen, hours_key, Instant::now(), json_str.clone()));
+    }
+    serde_json::value::RawValue::from_string(json_str).map_err(Into::into)
+}
+
 fn handle_connection(
     mut stream: RpcStream,
     tx: std::sync::mpsc::SyncSender<LoopEvent>,
@@ -2700,6 +3289,8 @@ fn handle_connection(
     timing_tx: std::sync::mpsc::SyncSender<RequestTiming>,
     #[cfg(windows)] expected_secret: std::sync::Arc<String>,
 ) {
+    static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let caller_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _connection = ActiveConnection(active);
     #[cfg(windows)]
     let _ = stream.set_nodelay(true);
@@ -2800,6 +3391,12 @@ fn handle_connection(
             .arguments
             .as_object_mut()
             .and_then(|args| args.remove(PREV_TRACE_ARGUMENT));
+        let explicit_caller = request
+            .arguments
+            .as_object_mut()
+            .and_then(|args| args.remove(CALLER_ARGUMENT))
+            .and_then(|v| v.as_u64())
+            .filter(|&id| id != 0);
         let trace_id = match request
             .arguments
             .as_object_mut()
@@ -2821,20 +3418,103 @@ fn handle_connection(
                 }
             },
         };
+        if request.name == "code_usage" {
+            let started_exec = Instant::now();
+            let hours = match request.arguments.get("hours") {
+                None | Some(Value::Null) => 24.0,
+                Some(v) => match v.as_f64() {
+                    Some(h) if h.is_finite() && h > 0.0 && h <= 720.0 => h,
+                    _ => {
+                        let _ = respond_protocol(
+                            &mut stream,
+                            protocol,
+                            &Err("hours must be a finite number between 0 and 720".into()),
+                        );
+                        continue;
+                    }
+                },
+            };
+            let force = request
+                .arguments
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let summary_req_id = next_daemon_request_id();
+            let (summary_tx, summary_rx) = std::sync::mpsc::sync_channel(1);
+            let mut daemon_summary: Option<Value> = None;
+            if tx
+                .try_send(LoopEvent::Request(Envelope {
+                    request: Request {
+                        root: None,
+                        name: "code_daemon_summary".into(),
+                        arguments: json!({}),
+                        compact: true,
+                    },
+                    protocol,
+                    reply: summary_tx,
+                    queued_at: Instant::now(),
+                    caller_id: explicit_caller.unwrap_or(caller_id),
+                    trace_id: None,
+                    prev_trace,
+                    first_dispatch: true,
+                    id: summary_req_id,
+                }))
+                .is_ok()
+                && let Ok(summary_reply) = summary_rx.recv_timeout(Duration::from_secs(2))
+                && let Ok(WirePayload::Json(val)) = summary_reply.result
+            {
+                daemon_summary = Some(val);
+            }
+            let usage_req_id = next_daemon_request_id();
+            let usage_result: WirePayloadResult = compute_cached_usage_raw(hours, force, daemon_summary)
+                .map(WirePayload::RawJson)
+                .map_err(|e| e.to_string());
+            let execute_ms = started_exec.elapsed().as_secs_f64() * 1000.0;
+            let write_started = Instant::now();
+            let trace_meta = trace_id.as_deref().map(|tid| TraceMeta {
+                trace_id: tid,
+                daemon_request_id: usage_req_id,
+                queue_ms: 0.0,
+                execute_ms,
+            });
+            let sent = respond_protocol_buf(
+                &mut stream,
+                protocol,
+                &usage_result,
+                trace_meta,
+                &mut write_buf,
+            );
+            let response_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+            let (serialize_ms, socket_write_ms) = sent.as_ref().copied().unwrap_or((0.0, 0.0));
+            let _ = timing_tx.try_send(RequestTiming {
+                id: usage_req_id,
+                trace_id,
+                operation: "code_usage".into(),
+                root: None,
+                queue_ms: 0.0,
+                execute_ms,
+                response_ms,
+                serialize_ms,
+                socket_write_ms,
+                success: usage_result.is_ok(),
+                outcome: if usage_result.is_ok() { "ok" } else { "error" },
+            });
+            if sent.is_err() {
+                break;
+            }
+            continue;
+        }
         if tx
             .try_send(LoopEvent::Request(Envelope {
                 request,
                 protocol,
                 reply: reply_tx.clone(),
                 queued_at: Instant::now(),
+                caller_id: explicit_caller.unwrap_or(caller_id),
                 trace_id,
                 prev_trace,
                 first_dispatch: true,
-                id: {
-                    static NEXT_ID: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(1);
-                    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                },
+                id: next_daemon_request_id(),
             }))
             .is_err()
         {
@@ -2906,87 +3586,104 @@ pub fn serve() -> Result<()> {
     lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let memory = crate::memory::Controller::start(current_cgroup_dir()?, memory_guard)?;
     let socket = catalog::socket_path()?;
+    let staged_socket = dir.join("d.sock");
     #[cfg(unix)]
     let listener = {
-        match std::fs::symlink_metadata(&socket) {
-            Ok(meta) => {
-                use std::os::unix::fs::FileTypeExt;
-                if !meta.file_type().is_socket() {
+        use std::os::unix::fs::FileTypeExt;
+        for candidate in [&socket, &staged_socket] {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(meta) if !meta.file_type().is_socket() => {
                     return Err(invalid("refusing to replace non-socket runtime path").into());
                 }
-                std::fs::remove_file(&socket)?;
+                Ok(_) if candidate == &staged_socket => {
+                    std::fs::remove_file(candidate)?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
-        let listener = UnixListener::bind(&socket)?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let listener = UnixListener::bind(&staged_socket)?;
+        std::fs::set_permissions(&staged_socket, std::fs::Permissions::from_mode(0o600))?;
         listener
     };
     #[cfg(windows)]
     let (listener, rpc_secret) = {
-        if let Ok(meta) = std::fs::symlink_metadata(&socket) {
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(invalid("refusing to replace non-file runtime path").into());
+        for candidate in [&socket, &staged_socket] {
+            if let Ok(meta) = std::fs::symlink_metadata(candidate) {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(invalid("refusing to replace non-file runtime path").into());
+                }
+                if candidate == &staged_socket {
+                    std::fs::remove_file(candidate)?;
+                }
             }
-            std::fs::remove_file(&socket)?;
         }
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let secret = std::sync::Arc::new(format!("{}-{}", new_trace_id(), new_trace_id()));
-        std::fs::write(&socket, format!("{}\n{}\n", listener.local_addr()?, secret))?;
+        std::fs::write(&staged_socket, format!("{}\n{}\n", listener.local_addr()?, secret))?;
+        catalog::restrict_windows_file_acl(&staged_socket);
         (listener, secret)
     };
-    eprintln!("code-context daemon ready at {}", socket.display());
     let (tx, rx) = std::sync::mpsc::sync_channel::<LoopEvent>(256);
     let (timing_tx, timing_rx) = std::sync::mpsc::sync_channel::<RequestTiming>(128);
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut server = Server {
-        memory,
-        active_connections: Some(active.clone()),
-        runtime: Some(RuntimeIdentity::capture(&dir, &socket, &lock)?),
-        wake_tx: Some(tx.clone()),
-        ..Server::default()
-    };
     let acceptor = std::thread::Builder::new()
         .name("cctx-acceptor".into())
         .stack_size(WORKER_STACK_BYTES)
-        .spawn(move || -> Result<()> {
-            use std::sync::atomic::Ordering;
-            for stream in listener.incoming() {
-                let stream = stream?;
-                if active.fetch_add(1, Ordering::AcqRel) >= 128 {
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    let mut stream = stream;
-                    let _ = respond(&mut stream, Err("too many RPC connections".into()));
-                    continue;
+        .spawn({
+            let active = active.clone();
+            let tx = tx.clone();
+            move || -> Result<()> {
+                use std::sync::atomic::Ordering;
+                for stream in listener.incoming() {
+                    let stream = stream?;
+                    if active.fetch_add(1, Ordering::AcqRel) >= 128 {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        let mut stream = stream;
+                        let _ = respond(&mut stream, Err("too many RPC connections".into()));
+                        continue;
+                    }
+                    let active = active.clone();
+                    let worker_active = active.clone();
+                    let tx = tx.clone();
+                    let timing_tx = timing_tx.clone();
+                    #[cfg(windows)]
+                    let secret = rpc_secret.clone();
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("cctx-rpc".into())
+                        .stack_size(WORKER_STACK_BYTES)
+                        .spawn(move || {
+                            handle_connection(
+                                stream,
+                                tx,
+                                worker_active,
+                                timing_tx,
+                                #[cfg(windows)]
+                                secret,
+                            )
+                        })
+                    {
+                        eprintln!("failed to spawn RPC connection worker: {error}");
+                        // The closure was dropped without running its RAII decrement.
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
-                let active = active.clone();
-                let worker_active = active.clone();
-                let tx = tx.clone();
-                let timing_tx = timing_tx.clone();
-                #[cfg(windows)]
-                let secret = rpc_secret.clone();
-                if let Err(error) = std::thread::Builder::new()
-                    .name("cctx-rpc".into())
-                    .stack_size(WORKER_STACK_BYTES)
-                    .spawn(move || {
-                        handle_connection(
-                            stream,
-                            tx,
-                            worker_active,
-                            timing_tx,
-                            #[cfg(windows)]
-                            secret,
-                        )
-                    })
-                {
-                    eprintln!("failed to spawn RPC connection worker: {error}");
-                    // The closure was dropped without running its RAII decrement.
-                    active.fetch_sub(1, Ordering::AcqRel);
-                }
+                Ok(())
             }
-            Ok(())
         })?;
+    if let Err(error) = std::fs::rename(&staged_socket, &socket) {
+        let _ = std::fs::remove_file(&staged_socket);
+        return Err(error.into());
+    }
+    eprintln!("code-context daemon ready at {}", socket.display());
+    let mut server = Server {
+        memory,
+        active_connections: Some(active),
+        runtime: Some(RuntimeIdentity::capture(&dir, &socket, &lock)?),
+        wake_tx: Some(tx),
+        ..Server::default()
+    };
     let mut deferred = VecDeque::new();
     loop {
         server.poll_background();
@@ -3084,7 +3781,7 @@ fn dispatch_envelope(
         Ok(true) => match server.background_results.remove(&envelope.id) {
             Some(result) => result.map(WirePayload::Json),
             None => server
-                .call_wire(envelope.request)
+                .call_wire_for_caller(envelope.request, envelope.caller_id)
                 .map_err(|error| error.to_string()),
         },
     };
@@ -3157,6 +3854,7 @@ mod tests {
             reply,
             queued_at: Instant::now() - Duration::from_secs(29),
             id,
+            caller_id: 0,
             trace_id: None,
             prev_trace: None,
             first_dispatch: false,
@@ -3186,6 +3884,7 @@ mod tests {
             reply,
             queued_at: Instant::now() - Duration::from_secs(29),
             id,
+            caller_id: 0,
             trace_id: None,
             prev_trace: None,
             first_dispatch: false,
@@ -3215,6 +3914,7 @@ mod tests {
                 reply,
                 queued_at: Instant::now() - Duration::from_secs(29),
                 id,
+                caller_id: 0,
                 trace_id: None,
                 prev_trace: None,
                 first_dispatch: false,

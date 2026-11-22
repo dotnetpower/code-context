@@ -952,3 +952,320 @@ fn migration_rejects_binary_document_before_persisting_and_keeps_existing_budget
     assert_eq!(applied["source_verified"], true);
     assert_eq!(applied["after"]["policy"], before[0]["policy"]);
 }
+
+#[test]
+fn cold_registered_code_read_succeeds_immediately_enforces_policy_and_warms_background() {
+    let mut f = Fixture::new();
+    std::fs::write(f.repo.join(".gitignore"), "ignored.json\nsrc/ignored.rs\n").unwrap();
+    std::fs::write(f.repo.join("src/ignored.rs"), "secret\n").unwrap();
+    f.start();
+
+    let status_before = f.cli(&f.repo, &["status"]);
+    assert_eq!(status_before["data"]["index_state"], "unloaded");
+
+    let hit = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"page":true,"ranges":[{"path":"src/a.rs","start":1,"end":1}]}),
+    );
+    assert_eq!(hit["isError"], false, "{hit}");
+    let raw_text = hit["content"][0]["text"].as_str().unwrap();
+    assert!(raw_text.ends_with('\n'), "expected trailing newline before CCTX_TRACE: {raw_text:?}");
+    let page: Value = serde_json::from_str(raw_text).unwrap();
+    assert_eq!(page["complete"], true);
+    assert_eq!(page["snippets"][0]["lines"], json!(["main branch"]));
+
+    let denied_scope = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[{"path":"README.md","start":1,"end":1}]}),
+    );
+    assert_eq!(denied_scope["isError"], true);
+    assert!(
+        denied_scope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("READ_POLICY_DENIED"),
+        "{denied_scope}"
+    );
+
+    let denied_ignored = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[{"path":"src/ignored.rs","start":1,"end":1}]}),
+    );
+    assert_eq!(denied_ignored["isError"], true);
+    assert!(
+        denied_ignored["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("READ_UNAVAILABLE"),
+        "{denied_ignored}"
+    );
+
+    let deadline = Instant::now();
+    loop {
+        let status = f.cli(&f.repo, &["status"]);
+        if status["data"]["index_state"] == "loaded" {
+            assert_eq!(status["data"]["cache"]["misses"], 0);
+            assert!(status["data"]["cache"]["cold_direct_reads"].as_u64().unwrap() >= 1);
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(3));
+    }
+
+    let warm_grep = f.mcp_once(&f.repo, "code_grep", json!({"pattern":"main branch"}));
+    assert_eq!(warm_grep["isError"], false, "{warm_grep}");
+}
+
+#[test]
+fn mcp_initialize_warms_registered_session_root_without_touching_unregistered_roots() {
+    let mut f = Fixture::new();
+    let unregistered = f._dir.path().join("unregistered-init");
+    std::fs::create_dir(&unregistered).unwrap();
+    std::fs::write(unregistered.join("a.rs"), "unregistered\n").unwrap();
+    f.start();
+
+    let mut unreg_child = f
+        .command()
+        .current_dir(&unregistered)
+        .arg("shared-mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        unreg_child.stdin.as_mut().unwrap(),
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})
+    )
+    .unwrap();
+    drop(unreg_child.stdin.take());
+    assert!(unreg_child.wait_with_output().unwrap().status.success());
+    assert_eq!(f.cli(&f.repo, &["workspaces"]).as_array().unwrap().len(), 1);
+    assert_eq!(f.cli(&f.repo, &["status"])["data"]["index_state"], "unloaded");
+
+    let mut child = f
+        .command()
+        .current_dir(&f.repo)
+        .arg("shared-mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut init_line = String::new();
+    out.read_line(&mut init_line).unwrap();
+    assert!(serde_json::from_str::<Value>(&init_line).unwrap()["result"]["protocolVersion"].is_string());
+
+    let deadline = Instant::now();
+    loop {
+        let status = f.cli(&f.repo, &["status"]);
+        if status["data"]["index_state"] == "loaded" {
+            assert_eq!(status["data"]["cache"]["misses"], 0);
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(3));
+    }
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_context","arguments":{"pattern":"main branch"}}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut call_line = String::new();
+    out.read_line(&mut call_line).unwrap();
+    let call_resp: Value = serde_json::from_str(&call_line).unwrap();
+    assert_eq!(call_resp["result"]["isError"], false, "{call_resp}");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn next_ranges_continuation_is_not_falsely_omitted_as_overlap_read() {
+    let mut f = Fixture::new();
+    let lines_a: String = (1..=60)
+        .map(|i| format!("pub fn alpha_{i:02}() {{ let pad = \"{:x<80}\"; }}\n", i))
+        .collect();
+    let lines_b: String = (1..=60)
+        .map(|i| format!("pub fn beta_{i:02}() {{ let pad = \"{:y<80}\"; }}\n", i))
+        .collect();
+    std::fs::write(f.repo.join("src/big_a.rs"), lines_a).unwrap();
+    std::fs::write(f.repo.join("src/big_b.rs"), lines_b).unwrap();
+    f.start();
+
+    let first = f.mcp(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[
+            {"path":"src/big_a.rs","start":1,"end":60},
+            {"path":"src/big_b.rs","start":1,"end":60}
+        ]}),
+    );
+    assert_eq!(first["isError"], false, "{first}");
+    let first_body: Value =
+        serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(first_body["complete"], false);
+    let next_ranges = first_body["next_ranges"].clone();
+    assert!(!next_ranges.as_array().unwrap().is_empty());
+
+    let second = f.mcp_once(&f.repo, "code_read", json!({"ranges": next_ranges}));
+    assert_eq!(second["isError"], false, "{second}");
+    let second_text = second["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !second_text.contains("omitted on exact duplicate read"),
+        "deferred next_ranges must not be omitted as duplicate read: {second_text}"
+    );
+    assert!(second_text.contains("pub fn beta_30()"), "{second_text}");
+}
+
+#[test]
+fn cross_session_reads_are_isolated_while_same_session_duplicate_read_omits_middle() {
+    let mut f = Fixture::new();
+    let lines_a: String = (1..=45)
+        .map(|i| format!("pub fn fn_{i:02}() -> usize {{ {i} }}\n"))
+        .collect();
+    std::fs::write(f.repo.join("src/dup.rs"), lines_a).unwrap();
+    f.start();
+    f.cli(&f.repo, &["sync"]);
+
+    let mut sess_a = f
+        .command()
+        .current_dir(&f.repo)
+        .arg("shared-mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out_a = BufReader::new(sess_a.stdout.take().unwrap());
+    let in_a = sess_a.stdin.as_mut().unwrap();
+    let req = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"code_read","arguments":{"ranges":[{"path":"src/dup.rs","start":1,"end":45}]}}
+    });
+    writeln!(in_a, "{req}").unwrap();
+    in_a.flush().unwrap();
+    let mut line_a1 = String::new();
+    out_a.read_line(&mut line_a1).unwrap();
+    let a1 = serde_json::from_str::<Value>(&line_a1).unwrap()["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(a1.contains("pub fn fn_22()"), "{a1}");
+
+    // Second read in SAME persistent MCP session emits OVERLAP_READ omission.
+    writeln!(in_a, "{}", json!({
+        "jsonrpc":"2.0", "id":2, "method":"tools/call",
+        "params":{"name":"code_read","arguments":{"ranges":[{"path":"src/dup.rs","start":1,"end":45}]}}
+    })).unwrap();
+    in_a.flush().unwrap();
+    let mut line_a2 = String::new();
+    out_a.read_line(&mut line_a2).unwrap();
+    let a2 = serde_json::from_str::<Value>(&line_a2).unwrap()["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(a2.contains("omitted on exact duplicate read"), "{a2}");
+
+    // Separate MCP session (e.g. subagent or sibling chat) gets full content with zero omission.
+    let b1 = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[{"path":"src/dup.rs","start":1,"end":45}]}),
+    );
+    let b1_text = b1["content"][0]["text"].as_str().unwrap();
+    assert!(!b1_text.contains("omitted on exact duplicate read"), "{b1_text}");
+    assert!(b1_text.contains("pub fn fn_22()"), "{b1_text}");
+
+    drop(sess_a.stdin.take());
+    assert!(sess_a.wait().unwrap().success());
+}
+
+#[test]
+fn unprepared_authorized_worktree_serves_cold_code_read_immediately_and_syncs_globs_on_prune() {
+    let mut f = Fixture::new();
+    f.cli(&f.repo, &["authorize-worktrees"]);
+    f.start();
+
+    let hit = f.mcp_once(
+        &f.linked,
+        "code_read",
+        json!({"ranges":[{"path":"src/a.rs","start":1,"end":1}]}),
+    );
+    assert_eq!(hit["isError"], false, "{hit}");
+    let snippets: Value = serde_json::from_str(hit["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(snippets[0]["lines"], json!(["linked branch"]));
+
+    let deadline = Instant::now();
+    loop {
+        if f.cli(&f.repo, &["workspaces"]).as_array().unwrap().len() == 2 {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    f.cli(&f.repo, &["migrate", "--add-scope", ".", "--apply"]);
+    let pruned = f.cli(&f.repo, &["prune-worktrees", "--apply"]);
+    assert_eq!(pruned["synced_managed_roots"], json!([f.linked]));
+}
+
+#[test]
+fn mcp_sanitizes_quoted_keys_directory_reads_file_roots_and_scratch_roots() {
+    let mut f = Fixture::new();
+    f.start();
+
+    // 1. Malformed key `"end\""` is sanitized instead of failing schema deserialization.
+    let quoted_key = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[{"path":"src/a.rs","start":1,"end\"":1}]}),
+    );
+    assert_eq!(quoted_key["isError"], false, "{quoted_key}");
+
+    // 2. Directory target on code_read returns READ_TARGET_IS_DIRECTORY with code_files hint.
+    let dir_err = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"ranges":[{"path":"src","start":1,"end":5}]}),
+    );
+    assert_eq!(dir_err["isError"], true);
+    let dir_msg = dir_err["content"][0]["text"].as_str().unwrap();
+    assert!(dir_msg.contains("READ_TARGET_IS_DIRECTORY"), "{dir_msg}");
+    assert!(dir_msg.contains("code_files"), "{dir_msg}");
+
+    // 3. Passing a file inside a registered workspace as `root` auto-resolves to the workspace.
+    let file_in_repo = f.mcp_once(
+        &f.repo,
+        "code_read",
+        json!({"root": f.repo.join("src/a.rs")}),
+    );
+    assert_eq!(file_in_repo["isError"], false, "{file_in_repo}");
+
+    // 4. Standalone file outside registered workspaces fails immediately without queueing background load.
+    let ext_file = f._dir.path().join("standalone.md");
+    std::fs::write(&ext_file, "# standalone\n").unwrap();
+    let file_err = f.mcp_once(&f.repo, "code_read", json!({"root": ext_file, "ranges":[{"path":"standalone.md","start":1,"end":1}]}));
+    assert_eq!(file_err["isError"], true);
+    assert!(file_err["content"][0]["text"].as_str().unwrap().contains("UNREGISTERED_FILE_ROOT"));
+
+    // 5. `.copilot` scratch path fails immediately without CACHE_MISS -> CACHE_LOAD_FAILED two-step churn.
+    let scratch = f._dir.path().join(".copilot").join("session-state").join("abc");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let scratch_err = f.mcp_once(&f.repo, "code_files", json!({"root": scratch, "glob":"*"}));
+    assert_eq!(scratch_err["isError"], true);
+    assert!(scratch_err["content"][0]["text"].as_str().unwrap().contains("UNREGISTERED_SCRATCH_ROOT"));
+    assert_eq!(f.cli(&f.repo, &["status"])["data"]["cache"]["misses"], 0);
+}

@@ -760,6 +760,17 @@ pub fn parse_json_tolerant(raw: &str) -> std::result::Result<Value, serde_json::
 fn strip_trace_footer(text: &str) -> &str {
     if let Some(pos) = text.rfind("\nCCTX_TRACE {") {
         text[..pos].trim_end()
+    } else if let Some(pos) = text.rfind("CCTX_TRACE {") {
+        let tail = text[pos..].trim_end();
+        if !tail.contains('\n')
+            && tail
+                .strip_prefix("CCTX_TRACE ")
+                .is_some_and(|body| serde_json::from_str::<Value>(body).is_ok())
+        {
+            text[..pos].trim_end()
+        } else {
+            text
+        }
     } else {
         text
     }

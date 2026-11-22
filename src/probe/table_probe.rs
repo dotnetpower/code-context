@@ -17,6 +17,7 @@ const MAX_PARQUET_FOOTER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_THRIFT_DEPTH: usize = 32;
 const MAX_THRIFT_LIST_LEN: usize = 200_000;
 const MAX_CSV_LINES: usize = 500_000;
+const MAX_SQLITE_CLI_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ParquetSummary {
@@ -947,9 +948,11 @@ pub fn validate_readonly_sql(raw: &str) -> Result<String> {
     if trimmed.is_empty() {
         return Err(invalid("SQL query must not be empty").into());
     }
-    // Reject embedded semicolons outside string literals.
+    // Reject embedded semicolons outside string literals / quoted identifiers (`'...'`, `"..."`, `` `...` ``, `[...]`).
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
     let bytes = trimmed.as_bytes();
     let mut i = 0usize;
     let mut tokens: Vec<String> = Vec::new();
@@ -979,6 +982,24 @@ pub fn validate_readonly_sql(raw: &str) -> Result<String> {
             i += 1;
             continue;
         }
+        if in_backtick {
+            if b == b'`' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                    i += 2;
+                    continue;
+                }
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_bracket {
+            if b == b']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
         match b {
             b'\'' => {
                 if !cur_tok.is_empty() {
@@ -991,6 +1012,18 @@ pub fn validate_readonly_sql(raw: &str) -> Result<String> {
                     tokens.push(std::mem::take(&mut cur_tok));
                 }
                 in_double = true;
+            }
+            b'`' => {
+                if !cur_tok.is_empty() {
+                    tokens.push(std::mem::take(&mut cur_tok));
+                }
+                in_backtick = true;
+            }
+            b'[' => {
+                if !cur_tok.is_empty() {
+                    tokens.push(std::mem::take(&mut cur_tok));
+                }
+                in_bracket = true;
             }
             b';' => {
                 return Err(
@@ -1008,8 +1041,8 @@ pub fn validate_readonly_sql(raw: &str) -> Result<String> {
         }
         i += 1;
     }
-    if in_single || in_double {
-        return Err(invalid("unterminated quote in SQL query").into());
+    if in_single || in_double || in_backtick || in_bracket {
+        return Err(invalid("unterminated quote or identifier in SQL query").into());
     }
     if !cur_tok.is_empty() {
         tokens.push(cur_tok);
@@ -1063,15 +1096,18 @@ fn strip_sql_comments(sql: &str) -> String {
     let mut i = 0;
     let mut in_sq = false;
     let mut in_dq = false;
+    let mut in_bt = false;
+    let mut in_br = false;
     while i < bytes.len() {
-        if !in_sq && !in_dq && i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+        let in_quoted = in_sq || in_dq || in_bt || in_br;
+        if !in_quoted && i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
             out.push(' ');
             continue;
         }
-        if !in_sq && !in_dq && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+        if !in_quoted && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
@@ -1081,10 +1117,16 @@ fn strip_sql_comments(sql: &str) -> String {
             continue;
         }
         let ch = sql[i..].chars().next().unwrap_or(' ');
-        if ch == '\'' && !in_dq {
+        if ch == '\'' && !in_dq && !in_bt && !in_br {
             in_sq = !in_sq;
-        } else if ch == '"' && !in_sq {
+        } else if ch == '"' && !in_sq && !in_bt && !in_br {
             in_dq = !in_dq;
+        } else if ch == '`' && !in_sq && !in_dq && !in_br {
+            in_bt = !in_bt;
+        } else if ch == '[' && !in_quoted {
+            in_br = true;
+        } else if ch == ']' && in_br {
+            in_br = false;
         }
         out.push(ch);
         i += ch.len_utf8();
@@ -1113,10 +1155,10 @@ fn inspect_sqlite(path: &Path, args: &TableProbeArgs) -> Result<SqliteSummary> {
         .map(validate_readonly_sql)
         .transpose()?;
 
-    if let Ok(summary) =
-        inspect_sqlite_via_cli(path, page_size, wal_mode, args, validated_sql.as_deref())
-    {
-        return Ok(summary);
+    match inspect_sqlite_via_cli(path, page_size, wal_mode, args, validated_sql.as_deref()) {
+        Ok(summary) => return Ok(summary),
+        Err(SqliteCliFailure::MissingBinary) => {}
+        Err(SqliteCliFailure::Execution(err)) => return Err(err),
     }
 
     if validated_sql.is_some() {
@@ -1126,6 +1168,216 @@ fn inspect_sqlite(path: &Path, args: &TableProbeArgs) -> Result<SqliteSummary> {
         .into());
     }
     inspect_sqlite_pure_rust(path, page_size, wal_mode, args.table.as_deref())
+}
+
+enum SqliteCliFailure {
+    MissingBinary,
+    Execution(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for SqliteCliFailure {
+    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Execution(err)
+    }
+}
+
+struct BoundedSqliteOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn spawn_sqlite_pipe_reader<R: Read + Send + 'static>(
+    mut stream: R,
+    cap: usize,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(cap.min(8192))));
+    let writer = std::sync::Arc::clone(&shared);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        let mut captured = 0usize;
+        let limit = cap + 1;
+        while captured < limit {
+            let want = (limit - captured).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    let _ = done_tx.send(());
+                    return;
+                }
+                Ok(n) => {
+                    if let Ok(mut guard) = writer.lock() {
+                        guard.extend_from_slice(&chunk[..n]);
+                    }
+                    captured += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+        }
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        let _ = done_tx.send(());
+    });
+    (shared, done_rx)
+}
+
+fn run_sqlite3_bounded(
+    mode_flag: &str,
+    db_path: &Path,
+    sql: &str,
+    timeout_secs: u64,
+) -> std::result::Result<BoundedSqliteOutput, SqliteCliFailure> {
+    use std::time::{Duration, Instant};
+    let safe_path = safe_sqlite_cli_path(db_path);
+    let safe_sql = safe_sqlite_cli_sql(sql);
+    let mut cmd = Command::new("sqlite3");
+    cmd.args(["-safe", "-readonly", mode_flag, "-cmd", ".timeout 2000"])
+        .arg(&safe_path)
+        .arg(safe_sql.as_ref())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SqliteCliFailure::MissingBinary);
+        }
+        Err(err) => {
+            return Err(SqliteCliFailure::Execution(
+                invalid(format!("sqlite3 spawn failed: {err}")).into(),
+            ));
+        }
+    };
+    let child_pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SqliteCliFailure::Execution(invalid("missing sqlite3 stdout").into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SqliteCliFailure::Execution(invalid("missing sqlite3 stderr").into()))?;
+    let (out_shared, out_done) = spawn_sqlite_pipe_reader(stdout, MAX_SQLITE_CLI_BYTES);
+    let (err_shared, err_done) = spawn_sqlite_pipe_reader(stderr, 256 * 1024);
+
+    let deadline = Duration::from_secs(timeout_secs.clamp(1, 60));
+    let started = Instant::now();
+    let mut sleep_ms = 2u64;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(err) => return Err(SqliteCliFailure::Execution(err.into())),
+        }
+        if started.elapsed() >= deadline {
+            timed_out = true;
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::kill(-(child_pid as i32), libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        if out_shared
+            .lock()
+            .is_ok_and(|g| g.len() > MAX_SQLITE_CLI_BYTES)
+        {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::kill(-(child_pid as i32), libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SqliteCliFailure::Execution(
+                invalid(
+                    "SQLITE_OUTPUT_BUDGET_EXCEEDED: sqlite3 output exceeds 16 MiB; add a LIMIT clause or narrow selected columns",
+                )
+                .into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(sleep_ms));
+        sleep_ms = (sleep_ms * 2).min(20);
+    };
+
+    let grace = Duration::from_millis(if timed_out { 100 } else { 300 });
+    let _ = out_done.recv_timeout(grace);
+    let _ = err_done.recv_timeout(grace);
+
+    if timed_out {
+        return Err(SqliteCliFailure::Execution(
+            invalid(format!(
+                "SQLITE_QUERY_TIMEOUT: sqlite3 query exceeded {}s; add a WHERE/LIMIT clause or increase --timeout",
+                deadline.as_secs()
+            ))
+            .into(),
+        ));
+    }
+
+    let stdout_bytes = out_shared
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    if stdout_bytes.len() > MAX_SQLITE_CLI_BYTES {
+        return Err(SqliteCliFailure::Execution(
+            invalid(
+                "SQLITE_OUTPUT_BUDGET_EXCEEDED: sqlite3 output exceeds 16 MiB; add a LIMIT clause or narrow selected columns",
+            )
+            .into(),
+        ));
+    }
+    let stderr_bytes = err_shared
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+
+    Ok(BoundedSqliteOutput {
+        success: status.is_some_and(|s| s.success()),
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
 }
 
 fn safe_sqlite_cli_path(path: &Path) -> std::path::PathBuf {
@@ -1144,36 +1396,30 @@ fn safe_sqlite_cli_sql(sql: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn sqlite_cli_json_query(db_path: &Path, sql: &str) -> Result<Vec<Value>> {
-    let safe_path = safe_sqlite_cli_path(db_path);
-    let safe_sql = safe_sqlite_cli_sql(sql);
-    let out = Command::new("sqlite3")
-        .arg("-safe")
-        .arg("-readonly")
-        .arg("-json")
-        .args(["-cmd", ".timeout 2000"])
-        .arg(&safe_path)
-        .arg(safe_sql.as_ref())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| invalid(format!("sqlite3 spawn failed: {e}")))?;
+fn sqlite_cli_json_query(
+    db_path: &Path,
+    sql: &str,
+    timeout_secs: u64,
+) -> std::result::Result<Vec<Value>, SqliteCliFailure> {
+    let out = run_sqlite3_bounded("-json", db_path, sql, timeout_secs)?;
 
-    if !out.status.success() {
-        return Err(invalid(format!(
-            "sqlite3 error: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-        .into());
+    if !out.success {
+        return Err(SqliteCliFailure::Execution(
+            invalid(format!(
+                "sqlite3 error: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+            .into(),
+        ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: Vec<Value> = serde_json::from_str(trimmed)
-        .map_err(|e| invalid(format!("sqlite3 JSON parse failed: {e}")))?;
+    let parsed: Vec<Value> = serde_json::from_str(trimmed).map_err(|e| {
+        SqliteCliFailure::Execution(invalid(format!("sqlite3 JSON parse failed: {e}")).into())
+    })?;
     Ok(parsed)
 }
 
@@ -1187,7 +1433,8 @@ fn inspect_sqlite_via_cli(
     wal_mode: bool,
     args: &TableProbeArgs,
     validated_sql: Option<&str>,
-) -> Result<SqliteSummary> {
+) -> std::result::Result<SqliteSummary, SqliteCliFailure> {
+    let timeout_secs = args.timeout.clamp(1, 60);
     let max_samples = args.samples.min(20);
     let mut wal_os = path.as_os_str().to_os_string();
     wal_os.push("-wal");
@@ -1234,17 +1481,7 @@ fn inspect_sqlite_via_cli(
             ));
         }
 
-        let safe_path = safe_sqlite_cli_path(path);
-        let safe_sql = safe_sqlite_cli_sql(&batch_sql);
-        let out = Command::new("sqlite3")
-            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000"])
-            .arg(&safe_path)
-            .arg(safe_sql.as_ref())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| invalid(format!("sqlite3 spawn failed: {e}")))?;
+        let out = run_sqlite3_bounded("-list", path, &batch_sql, timeout_secs)?;
 
         let mut master_cnt: Option<usize> = None;
         let mut applied = 0usize;
@@ -1297,7 +1534,7 @@ fn inspect_sqlite_via_cli(
                 tables,
                 query_rows: None,
             });
-        } else if !out.status.success() {
+        } else if !out.success {
             need_cli_schema = true;
         }
     }
@@ -1307,6 +1544,7 @@ fn inspect_sqlite_via_cli(
         let schema_rows = sqlite_cli_json_query(
             path,
             "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 40",
+            timeout_secs,
         )?;
         for row in schema_rows {
             let Some(name) = row.get("name").and_then(Value::as_str) else {
@@ -1360,17 +1598,7 @@ fn inspect_sqlite_via_cli(
             ));
         }
 
-        let safe_path = safe_sqlite_cli_path(path);
-        let safe_sql = safe_sqlite_cli_sql(&batch_sql);
-        if let Ok(out) = Command::new("sqlite3")
-            .args(["-safe", "-readonly", "-list", "-cmd", ".timeout 2000"])
-            .arg(&safe_path)
-            .arg(safe_sql.as_ref())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
+        if let Ok(out) = run_sqlite3_bounded("-list", path, &batch_sql, timeout_secs) {
             struct TblBatchStat {
                 cols: Vec<String>,
                 cnt: Option<i64>,
@@ -1420,7 +1648,7 @@ fn inspect_sqlite_via_cli(
     }
 
     let query_rows = if let Some(q) = validated_sql {
-        let rows = sqlite_cli_json_query(path, q)?;
+        let rows = sqlite_cli_json_query(path, q, timeout_secs)?;
         Some(
             rows.into_iter()
                 .take(50)

@@ -6,9 +6,11 @@ use unicode_width::UnicodeWidthStr;
 
 pub(crate) struct UsageSummary<'a> {
     pub hours: f64,
+    pub window_label: Option<&'a str>,
     pub used_aic: f64,
     pub saved_aic: f64,
     pub tokens_saved: u64,
+    pub time_saved_secs: f64,
     pub warm_pct: Option<f64>,
     pub adoption_pct: Option<f64>,
     pub models: &'a [Value],
@@ -158,9 +160,13 @@ impl UsageDisplay {
         } else {
             0.0
         };
+        let header_window = match summary.window_label {
+            Some(label) => label.to_owned(),
+            None => format!("Last {} hours", summary.hours),
+        };
         let mut out = vec![
             self.text(
-                &format!("⚡ CCTX USAGE · Last {} hours", summary.hours),
+                &format!("⚡ CCTX USAGE · {header_window}"),
                 Style::Title,
             ),
             String::new(),
@@ -183,7 +189,15 @@ impl UsageDisplay {
             String::new(),
             self.text("EFFICIENCY", Style::Title),
             self.text(
-                &format!("  Tokens avoided ~{}", super::fmt_tok(summary.tokens_saved)),
+                &if summary.time_saved_secs >= 0.5 {
+                    format!(
+                        "  Tokens ~{} · Time ~{}",
+                        super::fmt_tok(summary.tokens_saved),
+                        super::fmt_dur(summary.time_saved_secs)
+                    )
+                } else {
+                    format!("  Tokens avoided ~{}", super::fmt_tok(summary.tokens_saved))
+                },
                 Style::Normal,
             ),
             self.text(
@@ -496,9 +510,11 @@ mod tests {
         ];
         let summary = UsageSummary {
             hours: 2.0,
+            window_label: None,
             used_aic: 6000.0,
             saved_aic: 600.0,
             tokens_saved: 1_000_000,
+            time_saved_secs: 185.0,
             warm_pct: Some(93.6),
             adoption_pct: Some(86.2),
             models: &models,
@@ -581,9 +597,11 @@ mod tests {
     fn empty_summary_has_no_nan_or_spurious_advisories() {
         let summary = UsageSummary {
             hours: 2.0,
+            window_label: None,
             used_aic: 0.0,
             saved_aic: 0.0,
             tokens_saved: 0,
+            time_saved_secs: 0.0,
             warm_pct: None,
             adoption_pct: None,
             models: &[],

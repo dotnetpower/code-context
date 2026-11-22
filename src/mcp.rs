@@ -22,7 +22,7 @@ pub fn tools() -> Value {
     json!({"tools":[
         {
             "name":"code_files",
-            "description":"Find files by filename/path glob (!content).",
+            "description":"Find files by filename, path, or glob pattern without reading file contents.",
             "inputSchema":{"type":"object","properties":{
                 "glob":{"type":"string","minLength":1,"maxLength":1024,"description":"Path/name glob (e.g. *.rs, src/**/*.ts)."},
                 "paths":{"type":"array","maxItems":64,"items":{"type":"string"}},
@@ -32,19 +32,19 @@ pub fn tools() -> Value {
         },
         {
             "name":"code_grep",
-            "description":"Search saved source lines (literal default; regex=true for regex).",
+            "description":"Search workspace source lines for exact text or regex matches (literal default; regex=true for alternation).",
             "inputSchema":{"type":"object","properties":search_properties,"required":["pattern"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         },
         {
             "name":"code_read",
-            "description":"Read batched 1-based inclusive source ranges (<=150 lines).",
+            "description":"Read file lines, batched 1-based line ranges, or markdown heading sections (<=150 lines).",
             "inputSchema":{"type":"object","properties":{"ranges":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"path":{"type":"string"},"start":{"type":"integer","minimum":1},"end":{"type":"integer","minimum":1}},"required":["path","start","end"],"additionalProperties":false}}},"required":["ranges"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         },
         {
             "name":"code_context",
-            "description":"Search symbol/literal + surrounding source in 1 call.",
+            "description":"Find symbol definitions, references, callers, and surrounding function body in 1 call.",
             "inputSchema":{"type":"object","properties":context_properties,"required":["pattern"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         }
@@ -198,22 +198,138 @@ fn tools_for(backend: Backend) -> Value {
     tools
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpFraming {
+    JsonLines,
+    ContentLength,
+}
+
+fn starts_header_block(line: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let trimmed = text.trim_matches(['\r', '\n']);
+    let Some((name, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let key = name.trim();
+    key.eq_ignore_ascii_case("content-length") || key.eq_ignore_ascii_case("content-type")
+}
+
+pub(crate) fn read_mcp_frame<R: BufRead>(
+    input: &mut R,
+    bytes: &mut Vec<u8>,
+    max_message: usize,
+    exceed_msg: &'static str,
+) -> Result<Option<McpFraming>> {
+    loop {
+        bytes.clear();
+        let count = std::io::Read::take(&mut *input, max_message as u64 + 1)
+            .read_until(b'\n', bytes)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        if count > max_message {
+            return Err(invalid(exceed_msg).into());
+        }
+        if starts_header_block(bytes) {
+            let mut header_bytes = count;
+            let mut header_lines: Vec<Vec<u8>> = vec![bytes.clone()];
+            loop {
+                let mut line_buf = Vec::with_capacity(128);
+                let hdr_count = std::io::Read::take(&mut *input, 4096)
+                    .read_until(b'\n', &mut line_buf)?;
+                if hdr_count == 0 {
+                    return Err(invalid("unexpected EOF in MCP headers").into());
+                }
+                header_bytes = header_bytes.saturating_add(hdr_count);
+                if header_bytes > 16 * 1024 || header_lines.len() >= 32 {
+                    return Err(invalid("MCP headers exceed limit").into());
+                }
+                if line_buf == b"\r\n" || line_buf == b"\n" {
+                    break;
+                }
+                header_lines.push(line_buf);
+            }
+            let mut content_len: Option<usize> = None;
+            for raw_hdr in &header_lines {
+                let hdr_str = std::str::from_utf8(raw_hdr)
+                    .map_err(|_| invalid("invalid UTF-8 in MCP header"))?
+                    .trim_matches(['\r', '\n']);
+                let (name, value) = hdr_str
+                    .split_once(':')
+                    .ok_or_else(|| invalid("malformed MCP header line"))?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    let digits = value.trim();
+                    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(invalid("invalid MCP Content-Length value").into());
+                    }
+                    let parsed = digits
+                        .parse::<usize>()
+                        .map_err(|_| invalid("invalid MCP Content-Length value"))?;
+                    if let Some(prev) = content_len
+                        && prev != parsed
+                    {
+                        return Err(invalid("conflicting MCP Content-Length headers").into());
+                    }
+                    content_len = Some(parsed);
+                }
+            }
+            let body_len = content_len
+                .ok_or_else(|| invalid("missing Content-Length in MCP header block"))?;
+            if body_len > max_message {
+                return Err(invalid(exceed_msg).into());
+            }
+            bytes.clear();
+            bytes.resize(body_len, 0);
+            std::io::Read::read_exact(input, bytes)?;
+            return Ok(Some(McpFraming::ContentLength));
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        return Ok(Some(McpFraming::JsonLines));
+    }
+}
+
+pub(crate) fn encode_mcp_frame(
+    framing: McpFraming,
+    response: &Value,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    match framing {
+        McpFraming::JsonLines => {
+            serde_json::to_writer(&mut *out, response)?;
+            out.push(b'\n');
+        }
+        McpFraming::ContentLength => {
+            let body = serde_json::to_vec(response)?;
+            write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
+            out.extend_from_slice(&body);
+        }
+    }
+    Ok(())
+}
+
 pub fn serve_engine(
     engine: &mut Engine,
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<()> {
     let mut input = input;
+    let mut bytes = Vec::with_capacity(512);
+    let mut out_buf = Vec::with_capacity(1024);
     loop {
-        let mut bytes = Vec::new();
-        let count = std::io::Read::take(&mut input, MAX_MESSAGE as u64 + 1)
-            .read_until(b'\n', &mut bytes)?;
-        if count == 0 {
+        let Some(framing) = read_mcp_frame(
+            &mut input,
+            &mut bytes,
+            MAX_MESSAGE,
+            "MCP message exceeds 1 MiB",
+        )?
+        else {
             return Ok(());
-        }
-        if count > MAX_MESSAGE {
-            return Err(invalid("MCP message exceeds 1 MiB").into());
-        }
+        };
         let response = match serde_json::from_slice(&bytes) {
             Ok(request) => handle_engine(engine, request),
             Err(error) => Some(
@@ -221,7 +337,13 @@ pub fn serve_engine(
             ),
         };
         if let Some(response) = response {
-            write_response(&mut output, &response)?;
+            if framing == McpFraming::JsonLines {
+                write_response(&mut output, &response)?;
+            } else {
+                encode_mcp_frame(framing, &response, &mut out_buf)?;
+                output.write_all(&out_buf)?;
+                output.flush()?;
+            }
         }
     }
 }

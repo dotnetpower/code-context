@@ -87,6 +87,145 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+mod win_acl {
+    use std::collections::HashSet;
+    use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut core::ffi::c_void,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct TokenUser {
+        user: SidAndAttributes,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut core::ffi::c_void,
+            desired_access: u32,
+            token_handle: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut core::ffi::c_void,
+            token_information_class: u32,
+            token_information: *mut core::ffi::c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(
+            sid: *mut core::ffi::c_void,
+            string_sid: *mut *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        fn LocalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    fn current_user_sid() -> Option<&'static str> {
+        static SID: OnceLock<Option<String>> = OnceLock::new();
+        SID.get_or_init(|| unsafe {
+            let mut token: *mut core::ffi::c_void = core::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return None;
+            }
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TOKEN_USER_CLASS, core::ptr::null_mut(), 0, &mut needed);
+            if needed == 0 || needed > 4096 {
+                let _ = CloseHandle(token);
+                return None;
+            }
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+            if GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                buf.as_mut_ptr().cast::<core::ffi::c_void>(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                let _ = CloseHandle(token);
+                return None;
+            }
+            let tu = &*(buf.as_ptr().cast::<TokenUser>());
+            let mut wide_ptr: *mut u16 = core::ptr::null_mut();
+            let ok = ConvertSidToStringSidW(tu.user.sid, &mut wide_ptr);
+            let _ = CloseHandle(token);
+            if ok == 0 || wide_ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while len < 256 && *wide_ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = core::slice::from_raw_parts(wide_ptr, len);
+            let sid_str = String::from_utf16(slice).ok();
+            let _ = LocalFree(wide_ptr.cast::<core::ffi::c_void>());
+            sid_str.filter(|s| s.starts_with("S-1-"))
+        })
+        .as_deref()
+    }
+
+    pub fn apply(path: &Path, is_dir: bool, force: bool) {
+        static APPLIED_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+        if is_dir && !force {
+            let cache = APPLIED_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+            if let Ok(guard) = cache.lock()
+                && guard.contains(path)
+            {
+                return;
+            }
+        }
+        let Some(sid) = current_user_sid() else {
+            return;
+        };
+        let user_ace = if is_dir {
+            format!("*{sid}:(OI)(CI)F")
+        } else {
+            format!("*{sid}:F")
+        };
+        let sys_ace = if is_dir {
+            "*S-1-5-18:(OI)(CI)F"
+        } else {
+            "*S-1-5-18:F"
+        };
+        let status = Command::new("icacls.exe")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &user_ace, sys_ace])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if is_dir && status.is_ok_and(|s| s.success()) {
+            let cache = APPLIED_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(path.to_path_buf());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn restrict_windows_file_acl(path: &Path) {
+    win_acl::apply(path, false, true);
+}
+
+#[cfg(windows)]
 pub fn private_dir(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -97,9 +236,11 @@ pub fn private_dir(path: &Path) -> Result<()> {
                 ))
                 .into());
             }
+            win_acl::apply(path, true, false);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(path)?;
+            win_acl::apply(path, true, true);
         }
         Err(error) => return Err(error.into()),
     }
@@ -194,6 +335,43 @@ pub fn register(spec: Spec) -> Result<()> {
         specs.sort_by(|a, b| a.root.cmp(&b.root));
         Ok(())
     })
+}
+
+pub fn register_if_absent(spec: Spec) -> Result<bool> {
+    let workspace = spec.workspace()?;
+    let spec = Spec {
+        root: workspace.root,
+        scopes: workspace.scopes,
+        globs: workspace.globs,
+        excludes: workspace.excludes,
+        default_excludes: workspace.default_excludes,
+        prewarm: spec.prewarm,
+        policy: spec.policy,
+        allow_worktrees: spec.allow_worktrees,
+        managed_parent: spec.managed_parent,
+    };
+    let mut inserted = false;
+    mutate(|specs| {
+        if specs.iter().any(|s| s.root == spec.root) {
+            inserted = false;
+            return Ok(());
+        }
+        if specs
+            .iter()
+            .any(|s| spec.root.starts_with(&s.root) || s.root.starts_with(&spec.root))
+        {
+            return Err(invalid(
+                "cannot automatically initialize an overlapping root beneath or above an existing registration",
+            )
+            .into());
+        }
+        ensure_capacity(specs)?;
+        specs.push(spec);
+        specs.sort_by(|a, b| a.root.cmp(&b.root));
+        inserted = true;
+        Ok(())
+    })?;
+    Ok(inserted)
 }
 
 pub(crate) fn missing_managed_roots(specs: &[Spec]) -> Result<Vec<PathBuf>> {

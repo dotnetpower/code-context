@@ -512,6 +512,199 @@ void test('disposing client during an in-flight request aborts without starting 
   }
 });
 
+void test('code_sync runs on a dedicated barrier lane without blocking code_read and forwards caller token', async () => {
+  let releaseSync: (() => void) | undefined;
+  let seenCaller: unknown;
+  const testServer = await fixture((value, socket) => {
+    const input = value as DaemonRequest;
+    if (input.name === 'ping') {
+      writeResponse(socket, {
+        result: {
+          capabilities: {
+            request_tracing: true,
+            trace_clock: 'unix_ms',
+            caller_session_token: true,
+          },
+        },
+      });
+      return;
+    }
+    if (input.name === 'code_sync') {
+      releaseSync = (): void => {
+        writeResponse(socket, {
+          result: {
+            value: { synced: true },
+            _cctx_trace: { trace_id: input.arguments._cctx_trace, daemon_request_id: 1, queue_ms: 0, execute_ms: 5 },
+          },
+        });
+      };
+      return;
+    }
+    seenCaller = input.arguments._cctx_caller;
+    writeResponse(socket, {
+      result: {
+        value: [{ path: 'src/fast.rs', lines: ['ok'] }],
+        _cctx_trace: { trace_id: input.arguments._cctx_trace, daemon_request_id: 2, queue_ms: 0, execute_ms: 1 },
+      },
+    });
+  });
+  const client = new DaemonClient(() => settings(testServer.path));
+  try {
+    const syncPromise = client.requestTraced(request('code_sync'), uncancelled(), 'sync-1');
+    await new Promise<void>((r) => setTimeout(r, 25));
+    const fastRead = await client.requestTraced(request('code_read'), uncancelled(), 'read-1', 0, 424242);
+    assert.deepEqual(fastRead.value, [{ path: 'src/fast.rs', lines: ['ok'] }]);
+    assert.equal(seenCaller, 424242);
+    releaseSync?.();
+    const syncDone = await syncPromise;
+    assert.deepEqual(syncDone.value, { synced: true });
+    assert.equal(testServer.connections(), 2);
+  } finally {
+    client.dispose();
+    await testServer.cleanup();
+  }
+});
+
+void test('WSL bridge delivers initial Windows host_memory trace immediately and coalesces follow-ups', async () => {
+  const seenOps: string[] = [];
+  let directHostMem = 0;
+  let piggybackedHostMem = 0;
+  const testServer = await fixture((value, socket) => {
+    const input = value as DaemonRequest;
+    seenOps.push(input.name);
+    if (input.name === 'ping') {
+      writeResponse(socket, {
+        result: {
+          capabilities: {
+            request_tracing: true,
+            trace_clock: 'unix_ms',
+            client_trace_outcomes: true,
+            host_memory_reporting: true,
+          },
+        },
+      });
+      return;
+    }
+    if (input.name === 'code_trace') {
+      if (typeof input.arguments.host_memory === 'object' && input.arguments.host_memory !== null) {
+        directHostMem += 1;
+      }
+      writeResponse(socket, { result: { recorded: true } });
+      return;
+    }
+    if (Array.isArray(input.arguments._cctx_prev_trace)) {
+      for (const prev of input.arguments._cctx_prev_trace) {
+        if (typeof prev === 'object' && prev !== null && 'host_memory' in prev) {
+          piggybackedHostMem += 1;
+        }
+      }
+    }
+    writeResponse(socket, {
+      result: {
+        value: [{ root: '/home/user/repo' }],
+        _cctx_trace: { trace_id: input.arguments._cctx_trace, daemon_request_id: 9, queue_ms: 0, execute_ms: 1 },
+      },
+    });
+  });
+
+  const wslClient = new DaemonClient(
+    () => ({
+      socketPath: '',
+      autoStartService: false,
+      requestTimeoutMs: 2_000,
+      wslDistribution: 'Ubuntu-22.04',
+      wslExecutablePath: '/home/user/.local/bin/cctx',
+    }),
+    (): Promise<void> => Promise.resolve(),
+    async () => {
+      const { createConnection } = await import('node:net');
+      return new Promise((resolveConn, rejectConn) => {
+        const sock = createConnection(testServer.path);
+        sock.once('error', rejectConn);
+        sock.once('connect', () => resolveConn(sock));
+      });
+    },
+  );
+  Object.defineProperty(wslClient, 'usesWslBridge', { get: () => true });
+
+  try {
+    const first = await wslClient.requestTraced(request('code_workspaces'), uncancelled(), 'wsl-init-1');
+    first.trace.outcome = 'success';
+    first.trace.host_memory = { platform: 'win32', total_bytes: 64_000_000_000, available_bytes: 32_000_000_000 };
+    await wslClient.request({ ...request('code_trace'), arguments: first.trace }, uncancelled());
+    assert.equal(directHostMem, 1, 'initial host_memory must be delivered immediately on startup');
+
+    // Follow-up trace within the 4-minute window coalesces and piggybacks even onto code_workspaces
+    const second = await wslClient.requestTraced(request('code_workspaces'), uncancelled(), 'wsl-init-2');
+    second.trace.outcome = 'success';
+    second.trace.host_memory = { platform: 'win32', total_bytes: 64_000_000_000, available_bytes: 31_000_000_000 };
+    await wslClient.request({ ...request('code_trace'), arguments: second.trace }, uncancelled());
+    assert.equal(directHostMem, 1, 'second trace within refresh window should coalesce');
+
+    await wslClient.requestTraced(request('code_workspaces'), uncancelled(), 'wsl-init-3');
+    assert.equal(piggybackedHostMem, 1, 'coalesced trace should piggyback on next request including code_workspaces');
+  } finally {
+    wslClient.dispose();
+    await testServer.cleanup();
+  }
+});
+
+void test('queryUsage routes code_usage onto barrierLane without blocking concurrent code_read', async () => {
+  let releaseUsage: (() => void) | undefined;
+  const testServer = await fixture((value, socket) => {
+    const input = value as DaemonRequest;
+    if (input.name === 'ping') {
+      writeResponse(socket, {
+        result: {
+          capabilities: {
+            request_tracing: true,
+            trace_clock: 'unix_ms',
+            caller_session_token: true,
+            code_usage: true,
+          },
+        },
+      });
+      return;
+    }
+    if (input.name === 'code_usage') {
+      assert.equal(input.root, null);
+      assert.equal(input.arguments.hours, 24);
+      assert.equal(input.arguments.force, true);
+      releaseUsage = (): void => {
+        writeResponse(socket, {
+          result: {
+            hours: 24,
+            sessions: 5,
+            token_summary: { total_turns: 40, saved_aic: 120.5, estimated_total_tokens_saved: 500_000 },
+            model_usage: [],
+          },
+        });
+      };
+      return;
+    }
+    writeResponse(socket, {
+      result: [{ path: 'src/nonblocking.rs', lines: ['ok'] }],
+    });
+  });
+
+  const client = new DaemonClient(() => settings(testServer.path));
+  try {
+    const usagePromise = client.queryUsage(24, true);
+    for (let i = 0; i < 40 && !releaseUsage; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(releaseUsage, 'code_usage should be in-flight on barrierLane');
+    const fastRead = await client.request(request('code_read'), uncancelled());
+    assert.deepEqual(fastRead, [{ path: 'src/nonblocking.rs', lines: ['ok'] }]);
+    releaseUsage();
+    const usageResult = (await usagePromise) as Record<string, unknown>;
+    assert.equal(usageResult.sessions, 5);
+  } finally {
+    client.dispose();
+    await testServer.cleanup();
+  }
+});
+
 function attachFramedHandler(
   socket: Socket,
   handler: (requestValue: unknown, socket: Socket) => void,
