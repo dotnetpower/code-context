@@ -34,10 +34,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/configure-pages@v6.0.0
         if: github.event_name != 'pull_request'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -56,13 +56,13 @@ jobs:
         run: cd site && npx playwright install --with-deps chromium
       - name: Verify desktop/mobile CLS, no-JS answers, and calculator
         run: npm --prefix site run test:browser
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: site-browser-results
           path: site/test-results
           if-no-files-found: ignore
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5.0.0
         if: github.event_name != 'pull_request'
         with:
           path: site/dist
@@ -77,15 +77,15 @@ jobs:
     env:
       GSC_ACCESS_TOKEN: ${{ secrets.GSC_ACCESS_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: site/package-lock.json
       - id: deployment
-        uses: actions/deploy-pages@v4
-      - uses: actions/download-artifact@v4
+        uses: actions/deploy-pages@v5.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: github-pages
           path: ${{ runner.temp }}/site-pages
