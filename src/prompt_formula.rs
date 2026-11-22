@@ -1368,10 +1368,9 @@ fn legacy_cctx_line(line: &str) -> bool {
 fn find_yaml_tools_section(text: &str) -> Option<(usize, usize)> {
     let key_start = if text.starts_with("tools:\n") || text.starts_with("tools:\r\n") {
         0
-    } else if let Some(pos) = text.find("\ntools:\n").or_else(|| text.find("\ntools:\r\n")) {
-        pos + 1
     } else {
-        return None;
+        let pos = text.find("\ntools:\n").or_else(|| text.find("\ntools:\r\n"))?;
+        pos + 1
     };
     let nl = text[key_start..].find('\n')?;
     let body_start = key_start + nl + 1;
