@@ -656,6 +656,8 @@ void test('BPE status and build RPCs run on the isolated usage lane with forward
     seen.push(input);
     if (input.name === 'code_bpe_status') {
       writeResponse(socket, { result: { exists: true, active: true, platform: 'wsl' } });
+    } else if (input.name === 'code_bpe_audit') {
+      writeResponse(socket, { result: { passed: true, highest_severity: 'none' } });
     } else if (input.name === 'code_bpe_build') {
       writeResponse(socket, { result: { action: 'built', applied: true, reason: 'manual' } });
     } else {
@@ -666,6 +668,9 @@ void test('BPE status and build RPCs run on the isolated usage lane with forward
   try {
     const status = await client.queryBpeStatus({ window: '7d', include_windows_homes: true });
     assert.deepEqual(status, { exists: true, active: true, platform: 'wsl' });
+
+    const audit = await client.queryBpeAudit({ window: '7d', include_windows_homes: true });
+    assert.deepEqual(audit, { passed: true, highest_severity: 'none' });
 
     const built = await client.buildBpeProfile({
       window: '30d',
@@ -681,8 +686,10 @@ void test('BPE status and build RPCs run on the isolated usage lane with forward
     assert.equal(testServer.connections(), 2, 'BPE RPCs should use dedicated usageLane connection');
     assert.equal(seen[0]?.name, 'code_bpe_status');
     assert.deepEqual(seen[0]?.arguments, { window: '7d', include_windows_homes: true });
-    assert.equal(seen[1]?.name, 'code_bpe_build');
-    assert.deepEqual(seen[1]?.arguments, {
+    assert.equal(seen[1]?.name, 'code_bpe_audit');
+    assert.deepEqual(seen[1]?.arguments, { window: '7d', include_windows_homes: true });
+    assert.equal(seen[2]?.name, 'code_bpe_build');
+    assert.deepEqual(seen[2]?.arguments, {
       window: '30d',
       if_needed: true,
       dry_run: true,

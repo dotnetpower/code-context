@@ -2568,6 +2568,7 @@ impl Server {
             (Protocol::Bincode, "code_daemon_summary") => "bincode:code_daemon_summary",
             (Protocol::Bincode, "code_bpe_status") => "bincode:code_bpe_status",
             (Protocol::Bincode, "code_bpe_build") => "bincode:code_bpe_build",
+            (Protocol::Bincode, "code_bpe_audit") => "bincode:code_bpe_audit",
             (Protocol::Bincode, _) => "bincode:unknown",
             (Protocol::FramedJson, "ping") => "framed_json:ping",
             (Protocol::FramedJson, "code_workspaces") => "framed_json:code_workspaces",
@@ -2585,6 +2586,7 @@ impl Server {
             (Protocol::FramedJson, "code_daemon_summary") => "framed_json:code_daemon_summary",
             (Protocol::FramedJson, "code_bpe_status") => "framed_json:code_bpe_status",
             (Protocol::FramedJson, "code_bpe_build") => "framed_json:code_bpe_build",
+            (Protocol::FramedJson, "code_bpe_audit") => "framed_json:code_bpe_audit",
             (Protocol::FramedJson, _) => "framed_json:unknown",
             (Protocol::JsonLines, "ping") => "json_lines:ping",
             (Protocol::JsonLines, "code_workspaces") => "json_lines:code_workspaces",
@@ -2602,6 +2604,7 @@ impl Server {
             (Protocol::JsonLines, "code_daemon_summary") => "json_lines:code_daemon_summary",
             (Protocol::JsonLines, "code_bpe_status") => "json_lines:code_bpe_status",
             (Protocol::JsonLines, "code_bpe_build") => "json_lines:code_bpe_build",
+            (Protocol::JsonLines, "code_bpe_audit") => "json_lines:code_bpe_audit",
             (Protocol::JsonLines, _) => "json_lines:unknown",
         }
     }
@@ -3278,9 +3281,9 @@ fn handle_bpe_rpc_request(op: &str, args: &Value) -> Result<Value> {
         && !v.is_null()
     {
         match v.as_f64() {
-            Some(h) if h.is_finite() && h > 0.0 && h <= 8760.0 => cfg.window_hours = h,
+            Some(h) if h.is_finite() && (1.0..=8760.0).contains(&h) => cfg.window_hours = h,
             _ => {
-                return Err(invalid("hours must be a finite number between 0 and 8760").into());
+                return Err(invalid("hours must be a finite number between 1 and 8760").into());
             }
         }
     }
@@ -3298,6 +3301,10 @@ fn handle_bpe_rpc_request(op: &str, args: &Value) -> Result<Value> {
 
     if op == "code_bpe_status" {
         let report = crate::bpe_builder::inspect_bpe_status(&cfg)?;
+        return Ok(serde_json::to_value(report)?);
+    }
+    if op == "code_bpe_audit" {
+        let report = crate::bpe_builder::audit_bpe_profile(&cfg)?;
         return Ok(serde_json::to_value(report)?);
     }
 
@@ -3639,7 +3646,10 @@ fn handle_connection(
             }
             continue;
         }
-        if request.name == "code_bpe_status" || request.name == "code_bpe_build" {
+        if request.name == "code_bpe_status"
+            || request.name == "code_bpe_build"
+            || request.name == "code_bpe_audit"
+        {
             let started_exec = Instant::now();
             let req_id = next_daemon_request_id();
             let op_name = request.name.clone();

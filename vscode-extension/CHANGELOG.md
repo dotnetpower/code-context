@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.26.4
+
+- Add built-in red-team BPE self-audit engine and harden all 22 red-team
+  findings across Linux, WSL, and native Windows:
+  - New `cctx prompt bpe-audit` CLI, `code_bpe_audit` daemon RPC (`usageLane`),
+    `cctx doctor` `bpe_audit` diagnostics, and VS Code `Audit BPE Profile`
+    command inspect symlink/permission safety, SHA-256 `profile_digest`
+    integrity, cloud secret/DB URI/JWT/PII leakage, protected-keyword safety,
+    cyclic/non-saving rules, policy bounds, and auto-build backoff.
+  - Harden file I/O, DoS bounds, and Windows compatibility: non-symlink regular
+    file guards + owner/mode checks on `CCTX_BPE_PROFILE_PATH`, bounded reads on
+    all state files, O(N) case-insensitive XML stripping, vocab & heavy-hitter
+    n-gram caps, Windows `\\wsl.localhost\` UNC normalization & `..` traversal
+    rejection, UTF-8 BOM + uppercase `EVENTS.JSONL` ingestion, runtime protected
+    keyword preservation rollback, and bounded concurrent build waiters.
+
 ## 0.26.3
 
 - Add session-driven adaptive BPE & formula profile builder across Linux, WSL,

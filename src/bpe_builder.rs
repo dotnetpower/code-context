@@ -19,25 +19,32 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROFILE_BYTES: usize = 512 * 1024;
+const MAX_AUTO_STATE_BYTES: usize = 64 * 1024;
 const MAX_SESSION_FILES: usize = 512;
 const MAX_MESSAGES_SCANNED: usize = 4_000;
 const MAX_MESSAGE_CHARS: usize = 2_048;
+const MAX_XML_SCAN_BYTES: usize = 16 * 1024;
+const MAX_BPE_VOCAB_WORDS: usize = 4_096;
+const MAX_TOKENS_PER_MSG: usize = 160;
+const MAX_NGRAM_ENTRIES: usize = 65_536;
 const MAX_MERGES_LIMIT: usize = 512;
 const MAX_LEARNED_FILLERS: usize = 32;
 const MAX_LEARNED_REPLACEMENTS: usize = 64;
 const MAX_DIR_ENTRIES: usize = 2_048;
+const MAX_CONCURRENT_WAITERS: usize = 4;
 const ERROR_BACKOFF_SECS: u64 = 3_600;
 #[cfg(not(windows))]
 const MAX_WINDOWS_HOME_ENTRIES: usize = 12;
 
 static BUILD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static ACTIVE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -160,12 +167,126 @@ pub struct BpeProfile {
     pub learned_fillers: Vec<String>,
     #[serde(default)]
     pub learned_replacements: Vec<LearnedReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_digest: Option<String>,
 }
 
 impl BpeProfile {
     pub fn tokenizer_profile(&self) -> TokenizerProfile {
         TokenizerProfile::for_model(&self.tokenizer)
     }
+
+    pub fn compute_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.schema_version.to_le_bytes());
+        hasher.update(self.source.as_str().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.tokenizer.as_bytes());
+        hasher.update(b"\0");
+        for m in &self.merges {
+            hasher.update(m.left.as_bytes());
+            hasher.update(b"\x1f");
+            hasher.update(m.right.as_bytes());
+            hasher.update(b"\x1e");
+        }
+        hasher.update(b"\0");
+        for f in &self.learned_fillers {
+            hasher.update(f.as_bytes());
+            hasher.update(b"\x1e");
+        }
+        hasher.update(b"\0");
+        for r in &self.learned_replacements {
+            hasher.update(r.from.as_bytes());
+            hasher.update(b"\x1f");
+            hasher.update(r.to.as_bytes());
+            hasher.update(b"\x1e");
+        }
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
+    }
+}
+
+impl BpeBuildConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.window_hours.is_finite() || self.window_hours < 1.0 || self.window_hours > 8760.0 {
+            return Err(invalid("window_hours must be finite and between 1 and 8760").into());
+        }
+        if !(2..=100).contains(&self.min_freq) {
+            return Err(invalid("min_freq must be between 2 and 100").into());
+        }
+        if !(1..=50).contains(&self.min_sessions) {
+            return Err(invalid("min_sessions must be between 1 and 50").into());
+        }
+        if !(1..=20).contains(&self.min_savings_tokens) {
+            return Err(invalid("min_savings_tokens must be between 1 and 20").into());
+        }
+        if self.max_merges > MAX_MERGES_LIMIT {
+            return Err(invalid(format!("max_merges must be between 0 and {MAX_MERGES_LIMIT}")).into());
+        }
+        for dir in &self.session_dirs {
+            let raw = dir.to_string_lossy();
+            if raw.contains('\0') || raw.chars().any(|c| c.is_control()) {
+                return Err(invalid("session_dir contains control characters").into());
+            }
+            if dir.components().any(|c| matches!(c, Component::ParentDir)) {
+                return Err(invalid("session_dir must not contain '..' traversal segments").into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl AuditSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditFinding {
+    pub code: String,
+    pub severity: AuditSeverity,
+    pub category: String,
+    pub message: String,
+    pub remediation: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AuditCounts {
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BpeAuditReport {
+    pub passed: bool,
+    pub highest_severity: String,
+    pub counts: AuditCounts,
+    pub exists: bool,
+    pub digest_valid: Option<bool>,
+    pub profile_path: String,
+    pub platform: String,
+    pub findings: Vec<AuditFinding>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -410,6 +531,82 @@ fn profile_disabled_by_env() -> bool {
     false
 }
 
+fn ensure_regular_non_symlink_file(
+    path: &Path,
+    require_owner_perms: bool,
+) -> Result<Option<std::fs::Metadata>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(invalid(format!(
+            "refusing to access symlinked file: {}",
+            path.display()
+        ))
+        .into());
+    }
+    if !meta.file_type().is_file() {
+        return Err(invalid(format!(
+            "refusing to access non-regular file: {}",
+            path.display()
+        ))
+        .into());
+    }
+    #[cfg(unix)]
+    if require_owner_perms {
+        use std::os::unix::fs::MetadataExt;
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(invalid(format!(
+                "refusing to trust file not owned by current user: {}",
+                path.display()
+            ))
+            .into());
+        }
+        if (meta.mode() & 0o022) != 0 {
+            return Err(invalid(format!(
+                "refusing to trust group/world-writable file: {}",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    let _ = require_owner_perms;
+    Ok(Some(meta))
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: usize,
+    require_owner_perms: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(meta) = ensure_regular_non_symlink_file(path, require_owner_perms)? else {
+        return Ok(None);
+    };
+    if meta.len() as usize > max_bytes {
+        return Err(invalid(format!(
+            "file {} exceeds {} byte limit",
+            path.display(),
+            max_bytes
+        ))
+        .into());
+    }
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(max_bytes));
+    file.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(invalid(format!(
+            "file {} exceeds {} byte limit",
+            path.display(),
+            max_bytes
+        ))
+        .into());
+    }
+    Ok(Some(bytes))
+}
+
 fn resolve_runtime_profile_path() -> Option<PathBuf> {
     if profile_disabled_by_env() {
         return None;
@@ -417,7 +614,12 @@ fn resolve_runtime_profile_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("CCTX_BPE_PROFILE_PATH")
         && !explicit.is_empty()
     {
-        return Some(PathBuf::from(explicit));
+        let p = PathBuf::from(explicit);
+        if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+            return None;
+        }
+        ensure_regular_non_symlink_file(&p, true).ok().flatten()?;
+        return Some(p);
     }
     // Keep unit/integration tests deterministic unless they explicitly opt into a state dir.
     #[cfg(test)]
@@ -435,14 +637,14 @@ pub fn invalidate_profile_cache() {
 }
 
 /// Loads the active learned BPE profile from disk with lightweight `mtime` + `len` caching.
-/// Always fails open (`None`) on missing, oversized, or corrupted profile files.
+/// Always fails open (`None`) on missing, oversized, symlinked, or corrupted profile files.
 pub fn load_active_profile() -> Option<BpeProfile> {
     let path = resolve_runtime_profile_path()?;
     load_profile_cached(&path)
 }
 
 fn load_profile_cached(path: &Path) -> Option<BpeProfile> {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(Some(meta)) = ensure_regular_non_symlink_file(path, true) else {
         invalidate_profile_cache();
         return None;
     };
@@ -482,17 +684,9 @@ fn load_profile_cached(path: &Path) -> Option<BpeProfile> {
 }
 
 pub fn read_profile_file(path: &Path) -> Result<Option<BpeProfile>> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let Some(bytes) = read_bounded_regular_file(path, MAX_PROFILE_BYTES, false)? else {
+        return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.take((MAX_PROFILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_PROFILE_BYTES {
-        return Err(invalid("bpe-profile.json exceeds 512 KiB limit").into());
-    }
     let mut profile: BpeProfile = serde_json::from_slice(&bytes)?;
     if profile.schema_version != PROFILE_SCHEMA_VERSION {
         return Ok(None);
@@ -562,6 +756,21 @@ fn sanitize_loaded_profile(profile: &mut BpeProfile) {
     }
     clean_rules.sort_by(|a, b| b.from.len().cmp(&a.from.len()).then_with(|| a.from.cmp(&b.from)));
     profile.learned_replacements = clean_rules;
+
+    // Clamp auto-build policy fields so corrupted/tampered JSON cannot trigger rebuild storms.
+    let p = &mut profile.auto_policy;
+    if !p.min_interval_hours.is_finite() {
+        p.min_interval_hours = 24.0;
+    } else {
+        p.min_interval_hours = p.min_interval_hours.clamp(0.5, 720.0);
+    }
+    p.min_new_sessions = p.min_new_sessions.clamp(1, 500);
+    p.min_new_messages = p.min_new_messages.clamp(1, 5_000);
+    if !p.drift_threshold.is_finite() {
+        p.drift_threshold = 0.18;
+    } else {
+        p.drift_threshold = p.drift_threshold.clamp(0.05, 0.95);
+    }
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -569,6 +778,16 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| invalid("profile path missing parent"))?;
     private_dir(parent)?;
+    // Refuse replacing an existing symlink target.
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(invalid(format!(
+            "refusing to overwrite symlink target: {}",
+            path.display()
+        ))
+        .into());
+    }
     let mut tmp = tempfile::Builder::new()
         .prefix(".bpe-profile-")
         .tempfile_in(parent)?;
@@ -610,6 +829,15 @@ where
 {
     private_dir(dir)?;
     let lock_path = lock_path_in(dir);
+    if let Ok(meta) = std::fs::symlink_metadata(&lock_path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(invalid(format!(
+            "refusing to lock symlink/non-regular file: {}",
+            lock_path.display()
+        ))
+        .into());
+    }
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -633,15 +861,32 @@ where
 
 fn read_auto_state(dir: &Path) -> AutoBuildState {
     let path = auto_state_path_in(dir);
-    std::fs::read(&path)
+    read_bounded_regular_file(&path, MAX_AUTO_STATE_BYTES, false)
         .ok()
+        .flatten()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
+fn sanitize_error_line(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(256)
+        .collect()
+}
+
 fn write_auto_state(dir: &Path, state: &AutoBuildState) {
+    let mut clean = state.clone();
+    if let Some(ref msg) = clean.last_error {
+        clean.last_error = Some(sanitize_error_line(msg));
+    }
     let path = auto_state_path_in(dir);
-    if let Ok(bytes) = serde_json::to_vec(state) {
+    if let Ok(bytes) = serde_json::to_vec(&clean) {
         let _ = write_private_atomic(&path, &bytes);
     }
 }
@@ -725,25 +970,70 @@ pub fn discover_session_homes(include_windows_homes: bool) -> Vec<PathBuf> {
     homes
 }
 
-/// Normalizes a Windows drive path (`C:\Users\alice\...`) to WSL mount syntax (`/mnt/c/Users/alice/...`)
-/// when running inside Linux/WSL so cross-platform CLI/RPC invocations work seamlessly.
-pub fn normalize_cross_platform_dir(path: &Path) -> PathBuf {
-    #[cfg(not(windows))]
-    {
-        if let Some(raw) = path.to_str() {
-            let b = raw.as_bytes();
-            if b.len() >= 3
-                && b[0].is_ascii_alphabetic()
-                && b[1] == b':'
-                && (b[2] == b'\\' || b[2] == b'/')
-            {
-                let drive = (b[0] as char).to_ascii_lowercase();
-                let rest = raw[3..].replace('\\', "/");
-                return PathBuf::from(format!("/mnt/{drive}/{rest}"));
+/// Normalizes a Windows drive path (`C:\Users\alice\...`) or Windows WSL UNC path
+/// (`\\wsl.localhost\Ubuntu\home\...` / `\\wsl$\Ubuntu\home\...`) to Linux mount syntax
+/// when running inside Linux/WSL. Rejects path traversal (`..`) and control characters
+/// by returning `None`.
+pub fn normalize_cross_platform_dir_checked(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    if raw.contains('\0') || raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let candidate = {
+        #[cfg(not(windows))]
+        {
+            if let Some(s) = path.to_str() {
+                let lower = s.to_ascii_lowercase();
+                if let Some(after_unc) = lower
+                    .strip_prefix(r"\\wsl.localhost\")
+                    .or_else(|| lower.strip_prefix(r"\\wsl$\"))
+                    .or_else(|| lower.strip_prefix("//wsl.localhost/"))
+                    .or_else(|| lower.strip_prefix("//wsl$/"))
+                {
+                    let offset = s.len() - after_unc.len();
+                    let rest_orig = &s[offset..];
+                    let norm_rest = rest_orig.replace('\\', "/");
+                    // Drop the `<distro>` component and map to `/<linux_path>`.
+                    if let Some((_, linux_tail)) = norm_rest.split_once('/') {
+                        PathBuf::from(format!("/{linux_tail}"))
+                    } else {
+                        PathBuf::from("/")
+                    }
+                } else {
+                    let b = s.as_bytes();
+                    if b.len() >= 3
+                        && b[0].is_ascii_alphabetic()
+                        && b[1] == b':'
+                        && (b[2] == b'\\' || b[2] == b'/')
+                    {
+                        let drive = (b[0] as char).to_ascii_lowercase();
+                        let rest = s[3..].replace('\\', "/");
+                        PathBuf::from(format!("/mnt/{drive}/{rest}"))
+                    } else {
+                        path.to_path_buf()
+                    }
+                }
+            } else {
+                path.to_path_buf()
             }
         }
+        #[cfg(windows)]
+        {
+            path.to_path_buf()
+        }
+    };
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
     }
-    path.to_path_buf()
+    Some(candidate)
+}
+
+/// Backward-compatible wrapper returning a normalized path (or original path on non-traversing input).
+pub fn normalize_cross_platform_dir(path: &Path) -> PathBuf {
+    normalize_cross_platform_dir_checked(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 #[derive(Clone, Debug)]
@@ -767,12 +1057,9 @@ fn register_session_file(
     path: PathBuf,
     cutoff_unix: u64,
 ) {
-    let Ok(meta) = path.metadata() else {
+    let Ok(Some(meta)) = ensure_regular_non_symlink_file(&path, false) else {
         return;
     };
-    if !meta.is_file() {
-        return;
-    }
     let mtime_secs = meta
         .modified()
         .ok()
@@ -797,13 +1084,49 @@ fn register_session_file(
     }
 }
 
+fn is_jsonl_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+}
+
+fn find_events_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
+    let direct = dir.join("events.jsonl");
+    if ensure_regular_non_symlink_file(&direct, false)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Some(direct);
+    }
+    // Windows filesystems or exported archives may uppercase filenames (`EVENTS.JSONL`).
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten().take(32) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("events.jsonl")
+            {
+                let p = entry.path();
+                if ensure_regular_non_symlink_file(&p, false)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn scan_copilot_session_dir(
     by_key: &mut BTreeMap<String, SessionFileEntry>,
     dir: &Path,
     cutoff_unix: u64,
 ) {
-    let direct = dir.join("events.jsonl");
-    if direct.is_file() {
+    if let Some(direct) = find_events_jsonl_in_dir(dir) {
         let sid = dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -819,9 +1142,13 @@ fn scan_copilot_session_dir(
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten().take(MAX_DIR_ENTRIES) {
             let p = entry.path();
+            if let Ok(sm) = std::fs::symlink_metadata(&p)
+                && sm.file_type().is_symlink()
+            {
+                continue;
+            }
             if p.is_dir() {
-                let events = p.join("events.jsonl");
-                if events.is_file() {
+                if let Some(events) = find_events_jsonl_in_dir(&p) {
                     let sid = entry.file_name().to_string_lossy().into_owned();
                     register_session_file(
                         by_key,
@@ -831,7 +1158,7 @@ fn scan_copilot_session_dir(
                         cutoff_unix,
                     );
                 }
-            } else if p.extension().is_some_and(|ext| ext == "jsonl") {
+            } else if is_jsonl_path(&p) {
                 let sid = entry.file_name().to_string_lossy().into_owned();
                 register_session_file(
                     by_key,
@@ -855,8 +1182,9 @@ fn collect_session_files(
 
     if !explicit_session_dirs.is_empty() {
         for dir in explicit_session_dirs {
-            let norm = normalize_cross_platform_dir(dir);
-            scan_copilot_session_dir(&mut by_key, &norm, cutoff_unix);
+            if let Some(norm) = normalize_cross_platform_dir_checked(dir) {
+                scan_copilot_session_dir(&mut by_key, &norm, cutoff_unix);
+            }
         }
     } else {
         for home in homes {
@@ -871,7 +1199,7 @@ fn collect_session_files(
                         if let Ok(files) = std::fs::read_dir(proj.path()) {
                             for f in files.flatten().take(MAX_DIR_ENTRIES) {
                                 let p = f.path();
-                                if p.extension().is_some_and(|e| e == "jsonl") {
+                                if is_jsonl_path(&p) {
                                     let sid = format!(
                                         "claude:{}/{}",
                                         proj.file_name().to_string_lossy(),
@@ -933,10 +1261,12 @@ fn check_rebuild_needed(
 
     let elapsed_secs = now_unix.saturating_sub(prev.built_at_unix);
     let hours_since = elapsed_secs as f64 / 3600.0;
-    let changed_sessions = files
+    let mtime_changed = files
         .iter()
         .filter(|f| f.mtime_secs > prev.watermark.latest_event_mtime_secs)
         .count();
+    let count_growth = total_sessions_in_window.saturating_sub(prev.watermark.session_count);
+    let changed_sessions = mtime_changed.max(count_growth);
 
     if let Some(drift) = drift_score
         && drift >= policy.drift_threshold
@@ -1040,21 +1370,32 @@ fn extract_corpus(files: &[SessionFileEntry], cutoff_unix: u64) -> ExtractedCorp
             continue;
         };
         let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut first_line = true;
         while let Ok(Some(valid_line)) =
             read_bounded_jsonl_line(&mut reader, &mut line, MAX_JSONL_LINE_BYTES)
         {
-            if !valid_line || line.trim().is_empty() {
+            if !valid_line {
+                first_line = false;
+                continue;
+            }
+            let raw_line = if first_line {
+                first_line = false;
+                line.trim_start_matches('\u{FEFF}')
+            } else {
+                line.as_str()
+            };
+            if raw_line.trim().is_empty() {
                 continue;
             }
             match entry.kind {
                 SessionFileKind::CopilotEvents => {
-                    let is_user_msg = line.contains("\"user.message\"");
-                    let is_usage = line.contains("\"session.usage_record\"")
-                        || line.contains("\"assistant.usage\"");
+                    let is_user_msg = raw_line.contains("\"user.message\"");
+                    let is_usage = raw_line.contains("\"session.usage_record\"")
+                        || raw_line.contains("\"assistant.usage\"");
                     if !is_user_msg && !is_usage {
                         continue;
                     }
-                    let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+                    let Ok(ev) = serde_json::from_str::<Value>(raw_line) else {
                         continue;
                     };
                     let Some(ev_type) = ev.get("type").and_then(Value::as_str) else {
@@ -1098,10 +1439,10 @@ fn extract_corpus(files: &[SessionFileEntry], cutoff_unix: u64) -> ExtractedCorp
                     }
                 }
                 SessionFileKind::ClaudeProject => {
-                    if !line.contains("\"user\"") && !line.contains("\"model\"") {
+                    if !raw_line.contains("\"user\"") && !raw_line.contains("\"model\"") {
                         continue;
                     }
-                    let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+                    let Ok(ev) = serde_json::from_str::<Value>(raw_line) else {
                         continue;
                     };
                     if ev.get("type").and_then(Value::as_str) == Some("user") {
@@ -1294,24 +1635,47 @@ pub fn sanitize_user_prompt(raw: &str) -> Option<String> {
 }
 
 fn strip_xml_blocks(input: &str, tags: &[&str]) -> String {
-    let mut s = input.to_string();
-    for tag in tags {
-        let open = format!("<{tag}");
-        let close = format!("</{tag}>");
-        while let Some(start) = s.find(&open) {
-            if let Some(rel_end) = s[start..].find(&close) {
-                let end = start + rel_end + close.len();
-                s.replace_range(start..end, " ");
+    // Pre-clip to MAX_XML_SCAN_BYTES on a valid UTF-8 boundary to avoid O(N^2) adversarial payloads.
+    let mut clipped_end = input.len().min(MAX_XML_SCAN_BYTES);
+    while clipped_end > 0 && !input.is_char_boundary(clipped_end) {
+        clipped_end -= 1;
+    }
+    let slice = &input[..clipped_end];
+    let lower = slice.to_ascii_lowercase();
+    let mut out = String::with_capacity(slice.len());
+    let mut cursor = 0usize;
+
+    while cursor < slice.len() {
+        let Some(rel_lt) = lower[cursor..].find('<') else {
+            out.push_str(&slice[cursor..]);
+            break;
+        };
+        let tag_start = cursor + rel_lt;
+        let rest_lower = &lower[tag_start + 1..];
+        let matched_tag = tags.iter().copied().find(|tag| {
+            rest_lower.starts_with(tag)
+                && rest_lower[tag.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '>' || c.is_whitespace() || c == '/')
+        });
+        if let Some(tag) = matched_tag {
+            out.push_str(&slice[cursor..tag_start]);
+            out.push(' ');
+            let close_pat = format!("</{tag}>");
+            if let Some(rel_close) = lower[tag_start..].find(&close_pat) {
+                cursor = tag_start + rel_close + close_pat.len();
+            } else if let Some(rel_nl) = lower[tag_start..].find('\n') {
+                cursor = tag_start + rel_nl + 1;
             } else {
-                // Unclosed tag: drop from tag start to end of line.
-                let end = s[start..]
-                    .find('\n')
-                    .map_or(s.len(), |nl| start + nl + 1);
-                s.replace_range(start..end, " ");
+                cursor = slice.len();
             }
+        } else {
+            out.push_str(&slice[cursor..=tag_start]);
+            cursor = tag_start + 1;
         }
     }
-    s
+    out
 }
 
 fn strip_fenced_code_blocks(input: &str) -> String {
@@ -1331,42 +1695,97 @@ fn strip_fenced_code_blocks(input: &str) -> String {
     out
 }
 
-fn contains_secret_like_token(text: &str) -> bool {
+/// Detects secrets, cloud API keys, database credentials, JWTs, or PII patterns.
+/// Shared by both prompt ingestion sanitization and the built-in self-audit engine.
+pub fn detect_sensitive_patterns(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
-    let markers = [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "github_pat_",
-        "sk-proj-",
-        "sk-ant-",
-        "sk-live-",
-        "xoxb-",
-        "xoxp-",
-        "akia",
-        "-----begin private key",
-        "-----begin rsa private key",
-        "-----begin openssh private key",
-        "authorization: bearer ",
-        "password=",
-        "passwd=",
-        "api_key=",
-        "apikey=",
-        "access_key=",
-        "client_secret=",
-        "secret_key=",
-        "auth_token=",
-        "bearer eyj",
+    let markers: &[(&str, &str)] = &[
+        ("ghp_", "github_token"),
+        ("gho_", "github_token"),
+        ("ghu_", "github_token"),
+        ("ghs_", "github_token"),
+        ("github_pat_", "github_pat"),
+        ("sk-proj-", "openai_key"),
+        ("sk-ant-", "anthropic_key"),
+        ("sk-live-", "stripe_key"),
+        ("sk_live_", "stripe_key"),
+        ("rk_live_", "stripe_key"),
+        ("pk_live_", "stripe_key"),
+        ("xoxb-", "slack_token"),
+        ("xoxp-", "slack_token"),
+        ("xoxa-", "slack_token"),
+        ("xoxr-", "slack_token"),
+        ("aiza", "gcp_api_key"),
+        ("akia", "aws_access_key"),
+        ("asia", "aws_sts_key"),
+        ("-----begin private key", "private_key"),
+        ("-----begin rsa private key", "private_key"),
+        ("-----begin openssh private key", "private_key"),
+        ("authorization: bearer ", "bearer_token"),
+        ("bearer eyj", "bearer_jwt"),
+        ("password=", "credential_kv"),
+        ("passwd=", "credential_kv"),
+        ("api_key=", "credential_kv"),
+        ("apikey=", "credential_kv"),
+        ("access_key=", "credential_kv"),
+        ("client_secret=", "credential_kv"),
+        ("secret_key=", "credential_kv"),
+        ("auth_token=", "credential_kv"),
+        ("postgres://", "db_uri"),
+        ("postgresql://", "db_uri"),
+        ("mongodb://", "db_uri"),
+        ("mongodb+srv://", "db_uri"),
+        ("mysql://", "db_uri"),
+        ("redis://", "db_uri"),
     ];
-    if markers.iter().any(|m| lower.contains(m)) {
-        return true;
+    for &(marker, label) in markers {
+        if lower.contains(marker) {
+            // Avoid false positives on short words like "asia" unless followed by uppercase/digits (AWS STS `ASIA...`).
+            if matches!(marker, "asia" | "akia" | "aiza") {
+                let has_key_shape = text.split_whitespace().any(|tok| {
+                    let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                    t.len() >= 16
+                        && (t.starts_with("AKIA") || t.starts_with("ASIA") || t.starts_with("AIza"))
+                        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                });
+                if !has_key_shape {
+                    continue;
+                }
+            }
+            return Some(label);
+        }
+    }
+    if lower.contains("sig=") && lower.contains("&se=") {
+        return Some("azure_sas_token");
     }
     // Detect JWT-like 3-part base64url tokens starting with `eyJ`.
-    text.split_whitespace().any(|tok| {
+    if text.split_whitespace().any(|tok| {
         let t = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
         t.starts_with("eyJ") && t.len() >= 36 && t.matches('.').count() == 2
-    })
+    }) {
+        return Some("jwt_token");
+    }
+    // Detect Korean resident registration number (`dddddd-ddddddd`) or mobile phone (`010-dddd-dddd`).
+    if text.split_whitespace().any(|tok| {
+        let t = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')'));
+        let parts: Vec<&str> = t.split('-').collect();
+        (parts.len() == 2
+            && parts[0].len() == 6
+            && parts[1].len() == 7
+            && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit())))
+            || (parts.len() == 3
+                && parts[0] == "010"
+                && parts[1].len() == 4
+                && parts[2].len() == 4
+                && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit())))
+    }) {
+        return Some("pii_identifier");
+    }
+    None
+}
+
+fn contains_secret_like_token(text: &str) -> bool {
+    detect_sensitive_patterns(text).is_some()
 }
 
 fn is_noisy_token(tok: &str) -> bool {
@@ -1449,6 +1868,7 @@ pub fn train_corpus_bpe(messages: &[String], max_merges: usize, min_pair_freq: u
     }
 
     // Represent each unique word as a sequence of symbols plus end-of-word marker `</w>`.
+    // Bound vocabulary to top MAX_BPE_VOCAB_WORDS by frequency so worst-case training stays <25ms.
     let mut vocab: Vec<(Vec<String>, usize)> = word_counts
         .into_iter()
         .map(|(word, freq)| {
@@ -1458,6 +1878,7 @@ pub fn train_corpus_bpe(messages: &[String], max_merges: usize, min_pair_freq: u
         })
         .collect();
     vocab.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    vocab.truncate(MAX_BPE_VOCAB_WORDS);
 
     let mut merges: Vec<BpeMergeRule> = Vec::with_capacity(cap);
     for _ in 0..cap {
@@ -1650,7 +2071,7 @@ fn contains_protected_keyword(text: &str) -> bool {
         .any(|kw| lower.contains(kw) || text.contains(kw))
 }
 
-fn preserves_protected_keywords(from: &str, to: &str) -> bool {
+pub(crate) fn preserves_protected_keywords(from: &str, to: &str) -> bool {
     let from_lower = from.to_ascii_lowercase();
     let to_lower = to.to_ascii_lowercase();
     for kw in PROTECTED_KEYWORDS {
@@ -1761,65 +2182,58 @@ fn mine_formula_rules(
     learned_fillers.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     learned_fillers.truncate(MAX_LEARNED_FILLERS);
 
-    // 2. Mine recurring 2..=6 word n-grams across sessions and synthesize safe compact formulas.
-    let mut ngram_counts: HashMap<String, (usize, BTreeSet<String>)> = HashMap::new();
+    // 2. Mine recurring 2..=6 word n-grams across sessions directly into minimal transformed spans
+    // so non-transformable 1-off n-grams never consume memory or evict real recurring patterns.
+    let mut minimal_rules: HashMap<(String, String), (usize, BTreeSet<String>)> = HashMap::new();
     for msg in messages {
         let (norm, _, _) = normalize_bpe_operators(&msg.text);
         let words: Vec<&str> = norm
             .split_whitespace()
+            .take(MAX_TOKENS_PER_MSG)
             .map(|w| w.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | '.' | '?' | '!')))
             .filter(|w| !w.is_empty())
             .collect();
         if words.len() < 2 {
             continue;
         }
-        let mut seen_in_msg: BTreeSet<String> = BTreeSet::new();
+        let mut seen_in_msg: BTreeSet<(String, String)> = BTreeSet::new();
         for n in 2..=6.min(words.len()) {
             for win in words.windows(n) {
                 let phrase = win.join(" ");
-                if !is_safe_phrase(&phrase) || !seen_in_msg.insert(phrase.clone()) {
+                if !is_safe_phrase(&phrase) || contains_protected_keyword(&phrase) {
                     continue;
                 }
-                let entry = ngram_counts
-                    .entry(phrase)
+                let Some(compact) = synthesize_compact_formula(&phrase) else {
+                    continue;
+                };
+                let (min_from, min_to) = trim_common_word_affixes(&phrase, &compact);
+                if min_from.is_empty()
+                    || min_to.is_empty()
+                    || min_from == min_to
+                    || !is_safe_phrase(&min_from)
+                    || contains_protected_keyword(&min_from)
+                    || !preserves_protected_keywords(&min_from, &min_to)
+                {
+                    continue;
+                }
+                let key = (min_from, min_to);
+                if !seen_in_msg.insert(key.clone()) {
+                    continue;
+                }
+                if !minimal_rules.contains_key(&key) && minimal_rules.len() >= MAX_NGRAM_ENTRIES {
+                    // Evict single-occurrence cold entries before capping to preserve heavy hitters.
+                    minimal_rules.retain(|_, (cnt, _)| *cnt > 1);
+                    if minimal_rules.len() >= MAX_NGRAM_ENTRIES {
+                        continue;
+                    }
+                }
+                let entry = minimal_rules
+                    .entry(key)
                     .or_insert_with(|| (0, BTreeSet::new()));
                 entry.0 += 1;
                 entry.1.insert(msg.session_id.clone());
             }
         }
-    }
-
-    // Deduplicate by minimal transformed span (trimming unchanged leading/trailing context words)
-    // so sliding-window shingles over one repeated sentence collapse into one clean, general rule.
-    let mut minimal_rules: HashMap<(String, String), (usize, BTreeSet<String>)> = HashMap::new();
-    for (phrase, (freq, sessions)) in ngram_counts {
-        if freq < req_freq || sessions.len() < req_sessions {
-            continue;
-        }
-        // Never rewrite phrases containing negative/safety/scope constraints.
-        if contains_protected_keyword(&phrase) {
-            continue;
-        }
-        let Some(compact) = synthesize_compact_formula(&phrase) else {
-            continue;
-        };
-        let (min_from, min_to) = trim_common_word_affixes(&phrase, &compact);
-        if min_from.is_empty()
-            || min_to.is_empty()
-            || min_from == min_to
-            || !is_safe_phrase(&min_from)
-            || contains_protected_keyword(&min_from)
-            || !preserves_protected_keywords(&min_from, &min_to)
-        {
-            continue;
-        }
-        let entry = minimal_rules
-            .entry((min_from, min_to))
-            .or_insert_with(|| (0, BTreeSet::new()));
-        if freq > entry.0 {
-            entry.0 = freq;
-        }
-        entry.1.extend(sessions);
     }
 
     let mut candidates: Vec<LearnedReplacement> = Vec::new();
@@ -2127,10 +2541,7 @@ pub fn inspect_bpe_status(config: &BpeBuildConfig) -> Result<BpeStatusReport> {
 
 /// Builds (or conditionally auto-builds) the session-driven BPE profile.
 pub fn build_bpe_profile(config: &BpeBuildConfig) -> Result<BpeBuildReport> {
-    if !config.window_hours.is_finite() || config.window_hours <= 0.0 || config.window_hours > 8760.0
-    {
-        return Err(invalid("window_hours must be finite and between 0 and 8760").into());
-    }
+    config.validate()?;
     let state_dir = resolve_state_dir(config.state_dir_override.as_deref())?;
     let path = profile_path_in(&state_dir);
     let prev_path = prev_profile_path_in(&state_dir);
@@ -2145,8 +2556,8 @@ pub fn build_bpe_profile(config: &BpeBuildConfig) -> Result<BpeBuildReport> {
     };
     let scanned_homes: Vec<String> = homes.iter().map(|p| p.display().to_string()).collect();
 
-    // Non-blocking singleflight guard for conditional `if_needed` auto-builds so simultaneous
-    // multi-window triggers (WSL/Windows VS Code windows + daemon) never pile up.
+    // Non-blocking singleflight guard for conditional `if_needed` auto-builds and bounded
+    // concurrency waiter cap for manual builds so simultaneous bursts never pile up threads.
     struct InFlightGuard(bool);
     impl Drop for InFlightGuard {
         fn drop(&mut self) {
@@ -2155,33 +2566,51 @@ pub fn build_bpe_profile(config: &BpeBuildConfig) -> Result<BpeBuildReport> {
             }
         }
     }
+    struct WaiterGuard(bool);
+    impl Drop for WaiterGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                ACTIVE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
     let acquired_flight = BUILD_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
-    if !acquired_flight && config.if_needed {
-        let existing = read_profile_file(&path).ok().flatten();
-        return Ok(BpeBuildReport {
-            action: "skipped".to_string(),
-            applied: false,
-            dry_run: config.dry_run,
-            reason: "build already in progress".to_string(),
-            profile_path: path.display().to_string(),
-            platform: detect_platform_label().to_string(),
-            scanned_homes,
-            rebuild_check: RebuildCheck {
-                needed: false,
+    let _waiter_guard = if !acquired_flight {
+        if config.if_needed {
+            let existing = read_profile_file(&path).ok().flatten();
+            return Ok(BpeBuildReport {
+                action: "skipped".to_string(),
+                applied: false,
+                dry_run: config.dry_run,
                 reason: "build already in progress".to_string(),
-                changed_sessions: 0,
-                total_sessions_in_window: 0,
-                latest_event_mtime_secs: existing
-                    .as_ref()
-                    .map_or(0, |p| p.watermark.latest_event_mtime_secs),
-                hours_since_last_build: None,
-                drift_score: None,
-            },
-            profile: existing,
-        });
-    }
+                profile_path: path.display().to_string(),
+                platform: detect_platform_label().to_string(),
+                scanned_homes,
+                rebuild_check: RebuildCheck {
+                    needed: false,
+                    reason: "build already in progress".to_string(),
+                    changed_sessions: 0,
+                    total_sessions_in_window: 0,
+                    latest_event_mtime_secs: existing
+                        .as_ref()
+                        .map_or(0, |p| p.watermark.latest_event_mtime_secs),
+                    hours_since_last_build: None,
+                    drift_score: None,
+                },
+                profile: existing,
+            });
+        }
+        let prev_waiters = ACTIVE_WAITERS.fetch_add(1, Ordering::AcqRel);
+        if prev_waiters >= MAX_CONCURRENT_WAITERS {
+            ACTIVE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            return Err(invalid("too many concurrent BPE build requests; retry shortly").into());
+        }
+        WaiterGuard(true)
+    } else {
+        WaiterGuard(false)
+    };
     let _flight_guard = InFlightGuard(acquired_flight);
 
     with_profile_lock(&state_dir, !config.dry_run, || {
@@ -2312,6 +2741,7 @@ pub fn build_bpe_profile(config: &BpeBuildConfig) -> Result<BpeBuildReport> {
             merges,
             learned_fillers,
             learned_replacements,
+            profile_digest: None,
         };
 
         let encoder = BpeEncoder::new(&provisional.merges);
@@ -2354,12 +2784,12 @@ pub fn build_bpe_profile(config: &BpeBuildConfig) -> Result<BpeBuildReport> {
             bpe_avg_tokens_per_prompt: if texts.is_empty() { 0.0 } else { round2(total_bpe_tok as f64 / n) },
             bpe_chars_per_token,
         };
+        profile.profile_digest = Some(profile.compute_digest());
 
         let applied = if config.dry_run {
             false
         } else {
-            if path.is_file()
-                && let Ok(old_bytes) = std::fs::read(&path)
+            if let Ok(Some(old_bytes)) = read_bounded_regular_file(&path, MAX_PROFILE_BYTES, false)
             {
                 let _ = write_private_atomic(&prev_path, &old_bytes);
             }
@@ -2406,10 +2836,8 @@ pub fn reset_bpe_profile(state_dir_override: Option<&Path>) -> Result<BpeBuildRe
     let prev_path = prev_profile_path_in(&state_dir);
     let removed = with_profile_lock(&state_dir, true, || {
         let mut existed = false;
-        if path.is_file() {
-            if let Ok(old_bytes) = std::fs::read(&path) {
-                let _ = write_private_atomic(&prev_path, &old_bytes);
-            }
+        if let Ok(Some(old_bytes)) = read_bounded_regular_file(&path, MAX_PROFILE_BYTES, false) {
+            let _ = write_private_atomic(&prev_path, &old_bytes);
             std::fs::remove_file(&path)?;
             existed = true;
         }
@@ -2495,10 +2923,401 @@ pub fn parse_window_hours(window: &str) -> Result<f64> {
         }
         _ => return Err(invalid(format!("invalid window '{window}' (use e.g. 24h, 7d, 30d)")).into()),
     };
-    if !hours.is_finite() || hours <= 0.0 || hours > 8760.0 {
-        return Err(invalid("window must resolve between 0 and 8760 hours").into());
+    if !hours.is_finite() || hours < 1.0 || hours > 8760.0 {
+        return Err(invalid("window must resolve between 1 and 8760 hours").into());
     }
     Ok(hours)
+}
+
+/// Built-in red-team self-audit engine for `bpe-profile.json` and its state directory.
+/// Detects symlink/permission issues, digest tampering, oversized/corrupted JSON,
+/// protected-keyword violations, secret/PII leakage, cyclic/non-saving rules,
+/// policy bounds drift, and auto-build error backoff with severity ratings.
+pub fn audit_bpe_profile(config: &BpeBuildConfig) -> Result<BpeAuditReport> {
+    let state_dir = resolve_state_dir(config.state_dir_override.as_deref())?;
+    let path = profile_path_in(&state_dir);
+    let prev_path = prev_profile_path_in(&state_dir);
+    let lock_path = lock_path_in(&state_dir);
+    let auto_path = auto_state_path_in(&state_dir);
+
+    let mut findings: Vec<AuditFinding> = Vec::new();
+    let mut push = |code: &str, severity: AuditSeverity, category: &str, msg: String, rem: &str| {
+        findings.push(AuditFinding {
+            code: code.to_string(),
+            severity,
+            category: category.to_string(),
+            message: msg,
+            remediation: rem.to_string(),
+        });
+    };
+
+    // 1. Check all state files for symlinks, non-regular files, and Unix ownership/mode safety.
+    for (label, target) in [
+        ("bpe-profile.json", &path),
+        ("bpe-profile.prev.json", &prev_path),
+        ("bpe-profile.lock", &lock_path),
+        ("bpe-auto-state.json", &auto_path),
+    ] {
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    push(
+                        "BPE_SYMLINK_FILE",
+                        AuditSeverity::Critical,
+                        "filesystem_security",
+                        format!("{label} is a symlink or non-regular file ({})", target.display()),
+                        "Remove the symlink/special file and rebuild with `cctx prompt build-bpe`.",
+                    );
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let euid = unsafe { libc::geteuid() };
+                        if meta.uid() != euid || (meta.mode() & 0o022) != 0 {
+                            push(
+                                "BPE_UNSAFE_PERMISSIONS",
+                                AuditSeverity::Critical,
+                                "filesystem_security",
+                                format!(
+                                    "{label} has unsafe ownership or writable mode {:o}",
+                                    meta.mode() & 0o777
+                                ),
+                                "Run `chmod 600` on state files owned by your user or reset and rebuild.",
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                push(
+                    "BPE_STAT_ERROR",
+                    AuditSeverity::High,
+                    "filesystem_security",
+                    format!("failed to inspect {label}: {err}"),
+                    "Verify permissions on CCTX state directory.",
+                );
+            }
+        }
+    }
+
+    // 2. Inspect raw persisted profile (before sanitization) to detect on-disk tampering/defects.
+    let mut exists = false;
+    let mut digest_valid: Option<bool> = None;
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            exists = true;
+            if meta.len() as usize > MAX_PROFILE_BYTES {
+                push(
+                    "BPE_PROFILE_OVERSIZED",
+                    AuditSeverity::High,
+                    "dos_bounds",
+                    format!(
+                        "bpe-profile.json size {} exceeds {} byte limit",
+                        meta.len(),
+                        MAX_PROFILE_BYTES
+                    ),
+                    "Reset and rebuild with `cctx prompt build-bpe --reset && cctx prompt build-bpe`.",
+                );
+            } else if let Ok(Some(bytes)) =
+                read_bounded_regular_file(&path, MAX_PROFILE_BYTES, false)
+            {
+                match serde_json::from_slice::<BpeProfile>(&bytes) {
+                    Err(err) => {
+                        push(
+                            "BPE_PROFILE_CORRUPT_JSON",
+                            AuditSeverity::High,
+                            "integrity",
+                            format!("bpe-profile.json failed JSON parsing: {err}"),
+                            "Rollback or rebuild with `cctx prompt build-bpe --rollback` or `cctx prompt build-bpe`.",
+                        );
+                    }
+                    Ok(raw_prof) => {
+                        if raw_prof.schema_version != PROFILE_SCHEMA_VERSION {
+                            push(
+                                "BPE_SCHEMA_MISMATCH",
+                                AuditSeverity::High,
+                                "integrity",
+                                format!(
+                                    "unsupported schema_version {} (expected {})",
+                                    raw_prof.schema_version, PROFILE_SCHEMA_VERSION
+                                ),
+                                "Rebuild profile with current cctx binary.",
+                            );
+                        }
+                        if let Some(ref stored) = raw_prof.profile_digest {
+                            let expected = raw_prof.compute_digest();
+                            let ok = stored == &expected;
+                            digest_valid = Some(ok);
+                            if !ok {
+                                push(
+                                    "BPE_DIGEST_MISMATCH",
+                                    AuditSeverity::High,
+                                    "integrity",
+                                    "stored profile_digest does not match computed SHA-256 (file modified on disk)".to_string(),
+                                    "Rebuild with `cctx prompt build-bpe` or restore backup with `--rollback`.",
+                                );
+                            }
+                        } else {
+                            digest_valid = Some(false);
+                            push(
+                                "BPE_DIGEST_MISSING",
+                                AuditSeverity::Medium,
+                                "integrity",
+                                "profile_digest is missing (legacy profile built before integrity hashing)".to_string(),
+                                "Rebuild with `cctx prompt build-bpe` to attach SHA-256 integrity digest.",
+                            );
+                        }
+
+                        if raw_prof.merges.len() > MAX_MERGES_LIMIT
+                            || raw_prof.learned_fillers.len() > MAX_LEARNED_FILLERS
+                            || raw_prof.learned_replacements.len() > MAX_LEARNED_REPLACEMENTS
+                        {
+                            push(
+                                "BPE_TABLE_OVER_LIMIT",
+                                AuditSeverity::Medium,
+                                "dos_bounds",
+                                format!(
+                                    "profile tables exceed safe limits (merges={}, fillers={}, rules={})",
+                                    raw_prof.merges.len(),
+                                    raw_prof.learned_fillers.len(),
+                                    raw_prof.learned_replacements.len()
+                                ),
+                                "Rebuild profile with bounded parameters.",
+                            );
+                        }
+
+                        let tok = raw_prof.tokenizer_profile();
+                        for m in &raw_prof.merges {
+                            if let Some(kind) = detect_sensitive_patterns(&m.merged) {
+                                push(
+                                    "BPE_SENSITIVE_DATA_LEAK",
+                                    AuditSeverity::Critical,
+                                    "privacy_security",
+                                    format!("sensitive pattern ({kind}) detected in BPE merge table"),
+                                    "Reset and rebuild profile immediately.",
+                                );
+                                break;
+                            }
+                        }
+                        for filler in &raw_prof.learned_fillers {
+                            if contains_protected_keyword(filler) {
+                                push(
+                                    "BPE_PROTECTED_KEYWORD_VIOLATION",
+                                    AuditSeverity::Critical,
+                                    "semantic_safety",
+                                    format!("learned filler touches protected keyword: \"{filler}\""),
+                                    "Rebuild profile to purge unsafe filler.",
+                                );
+                            }
+                            if let Some(kind) = detect_sensitive_patterns(filler) {
+                                push(
+                                    "BPE_SENSITIVE_DATA_LEAK",
+                                    AuditSeverity::Critical,
+                                    "privacy_security",
+                                    format!("sensitive pattern ({kind}) detected in learned filler"),
+                                    "Reset and rebuild profile immediately.",
+                                );
+                            }
+                            if filler.contains('/') || filler.contains('\\') {
+                                push(
+                                    "BPE_SENSITIVE_DATA_LEAK",
+                                    AuditSeverity::Critical,
+                                    "privacy_security",
+                                    "path separator detected in learned filler".to_string(),
+                                    "Reset and rebuild profile.",
+                                );
+                            }
+                        }
+                        for (i, rule) in raw_prof.learned_replacements.iter().enumerate() {
+                            if contains_protected_keyword(&rule.from)
+                                || !preserves_protected_keywords(&rule.from, &rule.to)
+                            {
+                                push(
+                                    "BPE_PROTECTED_KEYWORD_VIOLATION",
+                                    AuditSeverity::Critical,
+                                    "semantic_safety",
+                                    format!(
+                                        "rule violates protected keyword safety: \"{}\" => \"{}\"",
+                                        rule.from, rule.to
+                                    ),
+                                    "Rebuild profile to purge unsafe rule.",
+                                );
+                            }
+                            if let Some(kind) = detect_sensitive_patterns(&rule.from)
+                                .or_else(|| detect_sensitive_patterns(&rule.to))
+                            {
+                                push(
+                                    "BPE_SENSITIVE_DATA_LEAK",
+                                    AuditSeverity::Critical,
+                                    "privacy_security",
+                                    format!("sensitive pattern ({kind}) detected in learned rule"),
+                                    "Reset and rebuild profile immediately.",
+                                );
+                            }
+                            if rule.from.is_empty()
+                                || rule.to.trim().is_empty()
+                                || rule.from == rule.to
+                            {
+                                push(
+                                    "BPE_CYCLIC_OR_DUPLICATE_RULE",
+                                    AuditSeverity::High,
+                                    "rule_soundness",
+                                    format!("degenerate or self-referential rule: \"{}\"", rule.from),
+                                    "Rebuild profile.",
+                                );
+                            }
+                            for other in &raw_prof.learned_replacements[i + 1..] {
+                                if other.from == rule.from
+                                    || other.to.contains(&rule.from)
+                                    || rule.to.contains(&other.from)
+                                {
+                                    push(
+                                        "BPE_CYCLIC_OR_DUPLICATE_RULE",
+                                        AuditSeverity::High,
+                                        "rule_soundness",
+                                        format!(
+                                            "duplicate or cyclic rule interaction between \"{}\" and \"{}\"",
+                                            rule.from, other.from
+                                        ),
+                                        "Rebuild profile to deduplicate rules.",
+                                    );
+                                    break;
+                                }
+                            }
+                            if rule.to.chars().count() > 96
+                                || rule.to.chars().count() * 4 < rule.from.chars().count()
+                                || estimate_bpe_tokens_for(&rule.from, tok)
+                                    <= estimate_bpe_tokens_for(&rule.to, tok)
+                            {
+                                push(
+                                    "BPE_NON_SAVING_OR_OVERLONG_RULE",
+                                    AuditSeverity::Medium,
+                                    "rule_soundness",
+                                    format!(
+                                        "non-saving or over-truncated rule: \"{}\" => \"{}\"",
+                                        rule.from, rule.to
+                                    ),
+                                    "Rebuild profile to prune ineffective rules.",
+                                );
+                            }
+                        }
+
+                        let p = &raw_prof.auto_policy;
+                        if !p.min_interval_hours.is_finite()
+                            || !(0.5..=720.0).contains(&p.min_interval_hours)
+                            || !(1..=500).contains(&p.min_new_sessions)
+                            || !(1..=5_000).contains(&p.min_new_messages)
+                            || !p.drift_threshold.is_finite()
+                            || !(0.05..=0.95).contains(&p.drift_threshold)
+                        {
+                            push(
+                                "BPE_INVALID_AUTO_POLICY",
+                                AuditSeverity::Medium,
+                                "policy_bounds",
+                                "auto_policy contains out-of-range parameters".to_string(),
+                                "Rebuild profile to restore safe policy bounds.",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            push(
+                "BPE_PROFILE_NOT_BUILT",
+                AuditSeverity::Low,
+                "lifecycle",
+                "bpe-profile.json has not been built yet (using built-in rules only)".to_string(),
+                "Run `cctx prompt build-bpe --window 7d` to personalize compression from Copilot sessions.",
+            );
+        }
+        _ => {}
+    }
+
+    // 3. Check auto-build error backoff state.
+    let auto_state = read_auto_state(&state_dir);
+    let now = config.now_unix.unwrap_or_else(now_unix_secs);
+    if auto_state.last_error_unix > 0
+        && now.saturating_sub(auto_state.last_error_unix) < ERROR_BACKOFF_SECS
+    {
+        push(
+            "BPE_AUTO_ERROR_BACKOFF",
+            AuditSeverity::Medium,
+            "auto_build",
+            format!(
+                "background auto-build is in error backoff: {}",
+                auto_state.last_error.as_deref().unwrap_or("unknown error")
+            ),
+            "Inspect permissions/logs and run `cctx prompt build-bpe` manually to clear backoff.",
+        );
+    }
+
+    // 4. Check staleness / rebuild readiness as informational Low finding.
+    if exists
+        && let Ok(status) = inspect_bpe_status(config)
+        && status.rebuild_check.needed
+    {
+        push(
+            "BPE_PROFILE_STALE",
+            AuditSeverity::Low,
+            "freshness",
+            format!("profile rebuild recommended: {}", status.rebuild_check.reason),
+            "Run `cctx prompt build-bpe --if-needed` or wait for background auto-build.",
+        );
+    }
+
+    findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.code.cmp(&b.code)));
+    let mut counts = AuditCounts::default();
+    for f in &findings {
+        match f.severity {
+            AuditSeverity::Critical => counts.critical += 1,
+            AuditSeverity::High => counts.high += 1,
+            AuditSeverity::Medium => counts.medium += 1,
+            AuditSeverity::Low => counts.low += 1,
+        }
+    }
+    let highest_severity = findings
+        .first()
+        .map_or("none", |f| f.severity.as_str())
+        .to_string();
+    let passed = counts.critical == 0 && counts.high == 0 && counts.medium == 0;
+
+    Ok(BpeAuditReport {
+        passed,
+        highest_severity,
+        counts,
+        exists,
+        digest_valid,
+        profile_path: path.display().to_string(),
+        platform: detect_platform_label().to_string(),
+        findings,
+    })
+}
+
+pub fn format_audit_report_text(report: &BpeAuditReport) -> String {
+    let mut out = format!(
+        "BPE self-audit [{}]: {} (highest={}, critical={}, high={}, medium={}, low={})\nPath: {}\n",
+        report.platform,
+        if report.passed { "PASS" } else { "FAIL" },
+        report.highest_severity,
+        report.counts.critical,
+        report.counts.high,
+        report.counts.medium,
+        report.counts.low,
+        report.profile_path
+    );
+    for f in &report.findings {
+        out.push_str(&format!(
+            "  [{}] {} ({}): {} -> {}\n",
+            f.severity.as_str().to_uppercase(),
+            f.code,
+            f.category,
+            f.message,
+            f.remediation
+        ));
+    }
+    out.trim_end().to_string()
 }
 
 pub fn format_build_report_text(report: &BpeBuildReport) -> String {
@@ -2763,6 +3582,7 @@ mod tests {
             merges,
             learned_fillers: Vec::new(),
             learned_replacements: Vec::new(),
+            profile_digest: None,
         };
         let same_drift = measure_bpe_drift(&profile, &corpus).unwrap();
         assert!(same_drift < 0.05);

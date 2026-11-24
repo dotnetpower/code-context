@@ -1,7 +1,8 @@
 use code_context::bpe_builder::{
-    BpeBuildConfig, BpeProfile, BpeSource, LearnedReplacement, build_bpe_profile,
-    normalize_cross_platform_dir, profile_path_in, read_profile_file, reset_bpe_profile,
-    rollback_bpe_profile,
+    AuditSeverity, BpeBuildConfig, BpeProfile, BpeSource, LearnedReplacement, audit_bpe_profile,
+    build_bpe_profile, detect_sensitive_patterns, normalize_cross_platform_dir,
+    normalize_cross_platform_dir_checked, profile_path_in, read_profile_file, reset_bpe_profile,
+    rollback_bpe_profile, sanitize_user_prompt,
 };
 use code_context::prompt_formula::{compress_task_prompt_with_profile, estimate_bpe_tokens};
 use serde_json::{Value, json};
@@ -429,4 +430,210 @@ fn daemon_bpe_status_build_and_validation_rpc() {
     let skipped = rpc("code_bpe_build", json!({ "window": "7d", "if_needed": true })).unwrap();
     assert_eq!(skipped["action"], "skipped");
     assert_eq!(skipped["applied"], false);
+
+    // Self-audit RPC returns clean pass (Critical=0, High=0, Medium=0)
+    let audit = rpc("code_bpe_audit", json!({ "window": "7d" })).unwrap();
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["digest_valid"], true);
+    assert_eq!(audit["counts"]["critical"], 0);
+    assert_eq!(audit["counts"]["high"], 0);
+    assert_eq!(audit["counts"]["medium"], 0);
+}
+
+#[test]
+fn self_audit_detects_tampering_secrets_cycles_perms_and_symlinks_then_passes_after_remediation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let now_ts = current_unix_secs().saturating_sub(180);
+    for sid in ["a1", "a2", "a3"] {
+        write_copilot_session(
+            &sessions,
+            sid,
+            &[json!({
+                "type": "user.message",
+                "timestamp": now_ts,
+                "data": { "content": "혹시 병목 원인을 분석해서 정리해줘 부탁해" }
+            })],
+            false,
+        );
+    }
+
+    let cfg = BpeBuildConfig {
+        session_dirs: vec![sessions.clone()],
+        state_dir_override: Some(state.clone()),
+        min_freq: 2,
+        min_sessions: 2,
+        ..BpeBuildConfig::default()
+    };
+
+    // 1. Clean build passes self-audit with zero Critical/High/Medium findings.
+    let rep = build_bpe_profile(&cfg).unwrap();
+    assert!(rep.applied);
+    let clean_audit = audit_bpe_profile(&cfg).unwrap();
+    assert!(clean_audit.passed, "expected clean audit pass: {clean_audit:?}");
+    assert_eq!(clean_audit.digest_valid, Some(true));
+    assert_eq!(clean_audit.counts.critical, 0);
+    assert_eq!(clean_audit.counts.high, 0);
+    assert_eq!(clean_audit.counts.medium, 0);
+
+    // 2. Tamper on disk with protected keyword violation, secret leak, cyclic rule, and unsafe auto_policy.
+    let path = profile_path_in(&state);
+    let mut prof: BpeProfile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    prof.learned_fillers.push("do not".to_string());
+    prof.learned_fillers
+        .push("postgres://admin:secret@db.internal:5432/prod".to_string());
+    prof.learned_replacements.push(LearnedReplacement {
+        from: "alpha beta".to_string(),
+        to: "gamma delta".to_string(),
+        frequency: 5,
+        session_count: 3,
+        tokens_saved: 1,
+    });
+    prof.learned_replacements.push(LearnedReplacement {
+        from: "gamma delta".to_string(),
+        to: "alpha beta".to_string(),
+        frequency: 5,
+        session_count: 3,
+        tokens_saved: 1,
+    });
+    prof.auto_policy.min_interval_hours = 0.01;
+    std::fs::write(&path, serde_json::to_vec_pretty(&prof).unwrap()).unwrap();
+
+    let tampered_audit = audit_bpe_profile(&cfg).unwrap();
+    assert!(!tampered_audit.passed);
+    assert_eq!(tampered_audit.digest_valid, Some(false));
+    let codes: Vec<&str> = tampered_audit
+        .findings
+        .iter()
+        .map(|f| f.code.as_str())
+        .collect();
+    assert!(codes.contains(&"BPE_DIGEST_MISMATCH"), "codes={codes:?}");
+    assert!(
+        codes.contains(&"BPE_PROTECTED_KEYWORD_VIOLATION"),
+        "codes={codes:?}"
+    );
+    assert!(codes.contains(&"BPE_SENSITIVE_DATA_LEAK"), "codes={codes:?}");
+    assert!(
+        codes.contains(&"BPE_CYCLIC_OR_DUPLICATE_RULE"),
+        "codes={codes:?}"
+    );
+    assert!(codes.contains(&"BPE_INVALID_AUTO_POLICY"), "codes={codes:?}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        // Unsafe group/world-writable permissions detection.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let perm_audit = audit_bpe_profile(&cfg).unwrap();
+        assert!(
+            perm_audit
+                .findings
+                .iter()
+                .any(|f| f.code == "BPE_UNSAFE_PERMISSIONS" && f.severity == AuditSeverity::Critical)
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Symlink attack detection & refusal.
+        let decoy = tmp.path().join("decoy.json");
+        std::fs::write(&decoy, b"{}").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&decoy, &path).unwrap();
+        let sym_audit = audit_bpe_profile(&cfg).unwrap();
+        assert!(
+            sym_audit
+                .findings
+                .iter()
+                .any(|f| f.code == "BPE_SYMLINK_FILE" && f.severity == AuditSeverity::Critical)
+        );
+        assert!(read_profile_file(&path).is_err());
+        assert!(build_bpe_profile(&cfg).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // 3. Rebuilding remediates all findings back to PASS (Critical=0, High=0, Medium=0).
+    let rebuilt = build_bpe_profile(&cfg).unwrap();
+    assert!(rebuilt.applied);
+    let final_audit = audit_bpe_profile(&cfg).unwrap();
+    assert!(final_audit.passed, "post-remediation audit failed: {final_audit:?}");
+    assert_eq!(final_audit.counts.critical, 0);
+    assert_eq!(final_audit.counts.high, 0);
+    assert_eq!(final_audit.counts.medium, 0);
+}
+
+#[test]
+fn windows_bom_uppercase_jsonl_unc_traversal_sensitive_and_xml_dos_hardening() {
+    // 1. Path traversal rejection & Windows WSL UNC normalization.
+    assert!(normalize_cross_platform_dir_checked(Path::new(r"C:\Users\..\..\etc\passwd")).is_none());
+    #[cfg(not(windows))]
+    {
+        let unc = normalize_cross_platform_dir_checked(Path::new(
+            r"\\wsl.localhost\Ubuntu-22.04\home\alice\.copilot\session-state",
+        ))
+        .unwrap();
+        assert_eq!(unc.to_string_lossy(), "/home/alice/.copilot/session-state");
+    }
+
+    // 2. Expanded cloud secrets, DB URIs, Azure SAS, and Korean PII detection.
+    for sample in [
+        "use AIzaSyD1234567890abcdef1234567890abcd for maps",
+        "key ASIAIOSFODNN7EXAMPLE here",
+        "connect postgres://user:pass@localhost:5432/db",
+        "url ?sv=2022&sig=abc123&se=2027-01-01",
+        "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        "contact 010-1234-5678 please",
+        "id 900101-1234567 check",
+    ] {
+        assert!(
+            detect_sensitive_patterns(sample).is_some(),
+            "missed sensitive sample: {sample}"
+        );
+        assert!(sanitize_user_prompt(sample).is_none());
+    }
+    // Normal word "Asia" must NOT trigger false positive AWS STS detection.
+    assert!(detect_sensitive_patterns("deploy to asia northeast region").is_none());
+
+    // 3. Adversarial case-varied nested XML tags finish quickly in O(N) without leaking inner text.
+    let mut evil_xml = String::new();
+    for _ in 0..400 {
+        evil_xml.push_str("<SYSTEM_REMINDER>hidden_payload</system_reminder>");
+    }
+    evil_xml.push_str(" 백엔드 성능을 분석해서 보고해줘");
+    let cleaned = sanitize_user_prompt(&evil_xml);
+    if let Some(c) = cleaned {
+        assert!(!c.contains("hidden_payload"));
+    }
+
+    // 4. Windows UTF-8 BOM + CRLF + uppercase `EVENTS.JSONL` ingestion.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let sessions = tmp.path().join("sessions");
+    let now_ts = current_unix_secs().saturating_sub(60);
+    for sid in ["win1", "win2"] {
+        let sdir = sessions.join(sid);
+        std::fs::create_dir_all(&sdir).unwrap();
+        let line = json!({
+            "type": "user.message",
+            "timestamp": now_ts,
+            "data": { "content": "혹시 윈도우 로그를 확인해서 보고해줘 부탁해" }
+        })
+        .to_string();
+        let body = format!("\u{FEFF}{line}\r\n");
+        std::fs::write(sdir.join("EVENTS.JSONL"), body).unwrap();
+    }
+
+    let cfg = BpeBuildConfig {
+        session_dirs: vec![sessions],
+        state_dir_override: Some(state.clone()),
+        min_freq: 2,
+        min_sessions: 2,
+        ..BpeBuildConfig::default()
+    };
+    let rep = build_bpe_profile(&cfg).unwrap();
+    assert!(rep.applied);
+    let prof = rep.profile.unwrap();
+    assert_eq!(prof.stats.messages_kept, 2);
+    assert!(audit_bpe_profile(&cfg).unwrap().passed);
 }

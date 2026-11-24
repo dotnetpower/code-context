@@ -199,6 +199,31 @@ export class DaemonClient {
     );
   }
 
+  public queryBpeAudit(
+    options: { window?: string; hours?: number; source?: 'copilot' | 'all'; include_windows_homes?: boolean } = {},
+    cancellation: CancellationLike = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose(): void {} }),
+    },
+  ): Promise<JsonValue> {
+    const args: { [key: string]: JsonValue } = {};
+    if (options.window !== undefined) { args.window = options.window; }
+    if (options.hours !== undefined) { args.hours = options.hours; }
+    if (options.source !== undefined) { args.source = options.source; }
+    if (options.include_windows_homes !== undefined) {
+      args.include_windows_homes = options.include_windows_homes;
+    }
+    return this.getUsageLane().request(
+      {
+        root: null,
+        name: 'code_bpe_audit',
+        arguments: args,
+        compact: true,
+      },
+      cancellation,
+    );
+  }
+
   public buildBpeProfile(
     options: {
       window?: string;
@@ -260,6 +285,7 @@ export class DaemonClient {
       !this.isBarrierLane &&
       (request.name === 'code_usage' ||
         request.name === 'code_bpe_status' ||
+        request.name === 'code_bpe_audit' ||
         request.name === 'code_bpe_build')
     ) {
       return this.getUsageLane().request<T>(request, cancellation);

@@ -628,7 +628,7 @@ pub fn compress_task_prompt_with_profile(
         if cleaned.is_empty() {
             continue;
         }
-        loop {
+        for _ in 0..32 {
             let mut changed = false;
             let lower = cleaned.to_ascii_lowercase();
             for phrase in filler_phrases {
@@ -1168,10 +1168,17 @@ fn clause_to_formula_with_profile(
         s = s.replace(from, to);
     }
     if let Some(prof) = profile {
+        let before_learned = s.clone();
         for rule in &prof.learned_replacements {
             if !rule.from.is_empty() && s.contains(&rule.from) {
-                s = replace_rule_at_boundary(&s, &rule.from, &rule.to);
+                let candidate = replace_rule_at_boundary(&s, &rule.from, &rule.to);
+                if crate::bpe_builder::preserves_protected_keywords(&s, &candidate) {
+                    s = candidate;
+                }
             }
+        }
+        if !crate::bpe_builder::preserves_protected_keywords(&before_learned, &s) {
+            s = before_learned;
         }
     }
     let mut collapsed = s

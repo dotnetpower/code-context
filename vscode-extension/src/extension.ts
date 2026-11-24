@@ -721,6 +721,11 @@ async function runBuildBpeProfileCommand(
             mode: 'status',
           },
           {
+            label: 'Audit BPE Profile (Self-Check)',
+            description: 'Run red-team integrity, security, and rule-safety self-audit',
+            mode: 'audit',
+          },
+          {
             label: 'Rollback Previous Profile',
             description: 'Restore bpe-profile.prev.json backup',
             mode: 'rollback',
@@ -744,20 +749,35 @@ async function runBuildBpeProfileCommand(
 
     const includeWindows = process.platform === 'win32' && activeClient.usesWslBridge;
     const extra = includeWindows ? { include_windows_homes: true } : {};
-    const result =
-      selected === 'status'
-        ? await activeClient.queryBpeStatus({ window: '7d', ...extra })
-        : selected === 'build-30d'
-          ? await activeClient.buildBpeProfile({ window: '30d', ...extra })
-          : selected === 'if-needed'
-            ? await activeClient.buildBpeProfile({ window: '7d', if_needed: true, ...extra })
-            : selected === 'dry-run'
-              ? await activeClient.buildBpeProfile({ window: '7d', dry_run: true, ...extra })
-              : selected === 'rollback'
-                ? await activeClient.buildBpeProfile({ rollback: true })
-                : selected === 'reset'
-                  ? await activeClient.buildBpeProfile({ reset: true })
-                  : await activeClient.buildBpeProfile({ window: '7d', ...extra });
+    let result: JsonValue;
+    switch (selected) {
+      case 'status':
+        result = await activeClient.queryBpeStatus({ window: '7d', ...extra });
+        break;
+      case 'audit':
+        result = await activeClient.queryBpeAudit({ window: '7d', ...extra });
+        break;
+      case 'build-7d':
+        result = await activeClient.buildBpeProfile({ window: '7d', ...extra });
+        break;
+      case 'build-30d':
+        result = await activeClient.buildBpeProfile({ window: '30d', ...extra });
+        break;
+      case 'if-needed':
+        result = await activeClient.buildBpeProfile({ window: '7d', if_needed: true, ...extra });
+        break;
+      case 'dry-run':
+        result = await activeClient.buildBpeProfile({ window: '7d', dry_run: true, ...extra });
+        break;
+      case 'rollback':
+        result = await activeClient.buildBpeProfile({ rollback: true });
+        break;
+      case 'reset':
+        result = await activeClient.buildBpeProfile({ reset: true });
+        break;
+      default:
+        throw new Error(`Unsupported BPE action mode: ${selected}`);
+    }
 
     output.info(formatLogDetails(`Code Context BPE (${selected})`, result));
     output.show(false);

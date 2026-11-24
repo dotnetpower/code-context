@@ -808,6 +808,27 @@ enum PromptSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run built-in red-team self-audit on bpe-profile.json (symlinks, perms, digest, secrets, rules, bounds)
+    BpeAudit {
+        /// Lookback window in hours (default: 168h / 7d)
+        #[arg(long, default_value_t = 168.0)]
+        hours: f64,
+        /// Preset lookback window (`24h`, `7d`, `14d`, `30d`, `90d`)
+        #[arg(long)]
+        window: Option<String>,
+        /// Session source (`copilot` or `all`)
+        #[arg(long, value_enum, default_value_t = BpeSource::Copilot)]
+        source: BpeSource,
+        /// Also scan mounted Windows user profiles (`/mnt/c/Users/*`) when running in WSL
+        #[arg(long)]
+        include_windows_homes: bool,
+        /// Explicit session directory (repeatable)
+        #[arg(long)]
+        session_dir: Vec<PathBuf>,
+        /// Emit structured JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn run_prompt_subcommand(sub: &PromptSubcommand) -> Result<()> {
@@ -895,6 +916,38 @@ fn run_prompt_subcommand(sub: &PromptSubcommand) -> Result<()> {
             }
             let mut stdout = io::stdout().lock();
             let text = code_context::bpe_builder::format_status_report_text(&report);
+            stdout.write_all(text.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            Ok(())
+        }
+        PromptSubcommand::BpeAudit {
+            hours,
+            window,
+            source,
+            include_windows_homes,
+            session_dir,
+            json,
+        } => {
+            let eff_hours = match window.as_deref() {
+                Some(w) => code_context::bpe_builder::parse_window_hours(w)?,
+                None => *hours,
+            };
+            let mut cfg = BpeBuildConfig {
+                window_hours: eff_hours,
+                source: *source,
+                session_dirs: session_dir.clone(),
+                ..BpeBuildConfig::default()
+            };
+            if *include_windows_homes {
+                cfg.include_windows_homes = true;
+            }
+            cfg.validate()?;
+            let report = code_context::bpe_builder::audit_bpe_profile(&cfg)?;
+            if *json {
+                return print(&serde_json::to_value(&report)?);
+            }
+            let mut stdout = io::stdout().lock();
+            let text = code_context::bpe_builder::format_audit_report_text(&report);
             stdout.write_all(text.as_bytes())?;
             stdout.write_all(b"\n")?;
             Ok(())

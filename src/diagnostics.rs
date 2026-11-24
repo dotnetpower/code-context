@@ -215,6 +215,10 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .collect();
     let windows_companion = inspect_windows_companion_binary();
     let subagent_definitions = inspect_subagent_definitions();
+    let bpe_audit = crate::bpe_builder::audit_bpe_profile(&crate::bpe_builder::BpeBuildConfig::default())
+        .ok()
+        .and_then(|rep| serde_json::to_value(rep).ok())
+        .unwrap_or(Value::Null);
     Ok(
         json!({"client":local,"daemon":remote,"daemon_error":daemon_error,
         "root_resolution":root_resolution,"registrations":specs,"processes":processes,
@@ -224,6 +228,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
         "stale_managed_worktrees":stale_managed_worktrees,
         "windows_companion":windows_companion,
         "subagent_definitions":subagent_definitions,
+        "bpe_audit":bpe_audit,
         "inspection_errors":inspection_errors,
         "chat_exposure":"unverified; executable/cwd is not a session-to-process mapping",
         "recovery":{
