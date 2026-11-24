@@ -264,6 +264,12 @@ void test('status and self-test commands print readable diagnostics and Windows 
   assert.ok(fixture.messages.some((message) => message.includes('Code Context native self-test\nextensionCallable: true')));
   assert.ok(fixture.messages.some((message) => message.includes('extensionVersion: 0.13.0')));
   assert.ok(fixture.messages.every((message) => !message.trimStart().startsWith('{')));
+
+  // Show Full Dashboard never prompts to pick a folder even on multi-root Windows WSL bridge!
+  fixture.calls.length = 0;
+  await fixture.invokeCommand('codeContextNative.showDashboard');
+  assert.ok(!fixture.calls.includes('pick-registered-root'), 'showDashboard must never ask to pick a root folder');
+  assert.ok(fixture.messages.some((message) => message.includes('CODE CONTEXT')));
 });
 
 void test('untrusted workspace only registers tools and never probes the daemon', async () => {

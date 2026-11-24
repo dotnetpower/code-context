@@ -130,8 +130,11 @@ export interface BackendUsageSnapshot {
   daemonCacheHits: number | undefined;
   daemonCacheMisses: number | undefined;
   daemonRecentSourceAvgMs: number | undefined;
+  rawDaemon: Record<string, unknown> | undefined;
   models: BackendModelUsageEntry[];
   tools: BackendToolUsageEntry[];
+  workspaces: Array<{ workspace: string; cctx: number; builtin: number; adoptionPercent: number }>;
+  advisories: Array<{ code: string; message: string }>;
 }
 
 function asFiniteNumber(v: unknown, fallback = 0): number {
@@ -382,6 +385,31 @@ export function parseBackendUsagePayload(raw: unknown, updatedAt = Date.now()): 
     asOptionalFiniteNumber(ts.estimated_time_saved_secs) ??
     (turnTimeSavedSecs + ioTimeSavedSecs + prefillTimeSavedSecs);
 
+  const workspaces: Array<{ workspace: string; cctx: number; builtin: number; adoptionPercent: number }> = [];
+  if (Array.isArray(insights?.workspace_adoption)) {
+    for (const item of insights.workspace_adoption) {
+      const ws = asObj(item);
+      if (!ws || typeof ws.workspace !== 'string') { continue; }
+      workspaces.push({
+        workspace: ws.workspace,
+        cctx: asFiniteNumber(ws.cctx),
+        builtin: asFiniteNumber(ws.builtin),
+        adoptionPercent: asFiniteNumber(ws.adoption_percent),
+      });
+    }
+  }
+  const advisories: Array<{ code: string; message: string }> = [];
+  if (Array.isArray(insights?.advisories)) {
+    for (const item of insights.advisories) {
+      const adv = asObj(item);
+      if (!adv || typeof adv.message !== 'string') { continue; }
+      advisories.push({
+        code: typeof adv.code === 'string' ? adv.code : 'info',
+        message: adv.message,
+      });
+    }
+  }
+
   return {
     updatedAt,
     computedAtMs: asOptionalFiniteNumber(root.computed_at_unix_ms) ?? updatedAt,
@@ -425,8 +453,11 @@ export function parseBackendUsagePayload(raw: unknown, updatedAt = Date.now()): 
     daemonCacheHits: asOptionalFiniteNumber(daemonCache?.hits),
     daemonCacheMisses: asOptionalFiniteNumber(daemonCache?.misses),
     daemonRecentSourceAvgMs: asOptionalFiniteNumber(daemon?.recent_source_avg_ms),
+    rawDaemon: daemon,
     models,
     tools,
+    workspaces,
+    advisories,
   };
 }
 
@@ -477,6 +508,15 @@ function escapeMdCell(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|').trim();
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function formatLocalUpdated(updatedAtMs: number, nowMs = Date.now()): string {
   const d = new Date(updatedAtMs);
   const hh = String(d.getHours()).padStart(2, '0');
@@ -516,7 +556,7 @@ export function classifyOutcome(error?: string): Outcome {
   }
   if (
     error.startsWith('READ_RANGE_OUT_OF_BOUNDS ') ||
-    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.(64|1000)|provide 1\.\.64 ranges|include\/exclude globs|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context root|No registered Code Context workspace|root must be an absolute path/u.test(error)
+    /READ_RANGE_OUT_OF_BOUNDS|READ_RANGE_LIMIT|READ_PLAN_TOO_LARGE|READ_PAGE_LIMIT|RESPONSE_BUDGET_EXCEEDED|reason=missing_on_disk|regex parse error|limit 1\.\.(64|1000)|provide 1\.\.64 ranges|include\/exclude globs|invalid range|unknown field|Windows Agent Sessions require|WSL Code Context (?:root|path)|No registered Code Context workspace|root must be an absolute path/u.test(error)
   ) {
     return 'invalid_request';
   }
@@ -1545,7 +1585,7 @@ export class UsageSummary {
       lines.push(
         `${daemonMeta}Updated \`${formatLocalUpdated(bu.updatedAt)}\`${bridgeNote}`,
         '',
-        '[$(pulse) Show Full Dashboard](command:codeContextNative.showStatus) · [$(beaker) Run Self-Test](command:codeContextNative.selfTest)',
+        '[$(pulse) Show Full Dashboard](command:codeContextNative.showDashboard) · [$(beaker) Run Self-Test](command:codeContextNative.selfTest)',
       );
       return lines.join('\n');
     }
@@ -1603,7 +1643,7 @@ export class UsageSummary {
       `_${this.last ? `Last: ${new Date(this.last.at).toISOString()} ${this.last.operation} (${this.last.outcome})` : 'No calls observed yet.'}_`,
       '',
       'Native calls in this extension host (including metadata), not all sessions.',
-      '[$(pulse) Show Full Dashboard](command:codeContextNative.showStatus) · [$(beaker) Run Self-Test](command:codeContextNative.selfTest)',
+      '[$(pulse) Show Full Dashboard](command:codeContextNative.showDashboard) · [$(beaker) Run Self-Test](command:codeContextNative.selfTest)',
     );
     return lines.join('\n');
   }
@@ -1755,5 +1795,201 @@ export class UsageSummary {
       ));
     }
     return lines.join('\n');
+  }
+
+  public renderDashboardHtml(daemonStatus?: unknown): string {
+    const bu = this.backendUsage;
+    const ds = asObj(daemonStatus) ?? bu?.rawDaemon;
+    const indexState = typeof ds?.index_state === 'string' ? ds.index_state : (bu?.daemonState ?? 'ready');
+    const cache = asObj(ds?.cache);
+    const adm = asObj(ds?.daemon_admission);
+    const reg = asObj(ds?.registry_admission);
+    const hits = asOptionalFiniteNumber(cache?.hits) ?? bu?.daemonCacheHits ?? 0;
+    const misses = asOptionalFiniteNumber(cache?.misses) ?? bu?.daemonCacheMisses ?? 0;
+    const dHitPct = hits + misses > 0 ? `${((100 * hits) / (hits + misses)).toFixed(1)}%` : '-';
+    const loadedRoots = asOptionalFiniteNumber(adm?.loaded_roots) ?? bu?.daemonLoadedRoots ?? 0;
+    const regRoots = asOptionalFiniteNumber(reg?.registered_roots) ?? bu?.daemonRegisteredRoots ?? 0;
+    const ramMib = (((asOptionalFiniteNumber(adm?.estimated_bytes) ?? bu?.daemonEstimatedBytes ?? 0)) / (1024 * 1024)).toFixed(1);
+
+    const style = `
+      :root { color-scheme: light dark; }
+      body {
+        font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+        color: var(--vscode-foreground);
+        background: var(--vscode-editor-background);
+        margin: 0;
+        padding: 24px 28px 40px;
+        line-height: 1.45;
+      }
+      .header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 18px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25)); padding-bottom: 12px; }
+      .title { font-size: 18px; font-weight: 600; margin: 0; }
+      .subtitle { font-size: 12px; color: var(--vscode-descriptionForeground); }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 22px; }
+      .card { background: var(--vscode-editorWidget-background, rgba(128,128,128,0.08)); border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.22)); border-radius: 8px; padding: 14px 16px; }
+      .card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
+      .card-value { font-size: 22px; font-weight: 700; color: var(--vscode-charts-green, #3fb950); }
+      .card-value.neutral { color: var(--vscode-foreground); }
+      .card-sub { font-size: 12px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+      h2 { font-size: 14px; font-weight: 600; margin: 22px 0 8px; display: flex; align-items: center; gap: 8px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-bottom: 16px; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.18)); text-align: right; white-space: nowrap; }
+      th:first-child, td:first-child { text-align: left; white-space: normal; }
+      th { font-size: 11px; font-weight: 600; color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background, rgba(128,128,128,0.06)); }
+      .tag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: rgba(128,128,128,0.18); color: var(--vscode-descriptionForeground); margin-left: 6px; }
+      .warn { color: var(--vscode-charts-yellow, #d29922); font-weight: 600; }
+      .good { color: var(--vscode-charts-green, #3fb950); font-weight: 600; }
+      .advisory-list { margin: 6px 0 16px; padding-left: 18px; font-size: 12.5px; }
+      .advisory-list li { margin-bottom: 4px; }
+      .footer { margin-top: 20px; font-size: 12px; color: var(--vscode-descriptionForeground); border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); padding-top: 10px; }
+      code { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+    `;
+
+    if (!bu) {
+      const pre = escapeHtml(this.formatDashboard(daemonStatus));
+      return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>${style} pre { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; overflow-x: auto; }</style></head><body><div class="header"><h1 class="title">Code Context — Dashboard</h1></div><pre>${pre}</pre></body></html>`;
+    }
+
+    const { sCount, cCount, pCount, eCount, savedTok, savedAic, savedSecs } = this.effectiveBackendTotals(bu);
+    const totalCalls = sCount + cCount + pCount + eCount;
+    const costBase = bu.usedAic + savedAic;
+    const costPct = costBase > 0 ? `-${((100 * savedAic) / costBase).toFixed(1)}%` : '0%';
+    const warmHitPct = bu.warmHitPercent !== undefined
+      ? `${bu.warmHitPercent.toFixed(1)}%`
+      : (sCount + cCount) > 0
+        ? `${((100 * sCount) / (sCount + cCount)).toFixed(1)}%`
+        : '-';
+    const adoptStr = bu.selectionPercent !== undefined ? `${bu.selectionPercent.toFixed(1)}%` : '-';
+    const latStr = formatSmartMs(this.effectiveLatencyMs());
+    const cachePct = bu.promptCacheHitPercent !== undefined
+      ? `${bu.promptCacheHitPercent.toFixed(1)}%`
+      : bu.inputTokens > 0
+        ? `${((100 * bu.cacheReadTokens) / bu.inputTokens).toFixed(1)}%`
+        : '-';
+    const freshAndWrite = Math.max(0, bu.uncachedInputTokens + bu.cacheWriteTokens);
+
+    const activeModels = bu.models.filter(
+      (m) => m.inputTokens > 0 || m.outputTokens > 0 || m.usedAic > 0 || m.cctxCalls > 0,
+    );
+    const modelRowsHtml = activeModels.map((m) => {
+      const mCache = m.inputTokens > 0 ? `${((100 * m.cacheReadTokens) / m.inputTokens).toFixed(1)}%` : '-';
+      const effLabel = m.effort && m.effort !== '-' ? `<span class="tag">${escapeHtml(m.effort === 'claude-agent' ? 'agent' : m.effort)}</span>` : '';
+      const lowAdopt = m.adoptionPercent !== undefined && m.adoptionPercent < 50 && m.lookupCalls >= 5;
+      const adoptCell = m.adoptionPercent !== undefined
+        ? `<span class="${lowAdopt ? 'warn' : ''}">${lowAdopt ? '⚠ ' : ''}${Math.round(m.adoptionPercent)}%</span> (${m.cctxCalls.toLocaleString('en-US')}/${m.lookupCalls.toLocaleString('en-US')})`
+        : `${m.cctxCalls.toLocaleString('en-US')}`;
+      return `<tr>
+        <td><strong>${escapeHtml(m.displayName)}</strong>${effLabel}</td>
+        <td>${m.sessions}/${m.turns.toLocaleString('en-US')}</td>
+        <td>${escapeHtml(formatCompactTokens(m.inputTokens))} (${mCache})</td>
+        <td>${escapeHtml(formatCompactTokens(m.outputTokens))} + ${escapeHtml(formatCompactTokens(m.reasoningTokens))}</td>
+        <td>$${(m.usedAic * 0.001).toFixed(2)}</td>
+        <td class="good">+$${(m.savedAic * 0.001).toFixed(2)}</td>
+        <td>${m.savedSecs >= 1 ? `~${escapeHtml(formatCompactDuration(m.savedSecs))}` : '-'}</td>
+        <td>${adoptCell}</td>
+      </tr>`;
+    }).join('');
+
+    const toolRowsHtml = bu.tools.map((t) => {
+      const errCnt = t.policyDenied + t.errors;
+      return `<tr>
+        <td><code>${escapeHtml(t.operation)}</code></td>
+        <td>${t.calls.toLocaleString('en-US')}</td>
+        <td>${t.successes.toLocaleString('en-US')}</td>
+        <td>${t.cacheMisses > 0 ? `<span class="warn">${t.cacheMisses}</span>` : '0'}</td>
+        <td>${errCnt > 0 ? `<span class="warn">${errCnt}</span>` : '0'}</td>
+        <td>~${escapeHtml(formatCompactTokens(t.avgPayloadTokens))} tok</td>
+        <td>${escapeHtml(formatSmartMs(t.medianMs))}</td>
+        <td>${escapeHtml(formatSmartMs(t.p95Ms))}</td>
+      </tr>`;
+    }).join('');
+
+    const wsRowsHtml = bu.workspaces.slice(0, 12).map((w) => {
+      const low = w.adoptionPercent < 60 && (w.cctx + w.builtin) >= 5;
+      return `<tr>
+        <td><code>${escapeHtml(w.workspace)}</code></td>
+        <td>${w.cctx.toLocaleString('en-US')}</td>
+        <td>${w.builtin.toLocaleString('en-US')}</td>
+        <td class="${low ? 'warn' : 'good'}">${low ? '⚠ ' : ''}${w.adoptionPercent.toFixed(1)}%</td>
+      </tr>`;
+    }).join('');
+
+    const advisoriesHtml = bu.advisories.length > 0
+      ? `<h2>Optimization Advisories</h2><ul class="advisory-list">${bu.advisories.slice(0, 8).map((a) => `<li><code>${escapeHtml(a.code)}</code> — ${escapeHtml(a.message)}</li>`).join('')}</ul>`
+      : '';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <title>Code Context — ${Math.round(bu.hours)}h Dashboard</title>
+  <style>${style}</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1 class="title">Code Context — Unified ${Math.round(bu.hours)}h Efficiency Dashboard</h1>
+      <div class="subtitle">${bu.sessions} sessions · ${bu.turns.toLocaleString('en-US')} turns · Input ${escapeHtml(formatShortTokens(bu.inputTokens))} (Cache ${cachePct} · Fresh+Write ${escapeHtml(formatShortTokens(freshAndWrite))})</div>
+    </div>
+    <div class="subtitle">Daemon <code>${escapeHtml(indexState)}</code> · ${loadedRoots}/${regRoots} roots (${ramMib} MiB) · Cache hit ${dHitPct} · Updated ${escapeHtml(formatLocalUpdated(bu.updatedAt))}</div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Cost Saved (@$0.001/AIC)</div>
+      <div class="card-value">+$${(savedAic * 0.001).toFixed(2)} <span style="font-size:14px;font-weight:600">(${costPct})</span></div>
+      <div class="card-sub">With cctx $${(bu.usedAic * 0.001).toFixed(2)} · API list ref +$${(savedAic * 0.01).toFixed(2)}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Time Saved (Est.)</div>
+      <div class="card-value">~${escapeHtml(formatCompactDuration(savedSecs))}</div>
+      <div class="card-sub">Turns ~${escapeHtml(formatCompactDuration(bu.turnTimeSavedSecs))} · Prefill ~${escapeHtml(formatCompactDuration(bu.prefillTimeSavedSecs))} · Index ~${escapeHtml(formatCompactDuration(bu.ioTimeSavedSecs))}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Tokens Avoided</div>
+      <div class="card-value">~${escapeHtml(formatShortTokens(savedTok))} tok</div>
+      <div class="card-sub">Direct ${escapeHtml(formatShortTokens(bu.directTokensSaved))} · Cache re-read ${escapeHtml(formatShortTokens(bu.compoundedTokensSaved))} · Turns ${escapeHtml(formatShortTokens(bu.turnTokensSaved))}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Adoption &amp; Speed</div>
+      <div class="card-value neutral">${escapeHtml(adoptStr)} · ${escapeHtml(latStr)}</div>
+      <div class="card-sub">Warm hit ${warmHitPct} (${sCount.toLocaleString('en-US')}/${totalCalls.toLocaleString('en-US')} calls) · Avoided PRs ~${bu.avoidedPremiumRequests.toFixed(0)}</div>
+    </div>
+  </div>
+
+  ${activeModels.length > 0 ? `
+  <h2>Active LLM Models (${Math.round(bu.hours)}h)</h2>
+  <table>
+    <thead>
+      <tr><th>Model</th><th>Sess/Turns</th><th>Input (Cache%)</th><th>Out + Rsn</th><th>Spend</th><th>Saved</th><th>Time Saved</th><th>CCTX Adoption</th></tr>
+    </thead>
+    <tbody>${modelRowsHtml}</tbody>
+  </table>` : ''}
+
+  ${bu.tools.length > 0 ? `
+  <h2>Unified CCTX Tool Breakdown (${Math.round(bu.hours)}h MCP + Native)</h2>
+  <table>
+    <thead>
+      <tr><th>Operation</th><th>Calls</th><th>Success</th><th>Cache Miss</th><th>Err/Deny</th><th>Avg Payload</th><th>Median (p50)</th><th>P95</th></tr>
+    </thead>
+    <tbody>${toolRowsHtml}</tbody>
+  </table>` : ''}
+
+  ${bu.workspaces.length > 0 ? `
+  <h2>Workspace Source Lookup Adoption</h2>
+  <table>
+    <thead>
+      <tr><th>Workspace</th><th>CCTX Lookups</th><th>Built-in / Shell Fallbacks</th><th>Adoption</th></tr>
+    </thead>
+    <tbody>${wsRowsHtml}</tbody>
+  </table>` : ''}
+
+  ${advisoriesHtml}
+
+  <div class="footer">
+    Modeled estimates across GitHub Copilot, Claude Code, and OpenAI Codex (@$0.001/AIC internal unit; @$0.01/AIC official GitHub AI Credits reference). Avoided-turn time deduplicates parallel tool bursts within each LLM turn.
+  </div>
+</body>
+</html>`;
   }
 }

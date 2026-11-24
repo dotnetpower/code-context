@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.26.3
+
+- Add session-driven adaptive BPE & formula profile builder across Linux, WSL,
+  and native Windows:
+  - New `cctx prompt build-bpe` & `cctx prompt bpe-status` commands (`--window`,
+    `--if-needed`, `--dry-run`, `--include-windows-homes`, `--reset`,
+    `--rollback`, `--source copilot|all`) learn a corpus-specific BPE merge
+    table and multi-session, safety-gated formula compression rules from local
+    Copilot `events.jsonl` `user.message` logs, stored atomically in
+    `state_dir()/bpe-profile.json` with backup rollback and lock protection.
+  - Non-blocking `cctx daemon` idle auto-build plus `code_bpe_status` /
+    `code_bpe_build` RPCs on `usageLane` so both WSL and native Windows
+    clients trigger manual or drift/activity-gated automatic rebuilds without
+    affecting prefix prompt caches.
+  - Add `Code Context: Build Session BPE Profile` command and
+    `codeContextNative.autoBuildBpeProfile` setting, alongside full 24h usage
+    dashboard and Windows/WSL root-resolution polish.
+
 ## 0.26.2
 
 - Unify 24h cross-harness usage & Time Saved dashboard across WSL and Windows UI

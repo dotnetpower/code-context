@@ -35,4 +35,17 @@ export interface ClientSettings {
   executablePath?: string;
   wslDistribution?: string;
   wslExecutablePath?: string;
+  autoBuildBpeProfile?: boolean;
+}
+
+export interface BpeBuildOptions {
+  window?: string;
+  hours?: number;
+  source?: 'copilot' | 'all';
+  include_windows_homes?: boolean;
+  if_needed?: boolean;
+  dry_run?: boolean;
+  reset?: boolean;
+  rollback?: boolean;
+  tokenizer?: string;
 }

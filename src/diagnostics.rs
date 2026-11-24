@@ -810,6 +810,17 @@ fn discover_usage_state_homes() -> Vec<PathBuf> {
             }
         }
     }
+    #[cfg(windows)]
+    if let (Some(drive), Some(path)) =
+        (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut combined = drive;
+        combined.push(path);
+        let p = PathBuf::from(combined);
+        if !p.as_os_str().is_empty() && !homes.contains(&p) {
+            homes.push(p);
+        }
+    }
     if homes.is_empty() {
         homes.push(PathBuf::from("."));
     }
@@ -2729,6 +2740,9 @@ fn usage_from_homes_with_label(
             "bpe_formula_tokens_saved": bpe_saved_tokens,
             "bpe_formula_saved_aic": bpe_saved_aic,
             "bpe_formula_status": bpe_status,
+            "bpe_profile": crate::bpe_builder::load_active_profile()
+                .as_ref()
+                .map(crate::bpe_builder::BpeProfileSummary::from),
             "estimated_total_tokens_saved": total_saved,
             "payload_saved_aic": payload_saved_aic_total,
             "avoided_turn_saved_aic": turn_saved_aic_total,

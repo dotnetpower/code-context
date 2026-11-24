@@ -5,8 +5,9 @@ import { basename, isAbsolute, join, relative, resolve, sep, posix } from 'node:
 import type { WorkspaceSpec } from './types.js';
 
 const WIN_DRIVE_PREFIX_RE = /^[a-z]:(?=[\\/])/u;
-const WSL_UNC_RE = /^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+(\\.+)$/iu;
-const WSL_FILE_URI_RE = /^file:\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(\/.*)$/iu;
+const WSL_UNC_RE = /^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)(\\.+)$/iu;
+const WSL_FILE_URI_RE = /^file:\/\/(?:wsl\.localhost|wsl\$)\/([^/]+)(\/.*)$/iu;
+const WSL_REMOTE_URI_RE = /^vscode-remote:\/\/wsl\+([^/]+)(\/.*)$/iu;
 const UNSAFE_POSIX_CHAR_RE = /[\\\0\r\n]/u;
 const UNSAFE_WSL_TARGET_RE = /[\\:\0\r\n]/u;
 const UNSAFE_LOCAL_TARGET_RE = /[\\/:\0\r\n]/u;
@@ -45,6 +46,20 @@ export function normalizeLocalPath(path: string): string {
   }
   const resolved = resolve(path);
   return resolved.replace(WIN_DRIVE_PREFIX_RE, (drive) => drive.toUpperCase());
+}
+
+function stripTrailingPosixSlash(p: string): string {
+  return p.length > 1 ? p.replace(/\/+$/u, '') : p;
+}
+
+export function normalizeWorkspaceSpecRoot(rawRoot: string, usesWslBridge: boolean): string {
+  if (
+    usesWslBridge ||
+    (rawRoot.startsWith('/') && !rawRoot.startsWith('//') && !/^\/[a-zA-Z]:[\\/]/u.test(rawRoot))
+  ) {
+    return stripTrailingPosixSlash(posix.normalize(rawRoot));
+  }
+  return resolve(rawRoot);
 }
 
 export class RootResolutionError extends Error {
@@ -176,33 +191,54 @@ export function wslCandidateToLinuxPath(
   wslDistribution = '',
 ): string | undefined {
   const cleaned = unwrapMarkdownLinkAndQuotes(candidate);
+  const expectedDistro = wslDistribution.trim().toLowerCase();
+  const distroMatches = (rawDistro: string): boolean => {
+    if (!expectedDistro) { return true; }
+    let decoded = rawDistro;
+    try { decoded = decodeURIComponent(rawDistro); } catch { /* ignore */ }
+    return decoded.toLowerCase() === expectedDistro;
+  };
   if (/^vscode-agent-host:\/\//iu.test(cleaned)) {
     const agentHost = parseAgentHostUriString(cleaned, true, wslDistribution);
     if (!agentHost) {
       return undefined;
     }
-    return posix.isAbsolute(agentHost.path) ? posix.normalize(agentHost.path) : undefined;
+    return posix.isAbsolute(agentHost.path) ? stripTrailingPosixSlash(posix.normalize(agentHost.path)) : undefined;
+  }
+  if (/^vscode-remote:\/\/wsl\+/iu.test(cleaned)) {
+    const remoteMatch = WSL_REMOTE_URI_RE.exec(cleaned);
+    if (remoteMatch?.[1] && remoteMatch[2] && distroMatches(remoteMatch[1])) {
+      try {
+        const decoded = decodeURIComponent(remoteMatch[2]);
+        return posix.isAbsolute(decoded) ? stripTrailingPosixSlash(posix.normalize(decoded)) : undefined;
+      } catch {
+        return posix.isAbsolute(remoteMatch[2]) ? stripTrailingPosixSlash(posix.normalize(remoteMatch[2])) : undefined;
+      }
+    }
+    return undefined;
   }
   if (cleaned.startsWith('\\\\')) {
     const uncMatch = WSL_UNC_RE.exec(cleaned);
-    if (uncMatch?.[1]) {
-      const converted = uncMatch[1].replaceAll('\\', '/');
-      return posix.isAbsolute(converted) ? posix.normalize(converted) : undefined;
+    if (uncMatch?.[1] && uncMatch[2] && distroMatches(uncMatch[1])) {
+      const converted = uncMatch[2].replaceAll('\\', '/');
+      return posix.isAbsolute(converted) ? stripTrailingPosixSlash(posix.normalize(converted)) : undefined;
     }
+    return undefined;
   }
   if (cleaned.startsWith('file://')) {
     const fileWslMatch = WSL_FILE_URI_RE.exec(cleaned);
-    if (fileWslMatch?.[1]) {
+    if (fileWslMatch?.[1] && fileWslMatch[2] && distroMatches(fileWslMatch[1])) {
       try {
-        const decoded = decodeURIComponent(fileWslMatch[1]);
-        return posix.isAbsolute(decoded) ? posix.normalize(decoded) : undefined;
+        const decoded = decodeURIComponent(fileWslMatch[2]);
+        return posix.isAbsolute(decoded) ? stripTrailingPosixSlash(posix.normalize(decoded)) : undefined;
       } catch {
-        return posix.isAbsolute(fileWslMatch[1]) ? posix.normalize(fileWslMatch[1]) : undefined;
+        return posix.isAbsolute(fileWslMatch[2]) ? stripTrailingPosixSlash(posix.normalize(fileWslMatch[2])) : undefined;
       }
     }
+    return undefined;
   }
-  if (posix.isAbsolute(cleaned) && !UNSAFE_POSIX_CHAR_RE.test(cleaned)) {
-    return posix.normalize(cleaned);
+  if (posix.isAbsolute(cleaned) && !cleaned.startsWith('//') && !UNSAFE_POSIX_CHAR_RE.test(cleaned)) {
+    return stripTrailingPosixSlash(posix.normalize(cleaned));
   }
   return undefined;
 }
@@ -257,16 +293,19 @@ export function disambiguateRootByRelativePaths(
         );
         if (basenameMatches.length === 1 && basenameMatches[0] !== undefined) {
           const matchedRoot = basenameMatches[0];
-          if (!rest || existsSync(usePosix ? posix.join(matchedRoot, rest) : join(matchedRoot, rest))) {
+          const canCheckFs = !(usePosix && process.platform === 'win32');
+          if (!rest || (canCheckFs && existsSync(usePosix ? posix.join(matchedRoot, rest) : join(matchedRoot, rest)))) {
             return matchedRoot;
           }
         }
       }
-      const existingMatches = roots.filter((root) =>
-        existsSync(usePosix ? posix.join(root, candidateRel) : join(root, candidateRel)),
-      );
-      if (existingMatches.length === 1 && existingMatches[0] !== undefined) {
-        return existingMatches[0];
+      if (!(usePosix && process.platform === 'win32')) {
+        const existingMatches = roots.filter((root) =>
+          existsSync(usePosix ? posix.join(root, candidateRel) : join(root, candidateRel)),
+        );
+        if (existingMatches.length === 1 && existingMatches[0] !== undefined) {
+          return existingMatches[0];
+        }
       }
     }
   }
@@ -278,9 +317,10 @@ export function resolveWslRoot(
   explicitPath: string | undefined,
   candidates: readonly string[] = [],
   relativeTargets: readonly string[] = [],
+  wslDistribution = '',
 ): string {
   let target = explicitPath;
-  const roots = workspaces.map((workspace) => workspace.root);
+  const roots = workspaces.map((workspace) => stripTrailingPosixSlash(posix.normalize(workspace.root)));
   if (target && !posix.isAbsolute(target) && !UNSAFE_WSL_TARGET_RE.test(target)) {
     const byName = roots.filter((root) => posix.basename(root) === target);
     if (byName.length === 1 && byName[0] !== undefined) {
@@ -295,7 +335,7 @@ export function resolveWslRoot(
   }
   if (!target && candidates.length > 0) {
     for (const candidate of candidates) {
-      const linuxCandidate = wslCandidateToLinuxPath(candidate);
+      const linuxCandidate = wslCandidateToLinuxPath(candidate, wslDistribution);
       if (linuxCandidate) {
         const match = bestContainingPosixRoot(roots, linuxCandidate);
         if (match) {
@@ -306,7 +346,7 @@ export function resolveWslRoot(
     }
   }
   target ??= disambiguateRootByRelativePaths(roots, relativeTargets, true);
-  target ??= workspaces.length === 1 ? workspaces[0]?.root : undefined;
+  target ??= roots.length === 1 ? roots[0] : undefined;
   if (!target) {
     const listed = workspaces.slice(0, 5).map((workspace) => workspace.root).join(', ');
     const hint = listed ? ` Registered roots: ${listed}` : '';
@@ -556,11 +596,11 @@ export function normalizeUriOrPath(raw: string): string {
   const trimmed = unwrapMarkdownLinkAndQuotes(raw);
   if (trimmed.startsWith('file://')) {
     const wslFileMatch = WSL_FILE_URI_RE.exec(trimmed);
-    if (wslFileMatch?.[1]) {
+    if (wslFileMatch?.[2]) {
       try {
-        return decodeURIComponent(wslFileMatch[1]);
+        return decodeURIComponent(wslFileMatch[2]);
       } catch {
-        return wslFileMatch[1];
+        return wslFileMatch[2];
       }
     }
     try {
@@ -664,14 +704,18 @@ export function normalizeRelativeTargetPath(rawPath: string, root?: string | nul
   if (!normalized.startsWith('\\\\') && !/^[a-zA-Z]:\\/u.test(normalized)) {
     normalized = normalized.replaceAll('\\', '/');
   }
-  if (root) {
-    const cleanRoot = root.replaceAll('\\', '/').replace(/\/+$/u, '');
+  const rawCleanRoot = root ? root.replaceAll('\\', '/') : undefined;
+  const cleanRoot =
+    rawCleanRoot && rawCleanRoot.length > 1 ? rawCleanRoot.replace(/\/+$/u, '') : rawCleanRoot;
+  const canProbeLocalFs = Boolean(root && !(process.platform === 'win32' && cleanRoot?.startsWith('/')));
+  if (root && cleanRoot) {
     if (normalized === cleanRoot) {
       return '.';
     }
-    if (normalized.startsWith(`${cleanRoot}/`)) {
-      normalized = normalized.slice(cleanRoot.length + 1);
-    } else {
+    const prefix = cleanRoot === '/' ? '/' : `${cleanRoot}/`;
+    if (normalized.startsWith(prefix)) {
+      normalized = normalized.slice(prefix.length);
+    } else if (canProbeLocalFs && cleanRoot !== '/') {
       const rootName = posix.basename(cleanRoot) || basename(cleanRoot);
       if (rootName && normalized.startsWith(`${rootName}/`)) {
         const stripped = normalized.slice(rootName.length + 1);
@@ -688,7 +732,7 @@ export function normalizeRelativeTargetPath(rawPath: string, root?: string | nul
     const gitStripped = normalized.slice(2);
     if (
       root
-        ? !existsSync(join(root, normalized)) && existsSync(join(root, gitStripped))
+        ? canProbeLocalFs && !existsSync(join(root, normalized)) && existsSync(join(root, gitStripped))
         : gitStripped.startsWith('src/') ||
           gitStripped.startsWith('tests/') ||
           gitStripped.startsWith('vscode-extension/')
@@ -698,12 +742,12 @@ export function normalizeRelativeTargetPath(rawPath: string, root?: string | nul
   }
   if ((normalized.startsWith('@/') || normalized.startsWith('~/')) && normalized.length > 2) {
     const aliasedSubpath = `src/${normalized.slice(2)}`;
-    if (!root || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
+    if (!root || !canProbeLocalFs || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
       normalized = aliasedSubpath;
     }
   } else if (normalized.startsWith('#') && normalized.length > 1 && normalized.includes('/')) {
     const aliasedSubpath = `src/${normalized.slice(1)}`;
-    if (!root || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
+    if (!root || !canProbeLocalFs || (!existsSync(join(root, normalized)) && existsSync(join(root, 'src')))) {
       normalized = aliasedSubpath;
     }
   }

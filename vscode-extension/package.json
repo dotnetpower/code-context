@@ -2,7 +2,7 @@
   "name": "code-context-native",
   "displayName": "Code Context by dotnetpower",
   "description": "Fast local code search, source reads, and context for AI agents. Native VS Code tools backed by one shared, adaptive cache.",
-  "version": "0.26.2",
+  "version": "0.26.3",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -93,6 +93,12 @@
         "category": "Code Context"
       },
       {
+        "command": "codeContextNative.showDashboard",
+        "title": "Code Context: Show Full Dashboard",
+        "category": "Code Context",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "codeContextNative.showStatus",
         "title": "Code Context: Show Native Tool Status",
         "category": "Code Context"
@@ -105,6 +111,11 @@
       {
         "command": "codeContextNative.registerWorkspace",
         "title": "Code Context: Register Current Workspace",
+        "category": "Code Context"
+      },
+      {
+        "command": "codeContextNative.buildBpeProfile",
+        "title": "Code Context: Build Session BPE Profile",
         "category": "Code Context"
       }
     ],
@@ -147,6 +158,11 @@
           "minimum": 1000,
           "maximum": 120000,
           "description": "Native tool request timeout in milliseconds."
+        },
+        "codeContextNative.autoBuildBpeProfile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically rebuild the session-driven BPE prompt profile in the background when Copilot question patterns or activity cross threshold (works on both WSL and Windows)."
         }
       }
     },

@@ -16,8 +16,10 @@ import {
   normalizeGlobPattern,
   normalizeRelativeTargetPath,
   normalizeUriOrPath,
+  normalizeWorkspaceSpecRoot,
   resolveRegisteredRoot,
   resolveRegisteredRootAfterRefresh,
+  resolveWslRoot,
   listedWorktreeRoot,
   parseGitIdentity,
   wslCandidateToLinuxPath,
@@ -439,5 +441,62 @@ void test('vscode-agent-host workspace and file URIs normalize safely across WSL
   assert.equal(
     agentHostPartsToPath(wslHexAuthority, '/untitled/1', untitledAhRaw, true, 'Ubuntu-22.04'),
     undefined,
+  );
+});
+
+void test('WSL workspace roots and remote/UNC candidates never turn into Windows drive paths', () => {
+  assert.equal(normalizeWorkspaceSpecRoot('/home/user/dev/code-context/', true), '/home/user/dev/code-context');
+  assert.equal(normalizeWorkspaceSpecRoot('/', true), '/');
+  assert.equal(normalizeRelativeTargetPath('/etc/hosts', '/'), 'etc/hosts');
+  assert.equal(normalizeWorkspaceSpecRoot('/home/user/dev/code-context', false), '/home/user/dev/code-context');
+  assert.equal(
+    wslCandidateToLinuxPath('[lib.rs](vscode-remote://wsl+Ubuntu-22.04/home/user/dev/code-context/src/lib.rs)', 'Ubuntu-22.04'),
+    '/home/user/dev/code-context/src/lib.rs',
+  );
+  assert.equal(
+    normalizeUriOrPath('file://wsl.localhost/Ubuntu-22.04/home/user/dev/code-context/src/lib.rs'),
+    '/home/user/dev/code-context/src/lib.rs',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('file://wsl.localhost/Ubuntu-22.04/home/user/dev/code-context', 'Ubuntu-22.04'),
+    '/home/user/dev/code-context',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('file://wsl.localhost/Debian/home/user/dev/code-context', 'Ubuntu-22.04'),
+    undefined,
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('vscode-remote://wsl+Ubuntu-22.04/home/user/dev/code-context', 'Ubuntu-22.04'),
+    '/home/user/dev/code-context',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('vscode-remote://wsl+Debian/home/user/dev/code-context', 'Ubuntu-22.04'),
+    undefined,
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('\\\\wsl.localhost\\Ubuntu-22.04\\home\\user\\dev\\code-context', 'Ubuntu-22.04'),
+    '/home/user/dev/code-context',
+  );
+  assert.equal(
+    wslCandidateToLinuxPath('\\\\wsl$\\Debian\\home\\user\\dev\\code-context', 'Ubuntu-22.04'),
+    undefined,
+  );
+  const wslSpecs: WorkspaceSpec[] = [
+    { root: '/home/user/dev/agent-san', scopes: ['src'], globs: ['*.rs'] },
+    { root: '/home/user/dev/code-context', scopes: ['src'], globs: ['*.rs'] },
+  ];
+  assert.equal(
+    resolveWslRoot(wslSpecs, '/home/user/dev/code-context', [], [], 'Ubuntu-22.04'),
+    '/home/user/dev/code-context',
+  );
+  assert.equal(
+    resolveWslRoot(
+      wslSpecs,
+      undefined,
+      ['vscode-remote://wsl+Ubuntu-22.04/home/user/dev/code-context/src/main.rs'],
+      [],
+      'Ubuntu-22.04',
+    ),
+    '/home/user/dev/code-context',
   );
 });

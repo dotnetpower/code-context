@@ -1,4 +1,4 @@
-import { posix, resolve } from 'node:path';
+import { posix } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import * as vscode from 'vscode';
@@ -22,9 +22,11 @@ import {
   normalizeGlobPattern,
   normalizeRelativeTargetPath,
   normalizeUriOrPath,
+  normalizeWorkspaceSpecRoot,
   resolveRegisteredRootAfterRefresh,
   resolveWslRoot,
   RootResolutionError,
+  unwrapMarkdownLinkAndQuotes,
   wslCandidateToLinuxPath,
 } from './rootResolver.js';
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
@@ -92,7 +94,8 @@ class WorkspaceRegistry {
     if (!Array.isArray(result)) {
       throw new Error('Code Context daemon returned an invalid workspace registry.');
     }
-    const workspaces = result.map(parseWorkspaceSpec);
+    const usesWsl = this.client.usesWslBridge;
+    const workspaces = result.map((entry) => parseWorkspaceSpec(entry, usesWsl));
     this.cached = workspaces;
     this.cachedAt = Date.now();
     return workspaces;
@@ -185,13 +188,18 @@ export class NativeToolBridge implements vscode.Disposable {
       const explicit = normalizeExplicitRootInput(
         extractRawRootInput(input as RootInput),
         this.client.usesWslBridge,
+        this.client.wslDistribution ?? '',
       );
       root = definition.needsRoot
         ? await this.resolveRoot(
             explicit,
             token,
             true,
-            extractInputPathCandidates(input),
+            extractInputPathCandidates(
+              input,
+              this.client.usesWslBridge,
+              this.client.wslDistribution ?? '',
+            ),
             extractRelativePathTargets(input),
           )
         : null;
@@ -295,7 +303,8 @@ export class NativeToolBridge implements vscode.Disposable {
     relativeTargets: readonly string[] = [],
   ): Promise<string> {
     ensureTrustedWorkspace();
-    const normalizedExplicit = normalizeExplicitRootInput(explicit, this.client.usesWslBridge);
+    const wslDistro = this.client.wslDistribution ?? '';
+    const normalizedExplicit = normalizeExplicitRootInput(explicit, this.client.usesWslBridge, wslDistro);
     if (
       this.client.usesWslBridge &&
       normalizedExplicit !== undefined &&
@@ -313,7 +322,7 @@ export class NativeToolBridge implements vscode.Disposable {
         }
       }
       // The daemon remains authoritative for registration and access policy.
-      return resolveWslRoot(knownWorkspaces, normalizedExplicit);
+      return resolveWslRoot(knownWorkspaces, normalizedExplicit, [], [], wslDistro);
     }
     const stickyCandidate =
       allowPreparation &&
@@ -323,17 +332,17 @@ export class NativeToolBridge implements vscode.Disposable {
         ? [this.lastResolvedRoot.root]
         : [];
     const candidates = [
-      ...workspaceCandidates(this.client.usesWslBridge, this.client.wslDistribution ?? ''),
+      ...workspaceCandidates(this.client.usesWslBridge, wslDistro),
       ...extraCandidates,
       ...stickyCandidate,
     ];
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
       try {
-        return resolveWslRoot(workspaces, normalizedExplicit, candidates, relativeTargets);
+        return resolveWslRoot(workspaces, normalizedExplicit, candidates, relativeTargets, wslDistro);
       } catch (error: unknown) {
         if (error instanceof RootResolutionError && stickyCandidate[0]) {
-          const stickyLinux = wslCandidateToLinuxPath(stickyCandidate[0]);
+          const stickyLinux = wslCandidateToLinuxPath(stickyCandidate[0], wslDistro);
           if (stickyLinux) {
             return stickyLinux;
           }
@@ -352,6 +361,27 @@ export class NativeToolBridge implements vscode.Disposable {
   }
 
   public get usesWslBridge(): boolean { return this.client.usesWslBridge; }
+
+  public prioritizeOpenWslRoots(workspaces: readonly WorkspaceSpec[]): string[] {
+    const roots = workspaces.map((workspace) => workspace.root);
+    if (!this.client.usesWslBridge || roots.length <= 1) {
+      return roots;
+    }
+    const wslDistro = this.client.wslDistribution ?? '';
+    const candidates = workspaceCandidates(true, wslDistro);
+    let matched: string | undefined;
+    try {
+      if (candidates.length > 0) {
+        matched = resolveWslRoot(workspaces, undefined, candidates, [], wslDistro);
+      }
+    } catch {
+      matched = undefined;
+    }
+    if (!matched || !roots.includes(matched)) {
+      return roots;
+    }
+    return [matched, ...roots.filter((r) => r !== matched)];
+  }
 
   public dispose(): void {
     for (const disposable of this.disposables) {
@@ -496,24 +526,65 @@ function rootSuffix(root: string | undefined): string {
   return name ? ` in ${name}` : '';
 }
 
+function isWslQualifiedInput(raw: string): boolean {
+  const cleaned = unwrapMarkdownLinkAndQuotes(raw);
+  return (
+    /^vscode-agent-host:\/\//iu.test(cleaned) ||
+    /^vscode-remote:\/\/wsl\+/iu.test(cleaned) ||
+    /^(?:\\\\|\/\/)(?:wsl\.localhost|wsl\$)[\\/]/iu.test(cleaned) ||
+    /^file:\/\/(?:wsl\.localhost|wsl\$)\//iu.test(cleaned)
+  );
+}
+
 function normalizeExplicitRootInput(
   rawRoot: string | undefined,
   usesWslBridge: boolean,
+  wslDistribution = '',
 ): string | undefined {
   if (rawRoot === undefined || rawRoot.trim().length === 0) {
     return undefined;
   }
+  if (usesWslBridge) {
+    const wslLinux = wslCandidateToLinuxPath(rawRoot, wslDistribution);
+    if (wslLinux) {
+      return wslLinux;
+    }
+    if (isWslQualifiedInput(rawRoot)) {
+      throw new RootResolutionError(
+        `WSL Code Context root URI does not match configured WSL distribution${wslDistribution ? ` (${wslDistribution})` : ''}.`,
+      );
+    }
+  }
   const normalized = normalizeUriOrPath(rawRoot);
-  if (usesWslBridge && /^\\\\wsl\.localhost\\/iu.test(normalized)) {
-    return wslCandidateToLinuxPath(normalized) ?? normalized;
+  if (usesWslBridge) {
+    return wslCandidateToLinuxPath(normalized, wslDistribution) ?? normalized;
   }
   return normalized;
 }
 
-function collectRawInputPaths(input: unknown): string[] {
+function collectRawInputPaths(
+  input: unknown,
+  usesWslBridge = false,
+  wslDistribution = '',
+): string[] {
   if (!isRecord(input)) {
     return [];
   }
+  const acceptAndExtract = (val: string): string | undefined => {
+    const unwrapped = unwrapMarkdownLinkAndQuotes(val);
+    if (usesWslBridge && isWslQualifiedInput(unwrapped)) {
+      const baseUri = unwrapped.replace(
+        /(?:#L?\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?|#[a-zA-Z0-9_.\-\p{L}]+|:\d+(?::\d+)?(?:-\d+(?::\d+)?)?)$/u,
+        '',
+      );
+      if (!wslCandidateToLinuxPath(baseUri, wslDistribution)) {
+        throw new RootResolutionError(
+          `WSL Code Context path URI does not match configured WSL distribution${wslDistribution ? ` (${wslDistribution})` : ''}.`,
+        );
+      }
+    }
+    return extractLineRangeFromPath(val).path;
+  };
   const raw: string[] = [];
   for (const key of [
     'path',
@@ -533,15 +604,18 @@ function collectRawInputPaths(input: unknown): string[] {
   ] as const) {
     const val = input[key];
     if (typeof val === 'string' && val.trim().length > 0) {
-      raw.push(extractLineRangeFromPath(val).path);
+      const extracted = acceptAndExtract(val);
+      if (extracted) { raw.push(extracted); }
     }
   }
   if (typeof input.paths === 'string' && input.paths.trim().length > 0) {
-    raw.push(extractLineRangeFromPath(input.paths).path);
+    const extracted = acceptAndExtract(input.paths);
+    if (extracted) { raw.push(extracted); }
   } else if (Array.isArray(input.paths)) {
     for (const item of input.paths) {
       if (typeof item === 'string' && item.trim().length > 0) {
-        raw.push(extractLineRangeFromPath(item).path);
+        const extracted = acceptAndExtract(item);
+        if (extracted) { raw.push(extracted); }
       }
     }
   }
@@ -563,7 +637,8 @@ function collectRawInputPaths(input: unknown): string[] {
         ] as const) {
           const rangePath = range[key];
           if (typeof rangePath === 'string' && rangePath.trim().length > 0) {
-            raw.push(extractLineRangeFromPath(rangePath).path);
+            const extracted = acceptAndExtract(rangePath);
+            if (extracted) { raw.push(extracted); }
             break;
           }
         }
@@ -574,7 +649,8 @@ function collectRawInputPaths(input: unknown): string[] {
     const globVal = input.glob.trim();
     const wildIdx = globVal.search(/[*?[\]{}]/u);
     if (wildIdx === -1) {
-      raw.push(extractLineRangeFromPath(globVal).path);
+      const extracted = acceptAndExtract(globVal);
+      if (extracted) { raw.push(extracted); }
     } else if (wildIdx > 0) {
       const beforeWild = globVal.slice(0, wildIdx);
       const lastSlash = beforeWild.lastIndexOf('/');
@@ -589,8 +665,12 @@ function collectRawInputPaths(input: unknown): string[] {
   return raw;
 }
 
-function extractInputPathCandidates(input: unknown): string[] {
-  return collectRawInputPaths(input).filter(
+function extractInputPathCandidates(
+  input: unknown,
+  usesWslBridge = false,
+  wslDistribution = '',
+): string[] {
+  return collectRawInputPaths(input, usesWslBridge, wslDistribution).filter(
     (item) =>
       (item.startsWith('/') && !item.startsWith('//') && item.indexOf('/', 1) > 1) ||
       /^\\\\(?:wsl\.localhost|wsl\$)\\/iu.test(item) ||
@@ -621,7 +701,7 @@ function request(
   };
 }
 
-function parseWorkspaceSpec(value: unknown): WorkspaceSpec {
+function parseWorkspaceSpec(value: unknown, usesWslBridge = false): WorkspaceSpec {
   if (!isRecord(value) || typeof value.root !== 'string') {
     throw new Error('Code Context workspace registry contains an invalid root.');
   }
@@ -629,7 +709,7 @@ function parseWorkspaceSpec(value: unknown): WorkspaceSpec {
     throw new Error(`Code Context workspace ${value.root} has invalid scopes or globs.`);
   }
   const spec: WorkspaceSpec = {
-    root: resolve(value.root),
+    root: normalizeWorkspaceSpecRoot(value.root, usesWslBridge),
     scopes: value.scopes,
     globs: value.globs,
   };
@@ -645,8 +725,10 @@ function parseWorkspaceSpec(value: unknown): WorkspaceSpec {
   if (typeof value.allow_worktrees === 'boolean') {
     spec.allow_worktrees = value.allow_worktrees;
   }
-  if (typeof value.managed_parent === 'string' || value.managed_parent === null) {
-    spec.managed_parent = value.managed_parent;
+  if (typeof value.managed_parent === 'string') {
+    spec.managed_parent = normalizeWorkspaceSpecRoot(value.managed_parent, usesWslBridge);
+  } else if (value.managed_parent === null) {
+    spec.managed_parent = null;
   }
   return spec;
 }
@@ -679,12 +761,39 @@ function pushUriCandidate(
     return;
   }
   if (uri.scheme === 'vscode-remote' && typeof uri.path === 'string' && uri.path.startsWith('/')) {
+    if (usesWslBridge) {
+      const authority = typeof uri.authority === 'string' ? uri.authority : '';
+      if (!authority.toLowerCase().startsWith('wsl+')) {
+        return;
+      }
+      const expected = wslDistribution.trim().toLowerCase();
+      if (expected.length > 0) {
+        let distro = authority.slice(4);
+        try {
+          distro = decodeURIComponent(distro);
+        } catch {
+          // Keep raw authority suffix on malformed percent encoding.
+        }
+        if (distro.toLowerCase() !== expected) {
+          return;
+        }
+      }
+    }
     if (!seen.has(uri.path)) {
       seen.add(uri.path);
       candidates.push(uri.path);
     }
+    return;
   }
   if (typeof uri.fsPath === 'string' && uri.fsPath.length > 0 && !seen.has(uri.fsPath)) {
+    if (usesWslBridge) {
+      const wslLinux = wslCandidateToLinuxPath(uri.fsPath, wslDistribution);
+      if (wslLinux && !seen.has(wslLinux)) {
+        seen.add(wslLinux);
+        candidates.push(wslLinux);
+      }
+      return;
+    }
     seen.add(uri.fsPath);
     candidates.push(uri.fsPath);
   }

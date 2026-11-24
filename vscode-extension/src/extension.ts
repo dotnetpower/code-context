@@ -36,6 +36,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   let renderUsage = (): void => {};
   const preparationFailures = new Map<string, { at: number; message: string }>();
+  let needsManualRegistration = false;
   const bridge = new NativeToolBridge(client, output, (path) => {
     const failure=preparationFailures.get(path);
     if (failure && performance.now()-failure.at<60_000) {
@@ -78,6 +79,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     throw new CacheMissError(`CACHE_MISS root=${path} state=registering background_load=true: source is not ready. Continue with a permitted host search/read under the same policy; do not poll, repeat this lookup, switch CCTX transports or run code_sync to wait for warmup.`);
   }, (event) => {
+    if (event.operation !== 'code_workspaces' && !event.error) {
+      needsManualRegistration = false;
+    }
     usage.record(event);
     renderUsage();
   }, (operation, deliveredChars) => {
@@ -90,14 +94,28 @@ export function activate(context: vscode.ExtensionContext): void {
     20,
   );
   status.name = 'Code Context Native';
-  status.command = 'codeContextNative.showStatus';
+  status.command = hasBackendUsageQuery ? 'codeContextNative.showDashboard' : 'codeContextNative.showStatus';
   status.text = '$(database) CCTX Native';
   status.tooltip = 'Show Code Context native tool status';
   status.show();
   let renderTimer: NodeJS.Timeout | undefined;
   let periodicUsageTimer: NodeJS.Timeout | undefined;
+  let autoBpeTimer: NodeJS.Timeout | undefined;
+  let periodicBpeTimer: NodeJS.Timeout | undefined;
+  let dashboardPanel: vscode.WebviewPanel | undefined;
   const applyStatusBarUsage = (target: vscode.StatusBarItem): void => {
     if (!usage.hasRenderableData) { return; }
+    if (dashboardPanel) {
+      try {
+        dashboardPanel.webview.html = usage.renderDashboardHtml();
+      } catch {
+        // Ignore disposed panel race.
+      }
+    }
+    if (needsManualRegistration) { return; }
+    if (hasBackendUsageQuery) {
+      target.command = 'codeContextNative.showDashboard';
+    }
     target.text = usage.text();
     if (typeof vscode.MarkdownString === 'function') {
       const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
@@ -128,7 +146,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
   renderUsage = (): void => {
-    if (usage.hasRenderableData) {
+    if (usage.hasRenderableData && !needsManualRegistration) {
       status.text = usage.text();
     }
     if (usage.last || hasBackendUsageQuery) {
@@ -146,10 +164,62 @@ export function activate(context: vscode.ExtensionContext): void {
     }, 60_000);
     periodicUsageTimer.unref?.();
   }
+  const hasBackendBpeBuild =
+    typeof (activeClient as { buildBpeProfile?: unknown }).buildBpeProfile === 'function';
+  let bpeBackendUnsupported = false;
+  let bpeAutoInFlight = false;
+  const runAutoBpeCheck = (): void => {
+    if (!hasBackendBpeBuild || bpeBackendUnsupported || bpeAutoInFlight || !vscode.workspace.isTrusted) {
+      return;
+    }
+    const winState = (vscode.window as { state?: { focused?: boolean } }).state;
+    if (winState && winState.focused === false) { return; }
+    const settings = readSettings();
+    if (settings.autoBuildBpeProfile === false) { return; }
+    const includeWindows = process.platform === 'win32' && activeClient.usesWslBridge;
+    bpeAutoInFlight = true;
+    void activeClient
+      .buildBpeProfile({
+        window: '7d',
+        if_needed: true,
+        ...(includeWindows ? { include_windows_homes: true } : {}),
+      })
+      .then((res) => {
+        if (res && typeof res === 'object' && !Array.isArray(res) && res.applied === true) {
+          const reason = typeof res.reason === 'string' ? res.reason : 'updated';
+          output.appendLine(`BPE_AUTO_BUILT: ${singleLine(reason)}`);
+        }
+      })
+      .catch((error: unknown) => {
+        const msg = String(error);
+        if (/unknown|unsupported/iu.test(msg)) {
+          bpeBackendUnsupported = true;
+        }
+        output.debug?.(`BPE_AUTO_CHECK_SKIPPED: ${singleLine(msg)}`);
+      })
+      .finally(() => {
+        bpeAutoInFlight = false;
+      });
+  };
+  if (hasBackendBpeBuild && typeof setTimeout === 'function') {
+    autoBpeTimer = setTimeout(() => {
+      autoBpeTimer = undefined;
+      runAutoBpeCheck();
+    }, 45_000);
+    autoBpeTimer.unref?.();
+  }
+  if (hasBackendBpeBuild && typeof setInterval === 'function') {
+    periodicBpeTimer = setInterval(() => {
+      runAutoBpeCheck();
+    }, 6 * 60 * 60 * 1000);
+    periodicBpeTimer.unref?.();
+  }
 
   let probing: Promise<void> | undefined;
   const probe = (): Promise<void> => {
-    probing ??= runStartupProbe(bridge, status, output).finally(() => {
+    probing ??= runStartupProbe(bridge, status, output).then((unregistered) => {
+      needsManualRegistration = unregistered;
+    }).finally(() => {
       probing = undefined;
       renderUsage();
     });
@@ -167,6 +237,16 @@ export function activate(context: vscode.ExtensionContext): void {
           clearInterval(periodicUsageTimer);
           periodicUsageTimer = undefined;
         }
+        if (autoBpeTimer && typeof clearTimeout === 'function') {
+          clearTimeout(autoBpeTimer);
+          autoBpeTimer = undefined;
+        }
+        if (periodicBpeTimer && typeof clearInterval === 'function') {
+          clearInterval(periodicBpeTimer);
+          periodicBpeTimer = undefined;
+        }
+        dashboardPanel?.dispose();
+        dashboardPanel = undefined;
       },
     },
     output,
@@ -189,6 +269,11 @@ export function activate(context: vscode.ExtensionContext): void {
         await vscode.window.showErrorMessage('Could not open the Code Context setup guide.');
       }
     }),
+    vscode.commands.registerCommand('codeContextNative.showDashboard', async () => {
+      dashboardPanel = await showDashboard(bridge, status, output, usage, dashboardPanel, () => {
+        dashboardPanel = undefined;
+      });
+    }),
     vscode.commands.registerCommand('codeContextNative.showStatus', async () => {
       await showStatus(bridge, status, output, usage, usage.lastRoot);
     }),
@@ -207,6 +292,12 @@ export function activate(context: vscode.ExtensionContext): void {
         if (await registerCurrentWorkspace(bridge, output)) {
           await probe();
         }
+      },
+    ),
+    vscode.commands.registerCommand(
+      'codeContextNative.buildBpeProfile',
+      async (mode?: string) => {
+        await runBuildBpeProfileCommand(activeClient, output, mode);
       },
     ),
     vscode.workspace.onDidChangeConfiguration((event) => {
@@ -256,6 +347,119 @@ export function deactivate(): void {
   client = undefined;
 }
 
+function orderedWorkspaceRoots(
+  bridge: NativeToolBridge,
+  workspaces: ReadonlyArray<{ root: string; scopes: string[]; globs: string[] }>,
+): string[] {
+  if (typeof (bridge as { prioritizeOpenWslRoots?: unknown }).prioritizeOpenWslRoots === 'function') {
+    return bridge.prioritizeOpenWslRoots(workspaces);
+  }
+  return workspaces.map((workspace) => workspace.root);
+}
+
+function isAgentsWindowWithoutVisibleEditors(): boolean {
+  const envObj = (vscode as { env?: { appName?: string } }).env;
+  if (typeof envObj?.appName === 'string' && /agents/iu.test(envObj.appName)) {
+    return true;
+  }
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const hasAgentHostFolder = folders.some(
+    (f) => typeof f.uri?.scheme === 'string' && f.uri.scheme === 'vscode-agent-host',
+  );
+  const visibleEditors = vscode.window.visibleTextEditors ?? [];
+  return hasAgentHostFolder && visibleEditors.length === 0;
+}
+
+async function showDashboard(
+  bridge: NativeToolBridge,
+  statusBar: vscode.StatusBarItem,
+  output: vscode.LogOutputChannel,
+  usage: UsageSummary,
+  existingPanel: vscode.WebviewPanel | undefined,
+  onPanelDisposed: () => void,
+): Promise<vscode.WebviewPanel | undefined> {
+  try {
+    await usage.refreshSessionTelemetryAsync(undefined, Date.now(), true);
+    if (usage.hasRenderableData) {
+      statusBar.text = usage.text();
+      if (typeof vscode.MarkdownString === 'function') {
+        const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
+        md.isTrusted = true;
+        statusBar.tooltip = md;
+      } else {
+        statusBar.tooltip = usage.tooltip();
+      }
+    }
+    let daemonStatus: unknown = usage.backendUsage?.rawDaemon;
+    if (!daemonStatus && usage.lastRoot) {
+      const source = new vscode.CancellationTokenSource();
+      try {
+        const root = await bridge.resolveRoot(usage.lastRoot, source.token, false);
+        daemonStatus = await bridge.invoke(
+          {
+            name: 'command_status',
+            operation: 'code_status',
+            needsRoot: true,
+            invocationMessage: () => 'Reading status',
+            arguments: () => ({}),
+          },
+          { root },
+          source.token,
+        );
+      } catch {
+        // Optional per-root status fallback; dashboard still renders cleanly without a root.
+      } finally {
+        source.dispose();
+      }
+    }
+    output.appendLine(`\n${usage.formatDashboard(daemonStatus)}`);
+    if (daemonStatus) {
+      output.info(formatLogDetails('Code Context status', daemonStatus as JsonValue));
+    }
+
+    const winWithWebview = vscode.window as {
+      createWebviewPanel?: typeof vscode.window.createWebviewPanel;
+    };
+    if (!isAgentsWindowWithoutVisibleEditors() && typeof winWithWebview.createWebviewPanel === 'function') {
+      try {
+        const col = vscode.ViewColumn?.Active ?? 1;
+        let panel = existingPanel;
+        if (panel) {
+          panel.reveal(col, false);
+        } else {
+          panel = winWithWebview.createWebviewPanel(
+            'codeContextDashboard',
+            'Code Context — 24h Dashboard',
+            col,
+            { enableScripts: false, retainContextWhenHidden: false },
+          );
+          panel.onDidDispose(() => {
+            onPanelDisposed();
+          });
+        }
+        panel.webview.html = usage.renderDashboardHtml(daemonStatus);
+        if (typeof setTimeout === 'function') {
+          await new Promise<void>((resolveDelay) => {
+            const t = setTimeout(resolveDelay, 30);
+            t.unref?.();
+          });
+        }
+        if (panel.visible !== false) {
+          return panel;
+        }
+        panel.dispose();
+      } catch {
+        // Fall back to focusing the Output channel if editor tabs/webviews are unavailable in this window.
+      }
+    }
+    output.show(false);
+    return undefined;
+  } catch (error: unknown) {
+    await showFailure(error, output);
+    return existingPanel;
+  }
+}
+
 async function showStatus(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
@@ -269,8 +473,9 @@ async function showStatus(
       let requestedRoot = explicitRoot;
       if (!requestedRoot && bridge.usesWslBridge) {
         const workspaces = await bridge.listWorkspaces(source.token);
-        requestedRoot = workspaces.length === 1 ? workspaces[0]?.root :
-          await vscode.window.showQuickPick(workspaces.map((workspace) => workspace.root),
+        const candidates = orderedWorkspaceRoots(bridge, workspaces);
+        requestedRoot = candidates.length === 1 ? candidates[0] :
+          await vscode.window.showQuickPick(candidates,
             { title: 'Code Context: Select a registered Linux root', placeHolder: 'Status does not load source.' });
         if (!requestedRoot) {
           output.info('STATUS_CANCELLED no registered root selected; register a Linux root if the list is empty.');
@@ -300,9 +505,9 @@ async function showStatus(
           statusBar.tooltip = usage.tooltip();
         }
       }
-      output.info(usage.formatDashboard(value));
+      output.appendLine(`\n${usage.formatDashboard(value)}`);
       output.info(formatLogDetails('Code Context status', value));
-      output.show(true);
+      output.show(false);
     } finally {
       source.dispose();
     }
@@ -336,7 +541,7 @@ async function runSelfTest(
       let requestedRoot = explicitRoot;
       if (!requestedRoot && client?.usesWslBridge && workspaces.length > 1) {
         requestedRoot = await vscode.window.showQuickPick(
-          workspaces.map((workspace) => workspace.root),
+          orderedWorkspaceRoots(bridge, workspaces),
           { title: 'Code Context: Select a registered Linux root', placeHolder: 'The self-test observes status; it does not load source.' },
         );
         if (!requestedRoot) {
@@ -394,7 +599,7 @@ async function runStartupProbe(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
   output: vscode.LogOutputChannel,
-): Promise<void> {
+): Promise<boolean> {
   const started = performance.now();
   const source = new vscode.CancellationTokenSource();
   try {
@@ -424,17 +629,20 @@ async function runStartupProbe(
     output.appendLine(
       `EXTENSION_CALLABLE tools=${registered.length} workspaces=${workspaces.length} root=${root} probe=codeWorkspaces index_initialization=on-demand source_scan=none elapsed_ms=${(performance.now() - started).toFixed(3)} agent_picker=unverified; enable Code Context tools in the agent tool settings`,
     );
+    return false;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof RootResolutionError) {
+      statusBar.command = 'codeContextNative.registerWorkspace';
       statusBar.text = '$(add) CCTX Register';
       statusBar.tooltip = 'Index initialization is deferred until the first source lookup; click for manual registration';
       output.appendLine(`NATIVE_UNREGISTERED_DEFERRED ${message}`);
-    } else {
-      statusBar.text = '$(warning) CCTX Native';
-      statusBar.tooltip = message;
-      output.error(`NATIVE_NOT_READY ${singleLine(message)}`);
+      return true;
     }
+    statusBar.text = '$(warning) CCTX Native';
+    statusBar.tooltip = message;
+    output.error(`NATIVE_NOT_READY ${singleLine(message)}`);
+    return false;
   } finally {
     source.dispose();
   }
@@ -473,7 +681,96 @@ function readSettings(): ClientSettings {
     executablePath: config.get<string>('executablePath', ''),
     wslDistribution: localWindowsWorkspace ? '' : config.get<string>('wslDistribution', ''),
     wslExecutablePath: localWindowsWorkspace ? '' : config.get<string>('wslExecutablePath', ''),
+    autoBuildBpeProfile: config.get<boolean>('autoBuildBpeProfile', true),
   };
+}
+
+async function runBuildBpeProfileCommand(
+  activeClient: DaemonClient,
+  output: vscode.LogOutputChannel,
+  presetMode?: string,
+): Promise<void> {
+  try {
+    let selected = presetMode;
+    if (!selected) {
+      const pick = await vscode.window.showQuickPick(
+        [
+          {
+            label: 'Build / Update Now (Last 7 days)',
+            description: 'Train BPE merges & safe formula rules from Copilot sessions',
+            mode: 'build-7d',
+          },
+          {
+            label: 'Build / Update Now (Last 30 days)',
+            description: 'Broader 30-day session corpus',
+            mode: 'build-30d',
+          },
+          {
+            label: 'Auto-build If Needed',
+            description: 'Rebuild only when session activity or pattern drift crosses threshold',
+            mode: 'if-needed',
+          },
+          {
+            label: 'Preview (Dry Run, 7 days)',
+            description: 'Inspect learned rules and token savings without saving',
+            mode: 'dry-run',
+          },
+          {
+            label: 'Show BPE Profile Status',
+            description: 'Inspect current profile summary and rebuild readiness',
+            mode: 'status',
+          },
+          {
+            label: 'Rollback Previous Profile',
+            description: 'Restore bpe-profile.prev.json backup',
+            mode: 'rollback',
+          },
+          {
+            label: 'Reset to Built-in Rules',
+            description: 'Remove persisted bpe-profile.json',
+            mode: 'reset',
+          },
+        ],
+        {
+          title: 'Code Context: Session BPE Profile Builder',
+          placeHolder: 'Choose a BPE profile action (works on both WSL and Windows)',
+        },
+      );
+      if (!pick) {
+        return;
+      }
+      selected = pick.mode;
+    }
+
+    const includeWindows = process.platform === 'win32' && activeClient.usesWslBridge;
+    const extra = includeWindows ? { include_windows_homes: true } : {};
+    const result =
+      selected === 'status'
+        ? await activeClient.queryBpeStatus({ window: '7d', ...extra })
+        : selected === 'build-30d'
+          ? await activeClient.buildBpeProfile({ window: '30d', ...extra })
+          : selected === 'if-needed'
+            ? await activeClient.buildBpeProfile({ window: '7d', if_needed: true, ...extra })
+            : selected === 'dry-run'
+              ? await activeClient.buildBpeProfile({ window: '7d', dry_run: true, ...extra })
+              : selected === 'rollback'
+                ? await activeClient.buildBpeProfile({ rollback: true })
+                : selected === 'reset'
+                  ? await activeClient.buildBpeProfile({ reset: true })
+                  : await activeClient.buildBpeProfile({ window: '7d', ...extra });
+
+    output.info(formatLogDetails(`Code Context BPE (${selected})`, result));
+    output.show(false);
+    const rec =
+      result && typeof result === 'object' && !Array.isArray(result) ? result : undefined;
+    const action = typeof rec?.action === 'string' ? rec.action : selected;
+    const reason = typeof rec?.reason === 'string' ? rec.reason : '';
+    await vscode.window.showInformationMessage(
+      `Code Context BPE (${action})${reason ? `: ${reason}` : ''}`,
+    );
+  } catch (error: unknown) {
+    await showFailure(error, output);
+  }
 }
 
 async function showFailure(

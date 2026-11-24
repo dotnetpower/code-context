@@ -1,3 +1,4 @@
+pub mod bpe_builder;
 pub mod catalog;
 pub mod context;
 pub mod daemon;

@@ -379,7 +379,15 @@ void test('backend code_usage snapshot unifies 24h MCP and Native telemetry acro
   // `code-context-code_read` (1300) + `cctxNativeRead` (50) merged into `code_read` (1,350) with readable miss/err badges
   assert.match(md, /`code_read` \| 1,350 \(`miss 2, err 4`\)/);
   assert.match(md, /_Admin ops: code_status 3_/);
+  assert.match(md, /command:codeContextNative\.showDashboard/);
   assert.doesNotMatch(md, /ExtHost bridge:/, 'bridge counters are hidden when bridge errors are zero');
+
+  const html = usage.renderDashboardHtml();
+  assert.match(html, /Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"/);
+  assert.match(html, /Unified 24h Efficiency Dashboard/);
+  assert.match(html, /\+\$13\.29/);
+  assert.match(html, /~1h 43m/);
+  assert.doesNotMatch(html, /Bori Pure-Rust/);
 
   // Full ASCII dashboard retains complete detail including TIME SAVED and all models/tools
   const dash = usage.formatDashboard({

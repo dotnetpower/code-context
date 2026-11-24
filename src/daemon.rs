@@ -1033,6 +1033,8 @@ pub struct Server {
     last_pressure_check: Option<std::time::Instant>,
     pressure_shrink_streak: u8,
     last_idle_maintenance: Option<std::time::Instant>,
+    bpe_auto_started_at: std::time::Instant,
+    last_bpe_auto_check: Option<std::time::Instant>,
     idle_timeout: Duration,
     active_connections: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     protocol_calls: BTreeMap<String, u64>,
@@ -1069,6 +1071,8 @@ impl Default for Server {
             last_pressure_check: None,
             pressure_shrink_streak: 0,
             last_idle_maintenance: None,
+            bpe_auto_started_at: Instant::now(),
+            last_bpe_auto_check: None,
             idle_timeout: IDLE_ROOT_TIMEOUT,
             active_connections: None,
             protocol_calls: BTreeMap::new(),
@@ -2562,6 +2566,8 @@ impl Server {
             (Protocol::Bincode, "code_profile_full") => "bincode:code_profile_full",
             (Protocol::Bincode, "code_usage") => "bincode:code_usage",
             (Protocol::Bincode, "code_daemon_summary") => "bincode:code_daemon_summary",
+            (Protocol::Bincode, "code_bpe_status") => "bincode:code_bpe_status",
+            (Protocol::Bincode, "code_bpe_build") => "bincode:code_bpe_build",
             (Protocol::Bincode, _) => "bincode:unknown",
             (Protocol::FramedJson, "ping") => "framed_json:ping",
             (Protocol::FramedJson, "code_workspaces") => "framed_json:code_workspaces",
@@ -2577,6 +2583,8 @@ impl Server {
             (Protocol::FramedJson, "code_profile_full") => "framed_json:code_profile_full",
             (Protocol::FramedJson, "code_usage") => "framed_json:code_usage",
             (Protocol::FramedJson, "code_daemon_summary") => "framed_json:code_daemon_summary",
+            (Protocol::FramedJson, "code_bpe_status") => "framed_json:code_bpe_status",
+            (Protocol::FramedJson, "code_bpe_build") => "framed_json:code_bpe_build",
             (Protocol::FramedJson, _) => "framed_json:unknown",
             (Protocol::JsonLines, "ping") => "json_lines:ping",
             (Protocol::JsonLines, "code_workspaces") => "json_lines:code_workspaces",
@@ -2592,6 +2600,8 @@ impl Server {
             (Protocol::JsonLines, "code_profile_full") => "json_lines:code_profile_full",
             (Protocol::JsonLines, "code_usage") => "json_lines:code_usage",
             (Protocol::JsonLines, "code_daemon_summary") => "json_lines:code_daemon_summary",
+            (Protocol::JsonLines, "code_bpe_status") => "json_lines:code_bpe_status",
+            (Protocol::JsonLines, "code_bpe_build") => "json_lines:code_bpe_build",
             (Protocol::JsonLines, _) => "json_lines:unknown",
         }
     }
@@ -2826,7 +2836,35 @@ impl Server {
                 }
             }
         }
+        self.maybe_schedule_bpe_auto_build();
         Ok(())
+    }
+
+    fn maybe_schedule_bpe_auto_build(&mut self) {
+        const BPE_WARMUP: Duration = Duration::from_secs(60);
+        const BPE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
+        #[cfg(test)]
+        if std::env::var_os("CCTX_BPE_AUTO_BUILD").is_none() {
+            return;
+        }
+        if self.background.is_some() || self.preparation.is_some() {
+            return;
+        }
+        if self.bpe_auto_started_at.elapsed() < BPE_WARMUP {
+            return;
+        }
+        if self
+            .last_bpe_auto_check
+            .is_some_and(|last| last.elapsed() < BPE_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_bpe_auto_check = Some(Instant::now());
+        let _ = std::thread::Builder::new()
+            .name("cctx-bpe-auto".into())
+            .spawn(|| {
+                let _ = crate::bpe_builder::auto_build_if_needed_background();
+            });
     }
 
     fn evict_idle_roots(&mut self) -> bool {
@@ -3205,6 +3243,103 @@ struct UsageCacheState {
     cached: Option<(u64, u64, Instant, String)>,
 }
 
+fn parse_opt_bool(args: &Value, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid(format!("{key} must be a boolean")).into()),
+    }
+}
+
+fn parse_opt_u64(args: &Value, key: &str, min: u64, max: u64) -> Result<Option<u64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
+            _ => Err(invalid(format!("{key} must be an integer between {min} and {max}")).into()),
+        },
+    }
+}
+
+fn handle_bpe_rpc_request(op: &str, args: &Value) -> Result<Value> {
+    if !args.is_object() && !args.is_null() {
+        return Err(invalid("BPE RPC arguments must be a JSON object").into());
+    }
+    let mut cfg = crate::bpe_builder::BpeBuildConfig::default();
+    match args.get("window") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(window)) => {
+            cfg.window_hours = crate::bpe_builder::parse_window_hours(window)?;
+        }
+        Some(_) => return Err(invalid("window must be a string (e.g. '7d', '30d')").into()),
+    }
+    if args.get("window").is_none_or(Value::is_null)
+        && let Some(v) = args.get("hours")
+        && !v.is_null()
+    {
+        match v.as_f64() {
+            Some(h) if h.is_finite() && h > 0.0 && h <= 8760.0 => cfg.window_hours = h,
+            _ => {
+                return Err(invalid("hours must be a finite number between 0 and 8760").into());
+            }
+        }
+    }
+    match args.get("source") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(src)) => {
+            cfg.source = crate::bpe_builder::BpeSource::parse_str(src)
+                .ok_or_else(|| invalid(format!("invalid source '{src}' (use 'copilot' or 'all')")))?;
+        }
+        Some(_) => return Err(invalid("source must be a string ('copilot' or 'all')").into()),
+    }
+    if let Some(v) = parse_opt_bool(args, "include_windows_homes")? {
+        cfg.include_windows_homes = v;
+    }
+
+    if op == "code_bpe_status" {
+        let report = crate::bpe_builder::inspect_bpe_status(&cfg)?;
+        return Ok(serde_json::to_value(report)?);
+    }
+
+    let reset = parse_opt_bool(args, "reset")?.unwrap_or(false);
+    let rollback = parse_opt_bool(args, "rollback")?.unwrap_or(false);
+    if reset && rollback {
+        return Err(invalid("cannot combine reset and rollback").into());
+    }
+    if reset {
+        let report = crate::bpe_builder::reset_bpe_profile(None)?;
+        return Ok(serde_json::to_value(report)?);
+    }
+    if rollback {
+        let report = crate::bpe_builder::rollback_bpe_profile(None)?;
+        return Ok(serde_json::to_value(report)?);
+    }
+
+    if let Some(v) = parse_opt_u64(args, "min_freq", 2, 100)? {
+        cfg.min_freq = v as usize;
+    }
+    if let Some(v) = parse_opt_u64(args, "min_sessions", 1, 50)? {
+        cfg.min_sessions = v as usize;
+    }
+    if let Some(v) = parse_opt_u64(args, "min_savings_tokens", 1, 20)? {
+        cfg.min_savings_tokens = v as usize;
+    }
+    if let Some(v) = parse_opt_u64(args, "max_merges", 0, 512)? {
+        cfg.max_merges = v as usize;
+    }
+    cfg.if_needed = parse_opt_bool(args, "if_needed")?.unwrap_or(false);
+    cfg.dry_run = parse_opt_bool(args, "dry_run")?.unwrap_or(false);
+    match args.get("tokenizer") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(tok)) => {
+            cfg.tokenizer = Some(crate::prompt_formula::TokenizerProfile::for_model(tok));
+        }
+        Some(_) => return Err(invalid("tokenizer must be a string").into()),
+    }
+    let report = crate::bpe_builder::build_bpe_profile(&cfg)?;
+    Ok(serde_json::to_value(report)?)
+}
+
 fn compute_cached_usage_raw(
     hours: f64,
     force_refresh: bool,
@@ -3498,6 +3633,49 @@ fn handle_connection(
                 socket_write_ms,
                 success: usage_result.is_ok(),
                 outcome: if usage_result.is_ok() { "ok" } else { "error" },
+            });
+            if sent.is_err() {
+                break;
+            }
+            continue;
+        }
+        if request.name == "code_bpe_status" || request.name == "code_bpe_build" {
+            let started_exec = Instant::now();
+            let req_id = next_daemon_request_id();
+            let op_name = request.name.clone();
+            let bpe_result: WirePayloadResult =
+                handle_bpe_rpc_request(&op_name, &request.arguments)
+                    .map(WirePayload::Json)
+                    .map_err(|e| e.to_string());
+            let execute_ms = started_exec.elapsed().as_secs_f64() * 1000.0;
+            let write_started = Instant::now();
+            let trace_meta = trace_id.as_deref().map(|tid| TraceMeta {
+                trace_id: tid,
+                daemon_request_id: req_id,
+                queue_ms: 0.0,
+                execute_ms,
+            });
+            let sent = respond_protocol_buf(
+                &mut stream,
+                protocol,
+                &bpe_result,
+                trace_meta,
+                &mut write_buf,
+            );
+            let response_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+            let (serialize_ms, socket_write_ms) = sent.as_ref().copied().unwrap_or((0.0, 0.0));
+            let _ = timing_tx.try_send(RequestTiming {
+                id: req_id,
+                trace_id,
+                operation: op_name,
+                root: None,
+                queue_ms: 0.0,
+                execute_ms,
+                response_ms,
+                serialize_ms,
+                socket_write_ms,
+                success: bpe_result.is_ok(),
+                outcome: if bpe_result.is_ok() { "ok" } else { "error" },
             });
             if sent.is_err() {
                 break;

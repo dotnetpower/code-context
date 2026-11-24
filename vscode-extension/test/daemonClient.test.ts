@@ -649,6 +649,51 @@ void test('WSL bridge delivers initial Windows host_memory trace immediately and
   }
 });
 
+void test('BPE status and build RPCs run on the isolated usage lane with forwarded options', async () => {
+  const seen: DaemonRequest[] = [];
+  const testServer = await fixture((value, socket) => {
+    const input = value as DaemonRequest;
+    seen.push(input);
+    if (input.name === 'code_bpe_status') {
+      writeResponse(socket, { result: { exists: true, active: true, platform: 'wsl' } });
+    } else if (input.name === 'code_bpe_build') {
+      writeResponse(socket, { result: { action: 'built', applied: true, reason: 'manual' } });
+    } else {
+      writeResponse(socket, { result: { ok: true } });
+    }
+  });
+  const client = new DaemonClient(() => settings(testServer.path));
+  try {
+    const status = await client.queryBpeStatus({ window: '7d', include_windows_homes: true });
+    assert.deepEqual(status, { exists: true, active: true, platform: 'wsl' });
+
+    const built = await client.buildBpeProfile({
+      window: '30d',
+      if_needed: true,
+      dry_run: true,
+      include_windows_homes: true,
+    });
+    assert.deepEqual(built, { action: 'built', applied: true, reason: 'manual' });
+
+    // Primary lane stays independent from usage/BPE lane.
+    const primary = await client.request(request('code_status'), uncancelled());
+    assert.deepEqual(primary, { ok: true });
+    assert.equal(testServer.connections(), 2, 'BPE RPCs should use dedicated usageLane connection');
+    assert.equal(seen[0]?.name, 'code_bpe_status');
+    assert.deepEqual(seen[0]?.arguments, { window: '7d', include_windows_homes: true });
+    assert.equal(seen[1]?.name, 'code_bpe_build');
+    assert.deepEqual(seen[1]?.arguments, {
+      window: '30d',
+      if_needed: true,
+      dry_run: true,
+      include_windows_homes: true,
+    });
+  } finally {
+    client.dispose();
+    await testServer.cleanup();
+  }
+});
+
 void test('queryUsage routes code_usage onto barrierLane without blocking concurrent code_read', async () => {
   let releaseUsage: (() => void) | undefined;
   const testServer = await fixture((value, socket) => {

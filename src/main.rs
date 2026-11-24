@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use code_context::bpe_builder::{BpeBuildConfig, BpeSource};
 use code_context::context::{ContextRequest, ReadRange};
 use code_context::engine::{Backend, Engine};
 use code_context::journal::JournalCommand;
@@ -102,6 +103,8 @@ enum Action {
         details: bool,
     },
     Prompt {
+        #[command(subcommand)]
+        command: Option<PromptSubcommand>,
         #[arg(long, value_enum, default_value_t = PromptStyle::Formula)]
         style: PromptStyle,
         #[arg(long, value_enum, default_value_t = PromptTarget::Instructions)]
@@ -246,12 +249,16 @@ fn run() -> Result<()> {
             return stdout.write_all(b"\n").map_err(Into::into);
         }
         Action::Prompt {
+            command,
             style,
             target,
             tokenizer,
             compress,
             json,
         } => {
+            if let Some(sub) = command {
+                return run_prompt_subcommand(sub);
+            }
             let root_opt = (args.root.as_os_str() != ".")
                 .then(|| catalog::canonicalize(&args.root).unwrap_or_else(|_| args.root.clone()));
             let report = code_context::prompt_formula::build_report_with_tokenizer(
@@ -728,6 +735,171 @@ fn run() -> Result<()> {
         _ => return Err(code_context::invalid("command requires shared backend").into()),
     };
     print(&value)
+}
+
+#[derive(Subcommand)]
+enum PromptSubcommand {
+    /// Build or conditionally auto-build a session-driven BPE & formula profile from Copilot logs
+    BuildBpe {
+        /// Lookback window in hours (default: 168h / 7d)
+        #[arg(long, default_value_t = 168.0)]
+        hours: f64,
+        /// Preset lookback window (`24h`, `7d`, `14d`, `30d`, `90d`)
+        #[arg(long)]
+        window: Option<String>,
+        /// Session source (`copilot` or `all`)
+        #[arg(long, value_enum, default_value_t = BpeSource::Copilot)]
+        source: BpeSource,
+        /// Minimum total occurrences required to learn a rule
+        #[arg(long, default_value_t = 3)]
+        min_freq: usize,
+        /// Minimum distinct sessions required to learn a rule
+        #[arg(long, default_value_t = 2)]
+        min_sessions: usize,
+        /// Minimum BPE tokens saved per rule
+        #[arg(long, default_value_t = 1)]
+        min_savings_tokens: usize,
+        /// Maximum BPE merges to learn (up to 512)
+        #[arg(long, default_value_t = 256)]
+        max_merges: usize,
+        /// Also scan mounted Windows user profiles (`/mnt/c/Users/*`) when running in WSL
+        #[arg(long)]
+        include_windows_homes: bool,
+        /// Explicit session directory (repeatable; useful for custom paths or tests)
+        #[arg(long)]
+        session_dir: Vec<PathBuf>,
+        /// Only rebuild if session activity, age, or question-pattern drift crosses threshold
+        #[arg(long)]
+        if_needed: bool,
+        /// Preview learned merges and rules without writing `bpe-profile.json`
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove the persisted `bpe-profile.json` and revert to built-in rules
+        #[arg(long)]
+        reset: bool,
+        /// Restore the previously backed-up `bpe-profile.prev.json`
+        #[arg(long)]
+        rollback: bool,
+        /// Override tokenizer profile (`o200k`, `claude-4-6`, `claude-4-7`)
+        #[arg(long, value_enum)]
+        tokenizer: Option<TokenizerProfile>,
+        /// Emit structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect active BPE profile status and whether an automatic rebuild is needed
+    BpeStatus {
+        /// Lookback window in hours (default: 168h / 7d)
+        #[arg(long, default_value_t = 168.0)]
+        hours: f64,
+        /// Preset lookback window (`24h`, `7d`, `14d`, `30d`, `90d`)
+        #[arg(long)]
+        window: Option<String>,
+        /// Session source (`copilot` or `all`)
+        #[arg(long, value_enum, default_value_t = BpeSource::Copilot)]
+        source: BpeSource,
+        /// Also scan mounted Windows user profiles (`/mnt/c/Users/*`) when running in WSL
+        #[arg(long)]
+        include_windows_homes: bool,
+        /// Explicit session directory (repeatable)
+        #[arg(long)]
+        session_dir: Vec<PathBuf>,
+        /// Emit structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn run_prompt_subcommand(sub: &PromptSubcommand) -> Result<()> {
+    match sub {
+        PromptSubcommand::BuildBpe {
+            hours,
+            window,
+            source,
+            min_freq,
+            min_sessions,
+            min_savings_tokens,
+            max_merges,
+            include_windows_homes,
+            session_dir,
+            if_needed,
+            dry_run,
+            reset,
+            rollback,
+            tokenizer,
+            json,
+        } => {
+            if *reset && *rollback {
+                return Err(code_context::invalid("cannot combine --reset and --rollback").into());
+            }
+            let report = if *reset {
+                code_context::bpe_builder::reset_bpe_profile(None)?
+            } else if *rollback {
+                code_context::bpe_builder::rollback_bpe_profile(None)?
+            } else {
+                let eff_hours = match window.as_deref() {
+                    Some(w) => code_context::bpe_builder::parse_window_hours(w)?,
+                    None => *hours,
+                };
+                let mut cfg = BpeBuildConfig {
+                    window_hours: eff_hours,
+                    source: *source,
+                    min_freq: *min_freq,
+                    min_sessions: *min_sessions,
+                    min_savings_tokens: *min_savings_tokens,
+                    max_merges: *max_merges,
+                    session_dirs: session_dir.clone(),
+                    dry_run: *dry_run,
+                    if_needed: *if_needed,
+                    tokenizer: *tokenizer,
+                    ..BpeBuildConfig::default()
+                };
+                if *include_windows_homes {
+                    cfg.include_windows_homes = true;
+                }
+                code_context::bpe_builder::build_bpe_profile(&cfg)?
+            };
+            if *json {
+                return print(&serde_json::to_value(&report)?);
+            }
+            let mut stdout = io::stdout().lock();
+            let text = code_context::bpe_builder::format_build_report_text(&report);
+            stdout.write_all(text.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            Ok(())
+        }
+        PromptSubcommand::BpeStatus {
+            hours,
+            window,
+            source,
+            include_windows_homes,
+            session_dir,
+            json,
+        } => {
+            let eff_hours = match window.as_deref() {
+                Some(w) => code_context::bpe_builder::parse_window_hours(w)?,
+                None => *hours,
+            };
+            let mut cfg = BpeBuildConfig {
+                window_hours: eff_hours,
+                source: *source,
+                session_dirs: session_dir.clone(),
+                ..BpeBuildConfig::default()
+            };
+            if *include_windows_homes {
+                cfg.include_windows_homes = true;
+            }
+            let report = code_context::bpe_builder::inspect_bpe_status(&cfg)?;
+            if *json {
+                return print(&serde_json::to_value(&report)?);
+            }
+            let mut stdout = io::stdout().lock();
+            let text = code_context::bpe_builder::format_status_report_text(&report);
+            stdout.write_all(text.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            Ok(())
+        }
+    }
 }
 
 fn print(value: &serde_json::Value) -> Result<()> {

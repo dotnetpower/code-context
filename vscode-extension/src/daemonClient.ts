@@ -174,6 +174,71 @@ export class DaemonClient {
     );
   }
 
+  public queryBpeStatus(
+    options: { window?: string; hours?: number; source?: 'copilot' | 'all'; include_windows_homes?: boolean } = {},
+    cancellation: CancellationLike = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose(): void {} }),
+    },
+  ): Promise<JsonValue> {
+    const args: { [key: string]: JsonValue } = {};
+    if (options.window !== undefined) { args.window = options.window; }
+    if (options.hours !== undefined) { args.hours = options.hours; }
+    if (options.source !== undefined) { args.source = options.source; }
+    if (options.include_windows_homes !== undefined) {
+      args.include_windows_homes = options.include_windows_homes;
+    }
+    return this.getUsageLane().request(
+      {
+        root: null,
+        name: 'code_bpe_status',
+        arguments: args,
+        compact: true,
+      },
+      cancellation,
+    );
+  }
+
+  public buildBpeProfile(
+    options: {
+      window?: string;
+      hours?: number;
+      source?: 'copilot' | 'all';
+      include_windows_homes?: boolean;
+      if_needed?: boolean;
+      dry_run?: boolean;
+      reset?: boolean;
+      rollback?: boolean;
+      tokenizer?: string;
+    } = {},
+    cancellation: CancellationLike = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose(): void {} }),
+    },
+  ): Promise<JsonValue> {
+    const args: { [key: string]: JsonValue } = {};
+    if (options.window !== undefined) { args.window = options.window; }
+    if (options.hours !== undefined) { args.hours = options.hours; }
+    if (options.source !== undefined) { args.source = options.source; }
+    if (options.include_windows_homes !== undefined) {
+      args.include_windows_homes = options.include_windows_homes;
+    }
+    if (options.if_needed !== undefined) { args.if_needed = options.if_needed; }
+    if (options.dry_run !== undefined) { args.dry_run = options.dry_run; }
+    if (options.reset !== undefined) { args.reset = options.reset; }
+    if (options.rollback !== undefined) { args.rollback = options.rollback; }
+    if (options.tokenizer !== undefined) { args.tokenizer = options.tokenizer; }
+    return this.getUsageLane().request(
+      {
+        root: null,
+        name: 'code_bpe_build',
+        arguments: args,
+        compact: true,
+      },
+      cancellation,
+    );
+  }
+
   public request<T = JsonValue>(
     request: DaemonRequest,
     cancellation: CancellationLike,
@@ -191,7 +256,12 @@ export class DaemonClient {
     if (!this.isBarrierLane && request.name === 'code_sync') {
       return this.getBarrierLane().request<T>(request, cancellation);
     }
-    if (!this.isBarrierLane && request.name === 'code_usage') {
+    if (
+      !this.isBarrierLane &&
+      (request.name === 'code_usage' ||
+        request.name === 'code_bpe_status' ||
+        request.name === 'code_bpe_build')
+    ) {
       return this.getUsageLane().request<T>(request, cancellation);
     }
     return this.enqueue<T>(request, cancellation);

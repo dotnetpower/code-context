@@ -183,12 +183,19 @@ void test('manifest contributes exactly the seven registered native tools', asyn
       .map((command) => command.command)
       .sort(),
     [
+      'codeContextNative.buildBpeProfile',
       'codeContextNative.configureConnection',
       'codeContextNative.gettingStarted',
       'codeContextNative.openSetupGuide',
       'codeContextNative.registerWorkspace',
       'codeContextNative.selfTest',
+      'codeContextNative.showDashboard',
       'codeContextNative.showStatus',
+    ],
+  );
+  assert.ok(
+    manifest.contributes?.configuration?.properties?.[
+      'codeContextNative.autoBuildBpeProfile'
     ],
   );
   assert.ok(

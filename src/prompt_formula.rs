@@ -110,7 +110,10 @@ impl TokenizerProfile {
 
     pub fn for_model(model: &str) -> Self {
         let lower = model.to_ascii_lowercase();
-        if lower.contains("opus-4-7")
+        if lower.contains("claude-4-7")
+            || lower.contains("claude-4.7")
+            || lower.contains("claude47")
+            || lower.contains("opus-4-7")
             || lower.contains("opus-4.7")
             || lower.contains("sonnet-4-7")
             || lower.contains("sonnet-4.7")
@@ -544,6 +547,17 @@ pub fn normalize_bpe_operators(input: &str) -> (String, usize, usize) {
 /// Converts a natural-language (English or Korean) code-search/analysis or workflow
 /// task prompt into a compact, BPE-aligned symbolic formula prompt suitable for LLM agents.
 pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
+    let active = crate::bpe_builder::load_active_profile();
+    compress_task_prompt_with_profile(input, root, active.as_ref())
+}
+
+/// Same as [`compress_task_prompt`], but applies an explicit learned [`crate::bpe_builder::BpeProfile`]
+/// overlay (or built-in rules only when `profile` is `None`).
+pub fn compress_task_prompt_with_profile(
+    input: &str,
+    root: Option<&Path>,
+    profile: Option<&crate::bpe_builder::BpeProfile>,
+) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -625,6 +639,16 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
                     break;
                 }
             }
+            if !changed
+                && let Some(prof) = profile
+            {
+                for phrase in &prof.learned_fillers {
+                    if strip_filler_at_boundary(&mut cleaned, phrase) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
             if !changed {
                 break;
             }
@@ -635,7 +659,7 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
         }
 
         if let Some((q_prefix, rest)) = split_question_prefix(cleaned) {
-            let formula_body = clause_to_formula(rest);
+            let formula_body = clause_to_formula_with_profile(rest, profile);
             questions.push(format!("{q_prefix} => {formula_body}"));
         } else if raw_segment.trim_end().ends_with('?')
             || cleaned.to_ascii_lowercase().starts_with("which ")
@@ -643,14 +667,14 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
             || cleaned.to_ascii_lowercase().starts_with("how ")
             || cleaned.to_ascii_lowercase().starts_with("where ")
         {
-            let body = clause_to_formula(cleaned);
+            let body = clause_to_formula_with_profile(cleaned, profile);
             if has_ko && body.contains("->") {
                 rules.push(body);
             } else {
                 questions.push(format!("? => {body}"));
             }
         } else {
-            rules.push(clause_to_formula(cleaned));
+            rules.push(clause_to_formula_with_profile(cleaned, profile));
         }
     }
 
@@ -694,13 +718,13 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
             out.push_str(&header_parts.join(" | "));
             out.push('\n');
         }
-        for rule in rules {
+        for rule in &rules {
             out.push_str("- ");
-            out.push_str(&rule);
+            out.push_str(rule);
             out.push('\n');
         }
-        for q in questions {
-            out.push_str(&q);
+        for q in &questions {
+            out.push_str(q);
             out.push('\n');
         }
         out.trim_end().to_string()
@@ -715,10 +739,23 @@ pub fn compress_task_prompt(input: &str, root: Option<&Path>) -> String {
         }
         _ => collapsed_norm,
     };
-    if estimate_bpe_tokens(&candidate) >= estimate_bpe_tokens(&minimal_fallback) {
-        minimal_fallback
-    } else {
+    let fallback_tok = estimate_bpe_tokens(&minimal_fallback);
+    if estimate_bpe_tokens(&candidate) < fallback_tok {
         candidate
+    } else if has_ko
+        && questions.is_empty()
+        && rules.len() == 1
+        && !wants_read_only
+        && root.is_none()
+        && !wants_fn_loc
+        && contains_hangul(&rules[0])
+        && estimate_bpe_tokens(&rules[0]) < fallback_tok
+    {
+        // For short Korean single-clause prompts that already contain Hangul, omitting the
+        // `[ko] :: ` wrapper preserves learned BPE/filler savings without breaking Korean replies.
+        rules.into_iter().next().unwrap_or(minimal_fallback)
+    } else {
+        minimal_fallback
     }
 }
 
@@ -878,7 +915,100 @@ fn normalize_korean_numbered_patterns(input: &str) -> String {
     rebuilt.join(" ")
 }
 
+fn is_boundary_char(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ',' | '.' | '?' | '!' | ':' | ';' | '(' | ')' | '[' | ']')
+}
+
+fn strip_filler_at_boundary(cleaned: &mut String, phrase: &str) -> bool {
+    let p_lower = phrase.to_ascii_lowercase();
+    if p_lower.is_empty() {
+        return false;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while search_from <= lower.len()
+        && let Some(rel) = lower[search_from..].find(&p_lower)
+    {
+        let start = search_from + rel;
+        let end = start + p_lower.len();
+        if !cleaned.is_char_boundary(start) || !cleaned.is_char_boundary(end) {
+            break;
+        }
+        let left_ok = start == 0
+            || cleaned[..start]
+                .chars()
+                .next_back()
+                .is_none_or(is_boundary_char);
+        let right_ok = end == cleaned.len()
+            || phrase.chars().last().is_some_and(is_boundary_char)
+            || cleaned[end..].chars().next().is_none_or(is_boundary_char);
+        if left_ok && right_ok {
+            cleaned.replace_range(start..end, " ");
+            *cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+            return true;
+        }
+        if let Some(ch) = lower[start..].chars().next() {
+            search_from = start + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn replace_rule_at_boundary(input: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return input.to_string();
+    }
+    let ascii_word_start = from.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let ascii_word_end = from
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !ascii_word_start && !ascii_word_end {
+        return input.replace(from, to);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find(from) {
+        let end = idx + from.len();
+        let left_ok = !ascii_word_start
+            || (idx == 0 && out.chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric()))
+            || (idx > 0
+                && rest[..idx]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric()));
+        let right_ok = !ascii_word_end
+            || rest[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+        out.push_str(&rest[..idx]);
+        if left_ok && right_ok {
+            out.push_str(to);
+        } else {
+            out.push_str(from);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(crate) fn clause_to_formula_builtin(clause: &str) -> String {
+    clause_to_formula_with_profile(clause, None)
+}
+
+#[allow(dead_code)]
 fn clause_to_formula(clause: &str) -> String {
+    clause_to_formula_with_profile(clause, None)
+}
+
+fn clause_to_formula_with_profile(
+    clause: &str,
+    profile: Option<&crate::bpe_builder::BpeProfile>,
+) -> String {
     let (bpe_normalized, _, _) = normalize_bpe_operators(
         clause.trim().trim_end_matches('?').trim_end_matches('.'),
     );
@@ -1037,6 +1167,13 @@ fn clause_to_formula(clause: &str) -> String {
     for (from, to) in replacements {
         s = s.replace(from, to);
     }
+    if let Some(prof) = profile {
+        for rule in &prof.learned_replacements {
+            if !rule.from.is_empty() && s.contains(&rule.from) {
+                s = replace_rule_at_boundary(&s, &rule.from, &rule.to);
+            }
+        }
+    }
     let mut collapsed = s
         .replace(", =>", " =>")
         .replace(", &", " &")
@@ -1071,8 +1208,9 @@ pub fn build_report_with_tokenizer(
     tokenizer: TokenizerProfile,
 ) -> Value {
     if let Some(raw_task) = compress {
+        let active_profile = crate::bpe_builder::load_active_profile();
         let (_, unicode_replaced, backticks_removed) = normalize_bpe_operators(raw_task);
-        let compressed = compress_task_prompt(raw_task, root);
+        let compressed = compress_task_prompt_with_profile(raw_task, root, active_profile.as_ref());
         let prose_tokens = estimate_bpe_tokens_for(raw_task, tokenizer);
         let formula_tokens = estimate_bpe_tokens_for(&compressed, tokenizer);
         let saved = prose_tokens.saturating_sub(formula_tokens);
@@ -1087,6 +1225,9 @@ pub fn build_report_with_tokenizer(
             "tokenizer": tokenizer.as_str(),
             "language": if contains_hangul(raw_task) { "ko" } else { "en" },
             "root": root.map(|p| p.display().to_string()),
+            "bpe_profile_applied": active_profile.is_some(),
+            "bpe_profile_merges": active_profile.as_ref().map_or(0, |p| p.merges.len()),
+            "bpe_profile_rules": active_profile.as_ref().map_or(0, |p| p.learned_fillers.len() + p.learned_replacements.len()),
             "input_bytes": raw_task.len(),
             "output_bytes": compressed.len(),
             "input_estimated_tokens": prose_tokens,

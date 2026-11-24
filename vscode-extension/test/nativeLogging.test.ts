@@ -124,3 +124,82 @@ void test('native failures retain their reason and severity in one line with com
     assert.ok(!f.logs[0]?.text.includes('\n'));
   }
 });
+
+void test('Windows path.win32.resolve never corrupts WSL listWorkspaces Linux roots into C:\\home\\...', async () => {
+  const nodePath = await import('node:path');
+  const rootResolverFile = resolve(__dirname, '../src/rootResolver.js');
+  const nativeToolsFile = resolve(__dirname, '../src/nativeTools.js');
+  const nativeRequire = createRequire(nativeToolsFile);
+
+  const winPathMock = {
+    ...nodePath,
+    resolve: (...args: string[]): string => nodePath.win32.resolve(...args),
+    isAbsolute: (p: string): boolean => nodePath.win32.isAbsolute(p),
+    basename: (p: string, suffix?: string): string => nodePath.win32.basename(p, suffix),
+    join: (...args: string[]): string => nodePath.win32.join(...args),
+    relative: (from: string, to: string): string => nodePath.win32.relative(from, to),
+    sep: nodePath.win32.sep,
+  };
+
+  const rootResolverExports: Record<string, unknown> = {};
+  runInNewContext(await readFile(rootResolverFile, 'utf8'), {
+    exports: rootResolverExports,
+    require: (name: string): unknown => (name === 'node:path' ? winPathMock : nativeRequire(name)),
+  });
+
+  const nativeExports: {
+    NativeToolBridge?: new (client: object, output: object) => {
+      listWorkspaces(token: object): Promise<Array<{ root: string }>>;
+      resolveRoot(explicit: string | undefined, token: object, allowPreparation?: boolean): Promise<string>;
+      prioritizeOpenWslRoots(workspaces: Array<{ root: string; scopes: string[]; globs: string[] }>): string[];
+    };
+  } = {};
+  runInNewContext(await readFile(nativeToolsFile, 'utf8'), {
+    exports: nativeExports,
+    performance,
+    require: (name: string): unknown => {
+      if (name === 'node:path') { return winPathMock; }
+      if (name === './rootResolver.js') { return rootResolverExports; }
+      if (name === 'vscode') {
+        return {
+          workspace: {
+            isTrusted: true,
+            workspaceFolders: [{ uri: { scheme: 'vscode-remote', authority: 'wsl+Ubuntu-22.04', path: '/home/user/dev/code-context', fsPath: '\\\\wsl.localhost\\Ubuntu-22.04\\home\\user\\dev\\code-context' } }],
+          },
+          window: {},
+          lm: { registerTool: (): object => ({ dispose(): void {} }) },
+        };
+      }
+      return nativeRequire(name);
+    },
+  });
+
+  assert.ok(nativeExports.NativeToolBridge);
+  const client = {
+    usesWslBridge: true,
+    wslDistribution: 'Ubuntu-22.04',
+    request: (): Promise<JsonValue> =>
+      Promise.resolve([
+        { root: '/home/user/dev/agent-san', scopes: ['src'], globs: ['*.rs'] },
+        { root: '/home/user/dev/code-context', scopes: ['src'], globs: ['*.rs'], managed_parent: '/home/user/dev/parent' },
+      ]),
+  };
+  const output = { info(): void {}, warn(): void {}, error(): void {} };
+  const bridge = new nativeExports.NativeToolBridge(client, output);
+  const listed = await bridge.listWorkspaces({});
+  assert.deepEqual(listed.map((w) => w.root), [
+    '/home/user/dev/agent-san',
+    '/home/user/dev/code-context',
+  ]);
+  // Selecting any QuickPick item returned by listWorkspaces on Windows resolves cleanly without throwing!
+  const resolved = await bridge.resolveRoot(listed[1]!.root, {}, false);
+  assert.equal(resolved, '/home/user/dev/code-context');
+  // Mismatched WSL distribution URIs are rejected instead of stripping authority and bypassing distro checks!
+  await assert.rejects(
+    bridge.resolveRoot('vscode-remote://wsl+Debian/home/user/dev/code-context', {}, false),
+    /does not match configured WSL distribution/,
+  );
+  // Open WSL workspace is prioritized first in QuickPick ordering.
+  const ordered = bridge.prioritizeOpenWslRoots(listed as Array<{ root: string; scopes: string[]; globs: string[] }>);
+  assert.equal(ordered[0], '/home/user/dev/code-context');
+});
